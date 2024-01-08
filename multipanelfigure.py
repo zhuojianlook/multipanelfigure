@@ -23,7 +23,6 @@ def create_multi_panel_figure(template, images, v_label_customizations, spacing,
         axes = np.array([[ax] for ax in axes])  # Convert to 2D array for consistency
 
     # Iterate over the grid and create each panel
-# Iterate over the grid and create each panel
     for i, (img_data, label_custom) in enumerate(zip(images, panel_label_customization)):
         row, col = divmod(i, cols)
         ax = axes[row, col] if isinstance(axes, np.ndarray) else axes[i]
@@ -192,7 +191,8 @@ image_data = []
 if uploaded_files and len(uploaded_files) == rows * cols:
     # Image cropping and panel label customization
     for i, uploaded_file in enumerate(uploaded_files):
-        st.write(f"Image {i+1} - {chr(97+i)}")
+        file_name = uploaded_file.name  # Get the filename of the uploaded file
+        st.write(f"{file_name} - Cropped")  # Display the filename instead of 'Image1-a'
         image = Image.open(uploaded_file)
         width, height = image.size
 
@@ -218,12 +218,16 @@ if uploaded_files and len(uploaded_files) == rows * cols:
 
         # Input for specifying position in the grid
         position = st.number_input(f'Position for Image {i+1} (0-{rows*cols-1})', min_value=0, max_value=rows*cols-1, key=f"pos_{i}")
-
+        
+        # When appending the data, use the file name without the extension as the label text
+        file_label = file_name.rsplit('.', 1)[0]  # Remove the file extension from the label
+        
         # Append image data including position and cropping details
         image_data.append({
             'bytes': img_bytes.getvalue(),
             'crop': (left, 0, right, height),
-            'position': position
+            'position': position,
+            'label': file_label  # Store the file label
         })
 
         # Panel label customization for each image
