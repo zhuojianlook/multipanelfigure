@@ -146,7 +146,7 @@ def create_blank_grid(template):
         row, col = divmod(i, cols)
         ax = axes[row][col] if rows > 1 else axes[col]
         ax.axis('off')
-        ax.text(0.5, 0.5, f'Position {i}', ha='center', va='center')
+        ax.text(0.5, 0.5, f'{i}', ha='center', va='center')
 
     return fig
 
