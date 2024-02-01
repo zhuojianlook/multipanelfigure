@@ -181,7 +181,7 @@ if st.sidebar.button('Show Grid Positions'):
 spacing = st.slider('Spacing Between Panels', 0.0, 0.1, 0.02)
 
 # File uploader for images
-uploaded_files = st.file_uploader('Upload .tif files', type=['tif'], accept_multiple_files=True)
+uploaded_files = st.file_uploader('Upload .tif .jpg .png files', type=['tif', 'png', 'jpg'], accept_multiple_files=True)
 
 # Initialize lists for label customizations and image data
 panel_label_customization = []
