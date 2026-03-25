@@ -68,10 +68,14 @@ A professional desktop application for creating multi-panel scientific figures w
 ## Installation
 
 ### Pre-built Releases
-Download the latest release for your platform:
-- **macOS (Apple Silicon)**: `.dmg` installer
-- **macOS (Intel)**: `.dmg` installer
-- **Windows**: `.msi` installer
+
+Download the latest release for your platform from the [Releases page](https://github.com/zhuojianlook/multipanelfigure/releases/latest):
+
+| Platform | File | Link |
+|---|---|---|
+| macOS (Apple Silicon) | `.dmg` installer | [Download](https://github.com/zhuojianlook/multipanelfigure/releases/latest) |
+| macOS (Intel) | `.dmg` installer | [Download](https://github.com/zhuojianlook/multipanelfigure/releases/latest) |
+| Windows | `.msi` or `.exe` installer | [Download](https://github.com/zhuojianlook/multipanelfigure/releases/latest) |
 
 ### Build from Source
 
