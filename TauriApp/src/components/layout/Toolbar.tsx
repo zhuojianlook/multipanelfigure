@@ -32,14 +32,20 @@ import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 
 const APP_VERSION = "0.1.0";
 const CHANGELOG = [
-  { version: "0.1.0", date: "2026-03-24", changes: [
-    "Initial release",
-    "Multi-panel grid layout with drag-and-drop",
-    "Image crop, adjustments, and annotations",
-    "Scale bars with unit auto-conversion",
-    "Primary and secondary headers with spanning support",
-    "Save/Load project sessions",
-    "Custom font support",
+  { version: "0.1.0", date: "2026-03-25", changes: [
+    "Initial standalone release as native desktop app",
+    "Multi-panel grid layout with drag-and-drop image management",
+    "Image editing: crop, rotate, flip, brightness, contrast, levels, color adjustments",
+    "Primary and secondary headers with spanning, full typography, and position control",
+    "Scale bars with auto unit conversion (km to pm) and predefined scale definitions",
+    "Annotations: symbols, measurement lines, area tools (rect, ellipse, custom polygon, magic wand)",
+    "Zoomed insets: standard overlay, adjacent panel, and external image support",
+    "Video support: frame extraction with play/seek controls",
+    "Save/Load projects (.mpf) with all media bundled for sharing",
+    "Export to TIFF/PNG at configurable DPI (72-600)",
+    "Custom font support with global font application",
+    "Dark mode interface with parking drawer for panel organization",
+    "Cross-platform: macOS (Apple Silicon + Intel) and Windows",
   ]},
 ];
 import { useFigureStore } from "../../store/figureStore";
@@ -57,6 +63,7 @@ export function Toolbar() {
   const [updateStatus, setUpdateStatus] = useState<"idle" | "checking" | "up-to-date" | "available" | "error">("idle");
   const [latestVersion, setLatestVersion] = useState<string | null>(null);
   const [updateUrl, setUpdateUrl] = useState<string | null>(null);
+  const [releaseNotes, setReleaseNotes] = useState("");
   const [citationCopied, setCitationCopied] = useState(false);
 
   const imageCount = Object.keys(loadedImages).length;
@@ -239,8 +246,26 @@ export function Toolbar() {
                   const data = await resp.json();
                   const tag = (data.tag_name || "").replace(/^v/, "");
                   setLatestVersion(tag);
-                  setUpdateUrl(data.html_url || null);
-                  if (tag && tag !== APP_VERSION) {
+                  // Find platform-specific download URL
+                  const platform = navigator.platform.toLowerCase();
+                  const isMac = platform.includes("mac");
+                  const isWin = platform.includes("win");
+                  const assets = data.assets || [];
+                  let dlUrl = data.html_url;
+                  for (const asset of assets) {
+                    const name = (asset.name || "").toLowerCase();
+                    if (isMac && name.endsWith(".dmg")) { dlUrl = asset.browser_download_url; break; }
+                    if (isWin && name.endsWith(".msi")) { dlUrl = asset.browser_download_url; break; }
+                  }
+                  setUpdateUrl(dlUrl || data.html_url || null);
+                  setReleaseNotes(data.body || "");
+                  // Semver comparison
+                  const current = APP_VERSION.split(".").map(Number);
+                  const latest = tag.split(".").map(Number);
+                  const isNewer = latest[0] > current[0] ||
+                    (latest[0] === current[0] && latest[1] > current[1]) ||
+                    (latest[0] === current[0] && latest[1] === current[1] && latest[2] > current[2]);
+                  if (tag && isNewer) {
                     setUpdateStatus("available");
                   } else {
                     setUpdateStatus("up-to-date");
@@ -259,12 +284,21 @@ export function Toolbar() {
               </Alert>
             )}
             {updateStatus === "available" && (
-              <Alert severity="info" sx={{ py: 0, fontSize: "0.75rem", width: "100%" }}>
-                Version {latestVersion} is available!{" "}
+              <Alert severity="info" sx={{ py: 0.5, fontSize: "0.75rem", width: "100%" }}>
+                <Typography sx={{ fontWeight: 600, fontSize: "0.8rem" }}>
+                  Version {latestVersion} is available!
+                </Typography>
+                {releaseNotes && (
+                  <Typography sx={{ fontSize: "0.65rem", mt: 0.5, maxHeight: 80, overflowY: "auto", whiteSpace: "pre-wrap", color: "text.secondary" }}>
+                    {releaseNotes}
+                  </Typography>
+                )}
                 {updateUrl && (
-                  <a href={updateUrl} target="_blank" rel="noopener noreferrer" style={{ color: "inherit" }}>
-                    Download from GitHub
-                  </a>
+                  <Button size="small" variant="contained" color="primary" sx={{ mt: 0.5, fontSize: "0.65rem", textTransform: "none" }}
+                    onClick={() => window.open(updateUrl, "_blank")}
+                  >
+                    Download Update
+                  </Button>
                 )}
               </Alert>
             )}
