@@ -10,9 +10,8 @@ Download the latest release for your platform from the [Releases page](https://g
 
 | Platform | File |
 |---|---|
-| macOS (Apple Silicon) | `Multi-Panel Figure Builder_x.x.x_aarch64.dmg` |
-| macOS (Intel) | `Multi-Panel Figure Builder_x.x.x_x64.dmg` |
-| Windows | `Multi-Panel Figure Builder_x.x.x_x64-setup.exe` or `.msi` |
+| macOS (Apple Silicon) | `.dmg` installer |
+| Windows | `.msi` or `.exe` installer |
 
 ## Features
 

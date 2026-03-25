@@ -74,7 +74,6 @@ Download the latest release for your platform from the [Releases page](https://g
 | Platform | File | Link |
 |---|---|---|
 | macOS (Apple Silicon) | `.dmg` installer | [Download](https://github.com/zhuojianlook/multipanelfigure/releases/latest) |
-| macOS (Intel) | `.dmg` installer | [Download](https://github.com/zhuojianlook/multipanelfigure/releases/latest) |
 | Windows | `.msi` or `.exe` installer | [Download](https://github.com/zhuojianlook/multipanelfigure/releases/latest) |
 
 ### Build from Source
