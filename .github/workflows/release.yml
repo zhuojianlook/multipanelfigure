@@ -92,8 +92,6 @@ jobs:
           name: release-${{ matrix.triple }}
           path: |
             TauriApp/src-tauri/target/release/bundle/dmg/*.dmg
-            TauriApp/src-tauri/target/release/bundle/macos/*.app
-            TauriApp/src-tauri/target/release/bundle/msi/*.msi
             TauriApp/src-tauri/target/release/bundle/nsis/*.exe
 
   create-release:
@@ -111,7 +109,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/**/*.dmg
-            artifacts/**/*.msi
-            artifacts/**/*.exe
+            artifacts/release-*/**/*.dmg
+            artifacts/release-*/**/*.exe
           generate_release_notes: true

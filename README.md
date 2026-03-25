@@ -11,7 +11,13 @@ Download the latest release for your platform from the [Releases page](https://g
 | Platform | File |
 |---|---|
 | macOS (Apple Silicon) | `.dmg` installer |
-| Windows | `.msi` or `.exe` installer |
+| Windows | `.exe` installer |
+
+> **macOS users:** If you see "App is damaged and can't be opened", run this in Terminal after mounting the DMG:
+> ```bash
+> xattr -cr /Applications/Multi-Panel\ Figure\ Builder.app
+> ```
+> This is normal for unsigned apps and only needs to be done once.
 
 ## Features
 
