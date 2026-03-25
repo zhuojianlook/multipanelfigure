@@ -1,0 +1,11 @@
+.DS_Store
+*.pyc
+__pycache__/
+.venv/
+node_modules/
+dist/
+target/
+*.tiff
+generated_figure.png
+sample_output.png
+test-results/

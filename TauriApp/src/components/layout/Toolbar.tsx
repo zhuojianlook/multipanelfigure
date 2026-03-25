@@ -1,0 +1,336 @@
+/* ──────────────────────────────────────────────────────────
+   Toolbar — horizontal bar above the image strip.
+   Load Images button, image count badge, Save Figure button,
+   Help/About button.
+   ────────────────────────────────────────────────────────── */
+
+import { useRef, useState } from "react";
+import {
+  Box,
+  Button,
+  Chip,
+  IconButton,
+  Menu,
+  MenuItem,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Typography,
+  Tooltip,
+  Divider,
+  CircularProgress,
+  Alert,
+} from "@mui/material";
+import AddPhotoAlternateIcon from "@mui/icons-material/AddPhotoAlternate";
+import SaveIcon from "@mui/icons-material/Save";
+import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
+import InfoIcon from "@mui/icons-material/Info";
+import RestartAltIcon from "@mui/icons-material/RestartAlt";
+import SystemUpdateAltIcon from "@mui/icons-material/SystemUpdateAlt";
+import ContentCopyIcon from "@mui/icons-material/ContentCopy";
+
+const APP_VERSION = "0.1.0";
+const CHANGELOG = [
+  { version: "0.1.0", date: "2026-03-24", changes: [
+    "Initial release",
+    "Multi-panel grid layout with drag-and-drop",
+    "Image crop, adjustments, and annotations",
+    "Scale bars with unit auto-conversion",
+    "Primary and secondary headers with spanning support",
+    "Save/Load project sessions",
+    "Custom font support",
+  ]},
+];
+import { useFigureStore } from "../../store/figureStore";
+import { SaveFigureDialog } from "../dialogs/SaveFigureDialog";
+import { api } from "../../api/client";
+
+export function Toolbar() {
+  const loadedImages = useFigureStore((s) => s.loadedImages);
+  const uploadImages = useFigureStore((s) => s.uploadImages);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [saveDlgOpen, setSaveDlgOpen] = useState(false);
+  const [newConfirmOpen, setNewConfirmOpen] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(true);
+  const [helpMenuAnchor, setHelpMenuAnchor] = useState<null | HTMLElement>(null);
+  const [updateStatus, setUpdateStatus] = useState<"idle" | "checking" | "up-to-date" | "available" | "error">("idle");
+  const [latestVersion, setLatestVersion] = useState<string | null>(null);
+  const [updateUrl, setUpdateUrl] = useState<string | null>(null);
+  const [citationCopied, setCitationCopied] = useState(false);
+
+  const imageCount = Object.keys(loadedImages).length;
+
+  const handleFiles = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const fileArr = Array.from(files);
+    await uploadImages(fileArr);
+    if (fileRef.current) fileRef.current.value = "";
+  };
+
+  return (
+    <Box
+      sx={{
+        display: "flex",
+        alignItems: "center",
+        gap: 1.5,
+        px: 1.5,
+        py: 0.75,
+        borderBottom: 1,
+        borderColor: "divider",
+        bgcolor: "background.paper",
+        flexShrink: 0,
+        flexWrap: "wrap",
+      }}
+    >
+      {/* Load images */}
+      <Button
+        variant="contained"
+        startIcon={<AddPhotoAlternateIcon />}
+        onClick={() => fileRef.current?.click()}
+      >
+        Load Media
+      </Button>
+
+      <input
+        ref={fileRef}
+        type="file"
+        accept=".tif,.tiff,.png,.jpg,.jpeg,.cr2,.cr3,.nef,.arw,.dng,.orf,.rw2,.pef,.raf,.nd2,.mp4,.avi,.mov,.mkv,.webm,.wmv,.flv,.m4v,.mpg,.mpeg,.3gp,.ts,.mts"
+        multiple
+        style={{ display: "none" }}
+        aria-label="Load image files"
+        onChange={(e) => handleFiles(e.target.files)}
+      />
+
+      {/* Badge */}
+      <Chip
+        label={`${imageCount} file${imageCount !== 1 ? "s" : ""}`}
+        size="small"
+        variant="outlined"
+      />
+
+      {/* New / Clear Session */}
+      <Tooltip title="New figure — clears all panels, images, and settings">
+        <Button
+          size="small"
+          variant="outlined"
+          color="error"
+          startIcon={<RestartAltIcon />}
+          onClick={() => {
+            setNewConfirmOpen(true);
+          }}
+        >
+          New
+        </Button>
+      </Tooltip>
+
+      {/* New figure confirmation dialog */}
+      <Dialog open={newConfirmOpen} onClose={() => setNewConfirmOpen(false)}>
+        <DialogTitle>New Figure</DialogTitle>
+        <DialogContent>
+          <Typography>Start a new figure? All current images, settings, and panels will be cleared.</Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setNewConfirmOpen(false)}>Cancel</Button>
+          <Button variant="contained" color="error" onClick={async () => {
+            setNewConfirmOpen(false);
+            try {
+              // Preserve user-defined scale bars
+              const savedScales = await api.getResolutions().catch(() => ({}));
+              // Reset backend to fresh 2x2 grid
+              await api.updateConfig({
+                rows: 2, cols: 2, spacing: 0.02, output_format: "TIFF", background: "White",
+                panels: [[{} as never, {} as never], [{} as never, {} as never]],
+                column_labels: [
+                  { text: "Column 1", font_size: 12, font_name: "arial.ttf", font_path: null, font_style: [], default_color: "#000000", distance: 0.01, position: "Top", rotation: 0, styled_segments: [], visible: true },
+                  { text: "Column 2", font_size: 12, font_name: "arial.ttf", font_path: null, font_style: [], default_color: "#000000", distance: 0.01, position: "Top", rotation: 0, styled_segments: [], visible: true },
+                ] as never,
+                row_labels: [
+                  { text: "Row 1", font_size: 12, font_name: "arial.ttf", font_path: null, font_style: [], default_color: "#000000", distance: 0.01, position: "Left", rotation: 90, styled_segments: [], visible: true },
+                  { text: "Row 2", font_size: 12, font_name: "arial.ttf", font_path: null, font_style: [], default_color: "#000000", distance: 0.01, position: "Left", rotation: 90, styled_segments: [], visible: true },
+                ] as never,
+                column_headers: [], row_headers: [],
+                resolution_entries: savedScales, dpi: 300,
+              });
+              // Delete all loaded images
+              const imgs = await api.listImages();
+              for (const name of imgs.names) {
+                await api.deleteImage(name).catch(() => {});
+              }
+            } catch (err) {
+              console.error("Clear session failed", err);
+            }
+            // Full reload to reset frontend state
+            window.location.reload();
+          }}>Confirm</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Box sx={{ flex: 1 }} />
+
+      {/* Save figure */}
+      <Button
+        variant="contained"
+        color="secondary"
+        startIcon={<SaveIcon />}
+        onClick={() => setSaveDlgOpen(true)}
+      >
+        Save Figure
+      </Button>
+
+      {/* Help menu */}
+      <Tooltip title="Help">
+        <IconButton size="small" onClick={(e) => setHelpMenuAnchor(e.currentTarget)}>
+          <HelpOutlineIcon sx={{ fontSize: 20 }} />
+        </IconButton>
+      </Tooltip>
+
+      <Menu
+        anchorEl={helpMenuAnchor}
+        open={Boolean(helpMenuAnchor)}
+        onClose={() => setHelpMenuAnchor(null)}
+      >
+        <MenuItem onClick={() => { setAboutOpen(true); setHelpMenuAnchor(null); }}>
+          <InfoIcon sx={{ mr: 1, fontSize: 18 }} /> About
+        </MenuItem>
+      </Menu>
+
+      <SaveFigureDialog open={saveDlgOpen} onClose={() => setSaveDlgOpen(false)} />
+
+      {/* About Dialog */}
+      <Dialog open={aboutOpen} onClose={() => { setAboutOpen(false); setUpdateStatus("idle"); }} maxWidth="sm" fullWidth>
+        <DialogTitle sx={{ pb: 1 }}>About</DialogTitle>
+        <DialogContent>
+          <Box sx={{ textAlign: "center", py: 2 }}>
+            <Typography variant="h5" gutterBottom sx={{ fontWeight: 600 }}>
+              Multi-Panel Figure Builder
+            </Typography>
+            <Typography variant="body2" color="text.secondary" gutterBottom>
+              Version {APP_VERSION}
+            </Typography>
+            <Typography variant="body2" sx={{ mt: 1 }}>
+              Created by <strong>Zhuojian Look</strong>
+            </Typography>
+            <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: "block" }}>
+              A professional tool for creating multi-panel scientific figures
+              with full control over layout, annotations, scale bars, and image adjustments.
+            </Typography>
+          </Box>
+
+          <Divider sx={{ my: 2 }} />
+
+          {/* Check for Updates */}
+          <Box sx={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 1, mb: 2 }}>
+            <Button
+              variant="outlined"
+              size="small"
+              startIcon={updateStatus === "checking" ? <CircularProgress size={14} /> : <SystemUpdateAltIcon />}
+              disabled={updateStatus === "checking"}
+              onClick={async () => {
+                setUpdateStatus("checking");
+                setLatestVersion(null);
+                setUpdateUrl(null);
+                try {
+                  const resp = await fetch(
+                    "https://api.github.com/repos/zhuojianlook/multipanelfigure/releases/latest",
+                    { headers: { Accept: "application/vnd.github.v3+json" } }
+                  );
+                  if (!resp.ok) throw new Error(`GitHub API: ${resp.status}`);
+                  const data = await resp.json();
+                  const tag = (data.tag_name || "").replace(/^v/, "");
+                  setLatestVersion(tag);
+                  setUpdateUrl(data.html_url || null);
+                  if (tag && tag !== APP_VERSION) {
+                    setUpdateStatus("available");
+                  } else {
+                    setUpdateStatus("up-to-date");
+                  }
+                } catch {
+                  setUpdateStatus("error");
+                }
+              }}
+            >
+              {updateStatus === "checking" ? "Checking..." : "Check for Updates"}
+            </Button>
+
+            {updateStatus === "up-to-date" && (
+              <Alert severity="success" sx={{ py: 0, fontSize: "0.75rem", width: "100%" }}>
+                You are running the latest version ({APP_VERSION}).
+              </Alert>
+            )}
+            {updateStatus === "available" && (
+              <Alert severity="info" sx={{ py: 0, fontSize: "0.75rem", width: "100%" }}>
+                Version {latestVersion} is available!{" "}
+                {updateUrl && (
+                  <a href={updateUrl} target="_blank" rel="noopener noreferrer" style={{ color: "inherit" }}>
+                    Download from GitHub
+                  </a>
+                )}
+              </Alert>
+            )}
+            {updateStatus === "error" && (
+              <Alert severity="warning" sx={{ py: 0, fontSize: "0.75rem", width: "100%" }}>
+                Could not check for updates. Please check your internet connection.
+              </Alert>
+            )}
+          </Box>
+
+          <Divider sx={{ my: 2 }} />
+
+          {/* Citation */}
+          <Typography variant="subtitle2" sx={{ mb: 1 }}>Citation</Typography>
+          <Box sx={{
+            bgcolor: "action.hover",
+            borderRadius: 1,
+            p: 1.5,
+            mb: 2,
+            position: "relative",
+            fontFamily: "monospace",
+            fontSize: "0.7rem",
+            lineHeight: 1.5,
+            color: "text.secondary",
+          }}>
+            <Typography sx={{ fontFamily: "inherit", fontSize: "inherit", lineHeight: "inherit", color: "inherit" }}>
+              Look, Z. (2026). Multi-Panel Figure Builder (Version {APP_VERSION}) [Computer software]. https://github.com/zhuojianlook/multipanelfigure
+            </Typography>
+            <Tooltip title={citationCopied ? "Copied!" : "Copy citation"}>
+              <IconButton
+                size="small"
+                sx={{ position: "absolute", top: 4, right: 4 }}
+                onClick={() => {
+                  navigator.clipboard.writeText(
+                    `Look, Z. (2026). Multi-Panel Figure Builder (Version ${APP_VERSION}) [Computer software]. https://github.com/zhuojianlook/multipanelfigure`
+                  );
+                  setCitationCopied(true);
+                  setTimeout(() => setCitationCopied(false), 2000);
+                }}
+              >
+                <ContentCopyIcon sx={{ fontSize: 14 }} />
+              </IconButton>
+            </Tooltip>
+          </Box>
+
+          <Divider sx={{ my: 2 }} />
+
+          {/* Changelog */}
+          <Typography variant="subtitle2" sx={{ mb: 1 }}>Changelog</Typography>
+          {CHANGELOG.map((entry) => (
+            <Box key={entry.version} sx={{ mb: 1.5 }}>
+              <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                v{entry.version} — {entry.date}
+              </Typography>
+              <Box component="ul" sx={{ m: 0, pl: 2.5, "& li": { fontSize: "0.75rem", color: "text.secondary" } }}>
+                {entry.changes.map((change, i) => (
+                  <li key={i}>{change}</li>
+                ))}
+              </Box>
+            </Box>
+          ))}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => { setAboutOpen(false); setUpdateStatus("idle"); }}>Close</Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+}

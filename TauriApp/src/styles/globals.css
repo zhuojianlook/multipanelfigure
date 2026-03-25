@@ -1,0 +1,99 @@
+@import "tailwindcss";
+
+/* ── Enforce system dark mode ──────────────────────────── */
+html {
+  color-scheme: dark;
+}
+
+/* ── Dark theme palette ─────────────────────────────────── */
+:root {
+  --c-bg: #1c1c1e;
+  --c-surface: #2c2c2e;
+  --c-surface2: #38383a;
+  --c-border: #48484a;
+  --c-text: #e5e5ea;
+  --c-text-dim: #8e8e93;
+  --c-accent: #5a7fa8;
+  --c-red: #ff453a;
+  --c-green: #63a66a;
+}
+
+/* ── Base resets ─────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+  background-color: var(--c-bg);
+  color: var(--c-text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Scrollbar styling ──────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--c-bg);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--c-border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--c-text-dim);
+}
+
+/* ── Utility: checkerboard bg for transparent images ───── */
+.checkerboard {
+  background-image: repeating-conic-gradient(
+    #303030 0% 25%,
+    #404040 0% 50%
+  );
+  background-size: 16px 16px;
+}
+
+/* ── Number input spinner arrows — always visible in dark mode ── */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  opacity: 1;
+  filter: invert(0.8);
+  height: auto;
+}
+
+/* ── Ensure all MUI Select dropdowns don't clip ────────────── */
+.MuiSelect-select {
+  overflow: visible !important;
+}
+
+/* ── Fix FormControlLabel clipping for toggles ─────────────── */
+.MuiFormControlLabel-root {
+  overflow: visible;
+}
+
+/* ── Slider thumb visibility in dark mode ──────────────────── */
+.MuiSlider-thumb {
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.2);
+}
+
+/* ── Utility: no-drag for Tauri window ─────────────────── */
+.no-drag {
+  -webkit-app-region: no-drag;
+}
