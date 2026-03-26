@@ -76,11 +76,7 @@ Download the latest release for your platform from the [Releases page](https://g
 | macOS (Apple Silicon) | `.dmg` installer | [Download](https://github.com/zhuojianlook/multipanelfigure/releases/latest) |
 | Windows | `.exe` installer | [Download](https://github.com/zhuojianlook/multipanelfigure/releases/latest) |
 
-> **macOS users:** If you see "App is damaged and can't be opened", run this in Terminal after installing:
-> ```bash
-> xattr -cr /Applications/Multi-Panel\ Figure\ Builder.app
-> ```
-> This is normal for unsigned apps and only needs to be done once.
+> **macOS users:** On first launch, right-click (or Control-click) the app and select **Open**. Click **Open** in the dialog to bypass Gatekeeper. This only needs to be done once.
 
 ### Build from Source
 

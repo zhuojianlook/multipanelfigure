@@ -86,6 +86,19 @@ jobs:
       - name: Build Tauri
         working-directory: TauriApp
         run: npx tauri build
+      - name: Ad-hoc sign macOS app and rebuild DMG
+        if: runner.os == 'macOS'
+        run: |
+          APP_PATH=$(find TauriApp/src-tauri/target/release/bundle/macos -name "*.app" -maxdepth 1)
+          echo "Signing $APP_PATH"
+          codesign --force --deep -s - "$APP_PATH"
+          codesign --verify "$APP_PATH" && echo "Signature valid"
+          # Rebuild DMG with the signed app
+          DMG_PATH=$(find TauriApp/src-tauri/target/release/bundle/dmg -name "*.dmg" -maxdepth 1)
+          DMG_NAME=$(basename "$DMG_PATH")
+          rm "$DMG_PATH"
+          hdiutil create -volname "Multi-Panel Figure Builder" -srcfolder "$APP_PATH" -ov -format UDZO "TauriApp/src-tauri/target/release/bundle/dmg/$DMG_NAME"
+        shell: bash
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
