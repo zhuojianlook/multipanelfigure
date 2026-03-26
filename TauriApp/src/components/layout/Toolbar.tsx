@@ -33,8 +33,12 @@ import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
-const APP_VERSION = "0.1.5";
+const APP_VERSION = "0.1.6";
 const CHANGELOG = [
+  { version: "0.1.6", date: "2026-03-26", changes: [
+    "Fixed updater URL encoding (spaces in filenames)",
+    "Better error diagnostics for update failures",
+  ]},
   { version: "0.1.5", date: "2026-03-26", changes: [
     "Updated about section description",
   ]},
@@ -269,7 +273,14 @@ export function Toolbar() {
                   }
                 } catch (e: unknown) {
                   console.error("Update check failed:", e);
-                  const msg = e instanceof Error ? e.message : String(e);
+                  let msg: string;
+                  if (e instanceof Error) {
+                    msg = `${e.name}: ${e.message}`;
+                  } else if (typeof e === "object" && e !== null) {
+                    msg = JSON.stringify(e);
+                  } else {
+                    msg = String(e);
+                  }
                   setReleaseNotes(msg);
                   setUpdateStatus("error");
                 }

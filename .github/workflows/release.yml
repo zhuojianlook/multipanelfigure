@@ -151,6 +151,10 @@ jobs:
           WIN_NAME=$(basename "$WIN_EXE" 2>/dev/null || echo "")
           MAC_NAME=$(basename "$MAC_TAR" 2>/dev/null || echo "")
 
+          # URL-encode filenames (spaces -> %20)
+          WIN_NAME_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${WIN_NAME}'))")
+          MAC_NAME_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${MAC_NAME}'))")
+
           cat > artifacts/latest.json << ENDJSON
           {
             "version": "${VERSION}",
@@ -159,11 +163,11 @@ jobs:
             "platforms": {
               "windows-x86_64": {
                 "signature": "${WIN_SIGNATURE}",
-                "url": "https://github.com/${REPO}/releases/download/v${VERSION}/${WIN_NAME}"
+                "url": "https://github.com/${REPO}/releases/download/v${VERSION}/${WIN_NAME_ENC}"
               },
               "darwin-aarch64": {
                 "signature": "${MAC_SIGNATURE}",
-                "url": "https://github.com/${REPO}/releases/download/v${VERSION}/${MAC_NAME}"
+                "url": "https://github.com/${REPO}/releases/download/v${VERSION}/${MAC_NAME_ENC}"
               }
             }
           }
