@@ -42,22 +42,35 @@ pub fn run() {
       if cfg!(debug_assertions) {
         port = 8765;
       } else {
-        // On macOS, remove quarantine attribute from sidecar before spawning.
-        // This prevents Gatekeeper from blocking the sidecar on fresh installs
-        // when the user has already approved the main app via right-click → Open.
+        // On macOS, remove quarantine attribute from the entire .app bundle.
+        // PyInstaller --onefile binaries extract to /tmp at runtime, and macOS
+        // propagates the quarantine flag to extracted files. Removing it from
+        // the whole bundle prevents Gatekeeper from blocking the sidecar.
         #[cfg(target_os = "macos")]
         {
           if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
+            // exe is at .app/Contents/MacOS/app — walk up to .app
+            if let Some(macos_dir) = exe_path.parent() {
+              // Remove quarantine from sidecar binary
               let sidecar_name = format!("api-server-{}-apple-darwin", std::env::consts::ARCH);
-              let sidecar_path = exe_dir.join(&sidecar_name);
+              let sidecar_path = macos_dir.join(&sidecar_name);
               eprintln!("[setup] Removing quarantine from sidecar: {:?}", sidecar_path);
               let _ = std::process::Command::new("xattr")
-                .args(["-dr", "com.apple.quarantine", &sidecar_path.to_string_lossy().to_string()])
+                .args(["-cr", &sidecar_path.to_string_lossy().to_string()])
                 .output();
               let _ = std::process::Command::new("chmod")
                 .args(["+x", &sidecar_path.to_string_lossy().to_string()])
                 .output();
+
+              // Also remove quarantine from the entire .app bundle
+              if let Some(contents_dir) = macos_dir.parent() {
+                if let Some(app_dir) = contents_dir.parent() {
+                  eprintln!("[setup] Removing quarantine from app bundle: {:?}", app_dir);
+                  let _ = std::process::Command::new("xattr")
+                    .args(["-cr", &app_dir.to_string_lossy().to_string()])
+                    .output();
+                }
+              }
             }
           }
         }
