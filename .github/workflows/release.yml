@@ -152,9 +152,9 @@ jobs:
           WIN_NAME=$(basename "$WIN_EXE" 2>/dev/null || echo "")
           MAC_NAME=$(basename "$MAC_TAR" 2>/dev/null || echo "")
 
-          # URL-encode filenames (spaces -> %20)
-          WIN_NAME_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${WIN_NAME}'))")
-          MAC_NAME_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${MAC_NAME}'))")
+          # GitHub replaces spaces with dots in release asset names
+          WIN_NAME_GH=$(echo "$WIN_NAME" | tr ' ' '.')
+          MAC_NAME_GH=$(echo "$MAC_NAME" | tr ' ' '.')
 
           cat > artifacts/latest.json << ENDJSON
           {
@@ -164,11 +164,11 @@ jobs:
             "platforms": {
               "windows-x86_64": {
                 "signature": "${WIN_SIGNATURE}",
-                "url": "https://github.com/${REPO}/releases/download/v${VERSION}/${WIN_NAME_ENC}"
+                "url": "https://github.com/${REPO}/releases/download/v${VERSION}/${WIN_NAME_GH}"
               },
               "darwin-aarch64": {
                 "signature": "${MAC_SIGNATURE}",
-                "url": "https://github.com/${REPO}/releases/download/v${VERSION}/${MAC_NAME_ENC}"
+                "url": "https://github.com/${REPO}/releases/download/v${VERSION}/${MAC_NAME_GH}"
               }
             }
           }
