@@ -11,7 +11,7 @@ import type {
   ProjectLoadResponse,
 } from "./types";
 
-const DEFAULT_BASE = "http://127.0.0.1:8765";
+const DEFAULT_BASE = "http://localhost:8765";
 
 class ApiClient {
   private base: string;

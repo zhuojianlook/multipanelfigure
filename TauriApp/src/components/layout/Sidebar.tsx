@@ -374,7 +374,7 @@ export function Sidebar() {
               form.append("files", f);
             }
             try {
-              await fetch("http://127.0.0.1:8765/api/fonts/upload", { method: "POST", body: form });
+              await fetch("http://localhost:8765/api/fonts/upload", { method: "POST", body: form });
               fetchFonts();
             } catch (err) {
               console.error("Font upload failed", err);

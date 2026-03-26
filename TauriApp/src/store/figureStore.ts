@@ -251,7 +251,7 @@ export const useFigureStore = create<FigureState>()(
         try {
           const controller = new AbortController();
           const timeout = setTimeout(() => controller.abort(), 2000);
-          const resp = await fetch("http://127.0.0.1:8765/api/health", { signal: controller.signal });
+          const resp = await fetch("http://localhost:8765/api/health", { signal: controller.signal });
           clearTimeout(timeout);
           if (resp.ok) { connected = true; break; }
         } catch {
