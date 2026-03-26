@@ -1337,8 +1337,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
         if (r?.thumbnail) setExtImageThumb(r.thumbnail);
       }).catch(() => setExtImageThumb(""));
       // Also fetch dimensions and set default crop to full image
-      fetch(`http://localhost:8765/api/images/${encodeURIComponent(extName)}/info`)
-        .then(r => r.json())
+      api.getImageInfo(extName)
         .then(info => {
           if (info.width && info.height) {
             setExtImageDims({ w: info.width, h: info.height });

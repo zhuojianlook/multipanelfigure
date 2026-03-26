@@ -1,8 +1,10 @@
 /* ──────────────────────────────────────────────────────────
    API client for the FastAPI backend (api_server.py).
    All methods return parsed JSON.
+   Uses Tauri HTTP plugin to bypass WebView restrictions.
    ────────────────────────────────────────────────────────── */
 
+import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import type {
   FigureConfig,
   UploadResponse,
@@ -11,7 +13,12 @@ import type {
   ProjectLoadResponse,
 } from "./types";
 
-const DEFAULT_BASE = "http://localhost:8765";
+const DEFAULT_BASE = "http://127.0.0.1:8765";
+
+// Use Tauri fetch if available, fallback to browser fetch
+const httpFetch: typeof globalThis.fetch = typeof tauriFetch === "function"
+  ? (tauriFetch as unknown as typeof globalThis.fetch)
+  : globalThis.fetch;
 
 class ApiClient {
   private base: string;
@@ -26,8 +33,8 @@ class ApiClient {
     return `${this.base}${path}`;
   }
 
-  private async json<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
-    const res = await fetch(input, init);
+  private async json<T>(input: string, init?: RequestInit): Promise<T> {
+    const res = await httpFetch(input, init);
     if (!res.ok) {
       const body = await res.text();
       throw new Error(`API ${res.status}: ${body}`);
@@ -119,7 +126,7 @@ class ApiClient {
   }
 
   async deleteImage(name: string): Promise<void> {
-    await fetch(this.url(`/api/images/${encodeURIComponent(name)}`), {
+    await httpFetch(this.url(`/api/images/${encodeURIComponent(name)}`), {
       method: "DELETE",
     });
   }
