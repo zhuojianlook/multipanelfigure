@@ -4,7 +4,7 @@
    Help/About button.
    ────────────────────────────────────────────────────────── */
 
-import { useRef, useState } from "react";
+import { useRef, useState, useEffect } from "react";
 import {
   Box,
   Button,
@@ -32,31 +32,17 @@ import DownloadIcon from "@mui/icons-material/Download";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { getVersion } from "@tauri-apps/api/app";
 
-const APP_VERSION = "0.1.7";
 const CHANGELOG = [
-  { version: "0.1.7", date: "2026-03-26", changes: [
-    "Switch updater endpoint to raw GitHub URL (fixes redirect issue)",
-  ]},
-  { version: "0.1.6", date: "2026-03-26", changes: [
-    "Fixed updater URL encoding (spaces in filenames)",
-    "Better error diagnostics for update failures",
-  ]},
-  { version: "0.1.5", date: "2026-03-26", changes: [
-    "Updated about section description",
-  ]},
-  { version: "0.1.4", date: "2026-03-26", changes: [
-    "Show actual error message when update check fails for easier debugging",
-  ]},
-  { version: "0.1.3", date: "2026-03-26", changes: [
-    "Updated about section description",
+  { version: "0.1.13", date: "2026-03-26", changes: [
+    "Fixed updater download URLs (GitHub asset naming mismatch)",
+    "Native in-app auto-updater now fully working on macOS and Windows",
   ]},
   { version: "0.1.2", date: "2026-03-26", changes: [
-    "Native in-app auto-updater — download and install updates without leaving the app",
-    "Restart button after update install for seamless upgrade experience",
-  ]},
-  { version: "0.1.1", date: "2026-03-26", changes: [
-    "Updated about section description",
+    "Native in-app auto-updater with download, install, and restart",
+    "Ad-hoc code signing for macOS (right-click > Open to bypass Gatekeeper)",
+    "DMG installer with Applications shortcut for drag-to-install",
   ]},
   { version: "0.1.0", date: "2026-03-25", changes: [
     "Initial standalone release as native desktop app",
@@ -92,6 +78,11 @@ export function Toolbar() {
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [updateRef, setUpdateRef] = useState<Awaited<ReturnType<typeof check>> | null>(null);
   const [citationCopied, setCitationCopied] = useState(false);
+  const [appVersion, setAppVersion] = useState("...");
+
+  useEffect(() => {
+    getVersion().then((v) => setAppVersion(v)).catch(() => setAppVersion("unknown"));
+  }, []);
 
   const imageCount = Object.keys(loadedImages).length;
 
@@ -240,7 +231,7 @@ export function Toolbar() {
               Multi-Panel Figure Builder
             </Typography>
             <Typography variant="body2" color="text.secondary" gutterBottom>
-              Version {APP_VERSION}
+              Version {appVersion}
             </Typography>
             <Typography variant="body2" sx={{ mt: 1 }}>
               Created by <strong>Zhuojian Look</strong>
@@ -288,7 +279,7 @@ export function Toolbar() {
 
             {updateStatus === "up-to-date" && (
               <Alert severity="success" sx={{ py: 0, fontSize: "0.75rem", width: "100%" }}>
-                You are running the latest version ({APP_VERSION}).
+                You are running the latest version ({appVersion}).
               </Alert>
             )}
             {updateStatus === "available" && (
@@ -377,7 +368,7 @@ export function Toolbar() {
             color: "text.secondary",
           }}>
             <Typography sx={{ fontFamily: "inherit", fontSize: "inherit", lineHeight: "inherit", color: "inherit" }}>
-              Look, Z. (2026). Multi-Panel Figure Builder (Version {APP_VERSION}) [Computer software]. https://github.com/zhuojianlook/multipanelfigure
+              Look, Z. (2026). Multi-Panel Figure Builder (Version {appVersion}) [Computer software]. https://github.com/zhuojianlook/multipanelfigure
             </Typography>
             <Tooltip title={citationCopied ? "Copied!" : "Copy citation"}>
               <IconButton
@@ -385,7 +376,7 @@ export function Toolbar() {
                 sx={{ position: "absolute", top: 4, right: 4 }}
                 onClick={() => {
                   navigator.clipboard.writeText(
-                    `Look, Z. (2026). Multi-Panel Figure Builder (Version ${APP_VERSION}) [Computer software]. https://github.com/zhuojianlook/multipanelfigure`
+                    `Look, Z. (2026). Multi-Panel Figure Builder (Version ${appVersion}) [Computer software]. https://github.com/zhuojianlook/multipanelfigure`
                   );
                   setCitationCopied(true);
                   setTimeout(() => setCitationCopied(false), 2000);
