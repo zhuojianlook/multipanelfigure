@@ -39,16 +39,18 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
 
 const CHANGELOG = [
-  { version: "0.1.30", date: "2026-03-27", changes: [
+  { version: "0.1.34", date: "2026-03-27", changes: [
+    "High-resolution Windows app icon (256x256 multi-size ICO)",
+    "Loading screen with spinner on startup instead of plain text",
+    "Changelog now shown when update is available before downloading",
+    "Fixed global font selection on Windows",
+  ]},
+  { version: "0.1.29", date: "2026-03-27", changes: [
     "All API calls routed through Rust IPC proxy for reliable cross-platform connectivity",
     "Sidecar process now properly killed on app exit, update, and restart",
     "Improved first-launch reliability on fresh macOS installations",
     "Detailed error diagnostics shown when backend connection fails",
-  ]},
-  { version: "0.1.25", date: "2026-03-26", changes: [
     "Fixed Windows backend connectivity (Private Network Access headers)",
-    "Windows sidecar now starts and connects reliably",
-    "Added python-multipart dependency for file upload support",
   ]},
   { version: "0.1.13", date: "2026-03-26", changes: [
     "Fixed updater download URLs (GitHub asset naming mismatch)",
@@ -56,7 +58,7 @@ const CHANGELOG = [
   ]},
   { version: "0.1.2", date: "2026-03-26", changes: [
     "Native in-app auto-updater with download, install, and restart",
-    "Ad-hoc code signing for macOS (right-click → Open to bypass Gatekeeper)",
+    "Ad-hoc code signing for macOS (right-click to Open to bypass Gatekeeper)",
     "DMG installer with Applications shortcut for drag-to-install",
   ]},
   { version: "0.1.0", date: "2026-03-25", changes: [
