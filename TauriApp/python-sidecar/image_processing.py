@@ -9,6 +9,7 @@ import colorsys
 import math
 import re
 import os
+from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 
 from models import (
@@ -105,12 +106,23 @@ def _load_font(font_path: Optional[str], size: int, font_name: Optional[str] = N
     is_bold = "Bold" in styles
     is_italic = "Italic" in styles
 
-    search_dirs = [
-        "/System/Library/Fonts", "/Library/Fonts",
-        os.path.expanduser("~/Library/Fonts"),
-        "/System/Library/Fonts/Supplemental",
-        "/usr/share/fonts/truetype",
-    ]
+    import platform
+    if platform.system() == "Windows":
+        search_dirs = [
+            os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
+            os.path.expanduser("~/AppData/Local/Microsoft/Windows/Fonts"),
+        ]
+    else:
+        search_dirs = [
+            "/System/Library/Fonts", "/Library/Fonts",
+            os.path.expanduser("~/Library/Fonts"),
+            "/System/Library/Fonts/Supplemental",
+            "/usr/share/fonts/truetype",
+        ]
+    # Also search persistent custom fonts dir
+    persistent_dir = str(Path.home() / ".multipanelfigure" / "fonts")
+    if os.path.isdir(persistent_dir):
+        search_dirs.append(persistent_dir)
 
     # If we have a font_name (e.g. "arial.ttf"), try to find bold/italic variant
     effective_name = font_name or (os.path.basename(font_path) if font_path else None)
@@ -160,14 +172,25 @@ def _load_font(font_path: Optional[str], size: int, font_name: Optional[str] = N
                 except Exception:
                     pass
     # Fallback to well-known system fonts
-    for fallback in [
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/System/Library/Fonts/SFNSText.ttf",
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        "/Library/Fonts/Arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]:
+    fallbacks = []
+    if platform.system() == "Windows":
+        win_fonts = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+        fallbacks = [
+            os.path.join(win_fonts, "arial.ttf"),
+            os.path.join(win_fonts, "segoeui.ttf"),
+            os.path.join(win_fonts, "calibri.ttf"),
+            os.path.join(win_fonts, "tahoma.ttf"),
+        ]
+    else:
+        fallbacks = [
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/System/Library/Fonts/SFNSText.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/Library/Fonts/Arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+    for fallback in fallbacks:
         if os.path.isfile(fallback):
             try:
                 return ImageFont.truetype(fallback, size)
