@@ -258,9 +258,16 @@ export const useFigureStore = create<FigureState>()(
       }
       if (!connected) {
         console.error("API server not reachable after 15 attempts");
+        // Try to get sidecar error from Tauri
+        let sidecarMsg = "";
+        try {
+          const { invoke } = await import("@tauri-apps/api/core");
+          const err = await invoke("get_sidecar_error");
+          if (err) sidecarMsg = ` Sidecar error: ${err}`;
+        } catch { /* not in Tauri context */ }
         set((s) => {
           s.config = buildDefaultConfig(2, 2);
-          s.apiError = "Cannot connect to backend server. Image loading and preview will not work. Try restarting the app.";
+          s.apiError = `Cannot connect to backend server. Image loading and preview will not work.${sidecarMsg}`;
         });
         return;
       }

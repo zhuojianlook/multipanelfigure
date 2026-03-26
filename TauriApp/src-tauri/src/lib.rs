@@ -1,12 +1,20 @@
 use tauri::Manager;
 use tauri_plugin_shell::ShellExt;
+use tauri_plugin_shell::process::CommandEvent;
+use std::sync::{Arc, Mutex};
 
 #[tauri::command]
 fn get_sidecar_port(state: tauri::State<'_, SidecarPort>) -> u16 {
     state.0
 }
 
+#[tauri::command]
+fn get_sidecar_error(state: tauri::State<'_, SidecarError>) -> Option<String> {
+    state.0.lock().unwrap().clone()
+}
+
 struct SidecarPort(u16);
+struct SidecarError(Arc<Mutex<Option<String>>>);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -24,27 +32,70 @@ pub fn run() {
         )?;
       }
 
+      let sidecar_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
       // Launch sidecar in production; in dev, assume it's already running
       let port: u16;
       if cfg!(debug_assertions) {
-        // Dev mode: use the manually started sidecar (default port from READY line)
         port = 8765;
       } else {
-        // Production: launch bundled sidecar binary
-        let sidecar = app.shell().sidecar("api-server")
-          .expect("failed to find sidecar binary")
-          .args(["--port", "8765"]);
-
-        let (_rx, _child) = sidecar.spawn()
-          .expect("failed to spawn sidecar");
-
+        let sidecar_result = app.shell().sidecar("api-server");
+        match sidecar_result {
+          Ok(cmd) => {
+            let cmd = cmd.args(["--port", "8765"]);
+            match cmd.spawn() {
+              Ok((mut rx, _child)) => {
+                // Capture sidecar stdout/stderr in background
+                let err_clone = sidecar_error.clone();
+                tauri::async_runtime::spawn(async move {
+                  while let Some(event) = rx.recv().await {
+                    match event {
+                      CommandEvent::Stderr(line) => {
+                        let msg = String::from_utf8_lossy(&line).to_string();
+                        eprintln!("[sidecar stderr] {}", msg);
+                        let mut e = err_clone.lock().unwrap();
+                        let current = e.get_or_insert_with(String::new);
+                        if current.len() < 2000 {
+                          current.push_str(&msg);
+                          current.push('\n');
+                        }
+                      }
+                      CommandEvent::Stdout(line) => {
+                        eprintln!("[sidecar stdout] {}", String::from_utf8_lossy(&line));
+                      }
+                      CommandEvent::Terminated(payload) => {
+                        let msg = format!("Sidecar exited with code: {:?}, signal: {:?}", payload.code, payload.signal);
+                        eprintln!("{}", msg);
+                        let mut e = err_clone.lock().unwrap();
+                        let current = e.get_or_insert_with(String::new);
+                        current.push_str(&msg);
+                      }
+                      _ => {}
+                    }
+                  }
+                });
+              }
+              Err(e) => {
+                let msg = format!("Failed to spawn sidecar: {}", e);
+                eprintln!("{}", msg);
+                *sidecar_error.lock().unwrap() = Some(msg);
+              }
+            }
+          }
+          Err(e) => {
+            let msg = format!("Failed to find sidecar binary: {}", e);
+            eprintln!("{}", msg);
+            *sidecar_error.lock().unwrap() = Some(msg);
+          }
+        }
         port = 8765;
       }
 
       app.manage(SidecarPort(port));
+      app.manage(SidecarError(sidecar_error));
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_sidecar_port])
+    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
