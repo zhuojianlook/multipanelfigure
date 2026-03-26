@@ -33,16 +33,12 @@ pub fn run() {
         // Production: launch bundled sidecar binary
         let sidecar = app.shell().sidecar("api-server")
           .expect("failed to find sidecar binary")
-          .args(["--port", "0"]);  // port 0 = auto-assign
+          .args(["--port", "8765"]);
 
-        let (mut rx, _child) = sidecar.spawn()
+        let (_rx, _child) = sidecar.spawn()
           .expect("failed to spawn sidecar");
 
-        // Read the READY:PORT line from stdout
-        port = 8765; // fallback
-        // Note: Tauri v2 sidecar stdout is handled via events, not BufReader
-        // The sidecar prints "READY:PORT" — we'll use a fixed port for now
-        // and improve this with event-based port reading later
+        port = 8765;
       }
 
       app.manage(SidecarPort(port));

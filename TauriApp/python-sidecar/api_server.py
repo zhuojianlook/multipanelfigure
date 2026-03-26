@@ -39,12 +39,19 @@ def pil_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
 
 def find_fonts(extra_dirs=None):
     fonts = {}
-    sys_dirs = [
-        "/System/Library/Fonts",
-        "/System/Library/Fonts/Supplemental",
-        "/Library/Fonts",
-        os.path.expanduser("~/Library/Fonts"),
-    ]
+    import platform
+    if platform.system() == "Windows":
+        sys_dirs = [
+            os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
+            os.path.expanduser("~/AppData/Local/Microsoft/Windows/Fonts"),
+        ]
+    else:
+        sys_dirs = [
+            "/System/Library/Fonts",
+            "/System/Library/Fonts/Supplemental",
+            "/Library/Fonts",
+            os.path.expanduser("~/Library/Fonts"),
+        ]
     app_dir = str(SCRIPT_DIR)
     app_dirs = [app_dir, os.path.join(app_dir, "..")]
     persistent_dir = str(Path.home() / ".multipanelfigure" / "fonts")
