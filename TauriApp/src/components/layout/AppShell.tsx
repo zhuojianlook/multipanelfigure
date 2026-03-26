@@ -56,13 +56,26 @@ export function AppShell() {
   if (!config) {
     return (
       <div
-        className="flex h-screen w-screen items-center justify-center"
+        className="flex h-screen w-screen items-center justify-center flex-col gap-4"
         style={{
           backgroundColor: "var(--c-bg)",
           color: "var(--c-text-dim)",
         }}
       >
-        <span className="text-sm">Connecting to backend...</span>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
+          <div style={{
+            width: 40, height: 40, border: "3px solid rgba(255,255,255,0.15)",
+            borderTopColor: "rgba(255,255,255,0.6)", borderRadius: "50%",
+            animation: "spin 0.8s linear infinite",
+          }} />
+          <span style={{ fontSize: 16, fontWeight: 500, letterSpacing: 0.5 }}>
+            Multi-Panel Figure Builder
+          </span>
+          <span style={{ fontSize: 12, opacity: 0.5 }}>
+            Loading...
+          </span>
+        </div>
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
       </div>
     );
   }
