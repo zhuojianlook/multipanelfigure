@@ -33,8 +33,11 @@ import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
-const APP_VERSION = "0.1.3";
+const APP_VERSION = "0.1.4";
 const CHANGELOG = [
+  { version: "0.1.4", date: "2026-03-26", changes: [
+    "Show actual error message when update check fails for easier debugging",
+  ]},
   { version: "0.1.3", date: "2026-03-26", changes: [
     "Updated about section description",
   ]},
@@ -261,8 +264,10 @@ export function Toolbar() {
                   } else {
                     setUpdateStatus("up-to-date");
                   }
-                } catch (e) {
+                } catch (e: unknown) {
                   console.error("Update check failed:", e);
+                  const msg = e instanceof Error ? e.message : String(e);
+                  setReleaseNotes(msg);
                   setUpdateStatus("error");
                 }
               }}
@@ -338,7 +343,7 @@ export function Toolbar() {
             )}
             {updateStatus === "error" && (
               <Alert severity="warning" sx={{ py: 0, fontSize: "0.75rem", width: "100%" }}>
-                Could not check for updates. Please check your internet connection.
+                Could not check for updates. {releaseNotes ? `Error: ${releaseNotes}` : "Please check your internet connection."}
               </Alert>
             )}
           </Box>
