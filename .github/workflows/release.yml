@@ -145,8 +145,8 @@ jobs:
           if [ -f "$WIN_SIG" ]; then WIN_SIGNATURE=$(cat "$WIN_SIG"); fi
           if [ -f "$MAC_SIG" ]; then MAC_SIGNATURE=$(cat "$MAC_SIG"); fi
 
-          # Find actual filenames for download URLs
-          WIN_EXE=$(find artifacts/ -name "*.exe" ! -name "*.exe.sig" | head -1)
+          # Find actual filenames for download URLs (use setup.exe, not sidecar)
+          WIN_EXE=$(find artifacts/ -name "*-setup.exe" | head -1)
           MAC_TAR=$(find artifacts/ -name "*.app.tar.gz" ! -name "*.sig" | head -1)
           WIN_NAME=$(basename "$WIN_EXE" 2>/dev/null || echo "")
           MAC_NAME=$(basename "$MAC_TAR" 2>/dev/null || echo "")
@@ -175,7 +175,7 @@ jobs:
         with:
           files: |
             artifacts/release-*/**/*.dmg
-            artifacts/release-*/**/*.exe
+            artifacts/release-*/**/*-setup.exe
             artifacts/release-*/**/*.app.tar.gz
             artifacts/release-*/**/*.sig
             artifacts/latest.json
