@@ -11,6 +11,7 @@ import { Toolbar } from "./Toolbar";
 import { ImageStrip } from "../image-strip/ImageStrip";
 import { PanelGrid } from "../grid/PanelGrid";
 import { PreviewPane } from "../preview/PreviewPane";
+import { Alert } from "@mui/material";
 
 export function AppShell() {
   const fetchConfig = useFigureStore((s) => s.fetchConfig);
@@ -18,6 +19,7 @@ export function AppShell() {
   const fetchImages = useFigureStore((s) => s.fetchImages);
   const config = useFigureStore((s) => s.config);
   const requestPreview = useFigureStore((s) => s.requestPreview);
+  const apiError = useFigureStore((s) => s.apiError);
 
   useEffect(() => {
     const init = async () => {
@@ -72,6 +74,13 @@ export function AppShell() {
       onMouseUp={onMouseUp}
       onMouseLeave={onMouseUp}
     >
+      {/* ── API Error Banner ────────────────────────────── */}
+      {apiError && (
+        <Alert severity="error" sx={{ position: "fixed", top: 0, left: 0, right: 0, zIndex: 9999, borderRadius: 0 }}>
+          {apiError}
+        </Alert>
+      )}
+
       {/* ── Sidebar ─────────────────────────────────────── */}
       <aside
         className="flex-none overflow-y-auto overflow-x-hidden border-r"

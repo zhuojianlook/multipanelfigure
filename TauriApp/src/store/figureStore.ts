@@ -31,6 +31,7 @@ interface FigureState {
   fonts: string[];
   previewImageB64: string | null;
   previewLoading: boolean;
+  apiError: string | null;
   configDirty: boolean;     // true when local changes haven't been previewed
   drawerPanels: PanelInfo[];
   drawerThumbnails: Record<number, string>;  // drawerIdx → processed base64 PNG
@@ -236,6 +237,7 @@ export const useFigureStore = create<FigureState>()(
     fonts: [],
     previewImageB64: null,
     previewLoading: false,
+    apiError: null,
     configDirty: false,
     drawerPanels: [],
     drawerThumbnails: {},
@@ -243,15 +245,36 @@ export const useFigureStore = create<FigureState>()(
     // ── Fetch initial state from backend ──────────────────
 
     fetchConfig: async () => {
+      // Wait for sidecar to be ready (retry up to 15 times with 1s delay)
+      let connected = false;
+      for (let attempt = 0; attempt < 15; attempt++) {
+        try {
+          const resp = await fetch("http://127.0.0.1:8765/api/health");
+          if (resp.ok) { connected = true; break; }
+        } catch {
+          // Server not ready yet
+        }
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      if (!connected) {
+        console.error("API server not reachable after 15 attempts");
+        set((s) => {
+          s.config = buildDefaultConfig(2, 2);
+          s.apiError = "Cannot connect to backend server. Image loading and preview will not work. Try restarting the app.";
+        });
+        return;
+      }
       try {
         const cfg = await api.getConfig();
         set((s) => {
           s.config = cfg;
+          s.apiError = null;
         });
       } catch (err) {
         console.warn("Failed to fetch config, using default", err);
         set((s) => {
           s.config = buildDefaultConfig(2, 2);
+          s.apiError = "Connected to backend but failed to load configuration.";
         });
       }
     },
