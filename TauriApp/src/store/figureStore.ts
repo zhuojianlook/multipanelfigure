@@ -245,11 +245,14 @@ export const useFigureStore = create<FigureState>()(
     // ── Fetch initial state from backend ──────────────────
 
     fetchConfig: async () => {
-      // Wait for sidecar to be ready (retry up to 15 times with 1s delay)
+      // Wait for sidecar to be ready (retry up to 10 times with 1s delay)
       let connected = false;
-      for (let attempt = 0; attempt < 15; attempt++) {
+      for (let attempt = 0; attempt < 10; attempt++) {
         try {
-          const resp = await fetch("http://127.0.0.1:8765/api/health");
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 2000);
+          const resp = await fetch("http://127.0.0.1:8765/api/health", { signal: controller.signal });
+          clearTimeout(timeout);
           if (resp.ok) { connected = true; break; }
         } catch {
           // Server not ready yet
