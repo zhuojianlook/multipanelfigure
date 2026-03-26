@@ -276,10 +276,11 @@ export const useFigureStore = create<FigureState>()(
           s.apiError = null;
         });
       } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
         console.warn("Failed to fetch config, using default", err);
         set((s) => {
           s.config = buildDefaultConfig(2, 2);
-          s.apiError = "Connected to backend but failed to load configuration.";
+          s.apiError = `Connected to backend but failed to load configuration. Error: ${errMsg}`;
         });
       }
     },
