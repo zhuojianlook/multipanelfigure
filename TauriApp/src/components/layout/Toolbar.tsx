@@ -266,7 +266,16 @@ export function Toolbar() {
                 setUpdateRef(null);
                 try {
                   const update = await check();
+                  window.alert("check() returned: " + JSON.stringify({
+                    type: typeof update,
+                    isNull: update === null,
+                    version: update?.version,
+                    body: update?.body,
+                    hasDownload: typeof update?.downloadAndInstall,
+                    keys: update ? Object.keys(update) : []
+                  }, null, 2));
                   if (update) {
+                    // check() returned an Update object
                     setLatestVersion(update.version);
                     setReleaseNotes(update.body || "");
                     setUpdateRef(update);
@@ -275,17 +284,35 @@ export function Toolbar() {
                     setUpdateStatus("up-to-date");
                   }
                 } catch (e: unknown) {
+                  window.alert("check() THREW: type=" + typeof e + "\n\nString(e)=" + String(e) + "\n\nJSON=" + JSON.stringify(e, null, 2));
                   console.error("Update check failed:", e);
-                  // Tauri updater may throw the update notes string on success
-                  // when there's a platform/signature issue. Show full diagnostics.
-                  let msg: string;
-                  try {
-                    msg = JSON.stringify(e, Object.getOwnPropertyNames(e as object), 2);
-                  } catch {
-                    msg = String(e);
+                  // In some Tauri v2 versions, check() throws the Update object
+                  // when an update IS available. Try to use it as an update.
+                  const maybeUpdate = e as { version?: string; body?: string; downloadAndInstall?: unknown };
+                  if (maybeUpdate && typeof maybeUpdate === "object" && maybeUpdate.version) {
+                    setLatestVersion(maybeUpdate.version);
+                    setReleaseNotes(maybeUpdate.body || "");
+                    setUpdateRef(maybeUpdate as Awaited<ReturnType<typeof check>>);
+                    setUpdateStatus("available");
+                  } else {
+                    // Genuine error — fetch latest.json manually as fallback
+                    try {
+                      const resp = await fetch("https://raw.githubusercontent.com/zhuojianlook/multipanelfigure/updater/latest.json");
+                      const data = await resp.json();
+                      const currentVersion = "0.1.8"; // Will be updated per release
+                      if (data.version && data.version !== currentVersion) {
+                        setLatestVersion(data.version);
+                        setReleaseNotes(`New version available. Please download from GitHub releases.`);
+                        setUpdateStatus("available");
+                      } else {
+                        setUpdateStatus("up-to-date");
+                      }
+                    } catch {
+                      const msg = e instanceof Error ? e.message : String(e);
+                      setReleaseNotes(msg);
+                      setUpdateStatus("error");
+                    }
                   }
-                  setReleaseNotes(msg);
-                  setUpdateStatus("error");
                 }
               }}
             >
