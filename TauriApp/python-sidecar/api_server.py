@@ -81,28 +81,42 @@ app.add_middleware(
 )
 
 # Support Private Network Access (CORS-RFC1918) for Windows WebView2.
-# WebView2 sends preflight requests with Access-Control-Request-Private-Network
-# header; we must respond with Access-Control-Allow-Private-Network: true.
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response
+# Uses a raw ASGI middleware (avoids BaseHTTPMiddleware compatibility issues).
+class PrivateNetworkMiddleware:
+    def __init__(self, wrapped_app):
+        self.wrapped_app = wrapped_app
 
-class PrivateNetworkMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        # Handle preflight OPTIONS requests for private network access
-        if request.method == "OPTIONS" and request.headers.get("access-control-request-private-network"):
-            return Response(
-                status_code=200,
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "*",
-                    "Access-Control-Allow-Headers": "*",
-                    "Access-Control-Allow-Private-Network": "true",
-                },
-            )
-        response = await call_next(request)
-        response.headers["Access-Control-Allow-Private-Network"] = "true"
-        return response
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.wrapped_app(scope, receive, send)
+            return
+
+        # Handle OPTIONS preflight for private network access
+        if scope.get("method") == "OPTIONS":
+            headers_dict = {k: v for k, v in scope.get("headers", [])}
+            if b"access-control-request-private-network" in headers_dict:
+                await send({
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        [b"access-control-allow-origin", b"*"],
+                        [b"access-control-allow-methods", b"*"],
+                        [b"access-control-allow-headers", b"*"],
+                        [b"access-control-allow-private-network", b"true"],
+                    ],
+                })
+                await send({"type": "http.response.body", "body": b""})
+                return
+
+        # Add private network header to all responses
+        async def send_with_header(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers.append([b"access-control-allow-private-network", b"true"])
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.wrapped_app(scope, receive, send_with_header)
 
 app.add_middleware(PrivateNetworkMiddleware)
 
