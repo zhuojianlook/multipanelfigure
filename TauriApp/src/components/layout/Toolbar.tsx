@@ -340,7 +340,9 @@ export function Toolbar() {
                     if (!updateRef) return;
                     try {
                       // Debug: show updateRef details before download
-                      window.alert("About to call downloadAndInstall()\n\nupdateRef type: " + typeof updateRef + "\navailable: " + (updateRef as Record<string, unknown>).available + "\nversion: " + (updateRef as Record<string, unknown>).version + "\nhasDownloadAndInstall: " + typeof (updateRef as Record<string, unknown>).downloadAndInstall + "\nhasDownload: " + typeof (updateRef as Record<string, unknown>).download + "\nhasInstall: " + typeof (updateRef as Record<string, unknown>).install);
+                      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                      const ref = updateRef as any;
+                      window.alert("About to call downloadAndInstall()\n\nupdateRef type: " + typeof updateRef + "\navailable: " + ref.available + "\nversion: " + ref.version + "\nhasDownloadAndInstall: " + typeof ref.downloadAndInstall + "\nhasDownload: " + typeof ref.download + "\nhasInstall: " + typeof ref.install);
                       setUpdateStatus("downloading");
                       setDownloadProgress(0);
                       let downloaded = 0;
