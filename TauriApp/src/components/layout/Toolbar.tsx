@@ -33,8 +33,11 @@ import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
-const APP_VERSION = "0.1.4";
+const APP_VERSION = "0.1.5";
 const CHANGELOG = [
+  { version: "0.1.5", date: "2026-03-26", changes: [
+    "Updated about section description",
+  ]},
   { version: "0.1.4", date: "2026-03-26", changes: [
     "Show actual error message when update check fails for easier debugging",
   ]},
@@ -236,8 +239,8 @@ export function Toolbar() {
               Created by <strong>Zhuojian Look</strong>
             </Typography>
             <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: "block" }}>
-              A professional tool for creating multi-panel scientific figures
-              with full control over layout, annotations, scale bars, and image adjustments. For the benefit of scientists and the pursuit of science.
+              A tool for creating professional multi-panel scientific figures
+              with full control over layout, annotations, scale bars, and image adjustments. For the benefit of scientists.
             </Typography>
           </Box>
 
