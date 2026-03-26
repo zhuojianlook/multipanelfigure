@@ -58,13 +58,22 @@ async function apiJson<T>(path: string, method: string = "GET", body?: string): 
   return parsed as T;
 }
 
+/** Last health check error for diagnostics */
+export let lastHealthError = "";
+
 /** Check if the sidecar API is reachable */
 export async function checkHealth(): Promise<boolean> {
   try {
     const text = await apiRequest("/api/health");
     const data = JSON.parse(text);
-    return data.status === "ok";
-  } catch {
+    if (data.status === "ok") {
+      lastHealthError = "";
+      return true;
+    }
+    lastHealthError = `Health response: ${text.substring(0, 200)}`;
+    return false;
+  } catch (e) {
+    lastHealthError = e instanceof Error ? e.message : String(e);
     return false;
   }
 }

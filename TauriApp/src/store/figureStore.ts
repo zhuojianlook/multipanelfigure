@@ -13,7 +13,7 @@ import type {
   HeaderGroup,
   PanelInfo,
 } from "../api/types";
-import { api, checkHealth } from "../api/client";
+import { api, checkHealth, lastHealthError } from "../api/client";
 
 // ── Loaded image metadata kept client-side ───────────────
 
@@ -245,24 +245,27 @@ export const useFigureStore = create<FigureState>()(
     // ── Fetch initial state from backend ──────────────────
 
     fetchConfig: async () => {
-      // Wait for sidecar to be ready (retry up to 15 times with 1s delay)
+      // Wait for sidecar to be ready (retry up to 30 times with 1s delay)
       let connected = false;
-      for (let attempt = 0; attempt < 15; attempt++) {
+      for (let attempt = 0; attempt < 30; attempt++) {
         if (await checkHealth()) { connected = true; break; }
         await new Promise(r => setTimeout(r, 1000));
       }
       if (!connected) {
-        console.error("API server not reachable after 15 attempts");
+        console.error("API server not reachable after 30 attempts");
+        // Gather diagnostic info
+        let diagMsg = "";
+        // Last health check error
+        if (lastHealthError) diagMsg += ` Last error: ${lastHealthError}`;
         // Try to get sidecar error from Tauri
-        let sidecarMsg = "";
         try {
           const { invoke } = await import("@tauri-apps/api/core");
           const err = await invoke("get_sidecar_error");
-          if (err) sidecarMsg = ` Sidecar error: ${err}`;
+          if (err) diagMsg += ` Sidecar stderr: ${String(err).substring(0, 300)}`;
         } catch { /* not in Tauri context */ }
         set((s) => {
           s.config = buildDefaultConfig(2, 2);
-          s.apiError = `Cannot connect to backend server. Image loading and preview will not work.${sidecarMsg}`;
+          s.apiError = `Cannot connect to backend server. Image loading and preview will not work.${diagMsg}`;
         });
         return;
       }
