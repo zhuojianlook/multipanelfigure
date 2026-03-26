@@ -33,8 +33,11 @@ import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
-const APP_VERSION = "0.1.6";
+const APP_VERSION = "0.1.7";
 const CHANGELOG = [
+  { version: "0.1.7", date: "2026-03-26", changes: [
+    "Switch updater endpoint to raw GitHub URL (fixes redirect issue)",
+  ]},
   { version: "0.1.6", date: "2026-03-26", changes: [
     "Fixed updater URL encoding (spaces in filenames)",
     "Better error diagnostics for update failures",
@@ -273,12 +276,12 @@ export function Toolbar() {
                   }
                 } catch (e: unknown) {
                   console.error("Update check failed:", e);
+                  // Tauri updater may throw the update notes string on success
+                  // when there's a platform/signature issue. Show full diagnostics.
                   let msg: string;
-                  if (e instanceof Error) {
-                    msg = `${e.name}: ${e.message}`;
-                  } else if (typeof e === "object" && e !== null) {
-                    msg = JSON.stringify(e);
-                  } else {
+                  try {
+                    msg = JSON.stringify(e, Object.getOwnPropertyNames(e as object), 2);
+                  } catch {
                     msg = String(e);
                   }
                   setReleaseNotes(msg);
