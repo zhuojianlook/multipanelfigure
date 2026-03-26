@@ -374,8 +374,7 @@ export function Sidebar() {
               form.append("files", f);
             }
             try {
-              const { fetch: tFetch } = await import("@tauri-apps/plugin-http");
-              await (tFetch as unknown as typeof globalThis.fetch)("http://127.0.0.1:8765/api/fonts/upload", { method: "POST", body: form });
+              await fetch("http://127.0.0.1:8765/api/fonts/upload", { method: "POST", body: form });
               fetchFonts();
             } catch (err) {
               console.error("Font upload failed", err);
