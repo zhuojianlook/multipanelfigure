@@ -369,12 +369,8 @@ export function Sidebar() {
           onChange={async (e) => {
             const files = e.target.files;
             if (!files || files.length === 0) return;
-            const form = new FormData();
-            for (const f of Array.from(files)) {
-              form.append("files", f);
-            }
             try {
-              await fetch("http://127.0.0.1:8765/api/fonts/upload", { method: "POST", body: form });
+              await api.uploadFonts(Array.from(files));
               fetchFonts();
             } catch (err) {
               console.error("Font upload failed", err);

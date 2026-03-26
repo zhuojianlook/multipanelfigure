@@ -1,7 +1,8 @@
 /* ──────────────────────────────────────────────────────────
    API client for the FastAPI backend (api_server.py).
    All methods return parsed JSON.
-   Uses standard browser fetch (works in Tauri WebView).
+   Uses Tauri IPC proxy (invoke) to bypass WebView restrictions
+   on localhost requests. Falls back to browser fetch in dev.
    ────────────────────────────────────────────────────────── */
 
 import type {
@@ -14,194 +15,185 @@ import type {
 
 const DEFAULT_BASE = "http://127.0.0.1:8765";
 
+/** Try to use Tauri invoke for HTTP requests; fall back to browser fetch */
+let _invoke: ((cmd: string, args: Record<string, unknown>) => Promise<unknown>) | null = null;
+let _invokeReady = false;
+
+async function getInvoke() {
+  if (_invokeReady) return _invoke;
+  try {
+    const mod = await import("@tauri-apps/api/core");
+    _invoke = mod.invoke;
+  } catch {
+    _invoke = null;
+  }
+  _invokeReady = true;
+  return _invoke;
+}
+
+/** Make an API request — uses Tauri proxy if available, else browser fetch */
+async function apiRequest(path: string, method: string = "GET", body?: string): Promise<string> {
+  const invoke = await getInvoke();
+  if (invoke) {
+    // Use Rust-side proxy to bypass WebView restrictions
+    return invoke("proxy_request", { method, path, body: body ?? null }) as Promise<string>;
+  }
+  // Fallback: browser fetch (works in dev)
+  const res = await fetch(`${DEFAULT_BASE}${path}`, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body,
+  });
+  return res.text();
+}
+
+/** Make a request and parse JSON response */
+async function apiJson<T>(path: string, method: string = "GET", body?: string): Promise<T> {
+  const text = await apiRequest(path, method, body);
+  const parsed = JSON.parse(text);
+  // Check for error responses
+  if (parsed.detail) {
+    throw new Error(`API error: ${JSON.stringify(parsed.detail)}`);
+  }
+  return parsed as T;
+}
+
+/** Check if the sidecar API is reachable */
+export async function checkHealth(): Promise<boolean> {
+  try {
+    const text = await apiRequest("/api/health");
+    const data = JSON.parse(text);
+    return data.status === "ok";
+  } catch {
+    return false;
+  }
+}
+
 class ApiClient {
-  private base: string;
-
-  constructor(baseUrl?: string) {
-    this.base = (baseUrl ?? DEFAULT_BASE).replace(/\/+$/, "");
-  }
-
-  // ── helpers ──────────────────────────────────────────────
-
-  private url(path: string): string {
-    return `${this.base}${path}`;
-  }
-
-  private async json<T>(input: string, init?: RequestInit): Promise<T> {
-    const res = await fetch(input, init);
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`API ${res.status}: ${body}`);
-    }
-    return res.json() as Promise<T>;
-  }
-
   // ── Config ─────────────────────────────────────────────
 
   async getConfig(): Promise<FigureConfig> {
-    return this.json<FigureConfig>(this.url("/api/config"));
+    return apiJson<FigureConfig>("/api/config");
   }
 
   async updateConfig(config: FigureConfig): Promise<FigureConfig> {
-    return this.json<FigureConfig>(this.url("/api/config"), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ config }),
-    });
+    return apiJson<FigureConfig>("/api/config", "PUT", JSON.stringify({ config }));
   }
 
   async patchGrid(rows: number, cols: number, spacing: number): Promise<FigureConfig> {
-    return this.json<FigureConfig>(this.url("/api/config/grid"), {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rows, cols, spacing }),
-    });
+    return apiJson<FigureConfig>("/api/config/grid", "PATCH", JSON.stringify({ rows, cols, spacing }));
   }
 
   async patchPanel(r: number, c: number, panel: Record<string, unknown>): Promise<unknown> {
-    return this.json(this.url(`/api/config/panel/${r}/${c}`), {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ panel }),
-    });
+    return apiJson(`/api/config/panel/${r}/${c}`, "PATCH", JSON.stringify({ panel }));
   }
 
   async patchColumnLabels(labels: unknown[]): Promise<unknown> {
-    return this.json(this.url("/api/config/column-labels"), {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ labels }),
-    });
+    return apiJson("/api/config/column-labels", "PATCH", JSON.stringify({ labels }));
   }
 
   async patchRowLabels(labels: unknown[]): Promise<unknown> {
-    return this.json(this.url("/api/config/row-labels"), {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ labels }),
-    });
+    return apiJson("/api/config/row-labels", "PATCH", JSON.stringify({ labels }));
   }
 
   async patchColumnHeaders(headers: unknown[]): Promise<unknown> {
-    return this.json(this.url("/api/config/column-headers"), {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ headers }),
-    });
+    return apiJson("/api/config/column-headers", "PATCH", JSON.stringify({ headers }));
   }
 
   async patchRowHeaders(headers: unknown[]): Promise<unknown> {
-    return this.json(this.url("/api/config/row-headers"), {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ headers }),
-    });
+    return apiJson("/api/config/row-headers", "PATCH", JSON.stringify({ headers }));
   }
 
   async patchBackground(background: string): Promise<unknown> {
-    return this.json(this.url("/api/config/background"), {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ background }),
-    });
+    return apiJson("/api/config/background", "PATCH", JSON.stringify({ background }));
   }
 
   // ── Image upload / management ──────────────────────────
 
   async uploadImages(files: File[]): Promise<UploadResponse> {
-    const form = new FormData();
-    for (const f of files) {
-      form.append("files", f);
+    // File uploads use base64 through Tauri IPC proxy
+    const invoke = await getInvoke();
+    if (invoke) {
+      const filesData: { name: string; data: string }[] = [];
+      for (const f of files) {
+        const buf = await f.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let binary = "";
+        for (let i = 0; i < bytes.length; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        filesData.push({ name: f.name, data: btoa(binary) });
+      }
+      const text = await invoke("proxy_upload", {
+        path: "/api/images/upload",
+        files: filesData,
+        fieldName: "files",
+      }) as string;
+      return JSON.parse(text) as UploadResponse;
     }
-    return this.json<UploadResponse>(this.url("/api/images/upload"), {
-      method: "POST",
-      body: form,
-    });
+    // Fallback: browser fetch with FormData
+    const form = new FormData();
+    for (const f of files) form.append("files", f);
+    const res = await fetch(`${DEFAULT_BASE}/api/images/upload`, { method: "POST", body: form });
+    return res.json() as Promise<UploadResponse>;
   }
 
   async deleteImage(name: string): Promise<void> {
-    await fetch(this.url(`/api/images/${encodeURIComponent(name)}`), {
-      method: "DELETE",
-    });
+    await apiRequest(`/api/images/${encodeURIComponent(name)}`, "DELETE");
   }
 
   async listImages(): Promise<ImagesListResponse> {
-    return this.json<ImagesListResponse>(this.url("/api/images"));
+    return apiJson<ImagesListResponse>("/api/images");
   }
 
   async getImageThumbnail(name: string): Promise<{ thumbnail: string }> {
-    return this.json<{ thumbnail: string }>(
-      this.url(`/api/images/${encodeURIComponent(name)}/thumb`),
-    );
+    return apiJson<{ thumbnail: string }>(`/api/images/${encodeURIComponent(name)}/thumb`);
   }
 
   async getImageInfo(name: string): Promise<{ width: number; height: number }> {
-    return this.json<{ width: number; height: number }>(
-      this.url(`/api/images/${encodeURIComponent(name)}/info`),
-    );
+    return apiJson<{ width: number; height: number }>(`/api/images/${encodeURIComponent(name)}/info`);
   }
 
   // ── Panel Preview ──────────────────────────────────────
 
   async getPanelPreview(r: number, c: number): Promise<{ image: string; processed_width?: number; processed_height?: number }> {
-    return this.json<{ image: string }>(this.url(`/api/panel-preview/${r}/${c}`));
+    return apiJson<{ image: string }>(`/api/panel-preview/${r}/${c}`);
   }
 
-  /** Atomically patch a panel AND get its processed preview in one request.
-   *  Eliminates race conditions from separate PATCH + GET calls. */
   async patchPanelAndPreview(
     r: number, c: number, panel: Record<string, unknown>,
   ): Promise<{ panel: Record<string, unknown>; image: string; processed_width?: number; processed_height?: number }> {
-    return this.json(this.url(`/api/panel-patch-preview/${r}/${c}`), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ panel }),
-    });
+    return apiJson(`/api/panel-patch-preview/${r}/${c}`, "POST", JSON.stringify({ panel }));
   }
 
   // ── Auto-Adjust ───────────────────────────────────────
 
-  /** Compute optimal adjustments from the original image. */
   async autoAdjust(
     r: number, c: number, type: "levels" | "contrast" | "white_balance",
   ): Promise<{ adjustments: Record<string, number> }> {
-    return this.json(this.url(`/api/auto-adjust/${r}/${c}`), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type }),
-    });
+    return apiJson(`/api/auto-adjust/${r}/${c}`, "POST", JSON.stringify({ type }));
   }
 
   // ── Panel rendered preview (with matplotlib overlays) ──
 
   async getPanelRenderedPreview(row: number, col: number): Promise<{ image: string }> {
-    return this.json(this.url(`/api/panel-rendered-preview/${row}/${col}`));
+    return apiJson(`/api/panel-rendered-preview/${row}/${col}`);
   }
 
   // ── Preview ────────────────────────────────────────────
 
   async getPreview(): Promise<PreviewResponse> {
-    return this.json<PreviewResponse>(this.url("/api/preview"), {
-      method: "POST",
-    });
+    return apiJson<PreviewResponse>("/api/preview", "POST");
   }
 
   // ── Save / Load project ────────────────────────────────
 
   async saveProject(path: string): Promise<{ ok: boolean }> {
-    return this.json(this.url("/api/project/save"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
-    });
+    return apiJson("/api/project/save", "POST", JSON.stringify({ path }));
   }
 
   async loadProject(path: string): Promise<ProjectLoadResponse> {
-    return this.json<ProjectLoadResponse>(this.url("/api/project/load"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
-    });
+    return apiJson<ProjectLoadResponse>("/api/project/load", "POST", JSON.stringify({ path }));
   }
 
   // ── Save final figure ──────────────────────────────────
@@ -212,78 +204,81 @@ class ApiClient {
     background: string = "White",
     dpi: number = 300,
   ): Promise<{ ok: boolean; path: string }> {
-    return this.json(this.url("/api/figure/save"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path, format, background, dpi }),
-    });
+    return apiJson("/api/figure/save", "POST", JSON.stringify({ path, format, background, dpi }));
   }
 
   // ── Fonts ──────────────────────────────────────────────
 
   async listFonts(): Promise<{ fonts: Record<string, string> }> {
-    return this.json<{ fonts: Record<string, string> }>(this.url("/api/fonts"));
+    return apiJson<{ fonts: Record<string, string> }>("/api/fonts");
   }
 
   async uploadFonts(files: File[]): Promise<{ names: string[]; total: number }> {
-    const form = new FormData();
-    for (const f of files) {
-      form.append("files", f);
+    const invoke = await getInvoke();
+    if (invoke) {
+      const filesData: { name: string; data: string }[] = [];
+      for (const f of files) {
+        const buf = await f.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let binary = "";
+        for (let i = 0; i < bytes.length; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        filesData.push({ name: f.name, data: btoa(binary) });
+      }
+      const text = await invoke("proxy_upload", {
+        path: "/api/fonts/upload",
+        files: filesData,
+        fieldName: "files",
+      }) as string;
+      return JSON.parse(text) as { names: string[]; total: number };
     }
-    return this.json<{ names: string[]; total: number }>(this.url("/api/fonts/upload"), {
-      method: "POST",
-      body: form,
-    });
+    const form = new FormData();
+    for (const f of files) form.append("files", f);
+    const res = await fetch(`${DEFAULT_BASE}/api/fonts/upload`, { method: "POST", body: form });
+    return res.json() as Promise<{ names: string[]; total: number }>;
   }
 
   // ── Resolution presets ─────────────────────────────────
 
   async getResolutions(): Promise<Record<string, number>> {
-    return this.json<Record<string, number>>(this.url("/api/resolutions"));
+    return apiJson<Record<string, number>>("/api/resolutions");
   }
 
   async updateResolutions(entries: Record<string, number>): Promise<void> {
-    await this.json(this.url("/api/resolutions"), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ entries }),
-    });
+    await apiJson("/api/resolutions", "PUT", JSON.stringify({ entries }));
   }
 
   // ── Measurements ────────────────────────────────────────
 
   async getMeasurements(): Promise<{ measurements: Array<{ panel: string; name: string; type: string; value: string }> }> {
-    return this.json(this.url("/api/measurements"));
+    return apiJson("/api/measurements");
   }
 
   // ── Image Thumbnail ──────────────────────────────────────
 
   async getImageThumb(name: string): Promise<{ thumbnail: string }> {
-    return this.json(this.url(`/api/images/${encodeURIComponent(name)}/thumb`));
+    return apiJson(`/api/images/${encodeURIComponent(name)}/thumb`);
   }
 
   // ── Video ────────────────────────────────────────────────
 
   async getVideoInfo(name: string): Promise<{ frame_count: number; fps: number; width: number; height: number; duration_sec: number }> {
-    return this.json(this.url(`/api/video/${encodeURIComponent(name)}/info`));
+    return apiJson(`/api/video/${encodeURIComponent(name)}/info`);
   }
 
   async getVideoFrame(name: string, frameNum: number): Promise<{ frame: number; width: number; height: number; thumbnail: string }> {
-    return this.json(this.url(`/api/video/${encodeURIComponent(name)}/frame/${frameNum}`));
+    return apiJson(`/api/video/${encodeURIComponent(name)}/frame/${frameNum}`);
   }
 
   async listVideos(): Promise<{ videos: string[] }> {
-    return this.json(this.url("/api/video/list"));
+    return apiJson("/api/video/list");
   }
 
   // ── Magic Wand Selection ────────────────────────────────
 
   async magicWandSelect(row: number, col: number, xPct: number, yPct: number, tolerance: number): Promise<{ points: number[][]; pixel_count: number; smooth?: boolean }> {
-    return this.json(this.url(`/api/magic-wand/${row}/${col}`), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ x_pct: xPct, y_pct: yPct, tolerance }),
-    });
+    return apiJson(`/api/magic-wand/${row}/${col}`, "POST", JSON.stringify({ x_pct: xPct, y_pct: yPct, tolerance }));
   }
 }
 

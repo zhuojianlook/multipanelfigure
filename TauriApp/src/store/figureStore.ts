@@ -13,7 +13,7 @@ import type {
   HeaderGroup,
   PanelInfo,
 } from "../api/types";
-import { api } from "../api/client";
+import { api, checkHealth } from "../api/client";
 
 // ── Loaded image metadata kept client-side ───────────────
 
@@ -248,15 +248,7 @@ export const useFigureStore = create<FigureState>()(
       // Wait for sidecar to be ready (retry up to 15 times with 1s delay)
       let connected = false;
       for (let attempt = 0; attempt < 15; attempt++) {
-        try {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 2000);
-          const resp = await fetch("http://127.0.0.1:8765/api/health", { signal: controller.signal });
-          clearTimeout(timeout);
-          if (resp.ok) { connected = true; break; }
-        } catch {
-          // Server not ready yet
-        }
+        if (await checkHealth()) { connected = true; break; }
         await new Promise(r => setTimeout(r, 1000));
       }
       if (!connected) {

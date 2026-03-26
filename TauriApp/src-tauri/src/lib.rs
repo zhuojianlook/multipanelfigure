@@ -14,6 +14,114 @@ fn get_sidecar_error(state: tauri::State<'_, SidecarError>) -> Option<String> {
     state.0.lock().unwrap().clone()
 }
 
+/// Proxy HTTP requests to the sidecar through Rust, bypassing WebView restrictions
+#[tauri::command]
+async fn proxy_request(
+    method: String,
+    path: String,
+    body: Option<String>,
+    state: tauri::State<'_, SidecarPort>,
+) -> Result<String, String> {
+    let port = state.0;
+    let url = format!("http://127.0.0.1:{}{}", port, path);
+    let client = reqwest::Client::new();
+
+    let req = match method.to_uppercase().as_str() {
+        "GET" => client.get(&url),
+        "POST" => {
+            let mut r = client.post(&url);
+            if let Some(b) = body {
+                r = r.header("Content-Type", "application/json").body(b);
+            }
+            r
+        }
+        "PUT" => {
+            let mut r = client.put(&url);
+            if let Some(b) = body {
+                r = r.header("Content-Type", "application/json").body(b);
+            }
+            r
+        }
+        "PATCH" => {
+            let mut r = client.patch(&url);
+            if let Some(b) = body {
+                r = r.header("Content-Type", "application/json").body(b);
+            }
+            r
+        }
+        "DELETE" => client.delete(&url),
+        _ => return Err(format!("Unsupported method: {}", method)),
+    };
+
+    let resp = req.send().await.map_err(|e| format!("Request failed: {}", e))?;
+    let text = resp.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
+    Ok(text)
+}
+
+/// Proxy file uploads to the sidecar through Rust
+#[tauri::command]
+async fn proxy_upload(
+    path: String,
+    files: Vec<FileData>,
+    field_name: String,
+    state: tauri::State<'_, SidecarPort>,
+) -> Result<String, String> {
+    let port = state.0;
+    let url = format!("http://127.0.0.1:{}{}", port, path);
+    let client = reqwest::Client::new();
+
+    let mut form = reqwest::multipart::Form::new();
+    for file in files {
+        let decoded = base64_decode(&file.data).map_err(|e| format!("Base64 decode error: {}", e))?;
+        let part = reqwest::multipart::Part::bytes(decoded)
+            .file_name(file.name)
+            .mime_str("application/octet-stream")
+            .map_err(|e| format!("MIME error: {}", e))?;
+        form = form.part(field_name.clone(), part);
+    }
+
+    let resp = client.post(&url).multipart(form).send().await
+        .map_err(|e| format!("Upload request failed: {}", e))?;
+    let text = resp.text().await
+        .map_err(|e| format!("Failed to read upload response: {}", e))?;
+    Ok(text)
+}
+
+#[derive(serde::Deserialize)]
+struct FileData {
+    name: String,
+    data: String,  // base64 encoded
+}
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    // Simple base64 decoder
+    let lookup = |c: u8| -> Result<u8, String> {
+        match c {
+            b'A'..=b'Z' => Ok(c - b'A'),
+            b'a'..=b'z' => Ok(c - b'a' + 26),
+            b'0'..=b'9' => Ok(c - b'0' + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            b'=' => Ok(0),
+            _ => Err(format!("Invalid base64 char: {}", c as char)),
+        }
+    };
+    let bytes: Vec<u8> = input.bytes().filter(|&b| b != b'\n' && b != b'\r').collect();
+    let mut result = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        if chunk.len() < 4 { break; }
+        let a = lookup(chunk[0])?;
+        let b = lookup(chunk[1])?;
+        let c = lookup(chunk[2])?;
+        let d = lookup(chunk[3])?;
+        result.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' { result.push((b << 4) | (c >> 2)); }
+        if chunk[3] != b'=' { result.push((c << 6) | d); }
+    }
+    Ok(result)
+}
+
 struct SidecarPort(u16);
 struct SidecarError(Arc<Mutex<Option<String>>>);
 struct SidecarChild(Arc<Mutex<Option<CommandChild>>>);
@@ -134,7 +242,7 @@ pub fn run() {
       app.manage(SidecarChild(sidecar_child));
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error])
+    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {
