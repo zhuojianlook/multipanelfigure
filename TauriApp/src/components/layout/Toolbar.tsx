@@ -339,6 +339,8 @@ export function Toolbar() {
                   onClick={async () => {
                     if (!updateRef) return;
                     try {
+                      // Debug: show updateRef details before download
+                      window.alert("About to call downloadAndInstall()\n\nupdateRef type: " + typeof updateRef + "\navailable: " + (updateRef as Record<string, unknown>).available + "\nversion: " + (updateRef as Record<string, unknown>).version + "\nhasDownloadAndInstall: " + typeof (updateRef as Record<string, unknown>).downloadAndInstall + "\nhasDownload: " + typeof (updateRef as Record<string, unknown>).download + "\nhasInstall: " + typeof (updateRef as Record<string, unknown>).install);
                       setUpdateStatus("downloading");
                       setDownloadProgress(0);
                       let downloaded = 0;
@@ -353,8 +355,12 @@ export function Toolbar() {
                         }
                       });
                       setUpdateStatus("ready");
-                    } catch (e) {
+                    } catch (e: unknown) {
+                      const errMsg = e instanceof Error ? e.message : String(e);
+                      const errStack = e instanceof Error ? e.stack : "no stack";
+                      window.alert("downloadAndInstall() FAILED:\n\ntype: " + typeof e + "\nmessage: " + errMsg + "\n\nstack: " + errStack);
                       console.error("Update download failed:", e);
+                      setReleaseNotes(errMsg);
                       setUpdateStatus("error");
                     }
                   }}
