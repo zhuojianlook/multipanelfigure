@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install Python deps
-        run: pip install pillow numpy matplotlib opencv-python-headless fastapi uvicorn pyinstaller
+        run: pip install pillow numpy matplotlib opencv-python-headless fastapi uvicorn python-multipart pyinstaller
       - name: Build sidecar
         working-directory: TauriApp/python-sidecar
         run: |
@@ -35,6 +35,7 @@ jobs:
             --hidden-import=uvicorn.lifespan \
             --hidden-import=uvicorn.lifespan.on \
             --hidden-import=uvicorn.lifespan.off \
+            --hidden-import=multipart --hidden-import=multipart.multipart \
             --collect-all PIL --collect-all matplotlib --collect-all cv2 \
             --noconfirm api_server.py
         shell: bash

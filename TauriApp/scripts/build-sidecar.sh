@@ -33,6 +33,8 @@ pyinstaller --onefile \
     --hidden-import=uvicorn.lifespan \
     --hidden-import=uvicorn.lifespan.on \
     --hidden-import=uvicorn.lifespan.off \
+    --hidden-import=multipart \
+    --hidden-import=multipart.multipart \
     --collect-all PIL \
     --collect-all matplotlib \
     --collect-all cv2 \
