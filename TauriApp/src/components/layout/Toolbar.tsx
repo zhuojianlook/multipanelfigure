@@ -297,6 +297,11 @@ export function Toolbar() {
                   onClick={async () => {
                     if (!updateRef) return;
                     try {
+                      // Kill sidecar before update to avoid file locks
+                      try {
+                        const { invoke } = await import("@tauri-apps/api/core");
+                        await invoke("kill_sidecar");
+                      } catch { /* ignore if not available */ }
                       setUpdateStatus("downloading");
                       setDownloadProgress(0);
                       let downloaded = 0;
@@ -339,7 +344,13 @@ export function Toolbar() {
                   Update installed! Restart to apply.
                 </Typography>
                 <Button size="small" variant="contained" color="success" sx={{ mt: 0.5, fontSize: "0.65rem", textTransform: "none" }}
-                  onClick={async () => { await relaunch(); }}
+                  onClick={async () => {
+                    try {
+                      const { invoke } = await import("@tauri-apps/api/core");
+                      await invoke("kill_sidecar");
+                    } catch { /* ignore */ }
+                    await relaunch();
+                  }}
                 >
                   Restart Now
                 </Button>

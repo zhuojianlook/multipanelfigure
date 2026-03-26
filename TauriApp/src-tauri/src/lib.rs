@@ -58,6 +58,38 @@ async fn proxy_request(
     Ok(text)
 }
 
+/// Kill the sidecar process — called before update restart
+#[tauri::command]
+async fn kill_sidecar(state: tauri::State<'_, SidecarChild>) -> Result<(), String> {
+    kill_sidecar_process(&state.0);
+    Ok(())
+}
+
+/// Helper to kill sidecar and any child processes
+fn kill_sidecar_process(child_mutex: &Arc<Mutex<Option<CommandChild>>>) {
+    if let Ok(mut guard) = child_mutex.lock() {
+        if let Some(child) = guard.take() {
+            eprintln!("[cleanup] Killing sidecar process");
+            let _ = child.kill();
+        }
+    }
+    // On Windows, PyInstaller --onefile spawns a child process that may survive.
+    // Kill any remaining api-server processes.
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/IM", "api-server.exe", "/T"])
+            .output();
+    }
+    // On macOS/Linux, kill any remaining api-server processes
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "api-server"])
+            .output();
+    }
+}
+
 /// Proxy file uploads to the sidecar through Rust
 #[tauri::command]
 async fn proxy_upload(
@@ -242,20 +274,24 @@ pub fn run() {
       app.manage(SidecarChild(sidecar_child));
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload])
+    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, kill_sidecar])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {
-      // Kill sidecar when app exits
-      if let tauri::RunEvent::Exit = event {
-        if let Some(state) = app_handle.try_state::<SidecarChild>() {
-          if let Ok(mut guard) = state.0.lock() {
-            if let Some(child) = guard.take() {
-              eprintln!("[cleanup] Killing sidecar process");
-              let _ = child.kill();
-            }
+      match event {
+        tauri::RunEvent::Exit => {
+          // Kill sidecar when app exits
+          if let Some(state) = app_handle.try_state::<SidecarChild>() {
+            kill_sidecar_process(&state.0);
           }
         }
+        tauri::RunEvent::ExitRequested { .. } => {
+          // Also kill sidecar when exit is requested (window close)
+          if let Some(state) = app_handle.try_state::<SidecarChild>() {
+            kill_sidecar_process(&state.0);
+          }
+        }
+        _ => {}
       }
     });
 }
