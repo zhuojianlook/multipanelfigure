@@ -28,10 +28,17 @@ import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
 import InfoIcon from "@mui/icons-material/Info";
 import RestartAltIcon from "@mui/icons-material/RestartAlt";
 import SystemUpdateAltIcon from "@mui/icons-material/SystemUpdateAlt";
+import DownloadIcon from "@mui/icons-material/Download";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 
-const APP_VERSION = "0.1.1";
+const APP_VERSION = "0.1.2";
 const CHANGELOG = [
+  { version: "0.1.2", date: "2026-03-26", changes: [
+    "Native in-app auto-updater — download and install updates without leaving the app",
+    "Restart button after update install for seamless upgrade experience",
+  ]},
   { version: "0.1.1", date: "2026-03-26", changes: [
     "Updated about section description",
   ]},
@@ -63,10 +70,11 @@ export function Toolbar() {
   const [newConfirmOpen, setNewConfirmOpen] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(true);
   const [helpMenuAnchor, setHelpMenuAnchor] = useState<null | HTMLElement>(null);
-  const [updateStatus, setUpdateStatus] = useState<"idle" | "checking" | "up-to-date" | "available" | "error">("idle");
+  const [updateStatus, setUpdateStatus] = useState<"idle" | "checking" | "up-to-date" | "available" | "downloading" | "ready" | "error">("idle");
   const [latestVersion, setLatestVersion] = useState<string | null>(null);
-  const [updateUrl, setUpdateUrl] = useState<string | null>(null);
   const [releaseNotes, setReleaseNotes] = useState("");
+  const [downloadProgress, setDownloadProgress] = useState(0);
+  const [updateRef, setUpdateRef] = useState<Awaited<ReturnType<typeof check>> | null>(null);
   const [citationCopied, setCitationCopied] = useState(false);
 
   const imageCount = Object.keys(loadedImages).length;
@@ -235,45 +243,23 @@ export function Toolbar() {
               variant="outlined"
               size="small"
               startIcon={updateStatus === "checking" ? <CircularProgress size={14} /> : <SystemUpdateAltIcon />}
-              disabled={updateStatus === "checking"}
+              disabled={updateStatus === "checking" || updateStatus === "downloading"}
               onClick={async () => {
                 setUpdateStatus("checking");
                 setLatestVersion(null);
-                setUpdateUrl(null);
+                setUpdateRef(null);
                 try {
-                  const resp = await fetch(
-                    "https://api.github.com/repos/zhuojianlook/multipanelfigure/releases/latest",
-                    { headers: { Accept: "application/vnd.github.v3+json" } }
-                  );
-                  if (!resp.ok) throw new Error(`GitHub API: ${resp.status}`);
-                  const data = await resp.json();
-                  const tag = (data.tag_name || "").replace(/^v/, "");
-                  setLatestVersion(tag);
-                  // Find platform-specific download URL
-                  const platform = navigator.platform.toLowerCase();
-                  const isMac = platform.includes("mac");
-                  const isWin = platform.includes("win");
-                  const assets = data.assets || [];
-                  let dlUrl = data.html_url;
-                  for (const asset of assets) {
-                    const name = (asset.name || "").toLowerCase();
-                    if (isMac && name.endsWith(".dmg")) { dlUrl = asset.browser_download_url; break; }
-                    if (isWin && name.endsWith(".msi")) { dlUrl = asset.browser_download_url; break; }
-                  }
-                  setUpdateUrl(dlUrl || data.html_url || null);
-                  setReleaseNotes(data.body || "");
-                  // Semver comparison
-                  const current = APP_VERSION.split(".").map(Number);
-                  const latest = tag.split(".").map(Number);
-                  const isNewer = latest[0] > current[0] ||
-                    (latest[0] === current[0] && latest[1] > current[1]) ||
-                    (latest[0] === current[0] && latest[1] === current[1] && latest[2] > current[2]);
-                  if (tag && isNewer) {
+                  const update = await check();
+                  if (update) {
+                    setLatestVersion(update.version);
+                    setReleaseNotes(update.body || "");
+                    setUpdateRef(update);
                     setUpdateStatus("available");
                   } else {
                     setUpdateStatus("up-to-date");
                   }
-                } catch {
+                } catch (e) {
+                  console.error("Update check failed:", e);
                   setUpdateStatus("error");
                 }
               }}
@@ -296,13 +282,55 @@ export function Toolbar() {
                     {releaseNotes}
                   </Typography>
                 )}
-                {updateUrl && (
-                  <Button size="small" variant="contained" color="primary" sx={{ mt: 0.5, fontSize: "0.65rem", textTransform: "none" }}
-                    onClick={() => window.open(updateUrl, "_blank")}
-                  >
-                    Download Update
-                  </Button>
-                )}
+                <Button size="small" variant="contained" color="primary" sx={{ mt: 0.5, fontSize: "0.65rem", textTransform: "none" }}
+                  startIcon={<DownloadIcon />}
+                  onClick={async () => {
+                    if (!updateRef) return;
+                    try {
+                      setUpdateStatus("downloading");
+                      setDownloadProgress(0);
+                      let downloaded = 0;
+                      await updateRef.downloadAndInstall((event) => {
+                        if (event.event === "Started" && event.data.contentLength) {
+                          setDownloadProgress(0);
+                        } else if (event.event === "Progress") {
+                          downloaded += event.data.chunkLength;
+                          setDownloadProgress(downloaded);
+                        } else if (event.event === "Finished") {
+                          setDownloadProgress(100);
+                        }
+                      });
+                      setUpdateStatus("ready");
+                    } catch (e) {
+                      console.error("Update download failed:", e);
+                      setUpdateStatus("error");
+                    }
+                  }}
+                >
+                  Download &amp; Install Update
+                </Button>
+              </Alert>
+            )}
+            {updateStatus === "downloading" && (
+              <Alert severity="info" sx={{ py: 0.5, fontSize: "0.75rem", width: "100%" }}>
+                <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                  <CircularProgress size={16} />
+                  <Typography sx={{ fontSize: "0.75rem" }}>
+                    Downloading update... {downloadProgress > 0 ? `(${(downloadProgress / 1024 / 1024).toFixed(1)} MB)` : ""}
+                  </Typography>
+                </Box>
+              </Alert>
+            )}
+            {updateStatus === "ready" && (
+              <Alert severity="success" sx={{ py: 0.5, fontSize: "0.75rem", width: "100%" }}>
+                <Typography sx={{ fontWeight: 600, fontSize: "0.8rem" }}>
+                  Update installed! Restart to apply.
+                </Typography>
+                <Button size="small" variant="contained" color="success" sx={{ mt: 0.5, fontSize: "0.65rem", textTransform: "none" }}
+                  onClick={async () => { await relaunch(); }}
+                >
+                  Restart Now
+                </Button>
               </Alert>
             )}
             {updateStatus === "error" && (

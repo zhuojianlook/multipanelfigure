@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Multi-Panel Figure Builder",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "identifier": "com.multipanelfigure.app",
   "build": {
     "frontendDist": "../dist",
@@ -26,6 +26,14 @@
     ],
     "security": {
       "csp": null
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/zhuojianlook/multipanelfigure/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk1NzcyNDZBNEFFRDVFNDcKUldSSFh1MUthaVIzbFZvL0oxSFo0VTB0d1BEdHZMa0VVTnZJRUpoYUQ1cXZNV21EdnhNdWFEZTYK"
     }
   },
   "bundle": {
