@@ -245,6 +245,8 @@ export const useFigureStore = create<FigureState>()(
     // ── Fetch initial state from backend ──────────────────
 
     fetchConfig: async () => {
+      // Give sidecar time to start (PyInstaller --onefile extracts on first run)
+      await new Promise(r => setTimeout(r, 2000));
       // Wait for sidecar to be ready (retry up to 30 times with 1s delay)
       let connected = false;
       for (let attempt = 0; attempt < 30; attempt++) {

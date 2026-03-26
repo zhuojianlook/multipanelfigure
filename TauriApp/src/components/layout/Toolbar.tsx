@@ -21,7 +21,11 @@ import {
   Divider,
   CircularProgress,
   Alert,
+  Accordion,
+  AccordionSummary,
+  AccordionDetails,
 } from "@mui/material";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import AddPhotoAlternateIcon from "@mui/icons-material/AddPhotoAlternate";
 import SaveIcon from "@mui/icons-material/Save";
 import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
@@ -35,13 +39,24 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
 
 const CHANGELOG = [
+  { version: "0.1.30", date: "2026-03-27", changes: [
+    "All API calls routed through Rust IPC proxy for reliable cross-platform connectivity",
+    "Sidecar process now properly killed on app exit, update, and restart",
+    "Improved first-launch reliability on fresh macOS installations",
+    "Detailed error diagnostics shown when backend connection fails",
+  ]},
+  { version: "0.1.25", date: "2026-03-26", changes: [
+    "Fixed Windows backend connectivity (Private Network Access headers)",
+    "Windows sidecar now starts and connects reliably",
+    "Added python-multipart dependency for file upload support",
+  ]},
   { version: "0.1.13", date: "2026-03-26", changes: [
     "Fixed updater download URLs (GitHub asset naming mismatch)",
     "Native in-app auto-updater now fully working on macOS and Windows",
   ]},
   { version: "0.1.2", date: "2026-03-26", changes: [
     "Native in-app auto-updater with download, install, and restart",
-    "Ad-hoc code signing for macOS (right-click > Open to bypass Gatekeeper)",
+    "Ad-hoc code signing for macOS (right-click → Open to bypass Gatekeeper)",
     "DMG installer with Applications shortcut for drag-to-install",
   ]},
   { version: "0.1.0", date: "2026-03-25", changes: [
@@ -57,7 +72,7 @@ const CHANGELOG = [
     "Export to TIFF/PNG at configurable DPI (72-600)",
     "Custom font support with global font application",
     "Dark mode interface with parking drawer for panel organization",
-    "Cross-platform: macOS (Apple Silicon + Intel) and Windows",
+    "Cross-platform: macOS (Apple Silicon) and Windows",
   ]},
 ];
 import { useFigureStore } from "../../store/figureStore";
@@ -287,11 +302,30 @@ export function Toolbar() {
                 <Typography sx={{ fontWeight: 600, fontSize: "0.8rem" }}>
                   Version {latestVersion} is available!
                 </Typography>
-                {releaseNotes && (
-                  <Typography sx={{ fontSize: "0.65rem", mt: 0.5, maxHeight: 80, overflowY: "auto", whiteSpace: "pre-wrap", color: "text.secondary" }}>
-                    {releaseNotes}
-                  </Typography>
-                )}
+                {/* Show changelog of what's new since current version */}
+                <Box sx={{ mt: 1, maxHeight: 160, overflowY: "auto" }}>
+                  {CHANGELOG.filter(entry => {
+                    // Show entries newer than current version
+                    const current = appVersion.split(".").map(Number);
+                    const entry_v = entry.version.split(".").map(Number);
+                    for (let i = 0; i < 3; i++) {
+                      if ((entry_v[i] || 0) > (current[i] || 0)) return true;
+                      if ((entry_v[i] || 0) < (current[i] || 0)) return false;
+                    }
+                    return false;
+                  }).map((entry) => (
+                    <Box key={entry.version} sx={{ mb: 1 }}>
+                      <Typography sx={{ fontWeight: 600, fontSize: "0.7rem" }}>
+                        v{entry.version} — {entry.date}
+                      </Typography>
+                      <Box component="ul" sx={{ m: 0, pl: 2, "& li": { fontSize: "0.65rem", color: "text.secondary", lineHeight: 1.4 } }}>
+                        {entry.changes.map((change, i) => (
+                          <li key={i}>{change}</li>
+                        ))}
+                      </Box>
+                    </Box>
+                  ))}
+                </Box>
                 <Button size="small" variant="contained" color="primary" sx={{ mt: 0.5, fontSize: "0.65rem", textTransform: "none" }}
                   startIcon={<DownloadIcon />}
                   onClick={async () => {
@@ -400,20 +434,26 @@ export function Toolbar() {
 
           <Divider sx={{ my: 2 }} />
 
-          {/* Changelog */}
-          <Typography variant="subtitle2" sx={{ mb: 1 }}>Changelog</Typography>
-          {CHANGELOG.map((entry) => (
-            <Box key={entry.version} sx={{ mb: 1.5 }}>
-              <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                v{entry.version} — {entry.date}
-              </Typography>
-              <Box component="ul" sx={{ m: 0, pl: 2.5, "& li": { fontSize: "0.75rem", color: "text.secondary" } }}>
-                {entry.changes.map((change, i) => (
-                  <li key={i}>{change}</li>
-                ))}
-              </Box>
-            </Box>
-          ))}
+          {/* Changelog — collapsible */}
+          <Accordion disableGutters elevation={0} sx={{ bgcolor: "transparent", "&:before": { display: "none" } }}>
+            <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ px: 0, minHeight: 32 }}>
+              <Typography variant="subtitle2">Changelog</Typography>
+            </AccordionSummary>
+            <AccordionDetails sx={{ px: 0, pt: 0 }}>
+              {CHANGELOG.map((entry) => (
+                <Box key={entry.version} sx={{ mb: 1.5 }}>
+                  <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                    v{entry.version} — {entry.date}
+                  </Typography>
+                  <Box component="ul" sx={{ m: 0, pl: 2.5, "& li": { fontSize: "0.75rem", color: "text.secondary" } }}>
+                    {entry.changes.map((change, i) => (
+                      <li key={i}>{change}</li>
+                    ))}
+                  </Box>
+                </Box>
+              ))}
+            </AccordionDetails>
+          </Accordion>
         </DialogContent>
         <DialogActions>
           <Button onClick={() => { setAboutOpen(false); setUpdateStatus("idle"); }}>Close</Button>
