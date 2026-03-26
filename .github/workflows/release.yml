@@ -93,11 +93,15 @@ jobs:
           echo "Signing $APP_PATH"
           codesign --force --deep -s - "$APP_PATH"
           codesign --verify "$APP_PATH" && echo "Signature valid"
-          # Rebuild DMG with the signed app
+          # Rebuild DMG with signed app + Applications symlink
           DMG_PATH=$(find TauriApp/src-tauri/target/release/bundle/dmg -name "*.dmg" -maxdepth 1)
           DMG_NAME=$(basename "$DMG_PATH")
           rm "$DMG_PATH"
-          hdiutil create -volname "Multi-Panel Figure Builder" -srcfolder "$APP_PATH" -ov -format UDZO "TauriApp/src-tauri/target/release/bundle/dmg/$DMG_NAME"
+          STAGE_DIR=$(mktemp -d)
+          cp -R "$APP_PATH" "$STAGE_DIR/"
+          ln -s /Applications "$STAGE_DIR/Applications"
+          hdiutil create -volname "Multi-Panel Figure Builder" -srcfolder "$STAGE_DIR" -ov -format UDZO "TauriApp/src-tauri/target/release/bundle/dmg/$DMG_NAME"
+          rm -rf "$STAGE_DIR"
         shell: bash
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
