@@ -30,8 +30,11 @@ import RestartAltIcon from "@mui/icons-material/RestartAlt";
 import SystemUpdateAltIcon from "@mui/icons-material/SystemUpdateAlt";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 
-const APP_VERSION = "0.1.0";
+const APP_VERSION = "0.1.1";
 const CHANGELOG = [
+  { version: "0.1.1", date: "2026-03-26", changes: [
+    "Updated about section description",
+  ]},
   { version: "0.1.0", date: "2026-03-25", changes: [
     "Initial standalone release as native desktop app",
     "Multi-panel grid layout with drag-and-drop image management",
@@ -220,7 +223,7 @@ export function Toolbar() {
             </Typography>
             <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: "block" }}>
               A professional tool for creating multi-panel scientific figures
-              with full control over layout, annotations, scale bars, and image adjustments.
+              with full control over layout, annotations, scale bars, and image adjustments. For the benefit of scientists.
             </Typography>
           </Box>
 
