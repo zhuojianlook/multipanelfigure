@@ -80,6 +80,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Support Private Network Access (CORS-RFC1918) for Windows WebView2.
+# WebView2 sends preflight requests with Access-Control-Request-Private-Network
+# header; we must respond with Access-Control-Allow-Private-Network: true.
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+
+class PrivateNetworkMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Handle preflight OPTIONS requests for private network access
+        if request.method == "OPTIONS" and request.headers.get("access-control-request-private-network"):
+            return Response(
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "*",
+                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Allow-Private-Network": "true",
+                },
+            )
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+        return response
+
+app.add_middleware(PrivateNetworkMiddleware)
+
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}

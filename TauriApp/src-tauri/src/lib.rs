@@ -1,6 +1,7 @@
 use tauri::Manager;
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_shell::process::CommandEvent;
+use tauri_plugin_shell::process::CommandChild;
 use std::sync::{Arc, Mutex};
 
 #[tauri::command]
@@ -15,6 +16,7 @@ fn get_sidecar_error(state: tauri::State<'_, SidecarError>) -> Option<String> {
 
 struct SidecarPort(u16);
 struct SidecarError(Arc<Mutex<Option<String>>>);
+struct SidecarChild(Arc<Mutex<Option<CommandChild>>>);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -33,6 +35,7 @@ pub fn run() {
       }
 
       let sidecar_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+      let sidecar_child: Arc<Mutex<Option<CommandChild>>> = Arc::new(Mutex::new(None));
 
       // Launch sidecar in production; in dev, assume it's already running
       let port: u16;
@@ -46,18 +49,12 @@ pub fn run() {
         {
           if let Ok(exe_path) = std::env::current_exe() {
             if let Some(exe_dir) = exe_path.parent() {
-              let sidecar_name = format!("api-server-{}", std::env::consts::ARCH);
-              let sidecar_name = if cfg!(target_os = "macos") {
-                format!("{}-apple-darwin", sidecar_name)
-              } else {
-                sidecar_name
-              };
+              let sidecar_name = format!("api-server-{}-apple-darwin", std::env::consts::ARCH);
               let sidecar_path = exe_dir.join(&sidecar_name);
               eprintln!("[setup] Removing quarantine from sidecar: {:?}", sidecar_path);
               let _ = std::process::Command::new("xattr")
                 .args(["-dr", "com.apple.quarantine", &sidecar_path.to_string_lossy().to_string()])
                 .output();
-              // Also ensure execute permission
               let _ = std::process::Command::new("chmod")
                 .args(["+x", &sidecar_path.to_string_lossy().to_string()])
                 .output();
@@ -70,7 +67,9 @@ pub fn run() {
           Ok(cmd) => {
             let cmd = cmd.args(["--port", "8765"]);
             match cmd.spawn() {
-              Ok((mut rx, _child)) => {
+              Ok((mut rx, child)) => {
+                // Store child handle so we can kill it on app exit
+                *sidecar_child.lock().unwrap() = Some(child);
                 // Capture sidecar stdout/stderr in background
                 let err_clone = sidecar_error.clone();
                 tauri::async_runtime::spawn(async move {
@@ -119,9 +118,23 @@ pub fn run() {
 
       app.manage(SidecarPort(port));
       app.manage(SidecarError(sidecar_error));
+      app.manage(SidecarChild(sidecar_child));
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error])
-    .run(tauri::generate_context!())
-    .expect("error while running tauri application");
+    .build(tauri::generate_context!())
+    .expect("error while building tauri application")
+    .run(|app_handle, event| {
+      // Kill sidecar when app exits
+      if let tauri::RunEvent::Exit = event {
+        if let Some(state) = app_handle.try_state::<SidecarChild>() {
+          if let Ok(mut guard) = state.0.lock() {
+            if let Some(child) = guard.take() {
+              eprintln!("[cleanup] Killing sidecar process");
+              let _ = child.kill();
+            }
+          }
+        }
+      }
+    });
 }
