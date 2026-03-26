@@ -39,6 +39,32 @@ pub fn run() {
       if cfg!(debug_assertions) {
         port = 8765;
       } else {
+        // On macOS, remove quarantine attribute from sidecar before spawning.
+        // This prevents Gatekeeper from blocking the sidecar on fresh installs
+        // when the user has already approved the main app via right-click → Open.
+        #[cfg(target_os = "macos")]
+        {
+          if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+              let sidecar_name = format!("api-server-{}", std::env::consts::ARCH);
+              let sidecar_name = if cfg!(target_os = "macos") {
+                format!("{}-apple-darwin", sidecar_name)
+              } else {
+                sidecar_name
+              };
+              let sidecar_path = exe_dir.join(&sidecar_name);
+              eprintln!("[setup] Removing quarantine from sidecar: {:?}", sidecar_path);
+              let _ = std::process::Command::new("xattr")
+                .args(["-dr", "com.apple.quarantine", &sidecar_path.to_string_lossy().to_string()])
+                .output();
+              // Also ensure execute permission
+              let _ = std::process::Command::new("chmod")
+                .args(["+x", &sidecar_path.to_string_lossy().to_string()])
+                .output();
+            }
+          }
+        }
+
         let sidecar_result = app.shell().sidecar("api-server");
         match sidecar_result {
           Ok(cmd) => {
