@@ -12,6 +12,11 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
+# Fix matplotlib font cache for PyInstaller --onefile (must be before matplotlib import)
+_mpl_config = os.path.join(os.path.expanduser("~"), ".multipanelfigure", "mplconfig")
+os.makedirs(_mpl_config, exist_ok=True)
+os.environ["MPLCONFIGDIR"] = _mpl_config
+
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware

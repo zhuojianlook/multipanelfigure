@@ -133,9 +133,36 @@ def _load_font(font_path: Optional[str], size: int, font_name: Optional[str] = N
         if is_bold and is_italic:
             suffixes = ["Bold Italic", "BoldItalic", "Bold_Italic", "BI", "bi"]
         elif is_bold:
-            suffixes = ["Bold", "Bd", "bold"]
+            suffixes = ["Bold", "Bd", "bold", "b"]
         elif is_italic:
-            suffixes = ["Italic", "It", "Oblique", "italic"]
+            suffixes = ["Italic", "It", "Oblique", "italic", "i"]
+
+        # Windows-specific common font variant filenames
+        _win_variants = {
+            "arial": {"Bold": "arialbd", "Italic": "ariali", "Bold Italic": "arialbi"},
+            "times": {"Bold": "timesbd", "Italic": "timesi", "Bold Italic": "timesbi"},
+            "calibri": {"Bold": "calibrib", "Italic": "calibrii", "Bold Italic": "calibriz"},
+            "consola": {"Bold": "consolab", "Italic": "consolai", "Bold Italic": "consolaz"},
+            "cour": {"Bold": "courbd", "Italic": "couri", "Bold Italic": "courbi"},
+            "verdana": {"Bold": "verdanab", "Italic": "verdanai", "Bold Italic": "verdanaz"},
+            "tahoma": {"Bold": "tahomabd"},
+            "comic": {"Bold": "comicbd", "Italic": "comici", "Bold Italic": "comicz"},
+            "georgia": {"Bold": "georgiab", "Italic": "georgiai", "Bold Italic": "georgiaz"},
+            "trebuc": {"Bold": "trebucbd", "Italic": "trebucit", "Bold Italic": "trebucbi"},
+        }
+        style_key = "Bold Italic" if (is_bold and is_italic) else ("Bold" if is_bold else "Italic")
+        base_lower = base.lower()
+        if base_lower in _win_variants and style_key in _win_variants[base_lower]:
+            win_name = _win_variants[base_lower][style_key]
+            for ext in [".ttf", ".ttc", ".otf"]:
+                for d in search_dirs:
+                    candidate = os.path.join(d, f"{win_name}{ext}")
+                    if os.path.isfile(candidate):
+                        try:
+                            return ImageFont.truetype(candidate, size)
+                        except Exception:
+                            pass
+
         for sfx in suffixes:
             for ext in [".ttf", ".ttc", ".otf"]:
                 variant_name = f"{base} {sfx}{ext}"
@@ -162,7 +189,7 @@ def _load_font(font_path: Optional[str], size: int, font_name: Optional[str] = N
             return ImageFont.truetype(font_path, size)
         except Exception:
             pass
-    # Try font by name in system locations
+    # Try font by name in system locations (exact match first)
     if effective_name:
         for d in search_dirs:
             candidate = os.path.join(d, effective_name)
@@ -170,7 +197,32 @@ def _load_font(font_path: Optional[str], size: int, font_name: Optional[str] = N
                 try:
                     return ImageFont.truetype(candidate, size)
                 except Exception:
-                    pass
+                    # Fallback: read via BytesIO to bypass Windows virtual folder issues
+                    try:
+                        with open(candidate, "rb") as f:
+                            return ImageFont.truetype(io.BytesIO(f.read()), size)
+                    except Exception:
+                        pass
+        # Case-insensitive scan (Windows font folder has varying casing)
+        name_lower = effective_name.lower()
+        for d in search_dirs:
+            if not os.path.isdir(d):
+                continue
+            try:
+                for fn in os.listdir(d):
+                    if fn.lower() == name_lower:
+                        candidate = os.path.join(d, fn)
+                        if os.path.isfile(candidate):
+                            try:
+                                return ImageFont.truetype(candidate, size)
+                            except Exception:
+                                try:
+                                    with open(candidate, "rb") as f:
+                                        return ImageFont.truetype(io.BytesIO(f.read()), size)
+                                except Exception:
+                                    pass
+            except (PermissionError, OSError):
+                continue
     # Fallback to well-known system fonts
     fallbacks = []
     if platform.system() == "Windows":

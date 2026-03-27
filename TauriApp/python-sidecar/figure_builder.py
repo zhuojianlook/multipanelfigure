@@ -191,6 +191,7 @@ def _resolve_font_path(font_name: str) -> Optional[str]:
     app_dir = os.path.dirname(os.path.abspath(__file__))
     persistent_dir = str(Path.home() / ".multipanelfigure" / "fonts")
     search_dirs = sys_dirs + [app_dir, os.path.join(app_dir, "..")] + [persistent_dir]
+    # First try exact match
     for d in search_dirs:
         if not os.path.isdir(d):
             continue
@@ -198,6 +199,19 @@ def _resolve_font_path(font_name: str) -> Optional[str]:
         if os.path.isfile(candidate):
             _font_path_cache[font_name] = candidate
             return candidate
+    # Case-insensitive scan (important for Windows virtual font folder)
+    font_lower = font_name.lower()
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for fn in os.listdir(d):
+                if fn.lower() == font_lower and os.path.isfile(os.path.join(d, fn)):
+                    result = os.path.join(d, fn)
+                    _font_path_cache[font_name] = result
+                    return result
+        except (PermissionError, OSError):
+            continue
     _font_path_cache[font_name] = None
     return None
 
