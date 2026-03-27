@@ -178,10 +178,16 @@ def _resolve_font_path(font_name: str) -> Optional[str]:
     """Resolve a font filename to its full path using the font discovery system."""
     if font_name in _font_path_cache:
         return _font_path_cache[font_name]
-    # Import find_fonts from api_server (or re-implement the search)
     from pathlib import Path
-    sys_dirs = ["/System/Library/Fonts", "/System/Library/Fonts/Supplemental",
-                "/Library/Fonts", os.path.expanduser("~/Library/Fonts")]
+    import platform
+    if platform.system() == "Windows":
+        sys_dirs = [
+            os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
+            os.path.expanduser("~/AppData/Local/Microsoft/Windows/Fonts"),
+        ]
+    else:
+        sys_dirs = ["/System/Library/Fonts", "/System/Library/Fonts/Supplemental",
+                    "/Library/Fonts", os.path.expanduser("~/Library/Fonts")]
     app_dir = os.path.dirname(os.path.abspath(__file__))
     persistent_dir = str(Path.home() / ".multipanelfigure" / "fonts")
     search_dirs = sys_dirs + [app_dir, os.path.join(app_dir, "..")] + [persistent_dir]
