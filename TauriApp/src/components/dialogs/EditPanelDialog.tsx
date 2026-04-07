@@ -37,6 +37,7 @@ import {
   Divider,
   Tooltip,
   Alert,
+  CircularProgress,
 } from "@mui/material";
 import DeleteIcon from "@mui/icons-material/Delete";
 import AddIcon from "@mui/icons-material/Add";
@@ -1093,6 +1094,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   const [extImageDims, setExtImageDims] = useState<{ w: number; h: number }>({ w: 1000, h: 1000 });
   const [videoFrame, setVideoFrame] = useState(0);
   const [selectedAnnotIdx, setSelectedAnnotIdx] = useState<{ type: "symbol" | "line" | "area"; idx: number } | null>(null);
+  const [magicWandLoading, setMagicWandLoading] = useState(false);
   const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Crop canvas state
@@ -2936,6 +2938,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       const clickX = (area as any).magic_click_x;
                       const clickY = (area as any).magic_click_y;
                       if (clickX != null && clickY != null) {
+                        setMagicWandLoading(true);
                         (async () => {
                           try {
                             const resp = await api.magicWandSelect(row, col, clickX, clickY, v);
@@ -2945,6 +2948,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                               updateLocal({ areas: areas2 } as unknown as Partial<PanelInfo>);
                             }
                           } catch (err) { console.error("Magic wand re-select failed:", err); }
+                          finally { setMagicWandLoading(false); }
                         })();
                       }
                     }} />
@@ -4508,8 +4512,8 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
 
                         if (area.shape === "Magic") {
                           // Magic wand: call backend to flood-fill select
-                          // Store click point for re-selection when tolerance changes
                           const tolerance = (area as any).magic_tolerance ?? 30;
+                          setMagicWandLoading(true);
                           (async () => {
                             try {
                               const resp = await api.magicWandSelect(row, col, rpx, rpy, tolerance);
@@ -4518,9 +4522,9 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                                 areas2[areaIdx] = {
                                   ...areas2[areaIdx],
                                   points: resp.points as [number, number][],
-                                  shape: "Magic",  // stay in Magic mode
+                                  shape: "Magic",
                                   smooth: true,
-                                  magic_click_x: rpx,  // store click point for re-selection
+                                  magic_click_x: rpx,
                                   magic_click_y: rpy,
                                 } as any;
                                 setSelectedAnnotIdx({ type: "area", idx: areaIdx });
@@ -4528,6 +4532,8 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                               }
                             } catch (err) {
                               console.error("Magic wand failed:", err);
+                            } finally {
+                              setMagicWandLoading(false);
                             }
                           })();
                           return;
@@ -4693,6 +4699,19 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   );
                 })()}
                 {/* Legacy symbol overlay removed — now using SVG shapes above */}
+                {/* Magic wand loading indicator */}
+                {magicWandLoading && (
+                  <Box sx={{
+                    position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    bgcolor: "rgba(0,0,0,0.4)", zIndex: 20, borderRadius: 1,
+                  }}>
+                    <Box sx={{ display: "flex", alignItems: "center", gap: 1, bgcolor: "background.paper", px: 2, py: 1, borderRadius: 1, boxShadow: 3 }}>
+                      <CircularProgress size={16} />
+                      <Typography variant="caption">Processing magic wand selection...</Typography>
+                    </Box>
+                  </Box>
+                )}
                 {/* Zoom inset overlay — draggable rectangle showing zoom area */}
                 {tabIdx === TAB_ZOOM && local.add_zoom_inset && local.zoom_inset && ["Standard Zoom", "Adjacent Panel"].includes(local.zoom_inset.inset_type) && (() => {
                   const zi = local.zoom_inset!;
