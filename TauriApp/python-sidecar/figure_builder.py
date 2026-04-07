@@ -896,10 +896,39 @@ def assemble_figure(cfg: FigureConfig,
     has_col_labels = any(lbl.text.strip() for lbl in cfg.column_labels)
     has_row_labels = any(lbl.text.strip() for lbl in cfg.row_labels)
     margin_inches = 0.15                # outer padding
-    top_extra_inches = (0.15 if has_col_labels else 0) + (0.2 * len(cfg.column_headers))
-    left_extra_inches = (0.15 if has_row_labels else 0) + (0.2 * len(cfg.row_headers))
+
+    # Calculate header space needed per level:
+    # Each level needs: gap (min 0.04") + font height + breathing room
+    # Use actual header font sizes when available
+    def _header_space(header_levels, ref_inches=10.0):
+        """Calculate total inches needed for header levels."""
+        total = 0.0
+        for level in header_levels:
+            max_fs = 10
+            max_dist = 0.0
+            for hdr in level.headers:
+                if hdr.columns_or_rows:
+                    max_fs = max(max_fs, hdr.font_size)
+                    max_dist = max(max_dist, hdr.distance)
+            gap = max(max_dist * ref_inches, 0.04)
+            font_h = max_fs / 72.0
+            total += gap + font_h + 0.05  # 0.05" breathing room
+        return total
+
+    ref_dim = 10.0  # approximate reference dimension for distance calc
+    top_extra_inches = (0.15 if has_col_labels else 0) + _header_space(cfg.column_headers, ref_dim)
+    left_extra_inches = (0.15 if has_row_labels else 0) + _header_space(cfg.row_headers, ref_dim)
+    # Also account for bottom/right headers
+    bottom_extra_inches = _header_space(
+        [l for l in cfg.column_headers if any(h.position == "Bottom" for h in l.headers)], ref_dim
+    ) if cfg.column_headers else 0.0
+    right_extra_inches = _header_space(
+        [l for l in cfg.row_headers if any(h.position == "Right" for h in l.headers)], ref_dim
+    ) if cfg.row_headers else 0.0
     top_margin_inches = margin_inches + top_extra_inches
     left_margin_inches = margin_inches + left_extra_inches
+    bottom_margin_inches = margin_inches + bottom_extra_inches
+    right_margin_inches = margin_inches + right_extra_inches
 
     # --- Mixed aspect ratio sizing (4.2) ---
     # When normalize_widths is enabled, scale smaller images to match the
@@ -981,16 +1010,16 @@ def assemble_figure(cfg: FigureConfig,
     content_h = sum(row_inches) + (rows - 1) * gap_inches
 
     # Figure dimensions: content + margins (all in inches)
-    fig_w = content_w + left_margin_inches + margin_inches
-    fig_h = content_h + top_margin_inches + margin_inches
+    fig_w = content_w + left_margin_inches + right_margin_inches
+    fig_h = content_h + top_margin_inches + bottom_margin_inches
 
     fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
 
     # Convert inch-based margins to figure-fractions for axes placement
     left_margin = left_margin_inches / fig_w
     top_margin = top_margin_inches / fig_h
-    right_margin = margin_inches / fig_w
-    bottom_margin = margin_inches / fig_h
+    right_margin = right_margin_inches / fig_w
+    bottom_margin = bottom_margin_inches / fig_h
 
     # Manually position each axes for pixel-exact spacing.
     # All coordinates are in figure-fraction [0, 1].
