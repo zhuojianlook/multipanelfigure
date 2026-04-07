@@ -125,6 +125,41 @@ struct FileData {
     data: String,  // base64 encoded
 }
 
+/// Upload files directly from disk paths — avoids base64/IPC size limits
+#[tauri::command]
+async fn upload_files_from_paths(
+    api_path: String,
+    file_paths: Vec<String>,
+    field_name: String,
+    state: tauri::State<'_, SidecarPort>,
+) -> Result<String, String> {
+    let port = state.0;
+    let url = format!("http://127.0.0.1:{}{}", port, api_path);
+    let client = reqwest::Client::new();
+
+    let mut form = reqwest::multipart::Form::new();
+    for file_path in &file_paths {
+        let path = std::path::Path::new(file_path);
+        let file_name = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let data = std::fs::read(path)
+            .map_err(|e| format!("Failed to read file {}: {}", file_path, e))?;
+        let part = reqwest::multipart::Part::bytes(data)
+            .file_name(file_name)
+            .mime_str("application/octet-stream")
+            .map_err(|e| format!("MIME error: {}", e))?;
+        form = form.part(field_name.clone(), part);
+    }
+
+    let resp = client.post(&url).multipart(form).send().await
+        .map_err(|e| format!("Upload request failed: {}", e))?;
+    let text = resp.text().await
+        .map_err(|e| format!("Failed to read upload response: {}", e))?;
+    Ok(text)
+}
+
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     use std::io::Read;
     // Simple base64 decoder
@@ -274,7 +309,7 @@ pub fn run() {
       app.manage(SidecarChild(sidecar_child));
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, kill_sidecar])
+    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, kill_sidecar])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {

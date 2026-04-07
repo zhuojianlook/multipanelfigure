@@ -127,7 +127,6 @@ class ApiClient {
       for (const f of files) {
         const buf = await f.arrayBuffer();
         const bytes = new Uint8Array(buf);
-        // Convert to base64 using chunked approach to avoid stack overflow on large files
         const CHUNK = 8192;
         const chunks: string[] = [];
         for (let i = 0; i < bytes.length; i += CHUNK) {
@@ -147,6 +146,20 @@ class ApiClient {
     for (const f of files) form.append("files", f);
     const res = await fetch(`${DEFAULT_BASE}/api/images/upload`, { method: "POST", body: form });
     return res.json() as Promise<UploadResponse>;
+  }
+
+  /** Upload images from file paths — Rust reads files directly, no base64/IPC limit */
+  async uploadImagesFromPaths(filePaths: string[]): Promise<UploadResponse> {
+    const invoke = await getInvoke();
+    if (invoke) {
+      const text = await invoke("upload_files_from_paths", {
+        apiPath: "/api/images/upload",
+        filePaths,
+        fieldName: "files",
+      }) as string;
+      return JSON.parse(text) as UploadResponse;
+    }
+    throw new Error("Path-based upload requires Tauri runtime");
   }
 
   async deleteImage(name: string): Promise<void> {

@@ -96,6 +96,7 @@ interface FigureState {
   movePanelFromDrawer: (drawerIdx: number, r: number, c: number) => void;
 
   uploadImages: (files: File[]) => Promise<void>;
+  uploadImagesFromPaths: (filePaths: string[]) => Promise<void>;
   removeImage: (name: string) => Promise<void>;
 
   requestPreview: () => void;
@@ -959,6 +960,26 @@ export const useFigureStore = create<FigureState>()(
         get().requestPreview();
       } catch (err) {
         console.error("Upload failed", err);
+        const msg = err instanceof Error ? err.message : String(err);
+        set((s) => { s.apiError = `Image upload failed: ${msg}`; });
+      }
+    },
+
+    uploadImagesFromPaths: async (filePaths) => {
+      try {
+        const { names, thumbnails } = await api.uploadImagesFromPaths(filePaths);
+        set((s) => {
+          for (const name of names) {
+            s.loadedImages[name] = {
+              name,
+              thumbnailB64: thumbnails[name] ?? "",
+            };
+          }
+          s.apiError = null;
+        });
+        get().requestPreview();
+      } catch (err) {
+        console.error("Upload from paths failed", err);
         const msg = err instanceof Error ? err.message : String(err);
         set((s) => { s.apiError = `Image upload failed: ${msg}`; });
       }

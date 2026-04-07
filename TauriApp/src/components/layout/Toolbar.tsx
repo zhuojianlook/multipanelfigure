@@ -84,6 +84,7 @@ import { api } from "../../api/client";
 export function Toolbar() {
   const loadedImages = useFigureStore((s) => s.loadedImages);
   const uploadImages = useFigureStore((s) => s.uploadImages);
+  const uploadImagesFromPaths = useFigureStore((s) => s.uploadImagesFromPaths);
   const fileRef = useRef<HTMLInputElement>(null);
   const [saveDlgOpen, setSaveDlgOpen] = useState(false);
   const [newConfirmOpen, setNewConfirmOpen] = useState(false);
@@ -111,8 +112,30 @@ export function Toolbar() {
     } catch (err) {
       console.error("Image upload failed:", err);
     } finally {
-      // Always reset so the same files can be re-selected
       if (fileRef.current) fileRef.current.value = "";
+    }
+  };
+
+  const handleLoadMedia = async () => {
+    try {
+      // Try Tauri native file dialog — returns file paths, avoids base64/IPC limits
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        multiple: true,
+        filters: [{
+          name: "Images & Video",
+          extensions: ["tif", "tiff", "png", "jpg", "jpeg", "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2", "pef", "raf", "nd2", "mp4", "avi", "mov", "mkv", "webm", "wmv", "flv", "m4v", "mpg", "mpeg", "3gp", "ts", "mts"],
+        }],
+      });
+      if (selected) {
+        const paths = Array.isArray(selected) ? selected : [selected];
+        if (paths.length > 0) {
+          await uploadImagesFromPaths(paths);
+        }
+      }
+    } catch {
+      // Fallback to HTML file input (dev mode / non-Tauri)
+      fileRef.current?.click();
     }
   };
 
@@ -135,7 +158,7 @@ export function Toolbar() {
       <Button
         variant="contained"
         startIcon={<AddPhotoAlternateIcon />}
-        onClick={() => fileRef.current?.click()}
+        onClick={handleLoadMedia}
       >
         Load Media
       </Button>
