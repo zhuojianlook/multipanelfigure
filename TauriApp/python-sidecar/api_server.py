@@ -1193,27 +1193,6 @@ def put_resolutions(body: ResolutionUpdate):
     return {"ok": True}
 
 
-# ── Entry Point ────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(description="Multi-Panel Figure Builder API Server")
-    parser.add_argument("--port", type=int, default=0, help="Port (0 = auto)")
-    parser.add_argument("--host", default="127.0.0.1")
-    args = parser.parse_args()
-
-    port = args.port
-    if port == 0:
-        import socket
-        with socket.socket() as s:
-            s.bind(("", 0))
-            port = s.getsockname()[1]
-
-    # Print ready signal for Tauri to read
-    print(f"READY:{port}", flush=True)
-
-    uvicorn.run(app, host=args.host, port=port, log_level="warning")
-
-
 # ── R Analysis Endpoints ───────────────────────────────────────────────────
 
 import subprocess
@@ -1245,12 +1224,10 @@ def run_r_code(body: RAnalysisRequest):
         return {"success": False, "stdout": "", "stderr": "R is not installed. Please install R from https://cran.r-project.org/", "plots": []}
 
     with tempfile.TemporaryDirectory(prefix="mpfig_r_") as tmpdir:
-        # Write data CSV
         data_path = os.path.join(tmpdir, "data.csv")
         with open(data_path, "w") as f:
             f.write(body.data_csv)
 
-        # Write R script with data loading prepended
         plot_dir = os.path.join(tmpdir, "plots")
         os.makedirs(plot_dir)
         script = f'# Auto-generated data loading\ndata <- read.csv("{data_path.replace(chr(92), "/")}")\n\n'
@@ -1269,7 +1246,6 @@ def run_r_code(body: RAnalysisRequest):
         with open(script_path, "w") as f:
             f.write(script)
 
-        # Run Rscript
         try:
             result = subprocess.run(
                 [rscript, script_path],
@@ -1281,7 +1257,6 @@ def run_r_code(body: RAnalysisRequest):
         except Exception as e:
             return {"success": False, "stdout": "", "stderr": str(e), "plots": []}
 
-        # Collect generated plot PNGs as base64
         plots_b64 = []
         for png_path in sorted(glob_mod.glob(os.path.join(plot_dir, "*.png"))):
             with open(png_path, "rb") as pf:
@@ -1293,6 +1268,32 @@ def run_r_code(body: RAnalysisRequest):
             "stderr": result.stderr,
             "plots": plots_b64,
         }
+
+
+# ── Entry Point ────────────────────────────────────────────────────────────
+
+def main():
+    import sys
+    try:
+        parser = argparse.ArgumentParser(description="Multi-Panel Figure Builder API Server")
+        parser.add_argument("--port", type=int, default=0, help="Port (0 = auto)")
+        parser.add_argument("--host", default="127.0.0.1")
+        args = parser.parse_args()
+
+        port = args.port
+        if port == 0:
+            import socket
+            with socket.socket() as s:
+                s.bind(("", 0))
+                port = s.getsockname()[1]
+
+        print(f"READY:{port}", flush=True)
+        uvicorn.run(app, host=args.host, port=port, log_level="warning")
+    except Exception as e:
+        print(f"FATAL: {e}", file=sys.stderr, flush=True)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
