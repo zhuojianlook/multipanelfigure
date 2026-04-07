@@ -1266,16 +1266,16 @@ def assemble_figure(cfg: FigureConfig,
                 t_br_px = _frac_to_px(tp, t_pad_fx + t_img_fx, t_pad_fy + t_img_fy)
 
                 # Draw border around zoomed image in target panel
-                border_color = zcolor
+                border_color = zi.rectangle_color or zcolor
                 bg_lower = (cfg.background or "white").lower()
-                rect_lower = (zi.rectangle_color or "#FF0000").lower()
+                rect_lower = border_color.lower()
                 if rect_lower in ("#ffffff", "white", "#fff") and bg_lower in ("white", "#ffffff", "#fff"):
                     border_color = "#000000"
-                # Draw 4 lines for even border thickness on all sides
-                draw_out.line([t_tl_px, t_tr_px], fill=border_color, width=zlw)
-                draw_out.line([t_tr_px, t_br_px], fill=border_color, width=zlw)
-                draw_out.line([t_br_px, t_bl_px], fill=border_color, width=zlw)
-                draw_out.line([t_bl_px, t_tl_px], fill=border_color, width=zlw)
+                # Use rectangle for uniform border thickness on all sides
+                draw_out.rectangle(
+                    [t_tl_px, t_br_px],
+                    outline=border_color, width=zlw
+                )
 
                 if side == "Right":
                     draw_out.line([s_tr_px, t_tl_px], fill=zcolor, width=zlw)

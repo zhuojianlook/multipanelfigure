@@ -879,10 +879,17 @@ def generate_preview():
                             fw, fh = miw, mih
                         scx = miw / max(fw, 1)
                         scy = mih / max(fh, 1)
-                        cx1 = int(zi.x * scx)
-                        cy1 = int(zi.y * scy)
-                        cx2 = int((zi.x + zi.width) * scx)
-                        cy2 = int((zi.y + zi.height) * scy)
+                        # Inset by rectangle border width so we crop only
+                        # pixels INSIDE the selection box, not the border
+                        bw = max(1, getattr(zi, 'rectangle_width', 2) or 2)
+                        bw_x = bw * scx
+                        bw_y = bw * scy
+                        cx1 = max(0, int(zi.x * scx + bw_x))
+                        cy1 = max(0, int(zi.y * scy + bw_y))
+                        cx2 = min(miw, int((zi.x + zi.width) * scx - bw_x))
+                        cy2 = min(mih, int((zi.y + zi.height) * scy - bw_y))
+                        cx2 = max(cx1 + 1, cx2)
+                        cy2 = max(cy1 + 1, cy2)
                         region = main_img.crop((cx1, cy1, cx2, cy2))
                         zw = max(1, int(zi.width * zi.zoom_factor * scx))
                         zh = max(1, int(zi.height * zi.zoom_factor * scy))
@@ -998,10 +1005,15 @@ def save_figure(body: SaveFigureRequest):
                             fw, fh = miw, mih
                         scx = miw / max(fw, 1)
                         scy = mih / max(fh, 1)
-                        cx1 = int(zi.x * scx)
-                        cy1 = int(zi.y * scy)
-                        cx2 = int((zi.x + zi.width) * scx)
-                        cy2 = int((zi.y + zi.height) * scy)
+                        bw = max(1, getattr(zi, 'rectangle_width', 2) or 2)
+                        bw_x = bw * scx
+                        bw_y = bw * scy
+                        cx1 = max(0, int(zi.x * scx + bw_x))
+                        cy1 = max(0, int(zi.y * scy + bw_y))
+                        cx2 = min(miw, int((zi.x + zi.width) * scx - bw_x))
+                        cy2 = min(mih, int((zi.y + zi.height) * scy - bw_y))
+                        cx2 = max(cx1 + 1, cx2)
+                        cy2 = max(cy1 + 1, cy2)
                         region = main_img.crop((cx1, cy1, cx2, cy2))
                         zw = max(1, int(zi.width * zi.zoom_factor * scx))
                         zh = max(1, int(zi.height * zi.zoom_factor * scy))

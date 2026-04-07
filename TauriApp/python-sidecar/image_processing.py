@@ -761,10 +761,7 @@ def draw_zoom_inset(image: Image.Image, panel: PanelInfo,
         sw = zi.width * iw / max(full_w, 1)
         sh = zi.height * ih / max(full_h, 1)
         draw = ImageDraw.Draw(img)
-        # Auto-contrast: if rect color is white on likely white bg, use black
         src_outline = zi.rectangle_color or "#FF0000"
-        if src_outline.lower() in ("#ffffff", "white", "#fff"):
-            src_outline = "#000000"
         draw.rectangle([int(sx), int(sy), int(sx + sw), int(sy + sh)],
                        outline=src_outline, width=max(1, zi.rectangle_width))
     return img

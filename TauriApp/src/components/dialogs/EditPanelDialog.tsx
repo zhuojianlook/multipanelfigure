@@ -1061,13 +1061,17 @@ function VideoFrameSelector({ imageName, onFrameChange, onFrameImage, frame, set
 }
 
 
+// Persist last-used tab across dialog opens
+let _lastTabIdx = 0;
+
 export function EditPanelDialog({ open, onClose, row, col }: Props) {
   const config = useFigureStore((s) => s.config);
   const updatePanel = useFigureStore((s) => s.updatePanel);
   const fonts = useFigureStore((s) => s.fonts);
   const loadedImages = useFigureStore((s) => s.loadedImages);
 
-  const [tabIdx, setTabIdx] = useState(0);
+  const [tabIdx, _setTabIdx] = useState(_lastTabIdx);
+  const setTabIdx = (v: number) => { _lastTabIdx = v; _setTabIdx(v); };
   const [local, setLocal] = useState<PanelInfo | null>(null);
 
   // Detect if current panel has a video file
@@ -1146,7 +1150,8 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       if (pu.input_black !== undefined) { pu.input_black_r = pu.input_black; pu.input_black_g = pu.input_black; pu.input_black_b = pu.input_black; delete pu.input_black; }
       if (pu.input_white !== undefined) { pu.input_white_r = pu.input_white; pu.input_white_g = pu.input_white; pu.input_white_b = pu.input_white; delete pu.input_white; }
       setLocal(p);
-      setTabIdx(0);
+      // Restore last-used tab (don't reset to 0)
+      _setTabIdx(_lastTabIdx);
       setPreviewB64("");
       const preset = ratioStrToPreset(p.aspect_ratio_str);
       setAspectPreset(preset);
