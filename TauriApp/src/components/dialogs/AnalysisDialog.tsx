@@ -170,6 +170,8 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
   // R status
   const [rInstalled, setRInstalled] = useState<boolean | null>(null);
   const [rVersion, setRVersion] = useState("");
+  const [customRPath, setCustomRPath] = useState("");
+  const [rPathInput, setRPathInput] = useState("");
 
   // Data
   const [selectedPanels, setSelectedPanels] = useState<Set<string>>(new Set());
@@ -188,18 +190,24 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
   const [selectedPlot, setSelectedPlot] = useState<number | null>(null);
 
   // Check R on open
+  const checkRStatus = useCallback(async (path?: string) => {
+    try {
+      const r = await api.checkR(path);
+      setRInstalled(r.installed);
+      setRVersion(r.version);
+      if (r.installed && path) setCustomRPath(path);
+    } catch {
+      setRInstalled(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (open) {
-      api.checkR().then((r) => {
-        setRInstalled(r.installed);
-        setRVersion(r.version);
-      }).catch(() => setRInstalled(false));
-
-      // Auto-select all panels
+      checkRStatus(customRPath || undefined);
       const panels = new Set(measurements.map(m => m.panel));
       setSelectedPanels(panels);
     }
-  }, [open, measurements]);
+  }, [open, measurements, checkRStatus, customRPath]);
 
   // Build CSV from selected data
   const buildCsv = useCallback(() => {
@@ -227,7 +235,7 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
     setSelectedPlot(null);
     try {
       const csv = buildCsv();
-      const result = await api.runR(code, csv);
+      const result = await api.runR(code, csv, customRPath || undefined);
       setStdout(result.stdout);
       setStderr(result.stderr);
       setPlots(result.plots);
@@ -235,6 +243,25 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
       setStderr(err instanceof Error ? err.message : String(err));
     } finally {
       setRunning(false);
+    }
+  };
+
+  const browseForR = async () => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "Rscript", extensions: ["*"] }],
+      });
+      if (selected) {
+        const path = typeof selected === "string" ? selected : (selected as { path: string }).path;
+        if (path) {
+          setRPathInput(path);
+          checkRStatus(path);
+        }
+      }
+    } catch {
+      // Not in Tauri context
     }
   };
 
@@ -422,8 +449,23 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
 
           {rInstalled === null && <CircularProgress size={20} />}
           {rInstalled === false && (
-            <Alert severity="warning" sx={{ fontSize: "0.65rem" }}>
-              R is not installed. Install R from <strong>https://cran.r-project.org/</strong> and ensure <code>Rscript</code> is on your PATH.
+            <Alert severity="warning" sx={{ fontSize: "0.65rem", "& .MuiAlert-message": { width: "100%" } }}>
+              <Typography variant="caption" sx={{ fontSize: "0.6rem", display: "block", mb: 1 }}>
+                R not detected automatically. Install R from <strong>https://cran.r-project.org/</strong> or specify the path to <code>Rscript</code> below.
+              </Typography>
+              <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
+                <TextField
+                  size="small"
+                  placeholder="/usr/local/bin/Rscript"
+                  value={rPathInput}
+                  onChange={(e) => setRPathInput(e.target.value)}
+                  sx={{ flex: 1, "& input": { fontSize: "0.6rem", py: 0.5, px: 1 } }}
+                />
+                <Button size="small" sx={{ fontSize: "0.55rem", textTransform: "none", minWidth: 0, px: 1 }}
+                  onClick={browseForR}>Browse</Button>
+                <Button size="small" variant="contained" sx={{ fontSize: "0.55rem", textTransform: "none", minWidth: 0, px: 1 }}
+                  onClick={() => checkRStatus(rPathInput || undefined)}>Check</Button>
+              </Box>
             </Alert>
           )}
 

@@ -299,12 +299,13 @@ class ApiClient {
 
   // ── R Analysis ──────────────────────────────────────────
 
-  async checkR(): Promise<{ installed: boolean; version: string }> {
-    return apiJson("/api/analysis/check-r");
+  async checkR(customPath?: string): Promise<{ installed: boolean; version: string }> {
+    const params = customPath ? `?rscript_path=${encodeURIComponent(customPath)}` : "";
+    return apiJson(`/api/analysis/check-r${params}`);
   }
 
-  async runR(code: string, dataCsv: string): Promise<{ success: boolean; stdout: string; stderr: string; plots: string[] }> {
-    return apiJson("/api/analysis/run-r", "POST", JSON.stringify({ code, data_csv: dataCsv }));
+  async runR(code: string, dataCsv: string, rscriptPath?: string): Promise<{ success: boolean; stdout: string; stderr: string; plots: string[] }> {
+    return apiJson("/api/analysis/run-r", "POST", JSON.stringify({ code, data_csv: dataCsv, rscript_path: rscriptPath || null }));
   }
 
   // ── Image Thumbnail ──────────────────────────────────────

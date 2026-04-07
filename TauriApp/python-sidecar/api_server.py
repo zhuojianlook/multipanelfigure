@@ -1202,26 +1202,75 @@ import glob as glob_mod
 class RAnalysisRequest(BaseModel):
     code: str
     data_csv: str  # CSV string
+    rscript_path: Optional[str] = None  # custom Rscript path
+
+
+def _find_rscript(custom_path: Optional[str] = None) -> Optional[str]:
+    """Find Rscript binary — checks custom path, PATH, and common install locations."""
+    # 1. User-specified custom path
+    if custom_path and os.path.isfile(custom_path):
+        return custom_path
+
+    # 2. Standard PATH lookup
+    found = shutil.which("Rscript")
+    if found:
+        return found
+
+    # 3. Common installation locations by platform
+    import platform
+    candidates = []
+    if platform.system() == "Darwin":  # macOS
+        candidates = [
+            "/usr/local/bin/Rscript",
+            "/opt/homebrew/bin/Rscript",
+            "/Library/Frameworks/R.framework/Versions/Current/Resources/bin/Rscript",
+            "/Library/Frameworks/R.framework/Resources/bin/Rscript",
+            os.path.expanduser("~/Library/Frameworks/R.framework/Resources/bin/Rscript"),
+        ]
+    elif platform.system() == "Windows":
+        # Check common R install paths on Windows
+        prog_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        prog_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        for pf in [prog_files, prog_files_x86]:
+            r_dir = os.path.join(pf, "R")
+            if os.path.isdir(r_dir):
+                for ver_dir in sorted(os.listdir(r_dir), reverse=True):
+                    cand = os.path.join(r_dir, ver_dir, "bin", "Rscript.exe")
+                    candidates.append(cand)
+        candidates.append(os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "R", "bin", "Rscript.exe"))
+    else:  # Linux
+        candidates = [
+            "/usr/bin/Rscript",
+            "/usr/local/bin/Rscript",
+            "/snap/bin/Rscript",
+        ]
+
+    for cand in candidates:
+        if cand and os.path.isfile(cand):
+            return cand
+
+    return None
+
 
 @app.get("/api/analysis/check-r")
-def check_r_installed():
-    """Check if Rscript is available on PATH."""
-    rscript = shutil.which("Rscript")
+def check_r_installed(rscript_path: Optional[str] = None):
+    """Check if Rscript is available."""
+    rscript = _find_rscript(rscript_path)
     if not rscript:
-        return {"installed": False, "version": ""}
+        return {"installed": False, "version": "", "path": ""}
     try:
         result = subprocess.run([rscript, "--version"], capture_output=True, text=True, timeout=5)
         version = (result.stderr + result.stdout).strip().split("\n")[0]
-        return {"installed": True, "version": version}
-    except Exception:
-        return {"installed": False, "version": ""}
+        return {"installed": True, "version": version, "path": rscript}
+    except Exception as e:
+        return {"installed": False, "version": str(e), "path": rscript}
 
 @app.post("/api/analysis/run-r")
 def run_r_code(body: RAnalysisRequest):
     """Run R code with provided data, return stdout/stderr and any generated plots."""
-    rscript = shutil.which("Rscript")
+    rscript = _find_rscript(body.rscript_path)
     if not rscript:
-        return {"success": False, "stdout": "", "stderr": "R is not installed. Please install R from https://cran.r-project.org/", "plots": []}
+        return {"success": False, "stdout": "", "stderr": "R is not installed. Please install R from https://cran.r-project.org/ or specify the Rscript path.", "plots": []}
 
     with tempfile.TemporaryDirectory(prefix="mpfig_r_") as tmpdir:
         data_path = os.path.join(tmpdir, "data.csv")
