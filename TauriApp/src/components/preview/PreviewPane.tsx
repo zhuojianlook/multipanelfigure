@@ -102,7 +102,7 @@ export function PreviewPane() {
     });
   };
 
-  const handleBackgroundChange = (newBg: string) => {
+  const handleBackgroundChange = async (newBg: string) => {
     if (!config) {
       setBackground(newBg);
       return;
@@ -115,14 +115,22 @@ export function PreviewPane() {
     config.column_headers.forEach((lv) => lv.headers.forEach((h) => allColors.push(h.default_color)));
     config.row_headers.forEach((lv) => lv.headers.forEach((h) => allColors.push(h.default_color)));
 
+    // Use Tauri native dialog with fallback to window.confirm
+    const nativeConfirm = async (message: string): Promise<boolean> => {
+      try {
+        const { ask } = await import("@tauri-apps/plugin-dialog");
+        return await ask(message, { title: "Multi-Panel Figure Builder", kind: "info" });
+      } catch {
+        return window.confirm(message);
+      }
+    };
+
     if (newBg === "Black" && allColors.some(isDark)) {
-      if (window.confirm("Switch dark header/label text to white for visibility on black background?")) {
-        switchTextColors("#FFFFFF", isDark);
-      }
+      const yes = await nativeConfirm("Switch dark header/label text to white for visibility on black background?");
+      if (yes) switchTextColors("#FFFFFF", isDark);
     } else if (newBg === "White" && allColors.some(isLight)) {
-      if (window.confirm("Switch light header/label text to black for visibility on white background?")) {
-        switchTextColors("#000000", isLight);
-      }
+      const yes = await nativeConfirm("Switch light header/label text to black for visibility on white background?");
+      if (yes) switchTextColors("#000000", isLight);
     }
 
     setBackground(newBg);

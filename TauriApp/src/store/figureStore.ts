@@ -12,6 +12,7 @@ import type {
   HeaderLevel,
   HeaderGroup,
   PanelInfo,
+  ImageGroup,
 } from "../api/types";
 import { api, checkHealth, lastHealthError } from "../api/client";
 
@@ -35,6 +36,7 @@ interface FigureState {
   configDirty: boolean;     // true when local changes haven't been previewed
   drawerPanels: PanelInfo[];
   drawerThumbnails: Record<number, string>;  // drawerIdx → processed base64 PNG
+  imageGroups: ImageGroup[];
 
   // ── actions ────────────────────────────────────────────
   fetchConfig: () => Promise<void>;
@@ -98,6 +100,13 @@ interface FigureState {
   uploadImages: (files: File[]) => Promise<void>;
   uploadImagesFromPaths: (filePaths: string[]) => Promise<void>;
   removeImage: (name: string) => Promise<void>;
+
+  // Image group management
+  createImageGroup: (name: string) => void;
+  renameImageGroup: (groupId: string, name: string) => void;
+  deleteImageGroup: (groupId: string) => void;
+  moveImageToGroup: (imageName: string, groupId: string) => void;
+  moveImageToTimeline: (imageName: string) => void;
 
   requestPreview: () => void;
   syncToBackend: () => Promise<void>;
@@ -242,6 +251,7 @@ export const useFigureStore = create<FigureState>()(
     configDirty: false,
     drawerPanels: [],
     drawerThumbnails: {},
+    imageGroups: [],
 
     // ── Fetch initial state from backend ──────────────────
 
@@ -990,6 +1000,10 @@ export const useFigureStore = create<FigureState>()(
         await api.deleteImage(name);
         set((s) => {
           delete s.loadedImages[name];
+          // Remove from any image group
+          s.imageGroups.forEach(g => {
+            g.imageNames = g.imageNames.filter(n => n !== name);
+          });
           if (s.config) {
             for (let r = 0; r < s.config.rows; r++) {
               for (let c = 0; c < s.config.cols; c++) {
@@ -1004,6 +1018,51 @@ export const useFigureStore = create<FigureState>()(
       } catch (err) {
         console.error("Delete failed", err);
       }
+    },
+
+    // ── Image Groups ─────────────────────────────────────
+
+    createImageGroup: (name) => {
+      set((s) => {
+        s.imageGroups.push({
+          id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+          name,
+          imageNames: [],
+        });
+      });
+    },
+
+    renameImageGroup: (groupId, name) => {
+      set((s) => {
+        const group = s.imageGroups.find(g => g.id === groupId);
+        if (group) group.name = name;
+      });
+    },
+
+    deleteImageGroup: (groupId) => {
+      set((s) => {
+        s.imageGroups = s.imageGroups.filter(g => g.id !== groupId);
+      });
+    },
+
+    moveImageToGroup: (imageName, groupId) => {
+      set((s) => {
+        // Remove from any existing group first (single-location invariant)
+        s.imageGroups.forEach(g => {
+          g.imageNames = g.imageNames.filter(n => n !== imageName);
+        });
+        // Add to target group
+        const target = s.imageGroups.find(g => g.id === groupId);
+        if (target) target.imageNames.push(imageName);
+      });
+    },
+
+    moveImageToTimeline: (imageName) => {
+      set((s) => {
+        s.imageGroups.forEach(g => {
+          g.imageNames = g.imageNames.filter(n => n !== imageName);
+        });
+      });
     },
 
     // ── Preview ───────────────────────────────────────────

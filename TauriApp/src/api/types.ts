@@ -271,3 +271,9 @@ export interface ProjectLoadResponse {
   image_names: string[];
   thumbnails: Record<string, string>;
 }
+
+export interface ImageGroup {
+  id: string;
+  name: string;
+  imageNames: string[];
+}
