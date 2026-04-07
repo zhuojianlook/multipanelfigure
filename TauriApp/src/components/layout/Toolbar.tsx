@@ -128,13 +128,17 @@ export function Toolbar() {
         }],
       });
       if (selected) {
-        const paths = Array.isArray(selected) ? selected : [selected];
+        const items = Array.isArray(selected) ? selected : [selected];
+        // open() may return strings or {path, name} objects depending on version
+        const paths = items.map((item: unknown) =>
+          typeof item === "string" ? item : (item as { path: string }).path
+        ).filter(Boolean);
         if (paths.length > 0) {
           await uploadImagesFromPaths(paths);
         }
       }
     } catch {
-      // Fallback to HTML file input (dev mode / non-Tauri)
+      // If dialog import fails (dev mode), fall back to HTML file input
       fileRef.current?.click();
     }
   };
