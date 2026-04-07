@@ -4246,14 +4246,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                                 const imgEl = svgEl?.parentElement?.querySelector("img") as HTMLImageElement | null;
                                 if (!imgEl) return;
                                 const startX = e.clientX, startY = e.clientY;
-                                const startCx = cx, startCy = cy;
+                                // Use percentage coordinates (0-100), not SVG viewBox units
+                                const startPctX = area.points[0][0];
+                                const startPctY = area.points[0][1];
                                 const onMove = (ev: MouseEvent) => {
                                   const rect = imgEl.getBoundingClientRect();
                                   const dx = ((ev.clientX - startX) / rect.width) * 100;
                                   const dy = ((ev.clientY - startY) / rect.height) * 100;
                                   const areas2 = [...(local.areas ?? [])];
                                   const pts2 = [...(areas2[ai].points ?? [])];
-                                  pts2[0] = [Math.round((startCx + dx) * 10) / 10, Math.round((startCy + dy) * 10) / 10];
+                                  pts2[0] = [Math.round((startPctX + dx) * 10) / 10, Math.round((startPctY + dy) * 10) / 10];
                                   areas2[ai] = { ...areas2[ai], points: pts2 };
                                   updateLocal({ areas: areas2 } as unknown as Partial<PanelInfo>);
                                 };
@@ -4368,14 +4370,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                               const imgEl = svgEl?.parentElement?.querySelector("img") as HTMLImageElement | null;
                               if (!imgEl) return;
                               const startX = e.clientX, startY = e.clientY;
-                              const startCx = cx, startCy = cy;
+                              // Use percentage coordinates (0-100), not SVG viewBox units
+                              const startPctX = area.points[0][0];
+                              const startPctY = area.points[0][1];
                               const onMove = (ev: MouseEvent) => {
                                 const rect = imgEl.getBoundingClientRect();
                                 const dx = ((ev.clientX - startX) / rect.width) * 100;
                                 const dy = ((ev.clientY - startY) / rect.height) * 100;
                                 const areas2 = [...(local.areas ?? [])];
                                 const pts2 = [...(areas2[ai].points ?? [])];
-                                pts2[0] = [Math.round((startCx + dx) * 10) / 10, Math.round((startCy + dy) * 10) / 10];
+                                pts2[0] = [Math.round((startPctX + dx) * 10) / 10, Math.round((startPctY + dy) * 10) / 10];
                                 areas2[ai] = { ...areas2[ai], points: pts2 };
                                 updateLocal({ areas: areas2 } as unknown as Partial<PanelInfo>);
                               };

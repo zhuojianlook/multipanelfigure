@@ -316,7 +316,8 @@ export function Sidebar() {
           <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
           <select
             id="global-font-select"
-            defaultValue={config?.column_labels?.[0]?.font_name || "arial.ttf"}
+            defaultValue={fonts.length > 0 ? (config?.column_labels?.[0]?.font_name || "arial.ttf") : ""}
+            key={fonts.length > 0 ? "loaded" : "empty"}
             style={{
               fontSize: "0.65rem",
               flex: 1,
