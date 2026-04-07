@@ -519,7 +519,7 @@ def compute_area_pixels(points: List[Tuple[float, float]], shape: str,
         coords = [(p[0] / 100.0 * image_width, p[1] / 100.0 * image_height) for p in points[:3]]
         return abs(0.5 * ((coords[1][0] - coords[0][0]) * (coords[2][1] - coords[0][1]) -
                           (coords[2][0] - coords[0][0]) * (coords[1][1] - coords[0][1])))
-    elif shape == "Custom" and len(points) >= 3:
+    elif shape in ("Custom", "Magic") and len(points) >= 3:
         # Shoelace formula for arbitrary polygon
         coords = [(p[0] / 100.0 * image_width, p[1] / 100.0 * image_height) for p in points]
         n = len(coords)
