@@ -1389,35 +1389,17 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
         const newCx = newCrop[0], newCy = newCrop[1], newCw = newCrop[2] - newCrop[0], newCh = newCrop[3] - newCrop[1];
 
         if (oldCw > 0 && oldCh > 0 && newCw > 0 && newCh > 0) {
-          // Transform: crop% → original px → new crop%
-          // No rounding — preserve full floating-point precision for measurement accuracy
+          // Annotations are stored in absolute pixel coords relative to the
+          // ORIGINAL image. They do NOT move when crop changes — they stay
+          // fixed to the pixels they were drawn on.
+          // Only zoom inset coordinates need transformation (they're in pixel coords).
+
           const transformPt = (pctX: number, pctY: number): [number, number] => {
             const origPx = pctX / 100 * oldCw + oldCx;
             const origPy = pctY / 100 * oldCh + oldCy;
             return [(origPx - newCx) / newCw * 100, (origPy - newCy) / newCh * 100];
           };
 
-          // Transform lines
-          if (next.lines?.length) {
-            next = { ...next, lines: next.lines.map(line => ({
-              ...line,
-              points: line.points?.map(([px, py]: [number, number]) => transformPt(px, py)) ?? [],
-            })) };
-          }
-          // Transform areas
-          if (next.areas?.length) {
-            next = { ...next, areas: next.areas.map(area => ({
-              ...area,
-              points: area.points?.map(([px, py]: [number, number]) => transformPt(px, py)) ?? [],
-            })) };
-          }
-          // Transform symbols
-          if (next.symbols?.length) {
-            next = { ...next, symbols: next.symbols.map(sym => {
-              const [nx, ny] = transformPt(sym.x, sym.y);
-              return { ...sym, x: nx, y: ny };
-            }) };
-          }
           // Transform zoom inset source region (pixel coords → % → transform → % → pixel coords)
           if (next.zoom_inset && next.add_zoom_inset) {
             const zi = { ...next.zoom_inset };
