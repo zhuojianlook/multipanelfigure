@@ -1208,6 +1208,88 @@ def main():
             s.bind(("", 0))
             port = s.getsockname()[1]
 
+# ── R Analysis Endpoints ───────────────────────────────────────────────────
+
+import subprocess
+import shutil
+import glob as glob_mod
+
+class RAnalysisRequest(BaseModel):
+    code: str
+    data_csv: str  # CSV string
+
+@app.get("/api/analysis/check-r")
+def check_r_installed():
+    """Check if Rscript is available on PATH."""
+    rscript = shutil.which("Rscript")
+    if not rscript:
+        return {"installed": False, "version": ""}
+    try:
+        result = subprocess.run([rscript, "--version"], capture_output=True, text=True, timeout=5)
+        version = (result.stderr + result.stdout).strip().split("\n")[0]
+        return {"installed": True, "version": version}
+    except Exception:
+        return {"installed": False, "version": ""}
+
+@app.post("/api/analysis/run-r")
+def run_r_code(body: RAnalysisRequest):
+    """Run R code with provided data, return stdout/stderr and any generated plots."""
+    rscript = shutil.which("Rscript")
+    if not rscript:
+        return {"success": False, "stdout": "", "stderr": "R is not installed. Please install R from https://cran.r-project.org/", "plots": []}
+
+    with tempfile.TemporaryDirectory(prefix="mpfig_r_") as tmpdir:
+        # Write data CSV
+        data_path = os.path.join(tmpdir, "data.csv")
+        with open(data_path, "w") as f:
+            f.write(body.data_csv)
+
+        # Write R script with data loading prepended
+        plot_dir = os.path.join(tmpdir, "plots")
+        os.makedirs(plot_dir)
+        script = f'# Auto-generated data loading\ndata <- read.csv("{data_path.replace(chr(92), "/")}")\n\n'
+        script += f'# Set plot output directory\n.plot_dir <- "{plot_dir.replace(chr(92), "/")}"\n'
+        script += '.plot_count <- 0\n'
+        script += 'mpfig_plot <- function(filename=NULL, width=800, height=600, res=150) {\n'
+        script += '  .plot_count <<- .plot_count + 1\n'
+        script += '  if (is.null(filename)) filename <- paste0("plot_", .plot_count, ".png")\n'
+        script += '  png(file.path(.plot_dir, filename), width=width, height=height, res=res)\n'
+        script += '}\n\n'
+        script += '# User code\n'
+        script += body.code
+        script += '\n\n# Close any open graphics devices\nwhile (dev.cur() > 1) dev.off()\n'
+
+        script_path = os.path.join(tmpdir, "analysis.R")
+        with open(script_path, "w") as f:
+            f.write(script)
+
+        # Run Rscript
+        try:
+            result = subprocess.run(
+                [rscript, script_path],
+                capture_output=True, text=True, timeout=60,
+                cwd=tmpdir
+            )
+        except subprocess.TimeoutExpired:
+            return {"success": False, "stdout": "", "stderr": "R script timed out after 60 seconds.", "plots": []}
+        except Exception as e:
+            return {"success": False, "stdout": "", "stderr": str(e), "plots": []}
+
+        # Collect generated plot PNGs as base64
+        plots_b64 = []
+        for png_path in sorted(glob_mod.glob(os.path.join(plot_dir, "*.png"))):
+            with open(png_path, "rb") as pf:
+                plots_b64.append(base64.b64encode(pf.read()).decode())
+
+        return {
+            "success": result.returncode == 0,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "plots": plots_b64,
+        }
+
+
+def main():
     # Print ready signal for Tauri to read
     print(f"READY:{port}", flush=True)
 

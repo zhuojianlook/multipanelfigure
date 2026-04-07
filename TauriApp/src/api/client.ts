@@ -297,6 +297,16 @@ class ApiClient {
     return apiJson("/api/measurements");
   }
 
+  // ── R Analysis ──────────────────────────────────────────
+
+  async checkR(): Promise<{ installed: boolean; version: string }> {
+    return apiJson("/api/analysis/check-r");
+  }
+
+  async runR(code: string, dataCsv: string): Promise<{ success: boolean; stdout: string; stderr: string; plots: string[] }> {
+    return apiJson("/api/analysis/run-r", "POST", JSON.stringify({ code, data_csv: dataCsv }));
+  }
+
   // ── Image Thumbnail ──────────────────────────────────────
 
   async getImageThumb(name: string): Promise<{ thumbnail: string }> {

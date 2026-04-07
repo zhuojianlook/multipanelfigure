@@ -29,6 +29,7 @@ import UploadFileIcon from "@mui/icons-material/UploadFile";
 import StraightenIcon from "@mui/icons-material/Straighten";
 import { useFigureStore } from "../../store/figureStore";
 import { api } from "../../api/client";
+import { AnalysisDialog } from "../dialogs/AnalysisDialog";
 
 /* ── tiny reusable pieces ─────────────────────────────── */
 
@@ -125,6 +126,9 @@ export function Sidebar() {
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [loadDialogOpen, setLoadDialogOpen] = useState(false);
   const [projectPath, setProjectPath] = useState("");
+
+  // Analysis dialog
+  const [analysisOpen, setAnalysisOpen] = useState(false);
 
   // Computed measurements from backend
   const [computedMeasurements, setComputedMeasurements] = useState<Array<{ panel: string; name: string; type: string; value: string }>>([]);
@@ -439,30 +443,49 @@ export function Sidebar() {
           </Typography>
         ) : (
           <>
-          <List dense disablePadding sx={{ maxHeight: 150, overflowY: "auto" }}>
-            {computedMeasurements.map((m, i) => (
-              <ListItem key={i} disableGutters sx={{ py: 0 }}>
-                <StraightenIcon sx={{ fontSize: 12, mr: 0.5, color: "text.secondary" }} />
-                <ListItemText
-                  primary={`${m.panel}: ${m.name}`}
-                  secondary={m.value}
-                  primaryTypographyProps={{ variant: "caption", sx: { fontSize: "0.6rem" } }}
-                  secondaryTypographyProps={{ variant: "caption", sx: { fontSize: "0.6rem", color: "primary.main" } }}
-                />
-              </ListItem>
-            ))}
-          </List>
-          <Button size="small" variant="text" sx={{ fontSize: "0.6rem", textTransform: "none" }}
-            onClick={() => {
-              if (computedMeasurements.length === 0) { alert("No measurements to export."); return; }
-              const csv = ["Panel,Name,Type,Value", ...computedMeasurements.map(m => `${m.panel},${m.name},${m.type},${m.value}`)].join("\n");
-              const blob = new Blob([csv], { type: "text/csv" });
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement("a");
-              a.href = url; a.download = "measurements.csv"; a.click();
-              URL.revokeObjectURL(url);
-            }}
-          >Export CSV</Button>
+          {/* Group measurements by panel */}
+          <Box sx={{ maxHeight: 200, overflowY: "auto" }}>
+            {(() => {
+              const grouped = new Map<string, typeof computedMeasurements>();
+              computedMeasurements.forEach(m => {
+                if (!grouped.has(m.panel)) grouped.set(m.panel, []);
+                grouped.get(m.panel)!.push(m);
+              });
+              return Array.from(grouped.entries()).map(([panel, measurements]) => (
+                <Box key={panel} sx={{ mb: 0.5 }}>
+                  <Typography variant="caption" sx={{ fontSize: "0.6rem", fontWeight: 700, color: "text.primary", display: "block", mb: 0.25 }}>
+                    {panel}
+                  </Typography>
+                  {measurements.map((m, i) => (
+                    <Box key={i} sx={{ display: "flex", alignItems: "center", pl: 1, py: 0.1 }}>
+                      <StraightenIcon sx={{ fontSize: 10, mr: 0.5, color: "text.secondary" }} />
+                      <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>
+                        {m.name}:&nbsp;
+                      </Typography>
+                      <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "primary.main", fontWeight: 600 }}>
+                        {m.value}
+                      </Typography>
+                    </Box>
+                  ))}
+                </Box>
+              ));
+            })()}
+          </Box>
+          <Box sx={{ display: "flex", gap: 0.5 }}>
+            <Button size="small" variant="text" sx={{ fontSize: "0.55rem", textTransform: "none", flex: 1 }}
+              onClick={() => {
+                const csv = ["Panel,Name,Type,Value", ...computedMeasurements.map(m => `${m.panel},${m.name},${m.type},${m.value}`)].join("\n");
+                const blob = new Blob([csv], { type: "text/csv" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url; a.download = "measurements.csv"; a.click();
+                URL.revokeObjectURL(url);
+              }}
+            >Export CSV</Button>
+            <Button size="small" variant="outlined" sx={{ fontSize: "0.55rem", textTransform: "none", flex: 1 }}
+              onClick={() => setAnalysisOpen(true)}
+            >Open Analysis</Button>
+          </Box>
           </>
         )}
       </Box>
@@ -618,6 +641,13 @@ export function Sidebar() {
           </Button>
         </DialogActions>
       </Dialog>
+
+      {/* Analysis Dialog */}
+      <AnalysisDialog
+        open={analysisOpen}
+        onClose={() => setAnalysisOpen(false)}
+        measurements={computedMeasurements}
+      />
     </Box>
   );
 }
