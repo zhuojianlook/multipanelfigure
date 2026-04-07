@@ -1275,11 +1275,14 @@ def run_r_code(body: RAnalysisRequest):
     with tempfile.TemporaryDirectory(prefix="mpfig_r_") as tmpdir:
         data_path = os.path.join(tmpdir, "data.csv")
         with open(data_path, "w") as f:
-            f.write(body.data_csv)
+            csv_text = body.data_csv.rstrip() + "\n"  # ensure trailing newline
+            f.write(csv_text)
 
         plot_dir = os.path.join(tmpdir, "plots")
         os.makedirs(plot_dir)
-        script = f'# Auto-generated data loading\ndata <- read.csv("{data_path.replace(chr(92), "/")}")\n\n'
+        script = '# Auto-install missing packages\n'
+        script += 'if (!requireNamespace("ggplot2", quietly=TRUE)) install.packages("ggplot2", repos="https://cloud.r-project.org", quiet=TRUE)\n\n'
+        script += f'# Auto-generated data loading\ndata <- read.csv("{data_path.replace(chr(92), "/")}")\n\n'
         script += f'# Set plot output directory\n.plot_dir <- "{plot_dir.replace(chr(92), "/")}"\n'
         script += '.plot_count <- 0\n'
         script += 'mpfig_plot <- function(filename=NULL, width=800, height=600, res=150) {\n'
@@ -1298,11 +1301,11 @@ def run_r_code(body: RAnalysisRequest):
         try:
             result = subprocess.run(
                 [rscript, script_path],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, timeout=120,
                 cwd=tmpdir
             )
         except subprocess.TimeoutExpired:
-            return {"success": False, "stdout": "", "stderr": "R script timed out after 60 seconds.", "plots": []}
+            return {"success": False, "stdout": "", "stderr": "R script timed out after 120 seconds (may be installing packages — try again).", "plots": []}
         except Exception as e:
             return {"success": False, "stdout": "", "stderr": str(e), "plots": []}
 
