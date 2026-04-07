@@ -159,6 +159,7 @@ function defaultPanel(): PanelInfo {
     areas: [],
     zoom_inset: null,
     add_zoom_inset: false,
+    zoom_insets: [],
     rotation: 0,
     flip_horizontal: false,
     flip_vertical: false,

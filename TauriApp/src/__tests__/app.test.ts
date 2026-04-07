@@ -65,6 +65,7 @@ function makeConfig(rows = 2, cols = 3): FigureConfig {
       areas: [],
       zoom_inset: null,
       add_zoom_inset: false,
+      zoom_insets: [],
       rotation: 0,
       flip_horizontal: false,
       flip_vertical: false,
