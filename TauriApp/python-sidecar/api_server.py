@@ -26,7 +26,9 @@ from pydantic import BaseModel
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFile
+# Accept slightly truncated images (common in scientific microscopy)
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from models import (
     FigureConfig, PanelInfo, AxisLabel, HeaderLevel, HeaderGroup,
     StyledSegment, save_config, load_config, save_project, load_project,
