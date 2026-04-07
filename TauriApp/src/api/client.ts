@@ -163,9 +163,17 @@ class ApiClient {
         filePaths: [filePath],
         fieldName: "files",
       }) as string;
-      const result = JSON.parse(text) as UploadResponse;
-      allNames.push(...result.names);
-      Object.assign(allThumbnails, result.thumbnails);
+      const result = JSON.parse(text);
+      // Validate response has expected fields
+      if (result.detail) {
+        throw new Error(`Server error for ${filePath.split(/[/\\]/).pop()}: ${result.detail}`);
+      }
+      if (result.names && Array.isArray(result.names)) {
+        allNames.push(...result.names);
+      }
+      if (result.thumbnails && typeof result.thumbnails === "object") {
+        Object.assign(allThumbnails, result.thumbnails);
+      }
     }
 
     return { names: allNames, thumbnails: allThumbnails };
