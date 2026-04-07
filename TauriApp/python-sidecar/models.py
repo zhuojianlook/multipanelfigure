@@ -240,8 +240,9 @@ class PanelInfo:
     lines: List[LineAnnotation] = field(default_factory=list)
     areas: List[AreaAnnotation] = field(default_factory=list)
 
-    zoom_inset: Optional[ZoomInsetSettings] = None
-    add_zoom_inset: bool = False
+    zoom_inset: Optional[ZoomInsetSettings] = None  # legacy single inset
+    add_zoom_inset: bool = False                    # legacy flag
+    zoom_insets: List[ZoomInsetSettings] = field(default_factory=list)  # NEW: array
     is_zoom_target: bool = False            # True if this panel is an adjacent-zoom target
     zoom_source_row: int = -1               # row of the source panel for adjacent zoom
     zoom_source_col: int = -1               # col of the source panel for adjacent zoom

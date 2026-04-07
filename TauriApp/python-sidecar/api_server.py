@@ -1208,6 +1208,12 @@ def main():
             s.bind(("", 0))
             port = s.getsockname()[1]
 
+    # Print ready signal for Tauri to read
+    print(f"READY:{port}", flush=True)
+
+    uvicorn.run(app, host=args.host, port=port, log_level="warning")
+
+
 # ── R Analysis Endpoints ───────────────────────────────────────────────────
 
 import subprocess
@@ -1287,13 +1293,6 @@ def run_r_code(body: RAnalysisRequest):
             "stderr": result.stderr,
             "plots": plots_b64,
         }
-
-
-def main():
-    # Print ready signal for Tauri to read
-    print(f"READY:{port}", flush=True)
-
-    uvicorn.run(app, host=args.host, port=port, log_level="warning")
 
 
 if __name__ == "__main__":

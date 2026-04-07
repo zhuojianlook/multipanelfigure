@@ -150,8 +150,9 @@ export interface PanelInfo {
   symbols: SymbolSettings[];
   lines: LineAnnotation[];
   areas: AreaAnnotation[];
-  zoom_inset: ZoomInsetSettings | null;
-  add_zoom_inset: boolean;
+  zoom_inset: ZoomInsetSettings | null;   // legacy single inset (backward compat)
+  add_zoom_inset: boolean;                // legacy flag
+  zoom_insets: ZoomInsetSettings[];       // NEW: array of zoom insets
   rotation: number;           // 0-360 degrees
   flip_horizontal: boolean;   // mirror left-right
   flip_vertical: boolean;     // mirror top-bottom
