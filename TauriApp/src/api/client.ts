@@ -127,11 +127,13 @@ class ApiClient {
       for (const f of files) {
         const buf = await f.arrayBuffer();
         const bytes = new Uint8Array(buf);
-        let binary = "";
-        for (let i = 0; i < bytes.length; i++) {
-          binary += String.fromCharCode(bytes[i]);
+        // Convert to base64 using chunked approach to avoid stack overflow on large files
+        const CHUNK = 8192;
+        const chunks: string[] = [];
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+          chunks.push(String.fromCharCode(...bytes.subarray(i, i + CHUNK)));
         }
-        filesData.push({ name: f.name, data: btoa(binary) });
+        filesData.push({ name: f.name, data: btoa(chunks.join("")) });
       }
       const text = await invoke("proxy_upload", {
         path: "/api/images/upload",
@@ -229,11 +231,12 @@ class ApiClient {
       for (const f of files) {
         const buf = await f.arrayBuffer();
         const bytes = new Uint8Array(buf);
-        let binary = "";
-        for (let i = 0; i < bytes.length; i++) {
-          binary += String.fromCharCode(bytes[i]);
+        const CHUNK = 8192;
+        const chunks: string[] = [];
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+          chunks.push(String.fromCharCode(...bytes.subarray(i, i + CHUNK)));
         }
-        filesData.push({ name: f.name, data: btoa(binary) });
+        filesData.push({ name: f.name, data: btoa(chunks.join("")) });
       }
       const text = await invoke("proxy_upload", {
         path: "/api/fonts/upload",

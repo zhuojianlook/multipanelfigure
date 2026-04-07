@@ -954,10 +954,13 @@ export const useFigureStore = create<FigureState>()(
               thumbnailB64: thumbnails[name] ?? "",
             };
           }
+          s.apiError = null;
         });
         get().requestPreview();
       } catch (err) {
         console.error("Upload failed", err);
+        const msg = err instanceof Error ? err.message : String(err);
+        set((s) => { s.apiError = `Image upload failed: ${msg}`; });
       }
     },
 

@@ -106,8 +106,14 @@ export function Toolbar() {
   const handleFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     const fileArr = Array.from(files);
-    await uploadImages(fileArr);
-    if (fileRef.current) fileRef.current.value = "";
+    try {
+      await uploadImages(fileArr);
+    } catch (err) {
+      console.error("Image upload failed:", err);
+    } finally {
+      // Always reset so the same files can be re-selected
+      if (fileRef.current) fileRef.current.value = "";
+    }
   };
 
   return (
