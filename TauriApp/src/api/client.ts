@@ -148,18 +148,27 @@ class ApiClient {
     return res.json() as Promise<UploadResponse>;
   }
 
-  /** Upload images from file paths — Rust reads files directly, no base64/IPC limit */
+  /** Upload images from file paths — one at a time to avoid IPC size limits */
   async uploadImagesFromPaths(filePaths: string[]): Promise<UploadResponse> {
     const invoke = await getInvoke();
-    if (invoke) {
+    if (!invoke) throw new Error("Path-based upload requires Tauri runtime");
+
+    const allNames: string[] = [];
+    const allThumbnails: Record<string, string> = {};
+
+    // Upload one file at a time to avoid IPC response size limits
+    for (const filePath of filePaths) {
       const text = await invoke("upload_files_from_paths", {
         apiPath: "/api/images/upload",
-        filePaths,
+        filePaths: [filePath],
         fieldName: "files",
       }) as string;
-      return JSON.parse(text) as UploadResponse;
+      const result = JSON.parse(text) as UploadResponse;
+      allNames.push(...result.names);
+      Object.assign(allThumbnails, result.thumbnails);
     }
-    throw new Error("Path-based upload requires Tauri runtime");
+
+    return { names: allNames, thumbnails: allThumbnails };
   }
 
   async deleteImage(name: string): Promise<void> {
