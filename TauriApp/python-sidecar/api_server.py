@@ -679,6 +679,10 @@ class MagicWandRequest(BaseModel):
     x_pct: float  # click X as percentage (0-100)
     y_pct: float  # click Y as percentage (0-100)
     tolerance: int = 30  # color tolerance 0-255
+    # Optional overrides for local (unsaved) panel state
+    rotation: Optional[float] = None
+    crop: Optional[List[int]] = None
+    crop_image: Optional[bool] = None
 
 @app.post("/api/magic-wand/{r}/{c}")
 def magic_wand_select(r: int, c: int, body: MagicWandRequest):
@@ -694,10 +698,16 @@ def magic_wand_select(r: int, c: int, body: MagicWandRequest):
 
     import cv2
 
-    # Use the raw image with crop applied (skip heavy adjustments for speed)
+    # Use the image with rotation + crop applied (skip heavy color adjustments for speed)
+    # Use local overrides if provided (EditPanelDialog sends unsaved state)
     img = loaded_images[panel.image_name].copy().convert("RGB")
-    if panel.crop_image and panel.crop and len(panel.crop) == 4:
-        img = img.crop(panel.crop)
+    rotation = body.rotation if body.rotation is not None else (getattr(panel, 'rotation', 0) or 0)
+    crop = body.crop if body.crop is not None else (panel.crop if panel.crop_image else None)
+    crop_image = body.crop_image if body.crop_image is not None else panel.crop_image
+    if rotation:
+        img = img.rotate(-rotation, expand=True, resample=Image.BICUBIC)
+    if crop_image and crop and len(crop) == 4:
+        img = img.crop(crop)
 
     # Downsample for speed — max 600px on longest side
     orig_w, orig_h = img.size

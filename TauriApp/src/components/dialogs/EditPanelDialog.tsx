@@ -1151,7 +1151,9 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       const preset = ratioStrToPreset(p.aspect_ratio_str);
       setAspectPreset(preset);
       if (preset === "Custom" && p.aspect_ratio_str) setCustomRatioStr(p.aspect_ratio_str);
-      setDisplayRotation(p.rotation ?? 0);
+      // Convert stored 0-360 to -180..180 for display
+      const rot = p.rotation ?? 0;
+      setDisplayRotation(rot > 180 ? rot - 360 : rot);
     }
   }, [panel, open]);
 
@@ -1689,23 +1691,24 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
         <TabPanel value={tabIdx} index={0 + tOff}>
           <Box sx={{ display: "flex", flexDirection: "column", gap: 1.5 }}>
 
-            {/* Rotation control — single-line layout matching adjustment sliders */}
-            <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1 }}>
+            {/* Rotation control — -180° to 180°, 0.1° fine step */}
+            <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, mb: 1 }}>
               <Typography variant="caption" sx={{ width: 56, flexShrink: 0 }}>Rotation</Typography>
               <Slider
                 size="small"
                 value={displayRotation}
-                min={0}
-                max={360}
-                step={1}
-                marks={[{ value: 0 }, { value: 90 }, { value: 180 }, { value: 270 }, { value: 360 }]}
+                min={-180}
+                max={180}
+                step={0.1}
+                marks={[{ value: -180 }, { value: -90 }, { value: 0 }, { value: 90 }, { value: 180 }]}
                 sx={{ mx: 1 }}
                 onChange={(_, v) => {
                   const deg = v as number;
                   setDisplayRotation(deg);
-                  const { rotW: newRotW, rotH: newRotH } = computeRotatedDims(imgNatW, imgNatH, deg);
+                  // Internally store as 0-360 for backend compatibility
+                  const absDeg = ((deg % 360) + 360) % 360;
+                  const { rotW: newRotW, rotH: newRotH } = computeRotatedDims(imgNatW, imgNatH, absDeg);
                   setCropRect((prev) => {
-                    // Keep crop size unchanged — only clamp position to stay within rotated bounds
                     const w = Math.min(prev.w, newRotW);
                     const h = Math.min(prev.h, newRotH);
                     return {
@@ -1714,40 +1717,66 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       w, h,
                     };
                   });
-                  setLocal((prev) => prev ? { ...prev, rotation: deg } : prev);
+                  setLocal((prev) => prev ? { ...prev, rotation: absDeg } : prev);
                 }}
                 onChangeCommitted={(_, v) => {
-                  const deg = v as number;
-                  updateLocal({ rotation: deg });
+                  const absDeg = (((v as number) % 360) + 360) % 360;
+                  updateLocal({ rotation: absDeg });
                 }}
               />
+              {/* Fine adjustment: -0.1° */}
+              <IconButton size="small" title="-0.1°" sx={{ p: 0.25 }} onClick={() => {
+                const deg = Math.max(-180, Math.round((displayRotation - 0.1) * 10) / 10);
+                setDisplayRotation(deg);
+                const absDeg = ((deg % 360) + 360) % 360;
+                const { rotW: newRotW, rotH: newRotH } = computeRotatedDims(imgNatW, imgNatH, absDeg);
+                setCropRect((prev) => {
+                  const w = Math.min(prev.w, newRotW);
+                  const h = Math.min(prev.h, newRotH);
+                  return { x: Math.max(0, Math.min(prev.x, newRotW - w)), y: Math.max(0, Math.min(prev.y, newRotH - h)), w, h };
+                });
+                updateLocal({ rotation: absDeg });
+              }}>
+                <Typography sx={{ fontSize: 10, lineHeight: 1 }}>&#9660;</Typography>
+              </IconButton>
               <TextField
                 type="number"
                 size="small"
                 value={displayRotation}
                 onChange={(e) => {
                   let v = Number(e.target.value);
-                  v = Math.max(0, Math.min(360, v));
+                  v = Math.max(-180, Math.min(180, v));
                   setDisplayRotation(v);
-                  const { rotW: newRotW, rotH: newRotH } = computeRotatedDims(imgNatW, imgNatH, v);
+                  const absDeg = ((v % 360) + 360) % 360;
+                  const { rotW: newRotW, rotH: newRotH } = computeRotatedDims(imgNatW, imgNatH, absDeg);
                   setCropRect((prev) => {
                     const w = Math.min(prev.w, newRotW);
                     const h = Math.min(prev.h, newRotH);
-                    return {
-                      x: Math.max(0, Math.min(prev.x, newRotW - w)),
-                      y: Math.max(0, Math.min(prev.y, newRotH - h)),
-                      w, h,
-                    };
+                    return { x: Math.max(0, Math.min(prev.x, newRotW - w)), y: Math.max(0, Math.min(prev.y, newRotH - h)), w, h };
                   });
-                  updateLocal({ rotation: v });
+                  updateLocal({ rotation: absDeg });
                 }}
-                inputProps={{ min: 0, max: 360, step: 1 }}
+                inputProps={{ min: -180, max: 180, step: 0.1 }}
                 sx={{ width: 72, flexShrink: 0, "& input": { textAlign: "center", py: 0.5, px: 1, fontSize: "0.75rem" } }}
               />
-              <Typography variant="caption" sx={{ flexShrink: 0, ml: -0.5 }}>&deg;</Typography>
+              {/* Fine adjustment: +0.1° */}
+              <IconButton size="small" title="+0.1°" sx={{ p: 0.25 }} onClick={() => {
+                const deg = Math.min(180, Math.round((displayRotation + 0.1) * 10) / 10);
+                setDisplayRotation(deg);
+                const absDeg = ((deg % 360) + 360) % 360;
+                const { rotW: newRotW, rotH: newRotH } = computeRotatedDims(imgNatW, imgNatH, absDeg);
+                setCropRect((prev) => {
+                  const w = Math.min(prev.w, newRotW);
+                  const h = Math.min(prev.h, newRotH);
+                  return { x: Math.max(0, Math.min(prev.x, newRotW - w)), y: Math.max(0, Math.min(prev.y, newRotH - h)), w, h };
+                });
+                updateLocal({ rotation: absDeg });
+              }}>
+                <Typography sx={{ fontSize: 10, lineHeight: 1 }}>&#9650;</Typography>
+              </IconButton>
+              <Typography variant="caption" sx={{ flexShrink: 0 }}>&deg;</Typography>
               <IconButton size="small" title="Reset rotation" onClick={() => {
                 setDisplayRotation(0);
-                // Reset to full image (no rotation = original dimensions)
                 setCropRect({ x: 0, y: 0, w: imgNatW, h: imgNatH });
                 updateLocal({ rotation: 0 });
               }}>
@@ -2941,7 +2970,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         setMagicWandLoading(true);
                         (async () => {
                           try {
-                            const resp = await api.magicWandSelect(row, col, clickX, clickY, v);
+                            const resp = await api.magicWandSelect(row, col, clickX, clickY, v, { rotation: local.rotation, crop: local.crop as number[] | undefined, crop_image: local.crop_image });
                             if (resp.points && resp.points.length >= 3) {
                               const areas2 = [...(local.areas ?? [])];
                               areas2[i] = { ...areas2[i], points: resp.points as [number, number][], smooth: true, magic_tolerance: v } as any;
@@ -4516,7 +4545,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                           setMagicWandLoading(true);
                           (async () => {
                             try {
-                              const resp = await api.magicWandSelect(row, col, rpx, rpy, tolerance);
+                              const resp = await api.magicWandSelect(row, col, rpx, rpy, tolerance, { rotation: local.rotation, crop: local.crop as number[] | undefined, crop_image: local.crop_image });
                               if (resp.points && resp.points.length >= 3) {
                                 const areas2 = [...(local.areas ?? [])];
                                 areas2[areaIdx] = {

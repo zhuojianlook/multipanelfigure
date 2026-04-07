@@ -319,8 +319,8 @@ class ApiClient {
 
   // ── Magic Wand Selection ────────────────────────────────
 
-  async magicWandSelect(row: number, col: number, xPct: number, yPct: number, tolerance: number): Promise<{ points: number[][]; pixel_count: number; smooth?: boolean }> {
-    return apiJson(`/api/magic-wand/${row}/${col}`, "POST", JSON.stringify({ x_pct: xPct, y_pct: yPct, tolerance }));
+  async magicWandSelect(row: number, col: number, xPct: number, yPct: number, tolerance: number, overrides?: { rotation?: number; crop?: number[]; crop_image?: boolean }): Promise<{ points: number[][]; pixel_count: number; smooth?: boolean }> {
+    return apiJson(`/api/magic-wand/${row}/${col}`, "POST", JSON.stringify({ x_pct: xPct, y_pct: yPct, tolerance, ...overrides }));
   }
 }
 
