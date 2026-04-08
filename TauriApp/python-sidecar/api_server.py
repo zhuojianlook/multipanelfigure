@@ -811,6 +811,10 @@ def get_measurements():
 @app.post("/api/preview")
 def generate_preview():
     rows, cols = cfg.rows, cfg.cols
+    # For large grids, cap preview image resolution to keep rendering fast
+    total_panels = rows * cols
+    max_preview_px = 1200 if total_panels <= 9 else 800 if total_panels <= 25 else 500
+
     # First pass: process panels WITHOUT labels/symbols/scale bar — those are
     # rendered via matplotlib AFTER normalize for immutable font sizing
     processed = []
@@ -819,9 +823,14 @@ def generate_preview():
         for c in range(cols):
             panel = cfg.panels[r][c]
             if panel.image_name and panel.image_name in loaded_images:
-                row_imgs.append(process_panel(
+                img = process_panel(
                     loaded_images[panel.image_name], panel,
-                    min_dims, loaded_images, skip_labels=True, skip_symbols=True))
+                    min_dims, loaded_images, skip_labels=True, skip_symbols=True)
+                # Downscale for preview if image is large
+                if img and max(img.size) > max_preview_px:
+                    scale = max_preview_px / max(img.size)
+                    img = img.resize((int(img.size[0] * scale), int(img.size[1] * scale)), Image.LANCZOS)
+                row_imgs.append(img)
             else:
                 row_imgs.append(None)
         processed.append(row_imgs)

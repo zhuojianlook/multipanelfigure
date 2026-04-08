@@ -916,19 +916,38 @@ def assemble_figure(cfg: FigureConfig,
         return total
 
     ref_dim = 10.0  # approximate reference dimension for distance calc
-    top_extra_inches = (0.15 if has_col_labels else 0) + _header_space(cfg.column_headers, ref_dim)
-    left_extra_inches = (0.15 if has_row_labels else 0) + _header_space(cfg.row_headers, ref_dim)
-    # Also account for bottom/right headers
-    bottom_extra_inches = _header_space(
-        [l for l in cfg.column_headers if any(h.position == "Bottom" for h in l.headers)], ref_dim
-    ) if cfg.column_headers else 0.0
-    right_extra_inches = _header_space(
-        [l for l in cfg.row_headers if any(h.position == "Right" for h in l.headers)], ref_dim
-    ) if cfg.row_headers else 0.0
-    top_margin_inches = margin_inches + top_extra_inches
-    left_margin_inches = margin_inches + left_extra_inches
-    bottom_margin_inches = margin_inches + bottom_extra_inches
-    right_margin_inches = margin_inches + right_extra_inches
+
+    # Split header levels by position for accurate margin calculation
+    def _header_space_by_pos(header_levels, position, ref_inches=10.0):
+        """Calculate space for headers at a specific position (Top/Bottom/Left/Right)."""
+        total = 0.0
+        for level in header_levels:
+            has_pos = any(h.position == position and h.columns_or_rows for h in level.headers)
+            if not has_pos:
+                continue
+            max_fs = 10
+            max_dist = 0.0
+            for hdr in level.headers:
+                if hdr.columns_or_rows and hdr.position == position:
+                    max_fs = max(max_fs, hdr.font_size)
+                    max_dist = max(max_dist, hdr.distance)
+            gap = max(max_dist * ref_inches, 0.04)
+            font_h = max_fs / 72.0
+            total += gap + font_h + 0.05
+        return total
+
+    # Column labels add space to top (or bottom if positioned there)
+    col_label_pos = cfg.column_labels[0].position if cfg.column_labels else "Top"
+    row_label_pos = cfg.row_labels[0].position if cfg.row_labels else "Left"
+    top_label_space = 0.15 if (has_col_labels and col_label_pos == "Top") else 0.0
+    bottom_label_space = 0.15 if (has_col_labels and col_label_pos == "Bottom") else 0.0
+    left_label_space = 0.15 if (has_row_labels and row_label_pos == "Left") else 0.0
+    right_label_space = 0.15 if (has_row_labels and row_label_pos == "Right") else 0.0
+
+    top_margin_inches = margin_inches + top_label_space + _header_space_by_pos(cfg.column_headers, "Top", ref_dim)
+    bottom_margin_inches = margin_inches + bottom_label_space + _header_space_by_pos(cfg.column_headers, "Bottom", ref_dim)
+    left_margin_inches = margin_inches + left_label_space + _header_space_by_pos(cfg.row_headers, "Left", ref_dim)
+    right_margin_inches = margin_inches + right_label_space + _header_space_by_pos(cfg.row_headers, "Right", ref_dim)
 
     # --- Mixed aspect ratio sizing (4.2) ---
     # When normalize_widths is enabled, scale smaller images to match the

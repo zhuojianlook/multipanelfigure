@@ -773,6 +773,7 @@ export function PanelGrid() {
         style={{
           gridTemplateColumns: colTemplate,
           gridTemplateRows: rowTemplate,
+          minWidth: cols > 5 ? `${cols * 120}px` : undefined,
         }}
       >
         {/* ── Corner: + Col Header button ──────────────── */}

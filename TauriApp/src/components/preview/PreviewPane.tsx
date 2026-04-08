@@ -5,8 +5,11 @@
    Background color dropdown in header area.
    ────────────────────────────────────────────────────────── */
 
-import { useCallback, useRef } from "react";
-import { Select, MenuItem, Button as MuiButton } from "@mui/material";
+import { useCallback, useRef, useState } from "react";
+import { Select, MenuItem, Button as MuiButton, IconButton, Tooltip } from "@mui/material";
+import ZoomInIcon from "@mui/icons-material/ZoomIn";
+import ZoomOutIcon from "@mui/icons-material/ZoomOut";
+import CenterFocusStrongIcon from "@mui/icons-material/CenterFocusStrong";
 import { useFigureStore } from "../../store/figureStore";
 
 /** Check if a color is dark (close to black) */
@@ -46,6 +49,39 @@ export function PreviewPane() {
   const setBackground = useFigureStore((s) => s.setBackground);
   const config = useFigureStore((s) => s.config);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // Pan & Zoom state
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const isPanning = useRef(false);
+  const panStart = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
+
+  const resetView = () => { setZoom(1); setPan({ x: 0, y: 0 }); };
+
+  const handleWheel = useCallback((e: React.WheelEvent) => {
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? 0.9 : 1.1;
+    setZoom(z => Math.max(0.1, Math.min(20, z * delta)));
+  }, []);
+
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return; // left button only
+    isPanning.current = true;
+    panStart.current = { x: e.clientX, y: e.clientY, panX: pan.x, panY: pan.y };
+    e.preventDefault();
+  }, [pan]);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    if (!isPanning.current) return;
+    setPan({
+      x: panStart.current.panX + (e.clientX - panStart.current.x),
+      y: panStart.current.panY + (e.clientY - panStart.current.y),
+    });
+  }, []);
+
+  const handleMouseUp = useCallback(() => {
+    isPanning.current = false;
+  }, []);
 
   const previewSrc = previewImageB64
     ? `data:image/png;base64,${previewImageB64}`
@@ -141,7 +177,7 @@ export function PreviewPane() {
   return (
     <div
       ref={containerRef}
-      className={`h-full flex flex-col items-center p-3 relative overflow-auto
+      className={`h-full flex flex-col items-center p-3 relative overflow-hidden
                   ${isTransparent ? "checkerboard" : ""}`}
       style={{
         backgroundColor: isTransparent
@@ -152,7 +188,7 @@ export function PreviewPane() {
       {/* Section header */}
       <div
         className="flex items-center justify-between w-full mb-2 px-1"
-        style={{ color: "var(--c-text-dim)" }}
+        style={{ color: "var(--c-text-dim)", zIndex: 5, position: "relative" }}
       >
         <div className="flex items-center gap-2">
           <span className="text-[10px] font-semibold tracking-wider uppercase">
@@ -176,13 +212,19 @@ export function PreviewPane() {
             <MenuItem value="Transparent" sx={{ fontSize: "0.625rem" }}>Transparent</MenuItem>
           </Select>
         </div>
-        <span className="text-[9px]">
-          {previewLoading
-            ? "Rendering..."
-            : previewSrc
-              ? "Right-click to copy"
-              : ""}
-        </span>
+        <div className="flex items-center gap-1">
+          {previewSrc && (
+            <>
+              <Tooltip title="Zoom out"><IconButton size="small" onClick={() => setZoom(z => Math.max(0.1, z * 0.8))} sx={{ p: 0.25 }}><ZoomOutIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
+              <span className="text-[9px]" style={{ minWidth: 32, textAlign: "center" }}>{Math.round(zoom * 100)}%</span>
+              <Tooltip title="Zoom in"><IconButton size="small" onClick={() => setZoom(z => Math.min(20, z * 1.2))} sx={{ p: 0.25 }}><ZoomInIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
+              <Tooltip title="Reset view"><IconButton size="small" onClick={resetView} sx={{ p: 0.25 }}><CenterFocusStrongIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
+            </>
+          )}
+          <span className="text-[9px] ml-1">
+            {previewLoading ? "Rendering..." : previewSrc ? "Right-click to copy" : ""}
+          </span>
+        </div>
       </div>
 
       {previewLoading && (
@@ -194,14 +236,31 @@ export function PreviewPane() {
       )}
 
       {previewSrc ? (
+        <div
+          style={{ flex: 1, width: "100%", overflow: "hidden", cursor: isPanning.current ? "grabbing" : "grab", position: "relative" }}
+          onWheel={handleWheel}
+          onMouseDown={handleMouseDown}
+          onMouseMove={handleMouseMove}
+          onMouseUp={handleMouseUp}
+          onMouseLeave={handleMouseUp}
+        >
         <img
           src={previewSrc}
           alt="Figure preview"
-          className="w-full object-contain rounded"
-          style={{ maxHeight: "80vh" }}
+          className="rounded"
+          style={{
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            transformOrigin: "center center",
+            maxWidth: "100%",
+            maxHeight: "80vh",
+            display: "block",
+            margin: "0 auto",
+            userSelect: "none",
+          }}
           onContextMenu={handleContextMenu}
           draggable={false}
         />
+        </div>
       ) : (
         <div className="flex-1 flex flex-col items-center justify-center gap-2">
           <span

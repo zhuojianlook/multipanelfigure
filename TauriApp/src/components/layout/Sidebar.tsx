@@ -62,7 +62,7 @@ function Field({
 function Spinner({
   value,
   min = 1,
-  max = 20,
+  max = 50,
   onChange,
 }: {
   value: number;
