@@ -939,10 +939,18 @@ def assemble_figure(cfg: FigureConfig,
     # Column labels add space to top (or bottom if positioned there)
     col_label_pos = cfg.column_labels[0].position if cfg.column_labels else "Top"
     row_label_pos = cfg.row_labels[0].position if cfg.row_labels else "Left"
-    top_label_space = 0.15 if (has_col_labels and col_label_pos == "Top") else 0.0
-    bottom_label_space = 0.15 if (has_col_labels and col_label_pos == "Bottom") else 0.0
-    left_label_space = 0.15 if (has_row_labels and row_label_pos == "Left") else 0.0
-    right_label_space = 0.15 if (has_row_labels and row_label_pos == "Right") else 0.0
+    # Label space: use actual label font size for accurate spacing
+    def _label_space(labels, has_labels):
+        if not has_labels or not labels:
+            return 0.0
+        fs = max((l.font_size for l in labels), default=12)
+        dist = max((l.distance for l in labels), default=0.01)
+        return max(0.2, dist * ref_dim + fs / 72.0 + 0.08)
+
+    top_label_space = _label_space(cfg.column_labels, has_col_labels and col_label_pos == "Top")
+    bottom_label_space = _label_space(cfg.column_labels, has_col_labels and col_label_pos == "Bottom")
+    left_label_space = _label_space(cfg.row_labels, has_row_labels and row_label_pos == "Left")
+    right_label_space = _label_space(cfg.row_labels, has_row_labels and row_label_pos == "Right")
 
     top_margin_inches = margin_inches + top_label_space + _header_space_by_pos(cfg.column_headers, "Top", ref_dim)
     bottom_margin_inches = margin_inches + bottom_label_space + _header_space_by_pos(cfg.column_headers, "Bottom", ref_dim)

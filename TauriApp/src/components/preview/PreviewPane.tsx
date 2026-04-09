@@ -87,6 +87,8 @@ export function PreviewPane() {
     ? `data:image/png;base64,${previewImageB64}`
     : null;
 
+  const [copyFeedback, setCopyFeedback] = useState("");
+
   const handleContextMenu = useCallback(
     async (e: React.MouseEvent) => {
       e.preventDefault();
@@ -97,8 +99,17 @@ export function PreviewPane() {
         await navigator.clipboard.write([
           new ClipboardItem({ "image/png": blob }),
         ]);
+        setCopyFeedback("Copied to clipboard!");
+        setTimeout(() => setCopyFeedback(""), 2000);
       } catch {
-        // clipboard write may fail in non-secure contexts
+        // Fallback: try copying as text URL
+        try {
+          await navigator.clipboard.writeText("Preview image copied");
+          setCopyFeedback("Copy failed — clipboard may not support images in this context");
+        } catch {
+          setCopyFeedback("Copy failed — try saving the figure instead");
+        }
+        setTimeout(() => setCopyFeedback(""), 3000);
       }
     },
     [previewSrc],
@@ -235,6 +246,14 @@ export function PreviewPane() {
         </div>
       )}
 
+      {/* Copy feedback toast */}
+      {copyFeedback && (
+        <div className="absolute top-12 left-1/2 -translate-x-1/2 z-20 px-3 py-1.5 rounded text-xs font-medium"
+          style={{ backgroundColor: "var(--c-accent)", color: "#fff", boxShadow: "0 2px 8px rgba(0,0,0,0.3)" }}>
+          {copyFeedback}
+        </div>
+      )}
+
       {previewSrc ? (
         <div
           style={{ flex: 1, width: "100%", overflow: "hidden", cursor: isPanning.current ? "grabbing" : "grab", position: "relative" }}
@@ -243,6 +262,7 @@ export function PreviewPane() {
           onMouseMove={handleMouseMove}
           onMouseUp={handleMouseUp}
           onMouseLeave={handleMouseUp}
+          onContextMenu={handleContextMenu}
         >
         <img
           src={previewSrc}
