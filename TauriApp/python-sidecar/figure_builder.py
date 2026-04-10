@@ -902,7 +902,7 @@ def assemble_figure(cfg: FigureConfig,
     # Then convert to figure-fractions after fig_w/fig_h are known.
     has_col_labels = any(lbl.text.strip() for lbl in cfg.column_labels)
     has_row_labels = any(lbl.text.strip() for lbl in cfg.row_labels)
-    margin_inches = 0.15                # outer padding
+    margin_inches = 0.08                # outer padding
 
     # Calculate header space needed per level:
     # Each level needs: gap (min 0.04") + font height + breathing room
@@ -938,10 +938,9 @@ def assemble_figure(cfg: FigureConfig,
                 if hdr.columns_or_rows and hdr.position == position:
                     max_fs = max(max_fs, hdr.font_size)
                     max_dist = max(max_dist, hdr.distance)
-            gap = max(max_dist * ref_inches, 0.06)
-            # Font height * 1.4 to account for ascenders/descenders/line spacing
-            font_h = max_fs / 72.0 * 1.4
-            total += gap + font_h + 0.1  # generous breathing room
+            gap = max(max_dist * ref_inches, 0.04)
+            font_h = max_fs / 72.0 * 1.2
+            total += gap + font_h + 0.04
         return total
 
     # Column/row labels can individually be at different positions.
@@ -955,8 +954,7 @@ def assemble_figure(cfg: FigureConfig,
             return 0.0
         fs = max((l.font_size for l in pos_labels), default=12)
         dist = max((l.distance for l in pos_labels), default=0.01)
-        # Font height * 1.4 for ascenders/descenders + generous padding
-        return max(0.25, dist * ref_dim + fs / 72.0 * 1.4 + 0.12)
+        return max(0.18, dist * ref_dim + fs / 72.0 * 1.2 + 0.06)
 
     top_label_space = _label_space_by_pos(cfg.column_labels, has_col_labels, "Top")
     bottom_label_space = _label_space_by_pos(cfg.column_labels, has_col_labels, "Bottom")
