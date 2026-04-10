@@ -370,12 +370,15 @@ def _add_column_headers(fig, axes, header_levels: List[HeaderLevel],
                             transform=fig.transFigure, color=hdr.line_color,
                             linewidth=hdr.line_width, linestyle='-', clip_on=False))
 
-        # After this tier, update base_y to the top of the rendered text
-        # so the next tier's distance is measured from this tier's text top
+        # After this tier, update base_y ONLY for the position that was used
         font_h_inches = max_font_size / 72.0
         tier_h_frac = _inches_to_frac(font_h_inches, fig_h)
-        base_y_top = base_y_top + dist_y + tier_h_frac
-        base_y_bottom = base_y_bottom - dist_y - tier_h_frac
+        has_top = any(h.position == "Top" and h.columns_or_rows for h in level.headers)
+        has_bottom = any(h.position == "Bottom" and h.columns_or_rows for h in level.headers)
+        if has_top:
+            base_y_top = base_y_top + dist_y + tier_h_frac
+        if has_bottom:
+            base_y_bottom = base_y_bottom - dist_y - tier_h_frac
 
 
 def _add_row_headers(fig, axes, header_levels: List[HeaderLevel],
@@ -473,8 +476,12 @@ def _add_row_headers(fig, axes, header_levels: List[HeaderLevel],
         # After this tier, update base_x to account for the text width
         font_h_inches = max_font_size / 72.0
         tier_w_frac = _inches_to_frac(font_h_inches, fig_w)
-        base_x_left = base_x_left - dist_x - tier_w_frac
-        base_x_right = base_x_right + dist_x + tier_w_frac
+        has_left = any(h.position == "Left" and h.columns_or_rows for h in level.headers)
+        has_right = any(h.position == "Right" and h.columns_or_rows for h in level.headers)
+        if has_left:
+            base_x_left = base_x_left - dist_x - tier_w_frac
+        if has_right:
+            base_x_right = base_x_right + dist_x + tier_w_frac
 
 
 # ── Simple column/row labels ─────────────────────────────────────────────

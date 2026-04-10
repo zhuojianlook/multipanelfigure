@@ -90,6 +90,50 @@ fn kill_sidecar_process(child_mutex: &Arc<Mutex<Option<CommandChild>>>) {
     }
 }
 
+/// Copy PNG image to system clipboard from base64
+#[tauri::command]
+async fn copy_image_to_clipboard(image_b64: String) -> Result<(), String> {
+    let decoded = base64_decode(&image_b64).map_err(|e| format!("Base64 decode: {}", e))?;
+
+    #[cfg(target_os = "macos")]
+    {
+        // Use pbcopy-like approach: write to temp file then use osascript
+        let tmp = std::env::temp_dir().join("mpfig_clipboard.png");
+        std::fs::write(&tmp, &decoded).map_err(|e| format!("Write temp: {}", e))?;
+        let status = std::process::Command::new("osascript")
+            .args(["-e", &format!(
+                "set the clipboard to (read (POSIX file \"{}\") as «class PNGf»)",
+                tmp.display()
+            )])
+            .status()
+            .map_err(|e| format!("osascript: {}", e))?;
+        let _ = std::fs::remove_file(&tmp);
+        if !status.success() {
+            return Err("osascript clipboard copy failed".into());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Write PNG to temp, use PowerShell to copy to clipboard
+        let tmp = std::env::temp_dir().join("mpfig_clipboard.png");
+        std::fs::write(&tmp, &decoded).map_err(|e| format!("Write temp: {}", e))?;
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &format!(
+                "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::SetImage([System.Drawing.Image]::FromFile('{}'))",
+                tmp.display()
+            )])
+            .status()
+            .map_err(|e| format!("PowerShell: {}", e))?;
+        let _ = std::fs::remove_file(&tmp);
+        if !status.success() {
+            return Err("PowerShell clipboard copy failed".into());
+        }
+    }
+
+    Ok(())
+}
+
 /// Proxy file uploads to the sidecar through Rust
 #[tauri::command]
 async fn proxy_upload(
@@ -309,7 +353,7 @@ pub fn run() {
       app.manage(SidecarChild(sidecar_child));
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, kill_sidecar])
+    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, kill_sidecar])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {

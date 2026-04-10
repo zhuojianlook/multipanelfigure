@@ -39,6 +39,11 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
 
 const CHANGELOG = [
+  { version: "0.1.59", date: "2026-04-10", changes: [
+    "Right-click to copy preview image to clipboard (macOS + Windows)",
+    "Fixed header truncation when sibling headers change position",
+    "Header position tracking: only accumulates space for used positions",
+  ]},
   { version: "0.1.57", date: "2026-04-08", changes: [
     "Preview pan & zoom: scroll to zoom, drag to pan, zoom controls + reset button",
     "Header bottom/right positioning: margins now calculated per position",

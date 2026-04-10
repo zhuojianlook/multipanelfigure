@@ -92,24 +92,27 @@ export function PreviewPane() {
   const handleContextMenu = useCallback(
     async (e: React.MouseEvent) => {
       e.preventDefault();
-      if (!previewSrc) return;
+      if (!previewImageB64) return;
       try {
-        const res = await fetch(previewSrc);
-        const blob = await res.blob();
-        await navigator.clipboard.write([
-          new ClipboardItem({ "image/png": blob }),
-        ]);
+        // Try Tauri clipboard write via IPC (works in WebView)
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("copy_image_to_clipboard", { imageB64: previewImageB64 });
         setCopyFeedback("Copied to clipboard!");
         setTimeout(() => setCopyFeedback(""), 2000);
       } catch {
-        // Fallback: try copying as text URL
+        // Fallback: try browser clipboard API
         try {
-          await navigator.clipboard.writeText("Preview image copied");
-          setCopyFeedback("Copy failed — clipboard may not support images in this context");
+          if (previewSrc) {
+            const res = await fetch(previewSrc);
+            const blob = await res.blob();
+            await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+            setCopyFeedback("Copied to clipboard!");
+            setTimeout(() => setCopyFeedback(""), 2000);
+          }
         } catch {
-          setCopyFeedback("Copy failed — try saving the figure instead");
+          setCopyFeedback("Copy not supported in this context — use Save Figure instead");
+          setTimeout(() => setCopyFeedback(""), 3000);
         }
-        setTimeout(() => setCopyFeedback(""), 3000);
       }
     },
     [previewSrc],
