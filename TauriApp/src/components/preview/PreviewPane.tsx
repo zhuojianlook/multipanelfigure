@@ -6,7 +6,7 @@
    ────────────────────────────────────────────────────────── */
 
 import { useCallback, useRef, useState } from "react";
-import { Select, MenuItem, Button as MuiButton, IconButton, Tooltip } from "@mui/material";
+import { Select, MenuItem, Button as MuiButton, IconButton, Tooltip, Dialog, DialogTitle, DialogContent, DialogActions, Typography, Button } from "@mui/material";
 import ZoomInIcon from "@mui/icons-material/ZoomIn";
 import ZoomOutIcon from "@mui/icons-material/ZoomOut";
 import CenterFocusStrongIcon from "@mui/icons-material/CenterFocusStrong";
@@ -152,38 +152,28 @@ export function PreviewPane() {
     });
   };
 
-  const handleBackgroundChange = async (newBg: string) => {
+  // Background color change dialog
+  const [colorDialog, setColorDialog] = useState<{ message: string; toColor: string; checkFn: (c: string) => boolean; newBg: string } | null>(null);
+
+  const handleBackgroundChange = (newBg: string) => {
     if (!config) {
       setBackground(newBg);
       return;
     }
 
-    // Collect all text colors
     const allColors: string[] = [];
     config.column_labels.forEach((l) => allColors.push(l.default_color));
     config.row_labels.forEach((l) => allColors.push(l.default_color));
     config.column_headers.forEach((lv) => lv.headers.forEach((h) => allColors.push(h.default_color)));
     config.row_headers.forEach((lv) => lv.headers.forEach((h) => allColors.push(h.default_color)));
 
-    // Use Tauri native dialog with fallback to window.confirm
-    const nativeConfirm = async (message: string): Promise<boolean> => {
-      try {
-        const { ask } = await import("@tauri-apps/plugin-dialog");
-        return await ask(message, { title: "Multi-Panel Figure Builder", kind: "info" });
-      } catch {
-        return window.confirm(message);
-      }
-    };
-
     if (newBg === "Black" && allColors.some(isDark)) {
-      const yes = await nativeConfirm("Switch dark header/label text to white for visibility on black background?");
-      if (yes) switchTextColors("#FFFFFF", isDark);
+      setColorDialog({ message: "Switch dark header/label text to white for visibility on black background?", toColor: "#FFFFFF", checkFn: isDark, newBg });
     } else if (newBg === "White" && allColors.some(isLight)) {
-      const yes = await nativeConfirm("Switch light header/label text to black for visibility on white background?");
-      if (yes) switchTextColors("#000000", isLight);
+      setColorDialog({ message: "Switch light header/label text to black for visibility on white background?", toColor: "#000000", checkFn: isLight, newBg });
+    } else {
+      setBackground(newBg);
     }
-
-    setBackground(newBg);
   };
 
   const isTransparent = background === "Transparent";
@@ -301,6 +291,23 @@ export function PreviewPane() {
           </MuiButton>
         </div>
       )}
+      {/* Background color text switch dialog */}
+      <Dialog open={!!colorDialog} onClose={() => { if (colorDialog) setBackground(colorDialog.newBg); setColorDialog(null); }}>
+        <DialogTitle>Switch Text Colors</DialogTitle>
+        <DialogContent>
+          <Typography>{colorDialog?.message}</Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => { if (colorDialog) setBackground(colorDialog.newBg); setColorDialog(null); }}>No</Button>
+          <Button variant="contained" onClick={() => {
+            if (colorDialog) {
+              switchTextColors(colorDialog.toColor, colorDialog.checkFn);
+              setBackground(colorDialog.newBg);
+            }
+            setColorDialog(null);
+          }}>Yes</Button>
+        </DialogActions>
+      </Dialog>
     </div>
   );
 }

@@ -938,9 +938,10 @@ def assemble_figure(cfg: FigureConfig,
                 if hdr.columns_or_rows and hdr.position == position:
                     max_fs = max(max_fs, hdr.font_size)
                     max_dist = max(max_dist, hdr.distance)
-            gap = max(max_dist * ref_inches, 0.04)
-            font_h = max_fs / 72.0
-            total += gap + font_h + 0.05
+            gap = max(max_dist * ref_inches, 0.06)
+            # Font height * 1.4 to account for ascenders/descenders/line spacing
+            font_h = max_fs / 72.0 * 1.4
+            total += gap + font_h + 0.1  # generous breathing room
         return total
 
     # Column labels add space to top (or bottom if positioned there)
@@ -952,7 +953,8 @@ def assemble_figure(cfg: FigureConfig,
             return 0.0
         fs = max((l.font_size for l in labels), default=12)
         dist = max((l.distance for l in labels), default=0.01)
-        return max(0.2, dist * ref_dim + fs / 72.0 + 0.08)
+        # Font height * 1.4 for ascenders/descenders + generous padding
+        return max(0.25, dist * ref_dim + fs / 72.0 * 1.4 + 0.12)
 
     top_label_space = _label_space(cfg.column_labels, has_col_labels and col_label_pos == "Top")
     bottom_label_space = _label_space(cfg.column_labels, has_col_labels and col_label_pos == "Bottom")
