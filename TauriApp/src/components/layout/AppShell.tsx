@@ -20,6 +20,7 @@ export function AppShell() {
   const config = useFigureStore((s) => s.config);
   const requestPreview = useFigureStore((s) => s.requestPreview);
   const apiError = useFigureStore((s) => s.apiError);
+  const uploadImagesFromPaths = useFigureStore((s) => s.uploadImagesFromPaths);
 
   useEffect(() => {
     const init = async () => {
@@ -31,6 +32,34 @@ export function AppShell() {
     init();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Listen for Tauri file drop events
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    (async () => {
+      try {
+        const { getCurrentWebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+        const webview = getCurrentWebviewWindow();
+        unlisten = await webview.onDragDropEvent((event) => {
+          if (event.payload.type === "drop") {
+            const paths = event.payload.paths;
+            // Filter for image/video extensions
+            const imageExts = new Set(["tif","tiff","png","jpg","jpeg","cr2","cr3","nef","arw","dng","orf","rw2","pef","raf","nd2","mp4","avi","mov","mkv","webm","wmv","flv","m4v","mpg","mpeg","3gp","ts","mts"]);
+            const validPaths = paths.filter(p => {
+              const ext = p.split(".").pop()?.toLowerCase() ?? "";
+              return imageExts.has(ext);
+            });
+            if (validPaths.length > 0) {
+              uploadImagesFromPaths(validPaths);
+            }
+          }
+        });
+      } catch {
+        // Not in Tauri context
+      }
+    })();
+    return () => { unlisten?.(); };
+  }, [uploadImagesFromPaths]);
 
   // Horizontal split: grid (left) | preview (right)
   // splitPct is the % width for the grid pane
