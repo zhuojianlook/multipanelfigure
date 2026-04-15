@@ -1061,8 +1061,61 @@ function VideoFrameSelector({ imageName, onFrameChange, onFrameImage, frame, set
 }
 
 
+// ── Z-Stack TIFF Frame Selector Component ─────────────────────────────
+function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, setFrame }: { imageName: string; onFrameChange: () => void; onFrameImage?: (b64: string) => void; frame: number; setFrame: (f: number) => void }) {
+  const [info, setInfo] = useState<{ frame_count: number; width: number; height: number } | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    api.getZStackInfo(imageName).then(setInfo).catch(() => setInfo(null));
+  }, [imageName]);
+
+  const seekToFrame = async (f: number) => {
+    setLoading(true);
+    try {
+      const resp = await api.getZStackFrame(imageName, f);
+      setFrame(f);
+      if (onFrameImage && resp.thumbnail) onFrameImage(resp.thumbnail);
+      onFrameChange();
+    } catch { /* ignore */ }
+    setLoading(false);
+  };
+
+  if (!info) return <Typography variant="caption" sx={{ color: "text.secondary" }}>Loading z-stack info...</Typography>;
+
+  return (
+    <Box sx={{ display: "flex", flexDirection: "column", gap: 1, mt: 1 }}>
+      <Typography variant="caption" sx={{ fontSize: "0.65rem" }}>
+        Slice {frame} / {info.frame_count - 1}
+      </Typography>
+      <Slider
+        value={frame} min={0} max={Math.max(0, info.frame_count - 1)} step={1}
+        onChange={(_, v) => setFrame(v as number)}
+        onChangeCommitted={(_, v) => seekToFrame(v as number)}
+        sx={{ mt: 0, mx: 1 }}
+      />
+      <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
+        <Button size="small" variant="outlined" onClick={() => seekToFrame(Math.max(0, frame - 1))}
+          disabled={loading || frame <= 0} sx={{ minWidth: 28, px: 0.5, fontSize: "0.75rem" }}>◀</Button>
+        <Button size="small" variant="outlined" onClick={() => seekToFrame(Math.min(info.frame_count - 1, frame + 1))}
+          disabled={loading || frame >= info.frame_count - 1} sx={{ minWidth: 28, px: 0.5, fontSize: "0.75rem" }}>▶</Button>
+        <TextField type="number" value={frame}
+          onChange={(e) => setFrame(Number(e.target.value))}
+          onKeyDown={(e) => { if (e.key === "Enter") seekToFrame(frame); }}
+          size="small" inputProps={{ min: 0, max: info.frame_count - 1 }}
+          sx={{ width: 70, "& input": { fontSize: "0.7rem", px: 0.75, py: 0.4, textAlign: "center" } }}
+        />
+      </Box>
+    </Box>
+  );
+}
+
+
 // Persist last-used tab across dialog opens
 let _lastTabIdx = 0;
+
+// Cache of which image names are z-stacks (populated lazily)
+const _zstackCache = new Map<string, number>(); // name → frame_count (1 = not z-stack)
 
 export function EditPanelDialog({ open, onClose, row, col }: Props) {
   const config = useFigureStore((s) => s.config);
@@ -1077,8 +1130,30 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   // Detect if current panel has a video file
   const VIDEO_EXTS = ['.mp4','.avi','.mov','.mkv','.webm','.wmv','.flv','.m4v','.mpg','.mpeg','.3gp','.ts','.mts'];
   const isVideoPanel = VIDEO_EXTS.some(ext => (local?.image_name || "").toLowerCase().endsWith(ext));
-  // Tab offset: video panels have an extra tab at index 0
-  const tOff = isVideoPanel ? 1 : 0;
+
+  // Detect if current panel has a z-stack TIFF (multi-frame)
+  const [isZStackPanel, setIsZStackPanel] = useState(false);
+  useEffect(() => {
+    const name = local?.image_name || "";
+    if (!name || !(/\.(tif|tiff)$/i.test(name))) {
+      setIsZStackPanel(false);
+      return;
+    }
+    // Check cache first
+    if (_zstackCache.has(name)) {
+      setIsZStackPanel((_zstackCache.get(name) ?? 1) > 1);
+      return;
+    }
+    api.listZStacks().then(resp => {
+      const isZ = resp.zstacks.includes(name);
+      _zstackCache.set(name, isZ ? 2 : 1); // 2 = is zstack, 1 = not
+      setIsZStackPanel(isZ);
+    }).catch(() => setIsZStackPanel(false));
+  }, [local?.image_name]);
+
+  // Tab offset: video OR z-stack panels have an extra tab at index 0
+  const hasFrameTab = isVideoPanel || isZStackPanel;
+  const tOff = hasFrameTab ? 1 : 0;
   // Logical tab indices (adjusted for video offset)
   const TAB_CROP = 0 + tOff;
   const TAB_ADJ = 1 + tOff;
@@ -1649,6 +1724,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
               return (
                 <Tabs value={tabIdx} onChange={(_, v) => setTabIdx(v)} variant="scrollable" scrollButtons="auto">
                   {isVid && <Tab label="Play & Seek" />}
+                  {!isVid && isZStackPanel && <Tab label="Z-Stack Slice" />}
                   <Tab label="Crop/Resize" />
                   <Tab label="Adjustments" />
                   <Tab label="Labels" />
@@ -1668,6 +1744,21 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 🎬 Video Frame Selector
               </Typography>
               <VideoFrameSelector imageName={local?.image_name || ""} frame={videoFrame} setFrame={setVideoFrame} onFrameChange={() => {
+                refreshPreview();
+              }} onFrameImage={(b64) => {
+                setPreviewB64(b64);
+              }} />
+            </Box>
+          </TabPanel>
+        )}
+        {/* Z-Stack Frame tab (only for multi-frame TIFF files) */}
+        {isZStackPanel && !isVideoPanel && (
+          <TabPanel value={tabIdx} index={0}>
+            <Box sx={{ display: "flex", flexDirection: "column", gap: 1.5 }}>
+              <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.85rem" }}>
+                📚 Z-Stack Slice Selector
+              </Typography>
+              <ZStackFrameSelector imageName={local?.image_name || ""} frame={videoFrame} setFrame={setVideoFrame} onFrameChange={() => {
                 refreshPreview();
               }} onFrameImage={(b64) => {
                 setPreviewB64(b64);

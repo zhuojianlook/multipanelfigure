@@ -328,6 +328,20 @@ class ApiClient {
     return apiJson("/api/video/list");
   }
 
+  // ── Z-Stack TIFF ─────────────────────────────────────────
+
+  async getZStackInfo(name: string): Promise<{ frame_count: number; width: number; height: number }> {
+    return apiJson(`/api/zstack/${encodeURIComponent(name)}/info`);
+  }
+
+  async getZStackFrame(name: string, frameNum: number): Promise<{ frame: number; width: number; height: number; thumbnail: string }> {
+    return apiJson(`/api/zstack/${encodeURIComponent(name)}/frame/${frameNum}`);
+  }
+
+  async listZStacks(): Promise<{ zstacks: string[] }> {
+    return apiJson("/api/zstack/list");
+  }
+
   // ── Magic Wand Selection ────────────────────────────────
 
   async magicWandSelect(row: number, col: number, xPct: number, yPct: number, tolerance: number, overrides?: { rotation?: number; crop?: number[]; crop_image?: boolean }): Promise<{ points: number[][]; pixel_count: number; smooth?: boolean }> {

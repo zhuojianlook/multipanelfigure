@@ -143,6 +143,11 @@ VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.wmv', '.flv', '.m
 loaded_videos: Dict[str, str] = {}  # name → temp file path
 video_frames: Dict[str, int] = {}   # name → selected frame number
 
+# Z-stack TIFF support
+loaded_zstacks: Dict[str, str] = {}    # name → temp file path for multi-frame TIFF
+zstack_frames: Dict[str, int] = {}     # name → selected frame number
+zstack_counts: Dict[str, int] = {}     # name → total frame count
+
 def _is_video(filename: str) -> bool:
     return Path(filename).suffix.lower() in VIDEO_EXTENSIONS
 
@@ -158,6 +163,29 @@ def _extract_video_frame(video_path: str, frame_num: int = 0) -> Image.Image:
     # OpenCV uses BGR, convert to RGB
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return Image.fromarray(frame_rgb)
+
+def _is_tiff(filename: str) -> bool:
+    return Path(filename).suffix.lower() in {'.tif', '.tiff'}
+
+def _extract_tiff_frame(tiff_path: str, frame_num: int = 0) -> Image.Image:
+    """Extract a specific frame from a multi-frame TIFF (z-stack)."""
+    img = Image.open(tiff_path)
+    try:
+        img.seek(frame_num)
+    except EOFError:
+        img.seek(0)
+    return img.convert("RGB")
+
+def _get_zstack_info(tiff_path: str) -> dict:
+    """Get z-stack TIFF metadata."""
+    img = Image.open(tiff_path)
+    n_frames = getattr(img, "n_frames", 1)
+    return {
+        "frame_count": n_frames,
+        "width": img.size[0],
+        "height": img.size[1],
+    }
+
 
 def _get_video_info(video_path: str) -> dict:
     """Get video metadata."""
@@ -374,6 +402,24 @@ async def upload_images(files: List[UploadFile] = File(...)):
                 img = _load_nd2(data, f.filename)
                 loaded_images[f.filename] = img
                 names.append(f.filename)
+            elif _is_tiff(f.filename):
+                # Check if it's a multi-frame TIFF (z-stack)
+                img_obj = Image.open(io.BytesIO(data))
+                n_frames = getattr(img_obj, "n_frames", 1)
+                if n_frames > 1:
+                    # Save to temp file for seeking (io.BytesIO doesn't persist)
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(f.filename).suffix)
+                    tmp.write(data)
+                    tmp.close()
+                    loaded_zstacks[f.filename] = tmp.name
+                    zstack_frames[f.filename] = 0
+                    zstack_counts[f.filename] = n_frames
+                    img = _extract_tiff_frame(tmp.name, 0)
+                    loaded_images[f.filename] = img
+                else:
+                    img = img_obj.convert("RGB")
+                    loaded_images[f.filename] = img
+                names.append(f.filename)
             else:
                 img = Image.open(io.BytesIO(data)).convert("RGB")
                 loaded_images[f.filename] = img
@@ -422,10 +468,52 @@ def list_videos():
     return {"videos": list(loaded_videos.keys())}
 
 
+# ── Z-Stack TIFF Endpoints ────────────────────────────────────────────────
+
+@app.get("/api/zstack/{name}/info")
+def get_zstack_info(name: str):
+    if name not in loaded_zstacks:
+        raise HTTPException(404, f"Z-stack '{name}' not found")
+    return _get_zstack_info(loaded_zstacks[name])
+
+@app.get("/api/zstack/{name}/frame/{frame_num}")
+def get_zstack_frame(name: str, frame_num: int):
+    if name not in loaded_zstacks:
+        raise HTTPException(404, f"Z-stack '{name}' not found")
+    img = _extract_tiff_frame(loaded_zstacks[name], frame_num)
+    loaded_images[name] = img
+    zstack_frames[name] = frame_num
+    _recalc_min_dims()
+    # Return a larger preview for display
+    preview = img.copy()
+    max_dim = 1200
+    if max(preview.size) > max_dim:
+        ratio = max_dim / max(preview.size)
+        preview = preview.resize((int(preview.size[0] * ratio), int(preview.size[1] * ratio)), Image.LANCZOS)
+    buf = io.BytesIO()
+    preview.save(buf, format="PNG")
+    preview_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return {"frame": frame_num, "width": img.size[0], "height": img.size[1],
+            "thumbnail": preview_b64}
+
+@app.get("/api/zstack/list")
+def list_zstacks():
+    return {"zstacks": list(loaded_zstacks.keys())}
+
+
 @app.delete("/api/images/{name}")
 def delete_image(name: str):
     if name in loaded_images:
         del loaded_images[name]
+        # Clean up z-stack temp file if present
+        if name in loaded_zstacks:
+            try:
+                os.unlink(loaded_zstacks[name])
+            except Exception:
+                pass
+            del loaded_zstacks[name]
+            zstack_frames.pop(name, None)
+            zstack_counts.pop(name, None)
         # Clear panel assignments
         for r in range(cfg.rows):
             for c in range(cfg.cols):
