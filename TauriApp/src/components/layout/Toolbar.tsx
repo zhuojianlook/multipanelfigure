@@ -356,16 +356,36 @@ export function Toolbar() {
                 setLatestVersion(null);
                 setUpdateRef(null);
                 try {
-                  // Use Tauri updater with the correct channel endpoint
+                  // Fetch the correct manifest based on channel
                   const manifestFile = updateChannel === "experimental" ? "latest-experimental.json" : "latest.json";
-                  const update = await check({
-                    headers: {},
-                    endpoints: [`https://raw.githubusercontent.com/zhuojianlook/multipanelfigure/updater/${manifestFile}`],
-                  } as Parameters<typeof check>[0]);
-                  if (update) {
-                    setLatestVersion(update.version);
-                    setReleaseNotes(update.body || "");
-                    setUpdateRef(update);
+                  const manifestUrl = `https://raw.githubusercontent.com/zhuojianlook/multipanelfigure/updater/${manifestFile}`;
+
+                  // First check if there's an update by fetching the manifest directly
+                  const manifestResp = await fetch(manifestUrl);
+                  if (!manifestResp.ok) throw new Error(`Failed to fetch manifest: ${manifestResp.status}`);
+                  const manifest = await manifestResp.json();
+                  const latestVer = manifest.version || "";
+
+                  // Compare versions
+                  const current = appVersion.split(".").map(Number);
+                  const latest = latestVer.split(".").map(Number);
+                  const isNewer = latest[0] > current[0] ||
+                    (latest[0] === current[0] && latest[1] > current[1]) ||
+                    (latest[0] === current[0] && latest[1] === current[1] && (latest[2] || 0) > (current[2] || 0));
+
+                  if (isNewer) {
+                    setLatestVersion(latestVer);
+                    setReleaseNotes(manifest.notes || "");
+                    // Try Tauri updater for the actual download
+                    try {
+                      const update = await check();
+                      if (update) {
+                        setUpdateRef(update);
+                      }
+                    } catch {
+                      // check() may fail for experimental channel — that's ok,
+                      // we'll still show the update is available
+                    }
                     setUpdateStatus("available");
                   } else {
                     setUpdateStatus("up-to-date");
@@ -418,32 +438,37 @@ export function Toolbar() {
                 <Button size="small" variant="contained" color="primary" sx={{ mt: 0.5, fontSize: "0.65rem", textTransform: "none" }}
                   startIcon={<DownloadIcon />}
                   onClick={async () => {
-                    if (!updateRef) return;
-                    try {
-                      // Kill sidecar before update to avoid file locks
+                    if (updateRef) {
                       try {
-                        const { invoke } = await import("@tauri-apps/api/core");
-                        await invoke("kill_sidecar");
-                      } catch { /* ignore if not available */ }
-                      setUpdateStatus("downloading");
-                      setDownloadProgress(0);
-                      let downloaded = 0;
-                      await updateRef.downloadAndInstall((event) => {
-                        if (event.event === "Started" && event.data.contentLength) {
-                          setDownloadProgress(0);
-                        } else if (event.event === "Progress") {
-                          downloaded += event.data.chunkLength;
-                          setDownloadProgress(downloaded);
-                        } else if (event.event === "Finished") {
-                          setDownloadProgress(100);
-                        }
-                      });
-                      setUpdateStatus("ready");
-                    } catch (e: unknown) {
-                      console.error("Update download failed:", e);
-                      const errMsg = e instanceof Error ? e.message : String(e);
-                      setReleaseNotes(errMsg);
-                      setUpdateStatus("error");
+                        // Kill sidecar before update to avoid file locks
+                        try {
+                          const { invoke } = await import("@tauri-apps/api/core");
+                          await invoke("kill_sidecar");
+                        } catch { /* ignore if not available */ }
+                        setUpdateStatus("downloading");
+                        setDownloadProgress(0);
+                        let downloaded = 0;
+                        await updateRef.downloadAndInstall((event) => {
+                          if (event.event === "Started" && event.data.contentLength) {
+                            setDownloadProgress(0);
+                          } else if (event.event === "Progress") {
+                            downloaded += event.data.chunkLength;
+                            setDownloadProgress(downloaded);
+                          } else if (event.event === "Finished") {
+                            setDownloadProgress(100);
+                          }
+                        });
+                        setUpdateStatus("ready");
+                      } catch (e: unknown) {
+                        console.error("Update download failed:", e);
+                        const errMsg = e instanceof Error ? e.message : String(e);
+                        setReleaseNotes(errMsg);
+                        setUpdateStatus("error");
+                      }
+                    } else {
+                      // No Tauri updater ref (experimental channel) — open release page
+                      const tag = updateChannel === "experimental" ? `exp-${latestVersion}` : `v${latestVersion}`;
+                      window.open(`https://github.com/zhuojianlook/multipanelfigure/releases/tag/${tag}`, "_blank");
                     }
                   }}
                 >
