@@ -501,6 +501,134 @@ def list_zstacks():
     return {"zstacks": list(loaded_zstacks.keys())}
 
 
+class ZStackProjectRequest(BaseModel):
+    start_frame: int = 0
+    end_frame: int = -1   # -1 = last frame
+    method: str = "max"   # max | avg | min
+
+@app.post("/api/zstack/{name}/project")
+def project_zstack(name: str, body: ZStackProjectRequest):
+    """Create a projection (max/avg/min) from a range of z-stack frames."""
+    if name not in loaded_zstacks:
+        raise HTTPException(404, f"Z-stack '{name}' not found")
+
+    tiff_path = loaded_zstacks[name]
+    img_obj = Image.open(tiff_path)
+    n_frames = getattr(img_obj, "n_frames", 1)
+
+    start = max(0, body.start_frame)
+    end = body.end_frame if body.end_frame >= 0 else n_frames - 1
+    end = min(end, n_frames - 1)
+    if start > end:
+        start, end = end, start
+
+    # Read frames into numpy stack
+    frames = []
+    for i in range(start, end + 1):
+        img_obj.seek(i)
+        frame = np.array(img_obj.convert("RGB"), dtype=np.float32)
+        frames.append(frame)
+
+    if not frames:
+        raise HTTPException(400, "No frames in range")
+
+    stack = np.stack(frames, axis=0)
+
+    # Apply projection
+    if body.method == "max":
+        result = np.max(stack, axis=0).astype(np.uint8)
+    elif body.method == "min":
+        result = np.min(stack, axis=0).astype(np.uint8)
+    elif body.method == "avg":
+        result = np.mean(stack, axis=0).astype(np.uint8)
+    else:
+        raise HTTPException(400, f"Unknown projection method: {body.method}")
+
+    projected = Image.fromarray(result)
+    loaded_images[name] = projected
+    _recalc_min_dims()
+
+    # Return preview
+    preview = projected.copy()
+    max_dim = 1200
+    if max(preview.size) > max_dim:
+        ratio = max_dim / max(preview.size)
+        preview = preview.resize((int(preview.size[0] * ratio), int(preview.size[1] * ratio)), Image.LANCZOS)
+    buf = io.BytesIO()
+    preview.save(buf, format="PNG")
+    preview_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return {
+        "method": body.method,
+        "start_frame": start,
+        "end_frame": end,
+        "width": projected.size[0],
+        "height": projected.size[1],
+        "thumbnail": preview_b64,
+    }
+
+
+class ZStackVolumeRequest(BaseModel):
+    start_frame: int = 0
+    end_frame: int = -1
+    max_dim: int = 256   # max dimension for downsampling
+
+@app.post("/api/zstack/{name}/volume")
+def get_volume_data(name: str, body: ZStackVolumeRequest):
+    """Return z-stack as a raw 3D uint8 array (grayscale) for 3D rendering."""
+    if name not in loaded_zstacks:
+        raise HTTPException(404, f"Z-stack '{name}' not found")
+
+    tiff_path = loaded_zstacks[name]
+    img_obj = Image.open(tiff_path)
+    n_frames = getattr(img_obj, "n_frames", 1)
+
+    start = max(0, body.start_frame)
+    end = body.end_frame if body.end_frame >= 0 else n_frames - 1
+    end = min(end, n_frames - 1)
+
+    # Read frames as grayscale
+    frames = []
+    for i in range(start, end + 1):
+        img_obj.seek(i)
+        frame = img_obj.convert("L")  # grayscale
+        frames.append(np.array(frame, dtype=np.uint8))
+
+    if not frames:
+        raise HTTPException(400, "No frames in range")
+
+    stack = np.stack(frames, axis=0)  # shape: (depth, height, width)
+    depth, height, width = stack.shape
+
+    # Downsample if needed
+    max_d = body.max_dim
+    if max(width, height, depth) > max_d:
+        scale = max_d / max(width, height, depth)
+        new_w = max(1, int(width * scale))
+        new_h = max(1, int(height * scale))
+        new_d = max(1, int(depth * scale))
+        # Resize each slice, then subsample depth
+        import cv2
+        resized = []
+        step = max(1, depth // new_d)
+        for i in range(0, depth, step):
+            if len(resized) >= new_d:
+                break
+            resized.append(cv2.resize(stack[i], (new_w, new_h), interpolation=cv2.INTER_AREA))
+        stack = np.stack(resized, axis=0)
+        depth, height, width = stack.shape
+
+    # Encode as base64 raw uint8
+    raw_bytes = stack.tobytes()
+    data_b64 = base64.b64encode(raw_bytes).decode("ascii")
+
+    return {
+        "data": data_b64,
+        "width": width,
+        "height": height,
+        "depth": depth,
+    }
+
+
 @app.delete("/api/images/{name}")
 def delete_image(name: str):
     if name in loaded_images:

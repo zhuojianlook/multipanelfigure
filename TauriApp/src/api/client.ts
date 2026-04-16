@@ -342,6 +342,14 @@ class ApiClient {
     return apiJson("/api/zstack/list");
   }
 
+  async projectZStack(name: string, startFrame: number, endFrame: number, method: string): Promise<{ method: string; start_frame: number; end_frame: number; width: number; height: number; thumbnail: string }> {
+    return apiJson(`/api/zstack/${encodeURIComponent(name)}/project`, "POST", JSON.stringify({ start_frame: startFrame, end_frame: endFrame, method }));
+  }
+
+  async getVolumeData(name: string, startFrame: number = 0, endFrame: number = -1, maxDim: number = 256): Promise<{ data: string; width: number; height: number; depth: number }> {
+    return apiJson(`/api/zstack/${encodeURIComponent(name)}/volume`, "POST", JSON.stringify({ start_frame: startFrame, end_frame: endFrame, max_dim: maxDim }));
+  }
+
   // ── Magic Wand Selection ────────────────────────────────
 
   async magicWandSelect(row: number, col: number, xPct: number, yPct: number, tolerance: number, overrides?: { rotation?: number; crop?: number[]; crop_image?: boolean }): Promise<{ points: number[][]; pixel_count: number; smooth?: boolean }> {

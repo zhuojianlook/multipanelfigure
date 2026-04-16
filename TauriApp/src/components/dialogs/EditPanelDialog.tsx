@@ -50,6 +50,7 @@ import CropSquareIcon from "@mui/icons-material/CropSquare";
 import { symbolToSvgPoints } from "../../utils/symbolDefs";
 import CircleIcon from "@mui/icons-material/Circle";
 import CloseIcon from "@mui/icons-material/Close";
+import { VolumeViewerDialog } from "./VolumeViewer";
 import { useFigureStore } from "../../store/figureStore";
 import { api } from "../../api/client";
 import type {
@@ -1065,9 +1066,16 @@ function VideoFrameSelector({ imageName, onFrameChange, onFrameImage, frame, set
 function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, setFrame }: { imageName: string; onFrameChange: () => void; onFrameImage?: (b64: string) => void; frame: number; setFrame: (f: number) => void }) {
   const [info, setInfo] = useState<{ frame_count: number; width: number; height: number } | null>(null);
   const [loading, setLoading] = useState(false);
+  const [projRange, setProjRange] = useState<[number, number]>([0, 0]);
+  const [projMethod, setProjMethod] = useState<"max" | "avg" | "min">("max");
+  const [projecting, setProjecting] = useState(false);
+  const [volumeOpen, setVolumeOpen] = useState(false);
 
   useEffect(() => {
-    api.getZStackInfo(imageName).then(setInfo).catch(() => setInfo(null));
+    api.getZStackInfo(imageName).then(i => {
+      setInfo(i);
+      setProjRange([0, i.frame_count - 1]);
+    }).catch(() => setInfo(null));
   }, [imageName]);
 
   const seekToFrame = async (f: number) => {
@@ -1081,11 +1089,25 @@ function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, se
     setLoading(false);
   };
 
+  const applyProjection = async () => {
+    setProjecting(true);
+    try {
+      const resp = await api.projectZStack(imageName, projRange[0], projRange[1], projMethod);
+      if (onFrameImage && resp.thumbnail) onFrameImage(resp.thumbnail);
+      onFrameChange();
+    } catch (e) {
+      console.error("Projection failed:", e);
+    }
+    setProjecting(false);
+  };
+
   if (!info) return <Typography variant="caption" sx={{ color: "text.secondary" }}>Loading z-stack info...</Typography>;
 
   return (
-    <Box sx={{ display: "flex", flexDirection: "column", gap: 1, mt: 1 }}>
-      <Typography variant="caption" sx={{ fontSize: "0.65rem" }}>
+    <Box sx={{ display: "flex", flexDirection: "column", gap: 1.5, mt: 1 }}>
+      {/* Single slice selection */}
+      <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.7rem" }}>Single Slice</Typography>
+      <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary" }}>
         Slice {frame} / {info.frame_count - 1}
       </Typography>
       <Slider
@@ -1106,6 +1128,66 @@ function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, se
           sx={{ width: 70, "& input": { fontSize: "0.7rem", px: 0.75, py: 0.4, textAlign: "center" } }}
         />
       </Box>
+
+      <Divider sx={{ my: 0.5 }} />
+
+      {/* Projection */}
+      <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.7rem" }}>Projection</Typography>
+      <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary" }}>
+        Range: slice {projRange[0]} – {projRange[1]} ({projRange[1] - projRange[0] + 1} slices)
+      </Typography>
+      <Slider
+        value={projRange}
+        min={0}
+        max={Math.max(0, info.frame_count - 1)}
+        step={1}
+        onChange={(_, v) => setProjRange(v as [number, number])}
+        valueLabelDisplay="auto"
+        sx={{ mx: 1 }}
+      />
+      <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
+        <Select
+          size="small"
+          value={projMethod}
+          onChange={(e) => setProjMethod(e.target.value as "max" | "avg" | "min")}
+          sx={{ fontSize: "0.65rem", minWidth: 120, "& .MuiSelect-select": { py: 0.3, px: 1 } }}
+        >
+          <MenuItem value="max" sx={{ fontSize: "0.65rem" }}>Maximum Intensity</MenuItem>
+          <MenuItem value="avg" sx={{ fontSize: "0.65rem" }}>Average Intensity</MenuItem>
+          <MenuItem value="min" sx={{ fontSize: "0.65rem" }}>Minimum Intensity</MenuItem>
+        </Select>
+        <Button
+          size="small"
+          variant="contained"
+          disabled={projecting}
+          onClick={applyProjection}
+          sx={{ fontSize: "0.6rem", textTransform: "none" }}
+        >
+          {projecting ? "Projecting..." : "Apply"}
+        </Button>
+      </Box>
+
+      <Divider sx={{ my: 0.5 }} />
+
+      {/* 3D View */}
+      <Button
+        size="small"
+        variant="outlined"
+        onClick={() => setVolumeOpen(true)}
+        sx={{ fontSize: "0.6rem", textTransform: "none" }}
+      >
+        🔬 3D Volume View
+      </Button>
+
+      {volumeOpen && (
+        <VolumeViewerDialog
+          open={volumeOpen}
+          onClose={() => setVolumeOpen(false)}
+          imageName={imageName}
+          startFrame={projRange[0]}
+          endFrame={projRange[1]}
+        />
+      )}
     </Box>
   );
 }
