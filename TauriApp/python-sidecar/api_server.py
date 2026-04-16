@@ -581,76 +581,142 @@ def project_zstack(name: str, body: ZStackProjectRequest):
     }
 
 
-class ZStackVolumeRequest(BaseModel):
+class ZStackVolumeRenderRequest(BaseModel):
     start_frame: int = 0
     end_frame: int = -1
-    max_dim: int = 128   # max dimension for downsampling (keep small for speed)
+    elev: float = 30.0        # camera elevation angle
+    azim: float = -60.0       # camera azimuth angle
+    threshold: float = 0.3    # intensity threshold (0-1)
+    z_spacing: float = 1.0    # z-axis scale factor
+    colormap: str = "gray"    # matplotlib colormap name
+    width: int = 800          # output image width
+    height: int = 600         # output image height
+    method: str = "surface"   # surface | mip_xy | mip_xz | mip_yz
 
-@app.post("/api/zstack/{name}/volume")
-def get_volume_data(name: str, body: ZStackVolumeRequest):
-    """Return z-stack as a raw 3D uint8 array (grayscale) for 3D rendering."""
-    if name not in loaded_zstacks:
-        raise HTTPException(404, f"Z-stack '{name}' not found")
+# Cache the loaded volume to avoid re-reading on every render
+_volume_cache: Dict[str, np.ndarray] = {}
+
+def _load_volume(name: str, start: int, end: int, max_dim: int = 128) -> np.ndarray:
+    """Load z-stack volume with caching and downsampling."""
+    cache_key = f"{name}_{start}_{end}"
+    if cache_key in _volume_cache:
+        return _volume_cache[cache_key]
 
     tiff_path = loaded_zstacks[name]
     img_obj = Image.open(tiff_path)
     n_frames = getattr(img_obj, "n_frames", 1)
+    end = min(end if end >= 0 else n_frames - 1, n_frames - 1)
+    start = max(0, start)
 
-    start = max(0, body.start_frame)
-    end = body.end_frame if body.end_frame >= 0 else n_frames - 1
-    end = min(end, n_frames - 1)
+    total = end - start + 1
+    step = max(1, total // max_dim)
 
-    # Pre-calculate how many frames we actually need (skip frames for speed)
-    total_frames = end - start + 1
-    max_d = body.max_dim
-    frame_step = max(1, total_frames // max_d)  # skip frames if too many
-
-    # Read frames as grayscale with subsampling
     frames = []
-    for i in range(start, end + 1, frame_step):
+    for i in range(start, end + 1, step):
         img_obj.seek(i)
-        frame = img_obj.convert("L")  # grayscale
-        # Downsample each frame immediately for speed
+        frame = img_obj.convert("L")
         fw, fh = frame.size
-        if max(fw, fh) > max_d:
-            scale_f = max_d / max(fw, fh)
-            frame = frame.resize((max(1, int(fw * scale_f)), max(1, int(fh * scale_f))), Image.NEAREST)
+        if max(fw, fh) > max_dim:
+            s = max_dim / max(fw, fh)
+            frame = frame.resize((max(1, int(fw * s)), max(1, int(fh * s))), Image.NEAREST)
         frames.append(np.array(frame, dtype=np.uint8))
 
-    if not frames:
-        raise HTTPException(400, "No frames in range")
+    vol = np.stack(frames, axis=0) if frames else np.zeros((1, 64, 64), dtype=np.uint8)
+    _volume_cache[cache_key] = vol
+    # Keep cache small
+    if len(_volume_cache) > 5:
+        oldest = next(iter(_volume_cache))
+        del _volume_cache[oldest]
+    return vol
 
-    stack = np.stack(frames, axis=0)  # shape: (depth, height, width)
-    depth, height, width = stack.shape
 
-    # Further downsample if needed
-    max_d = body.max_dim
-    if max(width, height, depth) > max_d:
-        scale = max_d / max(width, height, depth)
-        new_w = max(1, int(width * scale))
-        new_h = max(1, int(height * scale))
-        new_d = max(1, int(depth * scale))
-        # Resize each slice, then subsample depth
-        import cv2
-        resized = []
-        step = max(1, depth // new_d)
-        for i in range(0, depth, step):
-            if len(resized) >= new_d:
-                break
-            resized.append(cv2.resize(stack[i], (new_w, new_h), interpolation=cv2.INTER_AREA))
-        stack = np.stack(resized, axis=0)
-        depth, height, width = stack.shape
+@app.post("/api/zstack/{name}/volume-render")
+def render_volume(name: str, body: ZStackVolumeRenderRequest):
+    """Server-side 3D volume rendering — returns a PNG image."""
+    if name not in loaded_zstacks:
+        raise HTTPException(404, f"Z-stack '{name}' not found")
 
-    # Encode as base64 raw uint8
-    raw_bytes = stack.tobytes()
-    data_b64 = base64.b64encode(raw_bytes).decode("ascii")
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa
 
-    return {
-        "data": data_b64,
-        "width": width,
-        "height": height,
-        "depth": depth,
-    }
+    vol = _load_volume(name, body.start_frame, body.end_frame)
+    depth, height, width = vol.shape
+    norm_vol = vol.astype(np.float32) / 255.0
+
+    if body.method == "mip_xy":
+        # Maximum intensity projection — XY view
+        mip = np.max(norm_vol, axis=0)
+        fig, ax = plt.subplots(figsize=(body.width / 100, body.height / 100), dpi=100)
+        ax.imshow(mip, cmap=body.colormap, vmin=0, vmax=1)
+        ax.set_title("MIP — XY (top-down)", fontsize=10)
+        ax.axis("off")
+    elif body.method == "mip_xz":
+        mip = np.max(norm_vol, axis=1)
+        fig, ax = plt.subplots(figsize=(body.width / 100, body.height / 100), dpi=100)
+        ax.imshow(mip, cmap=body.colormap, vmin=0, vmax=1, aspect=body.z_spacing)
+        ax.set_title("MIP — XZ (front)", fontsize=10)
+        ax.axis("off")
+    elif body.method == "mip_yz":
+        mip = np.max(norm_vol, axis=2)
+        fig, ax = plt.subplots(figsize=(body.width / 100, body.height / 100), dpi=100)
+        ax.imshow(mip, cmap=body.colormap, vmin=0, vmax=1, aspect=body.z_spacing)
+        ax.set_title("MIP — YZ (side)", fontsize=10)
+        ax.axis("off")
+    else:
+        # 3D isosurface-like rendering using voxel scatter
+        fig = plt.figure(figsize=(body.width / 100, body.height / 100), dpi=100)
+        ax = fig.add_subplot(111, projection='3d')
+
+        # Threshold and downsample for 3D scatter
+        mask = norm_vol > body.threshold
+        # Further subsample if too many points
+        max_points = 50000
+        zz, yy, xx = np.where(mask)
+        if len(zz) > max_points:
+            idx = np.random.choice(len(zz), max_points, replace=False)
+            zz, yy, xx = zz[idx], yy[idx], xx[idx]
+
+        if len(zz) > 0:
+            vals = norm_vol[zz, yy, xx]
+            cmap = plt.get_cmap(body.colormap)
+            colors = cmap(vals)
+            colors[:, 3] = vals * 0.6  # alpha proportional to intensity
+            ax.scatter(xx, yy, zz * body.z_spacing, c=colors, s=1, depthshade=True)
+
+        ax.set_xlim(0, width)
+        ax.set_ylim(0, height)
+        ax.set_zlim(0, depth * body.z_spacing)
+        ax.view_init(elev=body.elev, azim=body.azim)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.set_facecolor("black")
+        fig.patch.set_facecolor("#1c1c1e")
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+        ax.tick_params(colors='white', labelsize=6)
+        ax.xaxis.label.set_color('white')
+        ax.yaxis.label.set_color('white')
+        ax.zaxis.label.set_color('white')
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight",
+                facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    img_b64 = base64.b64encode(buf.read()).decode("ascii")
+
+    return {"image": img_b64, "width": body.width, "height": body.height}
+
+
+# Keep old endpoint for backward compat
+@app.post("/api/zstack/{name}/volume")
+def get_volume_data(name: str):
+    """Deprecated — use /volume-render instead."""
+    return {"data": "", "width": 0, "height": 0, "depth": 0}
 
 
 @app.delete("/api/images/{name}")
