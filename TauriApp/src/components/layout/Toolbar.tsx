@@ -514,13 +514,13 @@ export function Toolbar() {
                 <Button size="small" variant="contained" color="primary" sx={{ mt: 0.5, fontSize: "0.65rem", textTransform: "none" }}
                   startIcon={<DownloadIcon />}
                   onClick={async () => {
-                    if (updateRef) {
+                    // For stable channel with Tauri updater ref, use native update
+                    if (updateRef && updateChannel === "stable") {
                       try {
-                        // Kill sidecar before update to avoid file locks
                         try {
                           const { invoke } = await import("@tauri-apps/api/core");
                           await invoke("kill_sidecar");
-                        } catch { /* ignore if not available */ }
+                        } catch { /* ignore */ }
                         setUpdateStatus("downloading");
                         setDownloadProgress(0);
                         let downloaded = 0;
@@ -542,13 +542,19 @@ export function Toolbar() {
                         setUpdateStatus("error");
                       }
                     } else {
-                      // No Tauri updater ref (experimental channel) — open release page
+                      // Experimental channel or no updater ref — open release download page
                       const tag = updateChannel === "experimental" ? `exp-${latestVersion}` : `v${latestVersion}`;
-                      window.open(`https://github.com/zhuojianlook/multipanelfigure/releases/tag/${tag}`, "_blank");
+                      const releaseUrl = `https://github.com/zhuojianlook/multipanelfigure/releases/tag/${tag}`;
+                      try {
+                        const { open } = await import("@tauri-apps/plugin-shell");
+                        await open(releaseUrl);
+                      } catch {
+                        window.open(releaseUrl, "_blank");
+                      }
                     }
                   }}
                 >
-                  Download &amp; Install Update
+                  {updateChannel === "stable" && updateRef ? "Download & Install Update" : "Open Download Page"}
                 </Button>
               </Alert>
             )}
