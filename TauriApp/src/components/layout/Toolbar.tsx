@@ -47,27 +47,30 @@ interface ChangelogEntry {
 
 let _changelogCache: ChangelogEntry[] | null = null;
 
+/** Fetch a URL via Rust proxy (bypasses WebView CORS), fallback to browser fetch */
+async function proxyFetch(url: string): Promise<string> {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return await invoke("fetch_url", { url }) as string;
+  } catch {
+    const resp = await fetch(url);
+    return resp.text();
+  }
+}
+
 async function fetchChangelog(): Promise<ChangelogEntry[]> {
   if (_changelogCache) return _changelogCache;
   try {
     const REPO = "zhuojianlook/multipanelfigure";
-    // Fetch releases
-    const relResp = await fetch(
-      `https://api.github.com/repos/${REPO}/releases?per_page=30`,
-      { headers: { Accept: "application/vnd.github.v3+json" } }
-    );
-    if (!relResp.ok) throw new Error(`GitHub API: ${relResp.status}`);
-    const releases = await relResp.json();
+    const relText = await proxyFetch(`https://api.github.com/repos/${REPO}/releases?per_page=30`);
+    const releases = JSON.parse(relText);
 
     // Fetch recent commits to extract commit messages (much more useful than release notes)
     let commitMessages: Record<string, string[]> = {};
     try {
-      const commitsResp = await fetch(
-        `https://api.github.com/repos/${REPO}/commits?per_page=100`,
-        { headers: { Accept: "application/vnd.github.v3+json" } }
-      );
-      if (commitsResp.ok) {
-        const commits = await commitsResp.json();
+      const commitsText = await proxyFetch(`https://api.github.com/repos/${REPO}/commits?per_page=100`);
+      const commits = JSON.parse(commitsText);
+      if (Array.isArray(commits)) {
         // Group commits by their closest tag (based on release dates)
         const tagDates = releases.map((r: { tag_name: string; published_at: string }) => ({
           tag: r.tag_name,
@@ -413,10 +416,9 @@ export function Toolbar() {
                   const manifestFile = updateChannel === "experimental" ? "latest-experimental.json" : "latest.json";
                   const manifestUrl = `https://raw.githubusercontent.com/zhuojianlook/multipanelfigure/updater/${manifestFile}`;
 
-                  // First check if there's an update by fetching the manifest directly
-                  const manifestResp = await fetch(manifestUrl);
-                  if (!manifestResp.ok) throw new Error(`Failed to fetch manifest: ${manifestResp.status}`);
-                  const manifest = await manifestResp.json();
+                  // Fetch manifest via Rust proxy (WebView blocks cross-origin)
+                  const manifestText = await proxyFetch(manifestUrl);
+                  const manifest = JSON.parse(manifestText) as { version: string; notes: string };
                   const latestVer = manifest.version || "";
 
                   // Compare versions

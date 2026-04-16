@@ -90,6 +90,16 @@ fn kill_sidecar_process(child_mutex: &Arc<Mutex<Option<CommandChild>>>) {
     }
 }
 
+/// Fetch a URL and return its body as text (bypasses WebView CORS restrictions)
+#[tauri::command]
+async fn fetch_url(url: String) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let resp = client.get(&url).send().await
+        .map_err(|e| format!("Fetch failed: {}", e))?;
+    resp.text().await
+        .map_err(|e| format!("Read body failed: {}", e))
+}
+
 /// Copy PNG image to system clipboard from base64
 #[tauri::command]
 async fn copy_image_to_clipboard(image_b64: String) -> Result<(), String> {
@@ -353,7 +363,7 @@ pub fn run() {
       app.manage(SidecarChild(sidecar_child));
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, kill_sidecar])
+    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, kill_sidecar])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {
