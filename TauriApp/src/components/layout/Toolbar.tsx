@@ -393,7 +393,7 @@ export function Toolbar() {
                 </Typography>
                 {/* Show changelog of what's new since current version */}
                 <Box sx={{ mt: 1, maxHeight: 160, overflowY: "auto" }}>
-                  {CHANGELOG.filter(entry => {
+                  {changelog.filter((entry: ChangelogEntry) => {
                     // Show entries newer than current version
                     const current = appVersion.split(".").map(Number);
                     const entry_v = entry.version.split(".").map(Number);
@@ -402,13 +402,13 @@ export function Toolbar() {
                       if ((entry_v[i] || 0) < (current[i] || 0)) return false;
                     }
                     return false;
-                  }).map((entry) => (
+                  }).map((entry: ChangelogEntry) => (
                     <Box key={entry.version} sx={{ mb: 1 }}>
                       <Typography sx={{ fontWeight: 600, fontSize: "0.7rem" }}>
                         v{entry.version} — {entry.date}
                       </Typography>
                       <Box component="ul" sx={{ m: 0, pl: 2, "& li": { fontSize: "0.65rem", color: "text.secondary", lineHeight: 1.4 } }}>
-                        {entry.changes.map((change, i) => (
+                        {entry.changes.map((change: string, i: number) => (
                           <li key={i}>{change}</li>
                         ))}
                       </Box>
