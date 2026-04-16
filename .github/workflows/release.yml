@@ -3,7 +3,8 @@ name: Build & Release
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*'      # stable releases
+      - 'exp-*'   # experimental releases
   workflow_dispatch:
 
 jobs:
@@ -121,7 +122,7 @@ jobs:
   create-release:
     needs: build-tauri
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/exp-')
     permissions:
       contents: write
     steps:
@@ -134,7 +135,16 @@ jobs:
         run: find artifacts/ -type f | sort
       - name: Generate latest.json for Tauri updater
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          TAG="${GITHUB_REF_NAME}"
+          # Determine channel and strip prefix
+          if [[ "$TAG" == exp-* ]]; then
+            CHANNEL="experimental"
+            VERSION="${TAG#exp-}"
+          else
+            CHANNEL="stable"
+            VERSION="${TAG#v}"
+          fi
+          echo "Channel: $CHANNEL, Version: $VERSION, Tag: $TAG"
           REPO="zhuojianlook/multipanelfigure"
 
           # Find signature files
@@ -157,34 +167,57 @@ jobs:
           WIN_NAME_GH=$(echo "$WIN_NAME" | tr ' ' '.')
           MAC_NAME_GH=$(echo "$MAC_NAME" | tr ' ' '.')
 
-          cat > artifacts/latest.json << ENDJSON
+          MANIFEST_NAME="latest.json"
+          if [ "$CHANNEL" = "experimental" ]; then
+            MANIFEST_NAME="latest-experimental.json"
+          fi
+
+          cat > "artifacts/${MANIFEST_NAME}" << ENDJSON
           {
             "version": "${VERSION}",
-            "notes": "Update to v${VERSION}",
+            "notes": "Update to ${TAG}",
             "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "platforms": {
               "windows-x86_64": {
                 "signature": "${WIN_SIGNATURE}",
-                "url": "https://github.com/${REPO}/releases/download/v${VERSION}/${WIN_NAME_GH}"
+                "url": "https://github.com/${REPO}/releases/download/${TAG}/${WIN_NAME_GH}"
               },
               "darwin-aarch64": {
                 "signature": "${MAC_SIGNATURE}",
-                "url": "https://github.com/${REPO}/releases/download/v${VERSION}/${MAC_NAME_GH}"
+                "url": "https://github.com/${REPO}/releases/download/${TAG}/${MAC_NAME_GH}"
               }
             }
           }
           ENDJSON
-          echo "Generated latest.json:"
-          cat artifacts/latest.json
-      - name: Push latest.json to updater branch
+          echo "Generated ${MANIFEST_NAME}:"
+          cat "artifacts/${MANIFEST_NAME}"
+      - name: Push manifest to updater branch
         run: |
+          TAG="${GITHUB_REF_NAME}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout --orphan updater-tmp
-          cp artifacts/latest.json latest.json
-          git add latest.json
-          git commit -m "Update latest.json for v${GITHUB_REF_NAME#v}"
-          git push origin updater-tmp:updater --force
+
+          # Fetch existing updater branch content if it exists
+          git fetch origin updater:updater-local 2>/dev/null || true
+
+          if git rev-parse --verify updater-local >/dev/null 2>&1; then
+            git checkout updater-local
+          else
+            git checkout --orphan updater-local
+            git rm -rf . 2>/dev/null || true
+          fi
+
+          # Copy the manifest (stable or experimental)
+          if [[ "$TAG" == exp-* ]]; then
+            cp artifacts/latest-experimental.json latest-experimental.json
+            git add latest-experimental.json
+          else
+            cp artifacts/latest.json latest.json
+            git add latest.json
+          fi
+
+          git commit -m "Update manifest for ${TAG}" --allow-empty
+          git push origin updater-local:updater --force
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Create Release
@@ -195,5 +228,6 @@ jobs:
             artifacts/release-*/**/*-setup.exe
             artifacts/release-*/**/*.app.tar.gz
             artifacts/release-*/**/*.sig
-            artifacts/latest.json
+            artifacts/latest*.json
           generate_release_notes: true
+          prerelease: ${{ startsWith(github.ref, 'refs/tags/exp-') }}

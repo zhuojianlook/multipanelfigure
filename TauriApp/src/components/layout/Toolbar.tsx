@@ -114,6 +114,15 @@ export function Toolbar() {
   const [updateRef, setUpdateRef] = useState<Awaited<ReturnType<typeof check>> | null>(null);
   const [citationCopied, setCitationCopied] = useState(false);
   const [appVersion, setAppVersion] = useState("...");
+  const [updateChannel, setUpdateChannel] = useState<"stable" | "experimental">(() => {
+    return (localStorage.getItem("mpfig_update_channel") as "stable" | "experimental") || "stable";
+  });
+
+  const toggleChannel = (channel: "stable" | "experimental") => {
+    setUpdateChannel(channel);
+    localStorage.setItem("mpfig_update_channel", channel);
+    setUpdateStatus("idle");
+  };
 
   useEffect(() => {
     getVersion().then((v) => setAppVersion(v)).catch(() => setAppVersion("unknown"));
@@ -311,6 +320,29 @@ export function Toolbar() {
 
           <Divider sx={{ my: 2 }} />
 
+          {/* Update Channel Toggle */}
+          <Box sx={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 1, mb: 1 }}>
+            <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary" }}>Update channel:</Typography>
+            <Button
+              size="small"
+              variant={updateChannel === "stable" ? "contained" : "outlined"}
+              onClick={() => toggleChannel("stable")}
+              sx={{ fontSize: "0.55rem", textTransform: "none", py: 0.1, px: 1, minWidth: 0 }}
+            >Stable</Button>
+            <Button
+              size="small"
+              variant={updateChannel === "experimental" ? "contained" : "outlined"}
+              color="warning"
+              onClick={() => toggleChannel("experimental")}
+              sx={{ fontSize: "0.55rem", textTransform: "none", py: 0.1, px: 1, minWidth: 0 }}
+            >Experimental</Button>
+          </Box>
+          {updateChannel === "experimental" && (
+            <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "warning.main", textAlign: "center", mb: 0.5 }}>
+              Experimental updates may contain unstable features
+            </Typography>
+          )}
+
           {/* Check for Updates */}
           <Box sx={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 1, mb: 2 }}>
             <Button
@@ -323,9 +355,13 @@ export function Toolbar() {
                 setLatestVersion(null);
                 setUpdateRef(null);
                 try {
-                  const update = await check();
+                  // Use Tauri updater with the correct channel endpoint
+                  const manifestFile = updateChannel === "experimental" ? "latest-experimental.json" : "latest.json";
+                  const update = await check({
+                    headers: {},
+                    endpoints: [`https://raw.githubusercontent.com/zhuojianlook/multipanelfigure/updater/${manifestFile}`],
+                  } as Parameters<typeof check>[0]);
                   if (update) {
-                    // check() returned an Update object
                     setLatestVersion(update.version);
                     setReleaseNotes(update.body || "");
                     setUpdateRef(update);
