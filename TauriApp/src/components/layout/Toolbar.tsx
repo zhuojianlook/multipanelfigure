@@ -64,6 +64,7 @@ async function fetchChangelog(): Promise<ChangelogEntry[]> {
     const REPO = "zhuojianlook/multipanelfigure";
     const relText = await proxyFetch(`https://api.github.com/repos/${REPO}/releases?per_page=30`);
     const releases = JSON.parse(relText);
+    if (!Array.isArray(releases)) throw new Error("Invalid releases response");
 
     // Fetch recent commits to extract commit messages (much more useful than release notes)
     let commitMessages: Record<string, string[]> = {};
@@ -138,8 +139,28 @@ async function fetchChangelog(): Promise<ChangelogEntry[]> {
     }
     _changelogCache = entries;
     return entries;
-  } catch {
-    return [{ version: "?", date: "", changes: ["Could not fetch changelog. Check your internet connection."] }];
+  } catch (e) {
+    console.error("Changelog fetch failed:", e);
+    // Return a static fallback changelog
+    return [
+      { version: "0.1.70", date: "2026-04-16", changes: [
+        "Stable/experimental update channels with channel switcher",
+        "Dynamic changelog fetched from GitHub releases",
+        "Z-stack TIFF slice selection",
+        "Drag-and-drop files from OS into timeline",
+        "Right-click to copy preview to clipboard",
+      ]},
+      { version: "0.1.57", date: "2026-04-08", changes: [
+        "Preview pan & zoom with controls",
+        "Header margin fixes for all positions",
+        "Grid horizontal scrolling, 50 row/col limit",
+        "R analysis integration with presets",
+        "Media groups for organizing images",
+      ]},
+      { version: "0.1.0", date: "2026-03-25", changes: [
+        "Initial release: multi-panel scientific figure builder",
+      ]},
+    ];
   }
 }
 import { useFigureStore } from "../../store/figureStore";
