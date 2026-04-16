@@ -176,6 +176,7 @@ export interface PanelInfo {
   input_white_b: number;      // 0-255, blue white-point
   invert: boolean;            // default false
   grayscale: boolean;         // default false
+  pseudocolor: string;        // "" = none, or colormap name: "hot", "cool", "viridis", "magma", "inferno", "plasma", "green", "red", "blue", "cyan", "magenta", "yellow"
 }
 
 // ── Header / axis labels ─────────────────────────────────

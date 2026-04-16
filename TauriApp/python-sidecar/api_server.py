@@ -477,14 +477,28 @@ def get_zstack_info(name: str):
     return _get_zstack_info(loaded_zstacks[name])
 
 @app.get("/api/zstack/{name}/frame/{frame_num}")
-def get_zstack_frame(name: str, frame_num: int):
+def get_zstack_frame(name: str, frame_num: int, row: Optional[int] = None, col: Optional[int] = None):
     if name not in loaded_zstacks:
         raise HTTPException(404, f"Z-stack '{name}' not found")
     img = _extract_tiff_frame(loaded_zstacks[name], frame_num)
-    loaded_images[name] = img
-    zstack_frames[name] = frame_num
+
+    # If row/col provided, update that specific panel's image assignment
+    # so different panels can show different frames of the same z-stack
+    if row is not None and col is not None:
+        panel_key = f"__zstack_{name}_r{row}c{col}"
+        loaded_images[panel_key] = img
+        zstack_frames[panel_key] = frame_num
+        # Also update the panel's image_name to use the panel-specific key
+        if row < cfg.rows and col < cfg.cols:
+            cfg.panels[row][col].image_name = panel_key
+        # Register as a virtual z-stack so info lookups work
+        loaded_zstacks[panel_key] = loaded_zstacks[name]
+        zstack_counts[panel_key] = zstack_counts.get(name, 1)
+    else:
+        loaded_images[name] = img
+        zstack_frames[name] = frame_num
+
     _recalc_min_dims()
-    # Return a larger preview for display
     preview = img.copy()
     max_dim = 1200
     if max(preview.size) > max_dim:
@@ -570,7 +584,7 @@ def project_zstack(name: str, body: ZStackProjectRequest):
 class ZStackVolumeRequest(BaseModel):
     start_frame: int = 0
     end_frame: int = -1
-    max_dim: int = 256   # max dimension for downsampling
+    max_dim: int = 128   # max dimension for downsampling (keep small for speed)
 
 @app.post("/api/zstack/{name}/volume")
 def get_volume_data(name: str, body: ZStackVolumeRequest):
@@ -586,11 +600,21 @@ def get_volume_data(name: str, body: ZStackVolumeRequest):
     end = body.end_frame if body.end_frame >= 0 else n_frames - 1
     end = min(end, n_frames - 1)
 
-    # Read frames as grayscale
+    # Pre-calculate how many frames we actually need (skip frames for speed)
+    total_frames = end - start + 1
+    max_d = body.max_dim
+    frame_step = max(1, total_frames // max_d)  # skip frames if too many
+
+    # Read frames as grayscale with subsampling
     frames = []
-    for i in range(start, end + 1):
+    for i in range(start, end + 1, frame_step):
         img_obj.seek(i)
         frame = img_obj.convert("L")  # grayscale
+        # Downsample each frame immediately for speed
+        fw, fh = frame.size
+        if max(fw, fh) > max_d:
+            scale_f = max_d / max(fw, fh)
+            frame = frame.resize((max(1, int(fw * scale_f)), max(1, int(fh * scale_f))), Image.NEAREST)
         frames.append(np.array(frame, dtype=np.uint8))
 
     if not frames:
@@ -599,7 +623,7 @@ def get_volume_data(name: str, body: ZStackVolumeRequest):
     stack = np.stack(frames, axis=0)  # shape: (depth, height, width)
     depth, height, width = stack.shape
 
-    # Downsample if needed
+    # Further downsample if needed
     max_d = body.max_dim
     if max(width, height, depth) > max_d:
         scale = max_d / max(width, height, depth)

@@ -334,8 +334,9 @@ class ApiClient {
     return apiJson(`/api/zstack/${encodeURIComponent(name)}/info`);
   }
 
-  async getZStackFrame(name: string, frameNum: number): Promise<{ frame: number; width: number; height: number; thumbnail: string }> {
-    return apiJson(`/api/zstack/${encodeURIComponent(name)}/frame/${frameNum}`);
+  async getZStackFrame(name: string, frameNum: number, row?: number, col?: number): Promise<{ frame: number; width: number; height: number; thumbnail: string }> {
+    const params = (row != null && col != null) ? `?row=${row}&col=${col}` : "";
+    return apiJson(`/api/zstack/${encodeURIComponent(name)}/frame/${frameNum}${params}`);
   }
 
   async listZStacks(): Promise<{ zstacks: string[] }> {
@@ -346,7 +347,7 @@ class ApiClient {
     return apiJson(`/api/zstack/${encodeURIComponent(name)}/project`, "POST", JSON.stringify({ start_frame: startFrame, end_frame: endFrame, method }));
   }
 
-  async getVolumeData(name: string, startFrame: number = 0, endFrame: number = -1, maxDim: number = 256): Promise<{ data: string; width: number; height: number; depth: number }> {
+  async getVolumeData(name: string, startFrame: number = 0, endFrame: number = -1, maxDim: number = 128): Promise<{ data: string; width: number; height: number; depth: number }> {
     return apiJson(`/api/zstack/${encodeURIComponent(name)}/volume`, "POST", JSON.stringify({ start_frame: startFrame, end_frame: endFrame, max_dim: maxDim }));
   }
 

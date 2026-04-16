@@ -270,6 +270,7 @@ class PanelInfo:
     input_white_b: int = 255               # 0-255, blue channel white-point
     invert: bool = False                    # default False
     grayscale: bool = False                 # default False
+    pseudocolor: str = ""                   # "" = none, or colormap name
 
 
 # ---------------------------------------------------------------------------

@@ -180,6 +180,7 @@ function defaultPanel(): PanelInfo {
     input_black_b: 0, input_white_b: 255,
     invert: false,
     grayscale: false,
+    pseudocolor: "",
   };
 }
 

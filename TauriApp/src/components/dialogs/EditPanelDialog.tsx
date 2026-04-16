@@ -1063,7 +1063,7 @@ function VideoFrameSelector({ imageName, onFrameChange, onFrameImage, frame, set
 
 
 // ── Z-Stack TIFF Frame Selector Component ─────────────────────────────
-function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, setFrame }: { imageName: string; onFrameChange: () => void; onFrameImage?: (b64: string) => void; frame: number; setFrame: (f: number) => void }) {
+function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, setFrame, panelRow, panelCol }: { imageName: string; onFrameChange: () => void; onFrameImage?: (b64: string) => void; frame: number; setFrame: (f: number) => void; panelRow?: number; panelCol?: number }) {
   const [info, setInfo] = useState<{ frame_count: number; width: number; height: number } | null>(null);
   const [loading, setLoading] = useState(false);
   const [projRange, setProjRange] = useState<[number, number]>([0, 0]);
@@ -1081,7 +1081,7 @@ function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, se
   const seekToFrame = async (f: number) => {
     setLoading(true);
     try {
-      const resp = await api.getZStackFrame(imageName, f);
+      const resp = await api.getZStackFrame(imageName, f, panelRow, panelCol);
       setFrame(f);
       if (onFrameImage && resp.thumbnail) onFrameImage(resp.thumbnail);
       onFrameChange();
@@ -1840,7 +1840,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
               <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.85rem" }}>
                 📚 Z-Stack Slice Selector
               </Typography>
-              <ZStackFrameSelector imageName={local?.image_name || ""} frame={videoFrame} setFrame={setVideoFrame} onFrameChange={() => {
+              <ZStackFrameSelector imageName={local?.image_name || ""} frame={videoFrame} setFrame={setVideoFrame} panelRow={row} panelCol={col} onFrameChange={() => {
                 refreshPreview();
               }} onFrameImage={(b64) => {
                 setPreviewB64(b64);
@@ -2349,6 +2349,35 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 control={<Checkbox size="small" checked={local.grayscale ?? false} onChange={(e) => updateLocal({ grayscale: e.target.checked })} />}
                 label={<Typography variant="caption">Grayscale</Typography>}
               />
+            </Box>
+
+            {/* Pseudocolor */}
+            <Box>
+              <Typography variant="caption" sx={{ fontSize: "0.7rem", fontWeight: 600, mb: 0.5, display: "block" }}>Pseudocolor (LUT)</Typography>
+              <Select
+                size="small"
+                value={local.pseudocolor || ""}
+                onChange={(e) => updateLocal({ pseudocolor: e.target.value })}
+                displayEmpty
+                sx={{ fontSize: "0.65rem", width: "100%", "& .MuiSelect-select": { py: 0.4, px: 1 } }}
+              >
+                <MenuItem value="" sx={{ fontSize: "0.65rem" }}>None (original colors)</MenuItem>
+                <MenuItem value="green" sx={{ fontSize: "0.65rem" }}>🟢 Green</MenuItem>
+                <MenuItem value="red" sx={{ fontSize: "0.65rem" }}>🔴 Red</MenuItem>
+                <MenuItem value="blue" sx={{ fontSize: "0.65rem" }}>🔵 Blue</MenuItem>
+                <MenuItem value="cyan" sx={{ fontSize: "0.65rem" }}>🔵 Cyan</MenuItem>
+                <MenuItem value="magenta" sx={{ fontSize: "0.65rem" }}>🟣 Magenta</MenuItem>
+                <MenuItem value="yellow" sx={{ fontSize: "0.65rem" }}>🟡 Yellow</MenuItem>
+                <MenuItem value="hot" sx={{ fontSize: "0.65rem" }}>🔥 Hot</MenuItem>
+                <MenuItem value="cool" sx={{ fontSize: "0.65rem" }}>❄️ Cool</MenuItem>
+                <MenuItem value="viridis" sx={{ fontSize: "0.65rem" }}>🌿 Viridis</MenuItem>
+                <MenuItem value="magma" sx={{ fontSize: "0.65rem" }}>🌋 Magma</MenuItem>
+                <MenuItem value="inferno" sx={{ fontSize: "0.65rem" }}>🔥 Inferno</MenuItem>
+                <MenuItem value="plasma" sx={{ fontSize: "0.65rem" }}>⚡ Plasma</MenuItem>
+              </Select>
+              <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", mt: 0.5, display: "block" }}>
+                Applies a false-color mapping to grayscale images
+              </Typography>
             </Box>
           </Box>
         </TabPanel>

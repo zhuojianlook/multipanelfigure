@@ -1039,6 +1039,33 @@ def process_panel(image: Image.Image, panel: PanelInfo,
         else:
             img = ImageOps.invert(img.convert("RGB"))
 
+    # 5b) Pseudocolor — apply colormap to grayscale images
+    pseudocolor = getattr(panel, 'pseudocolor', '') or ''
+    if pseudocolor:
+        import matplotlib.cm as cm
+        gray = ImageOps.grayscale(img)
+        arr = np.array(gray, dtype=np.float32) / 255.0
+        # Simple colormaps
+        SIMPLE_CMAPS = {
+            "green": lambda v: np.stack([np.zeros_like(v), v, np.zeros_like(v)], axis=-1),
+            "red": lambda v: np.stack([v, np.zeros_like(v), np.zeros_like(v)], axis=-1),
+            "blue": lambda v: np.stack([np.zeros_like(v), np.zeros_like(v), v], axis=-1),
+            "cyan": lambda v: np.stack([np.zeros_like(v), v, v], axis=-1),
+            "magenta": lambda v: np.stack([v, np.zeros_like(v), v], axis=-1),
+            "yellow": lambda v: np.stack([v, v, np.zeros_like(v)], axis=-1),
+        }
+        if pseudocolor in SIMPLE_CMAPS:
+            rgb = SIMPLE_CMAPS[pseudocolor](arr)
+            img = Image.fromarray((rgb * 255).astype(np.uint8), "RGB")
+        else:
+            # Use matplotlib colormaps
+            try:
+                cmap = cm.get_cmap(pseudocolor)
+                mapped = cmap(arr)[:, :, :3]  # drop alpha
+                img = Image.fromarray((mapped * 255).astype(np.uint8), "RGB")
+            except ValueError:
+                pass  # unknown colormap, skip
+
     # 6) Crop
     if not _direct_crop and panel.crop_image:
         aspect = parse_aspect_ratio(panel.aspect_ratio_str)

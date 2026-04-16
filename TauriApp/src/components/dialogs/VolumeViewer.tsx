@@ -124,7 +124,7 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
       setLoading(true);
       setError("");
       try {
-        const vol = await api.getVolumeData(imageName, startFrame, endFrame, 256);
+        const vol = await api.getVolumeData(imageName, startFrame, endFrame, 128);
 
         if (disposed) return;
 

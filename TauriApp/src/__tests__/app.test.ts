@@ -86,6 +86,7 @@ function makeConfig(rows = 2, cols = 3): FigureConfig {
       input_black_b: 0, input_white_b: 255,
       invert: false,
       grayscale: false,
+      pseudocolor: "",
     })),
   );
 
