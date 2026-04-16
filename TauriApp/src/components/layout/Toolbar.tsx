@@ -38,62 +38,54 @@ import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
 
-const CHANGELOG = [
-  { version: "0.1.59", date: "2026-04-10", changes: [
-    "Right-click to copy preview image to clipboard (macOS + Windows)",
-    "Fixed header truncation when sibling headers change position",
-    "Header position tracking: only accumulates space for used positions",
-  ]},
-  { version: "0.1.57", date: "2026-04-08", changes: [
-    "Preview pan & zoom: scroll to zoom, drag to pan, zoom controls + reset button",
-    "Header bottom/right positioning: margins now calculated per position",
-    "Panel grid horizontal scrolling for wide layouts (>5 columns)",
-    "Row/column limit increased from 20 to 50",
-    "Large grid preview performance: auto-downscale for faster rendering",
-    "R analysis: robust Rscript detection + custom path + auto-install ggplot2",
-    "Annotations no longer shift when crop changes (fixed to pixels)",
-    "Magic wand area measurement now calculates correctly",
-    "Edit panel remembers last-used tab across opens",
-    "Zoom inset: uniform border, excludes selection border from zoom content",
-  ]},
-  { version: "0.1.45", date: "2026-04-07", changes: [
-    "Media groups: organize images into named groups below timeline",
-    "Native OS dialog for background color text switching (Yes/No)",
-    "Rotation slider: -180\u00B0 to 180\u00B0 with 0.1\u00B0 fine adjustment arrows",
-    "Magic wand uses current image state (rotation/crop) for selection",
-    "Loading indicator for magic wand processing",
-    "Truncated image support (common in scientific microscopy)",
-    "Chunked file upload: reliable loading of large images",
-  ]},
-  { version: "0.1.34", date: "2026-03-27", changes: [
-    "High-resolution Windows app icon (256x256 multi-size ICO)",
-    "Loading screen with spinner on startup",
-    "Changelog shown when update is available before downloading",
-    "Fixed global font selection on Windows (system font paths + matplotlib cache)",
-    "Header spacing: margins calculated from actual font sizes",
-    "Background color switch prompt to adjust text colors",
-  ]},
-  { version: "0.1.29", date: "2026-03-27", changes: [
-    "All API calls routed through Rust IPC proxy for cross-platform connectivity",
-    "Sidecar process properly killed on app exit, update, and restart",
-    "First-launch reliability on fresh macOS installations",
-    "Fixed Windows backend connectivity (Private Network Access headers)",
-  ]},
-  { version: "0.1.2", date: "2026-03-26", changes: [
-    "Native in-app auto-updater with download, install, and restart",
-    "Ad-hoc code signing for macOS",
-    "DMG installer with Applications shortcut",
-  ]},
-  { version: "0.1.0", date: "2026-03-25", changes: [
-    "Initial standalone release as native desktop app",
-    "Multi-panel grid layout with drag-and-drop image management",
-    "Image editing: crop, rotate, flip, brightness, contrast, levels, color adjustments",
-    "Headers with spanning, typography, and position control",
-    "Scale bars, annotations, zoomed insets, video support",
-    "Save/Load projects, export TIFF/PNG, custom fonts, dark mode",
-    "Cross-platform: macOS (Apple Silicon) and Windows",
-  ]},
-];
+// Dynamic changelog — fetched from GitHub releases on dialog open
+interface ChangelogEntry {
+  version: string;
+  date: string;
+  changes: string[];
+}
+
+let _changelogCache: ChangelogEntry[] | null = null;
+
+async function fetchChangelog(): Promise<ChangelogEntry[]> {
+  if (_changelogCache) return _changelogCache;
+  try {
+    const resp = await fetch(
+      "https://api.github.com/repos/zhuojianlook/multipanelfigure/releases?per_page=30",
+      { headers: { Accept: "application/vnd.github.v3+json" } }
+    );
+    if (!resp.ok) throw new Error(`GitHub API: ${resp.status}`);
+    const releases = await resp.json();
+    const entries: ChangelogEntry[] = [];
+    for (const rel of releases) {
+      const tag = (rel.tag_name || "").replace(/^(v|exp-)/, "");
+      const date = (rel.published_at || "").slice(0, 10);
+      const body = rel.body || "";
+      // Parse commit messages from auto-generated release notes
+      const changes: string[] = [];
+      for (const line of body.split("\n")) {
+        const trimmed = line.trim();
+        // Match lines starting with * or - (markdown list items)
+        if (/^[*\-]\s+/.test(trimmed)) {
+          let text = trimmed.replace(/^[*\-]\s+/, "").trim();
+          // Remove PR links and commit hashes
+          text = text.replace(/\s+by\s+@\S+.*$/i, "").replace(/\s+in\s+https:\/\/\S+/g, "").trim();
+          if (text && text.length > 5) changes.push(text);
+        }
+      }
+      if (changes.length === 0 && body.trim()) {
+        // Use the first line of the body as a single change entry
+        const firstLine = body.trim().split("\n")[0].replace(/^#+\s*/, "").trim();
+        if (firstLine) changes.push(firstLine);
+      }
+      if (tag) entries.push({ version: tag, date, changes: changes.length > 0 ? changes : ["Release " + tag] });
+    }
+    _changelogCache = entries;
+    return entries;
+  } catch {
+    return [{ version: "?", date: "", changes: ["Could not fetch changelog. Check your internet connection."] }];
+  }
+}
 import { useFigureStore } from "../../store/figureStore";
 import { SaveFigureDialog } from "../dialogs/SaveFigureDialog";
 import { api } from "../../api/client";
@@ -124,9 +116,18 @@ export function Toolbar() {
     setUpdateStatus("idle");
   };
 
+  const [changelog, setChangelog] = useState<ChangelogEntry[]>([]);
+
   useEffect(() => {
     getVersion().then((v) => setAppVersion(v)).catch(() => setAppVersion("unknown"));
   }, []);
+
+  // Fetch changelog when About dialog opens
+  useEffect(() => {
+    if (aboutOpen) {
+      fetchChangelog().then(setChangelog);
+    }
+  }, [aboutOpen]);
 
   const imageCount = Object.keys(loadedImages).length;
 
@@ -528,7 +529,9 @@ export function Toolbar() {
               <Typography variant="subtitle2">Changelog</Typography>
             </AccordionSummary>
             <AccordionDetails sx={{ px: 0, pt: 0 }}>
-              {CHANGELOG.map((entry) => (
+              {changelog.length === 0 ? (
+                <Typography variant="caption" sx={{ color: "text.disabled" }}>Loading changelog...</Typography>
+              ) : changelog.map((entry) => (
                 <Box key={entry.version} sx={{ mb: 1.5 }}>
                   <Typography variant="body2" sx={{ fontWeight: 600 }}>
                     v{entry.version} — {entry.date}
