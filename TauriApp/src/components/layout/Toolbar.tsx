@@ -50,35 +50,88 @@ let _changelogCache: ChangelogEntry[] | null = null;
 async function fetchChangelog(): Promise<ChangelogEntry[]> {
   if (_changelogCache) return _changelogCache;
   try {
-    const resp = await fetch(
-      "https://api.github.com/repos/zhuojianlook/multipanelfigure/releases?per_page=30",
+    const REPO = "zhuojianlook/multipanelfigure";
+    // Fetch releases
+    const relResp = await fetch(
+      `https://api.github.com/repos/${REPO}/releases?per_page=30`,
       { headers: { Accept: "application/vnd.github.v3+json" } }
     );
-    if (!resp.ok) throw new Error(`GitHub API: ${resp.status}`);
-    const releases = await resp.json();
-    const entries: ChangelogEntry[] = [];
-    for (const rel of releases) {
-      const tag = (rel.tag_name || "").replace(/^(v|exp-)/, "");
-      const date = (rel.published_at || "").slice(0, 10);
-      const body = rel.body || "";
-      // Parse commit messages from auto-generated release notes
-      const changes: string[] = [];
-      for (const line of body.split("\n")) {
-        const trimmed = line.trim();
-        // Match lines starting with * or - (markdown list items)
-        if (/^[*\-]\s+/.test(trimmed)) {
-          let text = trimmed.replace(/^[*\-]\s+/, "").trim();
-          // Remove PR links and commit hashes
-          text = text.replace(/\s+by\s+@\S+.*$/i, "").replace(/\s+in\s+https:\/\/\S+/g, "").trim();
-          if (text && text.length > 5) changes.push(text);
+    if (!relResp.ok) throw new Error(`GitHub API: ${relResp.status}`);
+    const releases = await relResp.json();
+
+    // Fetch recent commits to extract commit messages (much more useful than release notes)
+    let commitMessages: Record<string, string[]> = {};
+    try {
+      const commitsResp = await fetch(
+        `https://api.github.com/repos/${REPO}/commits?per_page=100`,
+        { headers: { Accept: "application/vnd.github.v3+json" } }
+      );
+      if (commitsResp.ok) {
+        const commits = await commitsResp.json();
+        // Group commits by their closest tag (based on release dates)
+        const tagDates = releases.map((r: { tag_name: string; published_at: string }) => ({
+          tag: r.tag_name,
+          date: new Date(r.published_at).getTime(),
+        })).sort((a: { date: number }, b: { date: number }) => b.date - a.date);
+
+        for (const commit of commits) {
+          const msg = (commit.commit?.message || "").split("\n")[0].trim();
+          if (!msg || msg.startsWith("Merge") || msg.includes("Co-Authored-By")) continue;
+          // Clean up: remove conventional commit prefixes for readability
+          const cleaned = msg.replace(/^(feat|fix|chore|docs|refactor|style|test|ci|build)(\(.+?\))?:\s*/i, "").trim();
+          if (cleaned.length < 8) continue;
+          // Find which release this commit belongs to
+          const commitDate = new Date(commit.commit?.author?.date || "").getTime();
+          let assignedTag = tagDates[0]?.tag || "";
+          for (let i = 0; i < tagDates.length - 1; i++) {
+            if (commitDate <= tagDates[i].date && commitDate > tagDates[i + 1].date) {
+              assignedTag = tagDates[i].tag;
+              break;
+            }
+          }
+          if (assignedTag) {
+            if (!commitMessages[assignedTag]) commitMessages[assignedTag] = [];
+            if (commitMessages[assignedTag].length < 8) { // cap per release
+              commitMessages[assignedTag].push(cleaned);
+            }
+          }
         }
       }
-      if (changes.length === 0 && body.trim()) {
-        // Use the first line of the body as a single change entry
-        const firstLine = body.trim().split("\n")[0].replace(/^#+\s*/, "").trim();
-        if (firstLine) changes.push(firstLine);
+    } catch { /* commits fetch failed, fall back to release body */ }
+
+    const entries: ChangelogEntry[] = [];
+    for (const rel of releases) {
+      const tagName = rel.tag_name || "";
+      const version = tagName.replace(/^(v|exp-)/, "");
+      const date = (rel.published_at || "").slice(0, 10);
+      const isExp = tagName.startsWith("exp-");
+
+      // Use commit messages if available, otherwise parse release body
+      let changes: string[] = commitMessages[tagName] || [];
+
+      if (changes.length === 0) {
+        // Parse release body for meaningful lines
+        const body = rel.body || "";
+        for (const line of body.split("\n")) {
+          const trimmed = line.trim();
+          if (/^[*\-]\s+/.test(trimmed)) {
+            let text = trimmed.replace(/^[*\-]\s+/, "").trim();
+            text = text.replace(/\s+by\s+@\S+.*$/i, "").replace(/\s+in\s+https:\/\/\S+/g, "").trim();
+            // Skip "Full Changelog" links
+            if (text.includes("Full Changelog") || text.includes("github.com/compare")) continue;
+            if (text.length > 5) changes.push(text);
+          }
+        }
       }
-      if (tag) entries.push({ version: tag, date, changes: changes.length > 0 ? changes : ["Release " + tag] });
+
+      if (version) {
+        const label = isExp ? `${version} (experimental)` : version;
+        entries.push({
+          version: label,
+          date,
+          changes: changes.length > 0 ? changes : [`Release ${tagName}`],
+        });
+      }
     }
     _changelogCache = entries;
     return entries;
