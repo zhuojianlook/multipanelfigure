@@ -91,13 +91,12 @@ fn kill_sidecar_process(child_mutex: &Arc<Mutex<Option<CommandChild>>>) {
     }
 }
 
-/// Fetch a URL and return its body as text (bypasses WebView CORS restrictions)
 #[tauri::command]
 async fn download_and_install_update(
     app: tauri::AppHandle,
     manifest_url: String,
-) -> Result<(), String> {
-    // Build a fresh updater with the specified endpoint
+) -> Result<String, String> {
+    eprintln!("[updater] Checking update from: {}", manifest_url);
     let url = url::Url::parse(&manifest_url)
         .map_err(|e| format!("Invalid URL: {}", e))?;
     let updater = app.updater_builder()
@@ -106,16 +105,27 @@ async fn download_and_install_update(
         .build()
         .map_err(|e| format!("Failed to build updater: {}", e))?;
 
+    eprintln!("[updater] Calling check()...");
     let update = updater.check().await
         .map_err(|e| format!("Update check failed: {}", e))?;
-
     let update = update.ok_or_else(|| "No update available".to_string())?;
+    eprintln!("[updater] Got update: version={}", update.version);
 
-    // Download and install
-    update.download_and_install(|_chunk, _total| {}, || {}).await
-        .map_err(|e| format!("Download/install failed: {}", e))?;
+    let mut total_downloaded = 0u64;
+    update.download_and_install(
+        move |chunk, _total| {
+            total_downloaded += chunk as u64;
+            if total_downloaded % (1024 * 1024) < chunk as u64 {
+                eprintln!("[updater] Downloaded {} MB", total_downloaded / (1024 * 1024));
+            }
+        },
+        || {
+            eprintln!("[updater] Download complete, installing...");
+        },
+    ).await.map_err(|e| format!("Download/install failed: {}", e))?;
 
-    Ok(())
+    eprintln!("[updater] Install complete");
+    Ok("Installed. Please restart the app to apply.".to_string())
 }
 
 #[tauri::command]

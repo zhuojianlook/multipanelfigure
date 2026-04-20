@@ -521,7 +521,6 @@ export function Toolbar() {
                       setDownloadProgress(0);
 
                       if (updateChannel === "stable" && updateRef) {
-                        // Stable: use cached updater ref with progress events
                         let downloaded = 0;
                         await updateRef.downloadAndInstall((event) => {
                           if (event.event === "Started" && event.data.contentLength) {
@@ -534,16 +533,33 @@ export function Toolbar() {
                           }
                         });
                       } else {
-                        // Experimental (or stable fallback): use Rust command with custom endpoint
+                        // Experimental: use Rust command with custom endpoint
+                        // Add 3-minute timeout with browser fallback
                         const manifestFile = updateChannel === "experimental" ? "latest-experimental.json" : "latest.json";
                         const manifestUrl = `https://raw.githubusercontent.com/zhuojianlook/multipanelfigure/updater/${manifestFile}`;
-                        await invoke("download_and_install_update", { manifestUrl });
+                        const timeoutMs = 3 * 60 * 1000;
+                        const timeoutPromise = new Promise((_, reject) =>
+                          setTimeout(() => reject(new Error("Download timed out after 3 minutes")), timeoutMs)
+                        );
+                        await Promise.race([
+                          invoke("download_and_install_update", { manifestUrl }),
+                          timeoutPromise,
+                        ]);
                       }
                       setUpdateStatus("ready");
                     } catch (e: unknown) {
                       console.error("Update failed:", e);
                       const errMsg = e instanceof Error ? e.message : String(e);
-                      setReleaseNotes(errMsg);
+                      // On failure, offer browser download fallback
+                      const tag = updateChannel === "experimental" ? `exp-${latestVersion}` : `v${latestVersion}`;
+                      const releaseUrl = `https://github.com/zhuojianlook/multipanelfigure/releases/tag/${tag}`;
+                      try {
+                        const { open } = await import("@tauri-apps/plugin-shell");
+                        await open(releaseUrl);
+                        setReleaseNotes(`In-app update failed (${errMsg}). Opened browser for manual download.`);
+                      } catch {
+                        setReleaseNotes(errMsg);
+                      }
                       setUpdateStatus("error");
                     }
                   }}
