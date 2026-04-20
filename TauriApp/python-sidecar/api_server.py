@@ -601,7 +601,7 @@ _volume_cache: Dict[str, np.ndarray] = {}
 
 def _load_volume(name: str, start: int, end: int, max_dim: int = 128) -> np.ndarray:
     """Load z-stack volume with caching and downsampling."""
-    cache_key = f"{name}_{start}_{end}"
+    cache_key = f"{name}_{start}_{end}_{max_dim}"
     if cache_key in _volume_cache:
         return _volume_cache[cache_key]
 

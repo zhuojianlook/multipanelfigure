@@ -53,6 +53,7 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
 
   const [loading, setLoading] = useState(true);
+  const [loadingStage, setLoadingStage] = useState("Initializing...");
   const [error, setError] = useState("");
   const [threshold, setThreshold] = useState(0.2);
   const [opacity, setOpacity] = useState(0.6);
@@ -77,17 +78,21 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
     const init = async () => {
       setLoading(true);
       setError("");
+      setLoadingStage("Reading z-stack frames from disk...");
       try {
-        // Fetch small volume for fast interaction (64³ max)
-        const vol = await api.getVolumeData(imageName, startFrame, endFrame, 96);
+        console.log("[VolumeViewer] Fetching volume data for", imageName);
+        const t0 = performance.now();
+        const vol = await api.getVolumeData(imageName, startFrame, endFrame, 64);
+        console.log(`[VolumeViewer] Fetched ${vol.width}x${vol.height}x${vol.depth} in ${(performance.now() - t0).toFixed(0)}ms`);
         if (disposed) return;
 
-        // Decode base64 → Uint8Array
+        setLoadingStage("Decoding volume data...");
         const raw = atob(vol.data);
         const data = new Uint8Array(raw.length);
         for (let i = 0; i < raw.length; i++) data[i] = raw.charCodeAt(i);
+        console.log(`[VolumeViewer] Decoded ${data.length} bytes`);
 
-        // Create 3D texture
+        setLoadingStage("Creating 3D texture...");
         const texture = new THREE.Data3DTexture(data, vol.width, vol.height, vol.depth);
         texture.format = THREE.RedFormat;
         texture.type = THREE.UnsignedByteType;
@@ -95,7 +100,7 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
         texture.magFilter = THREE.LinearFilter;
         texture.needsUpdate = true;
 
-        // Setup Three.js
+        setLoadingStage("Setting up 3D scene...");
         const w = canvas.clientWidth || 900;
         const h = canvas.clientHeight || 700;
         const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
@@ -392,7 +397,7 @@ void main() {
             <Box sx={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", bgcolor: "rgba(0,0,0,0.5)" }}>
               <Box sx={{ display: "flex", alignItems: "center", gap: 1, bgcolor: "background.paper", px: 2, py: 1, borderRadius: 1 }}>
                 <CircularProgress size={16} />
-                <Typography variant="caption">Loading volume...</Typography>
+                <Typography variant="caption">{loadingStage}</Typography>
               </Box>
             </Box>
           )}
