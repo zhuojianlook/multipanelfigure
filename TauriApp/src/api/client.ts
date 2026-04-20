@@ -351,6 +351,19 @@ class ApiClient {
     return apiJson(`/api/zstack/${encodeURIComponent(name)}/volume`, "POST", JSON.stringify({ start_frame: startFrame, end_frame: endFrame, max_dim: maxDim }));
   }
 
+  async getZStackMips(name: string, opts: {
+    startFrame?: number; endFrame?: number; colormap?: string;
+    rotationFrames?: number; includeRotation?: boolean; maxDim?: number;
+  } = {}): Promise<{ mip_xy: string; mip_xz: string; mip_yz: string; rotation_frames: string[] }> {
+    return apiJson(`/api/zstack/${encodeURIComponent(name)}/mips`, "POST", JSON.stringify({
+      start_frame: opts.startFrame ?? 0, end_frame: opts.endFrame ?? -1,
+      colormap: opts.colormap ?? "gray",
+      rotation_frames: opts.rotationFrames ?? 36,
+      include_rotation: opts.includeRotation ?? false,
+      max_dim: opts.maxDim ?? 128,
+    }));
+  }
+
   async renderVolume(name: string, opts: {
     startFrame?: number; endFrame?: number; elev?: number; azim?: number;
     threshold?: number; zSpacing?: number; colormap?: string;

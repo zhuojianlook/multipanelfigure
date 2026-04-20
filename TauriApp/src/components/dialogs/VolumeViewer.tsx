@@ -1,20 +1,17 @@
 /* ──────────────────────────────────────────────────────────
-   VolumeViewer — Hybrid 3D volume rendering.
-   Client-side Three.js for real-time interaction (smooth rotation/zoom).
-   Server-side for high-res save/use-as-panel export.
+   VolumeViewer — Fast MIP views + optional rotation animation.
+   Scientific-standard approach (like Fiji/ImageJ).
    ────────────────────────────────────────────────────────── */
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Dialog, DialogTitle, DialogContent, DialogActions, IconButton, Box, Typography,
   Slider, Select, MenuItem, Button, CircularProgress, ToggleButtonGroup, ToggleButton,
-  FormControlLabel, Checkbox, TextField,
+  TextField,
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import SaveAltIcon from "@mui/icons-material/SaveAlt";
 import ImageIcon from "@mui/icons-material/Image";
-import * as THREE from "three";
-import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { api } from "../../api/client";
 import { useFigureStore } from "../../store/figureStore";
 
@@ -28,38 +25,23 @@ interface Props {
   panelCol?: number;
 }
 
-// Colormap shader helper (GLSL)
-const colormapGLSL = `
-vec3 applyColormap(float v, int cm) {
-  if (cm == 1) return vec3(clamp(v*3.0,0.0,1.0), clamp(v*3.0-1.0,0.0,1.0), clamp(v*3.0-2.0,0.0,1.0));
-  if (cm == 2) return vec3(v, 1.0-v, 1.0);
-  if (cm == 3) return vec3(0.267+v*0.062, 0.005+v*0.897, 0.329+v*0.266);
-  if (cm == 4) return vec3(v*0.8, v*v*0.5, v*0.3+0.1);
-  if (cm == 5) return vec3(v, v*v*0.3, v*v*0.1);
-  if (cm == 6) return vec3(0.05+v*0.89, 0.03+v*0.74, v*v*0.6);
-  return vec3(v);
-}
-`;
-
-const CMAP_NAMES = ["gray", "hot", "cool", "viridis", "magma", "inferno", "plasma"];
-
 export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFrame, panelRow, panelCol }: Props) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
-  const uniformsRef = useRef<Record<string, THREE.IUniform>>({});
-  const meshRef = useRef<THREE.Mesh | null>(null);
-  const controlsRef = useRef<OrbitControls | null>(null);
-  const sceneRef = useRef<THREE.Scene | null>(null);
-  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
-
   const [loading, setLoading] = useState(true);
-  const [loadingStage, setLoadingStage] = useState("Initializing...");
+  const [loadingStage, setLoadingStage] = useState("Loading...");
   const [error, setError] = useState("");
-  const [threshold, setThreshold] = useState(0.2);
-  const [opacity, setOpacity] = useState(0.6);
-  const [zSpacing, setZSpacing] = useState(1.0);
-  const [colormap, setColormap] = useState(0);
-  const [showAxes, setShowAxes] = useState(true);
+  const [colormap, setColormap] = useState("gray");
+  const [mode, setMode] = useState<"mip_xy" | "mip_xz" | "mip_yz" | "rotate">("mip_xy");
+  const [rotationIndex, setRotationIndex] = useState(18); // middle
+  const [playing, setPlaying] = useState(false);
+  const [hasRotation, setHasRotation] = useState(false);
+  const [loadingRotation, setLoadingRotation] = useState(false);
+
+  const mipsRef = useRef<{ mip_xy: string; mip_xz: string; mip_yz: string; rotation_frames: string[] }>({
+    mip_xy: "", mip_xz: "", mip_yz: "", rotation_frames: [],
+  });
+
+  // Force re-render by using state that updates alongside ref
+  const [, setTick] = useState(0);
 
   // Save dialog
   const [saveOpen, setSaveOpen] = useState(false);
@@ -69,246 +51,72 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
   const [saving, setSaving] = useState(false);
   const fetchImages = useFigureStore((s) => s.fetchImages);
 
-  // Initialize Three.js scene with volume data
+  // Load MIPs (fast)
   useEffect(() => {
-    if (!open || !canvasRef.current) return;
-    let disposed = false;
-    const canvas = canvasRef.current;
-
-    const init = async () => {
+    if (!open) return;
+    let cancelled = false;
+    (async () => {
       setLoading(true);
       setError("");
-      setLoadingStage("Reading z-stack frames from disk...");
+      setLoadingStage("Computing projections...");
       try {
-        console.log("[VolumeViewer] Fetching volume data for", imageName);
-        const t0 = performance.now();
-        const vol = await api.getVolumeData(imageName, startFrame, endFrame, 64);
-        console.log(`[VolumeViewer] Fetched ${vol.width}x${vol.height}x${vol.depth} in ${(performance.now() - t0).toFixed(0)}ms`);
-        if (disposed) return;
-
-        setLoadingStage("Decoding volume data...");
-        const raw = atob(vol.data);
-        const data = new Uint8Array(raw.length);
-        for (let i = 0; i < raw.length; i++) data[i] = raw.charCodeAt(i);
-        console.log(`[VolumeViewer] Decoded ${data.length} bytes`);
-
-        setLoadingStage("Creating 3D texture...");
-        const texture = new THREE.Data3DTexture(data, vol.width, vol.height, vol.depth);
-        texture.format = THREE.RedFormat;
-        texture.type = THREE.UnsignedByteType;
-        texture.minFilter = THREE.LinearFilter;
-        texture.magFilter = THREE.LinearFilter;
-        texture.needsUpdate = true;
-
-        setLoadingStage("Setting up 3D scene...");
-        const w = canvas.clientWidth || 900;
-        const h = canvas.clientHeight || 700;
-        const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
-        renderer.setSize(w, h);
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-        rendererRef.current = renderer;
-
-        const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0x1c1c1e);
-        sceneRef.current = scene;
-
-        const camera = new THREE.PerspectiveCamera(50, w / h, 0.01, 100);
-        const maxDim = Math.max(vol.width, vol.height, vol.depth * zSpacing);
-        camera.position.set(maxDim * 1.5, maxDim * 1.5, maxDim * 1.5);
-        camera.lookAt(vol.width / 2, vol.height / 2, (vol.depth * zSpacing) / 2);
-        cameraRef.current = camera;
-
-        const controls = new OrbitControls(camera, canvas);
-        controls.target.set(vol.width / 2, vol.height / 2, (vol.depth * zSpacing) / 2);
-        controls.enableDamping = true;
-        controls.dampingFactor = 0.1;
-        controls.update();
-        controlsRef.current = controls;
-
-        // Volume box
-        const geometry = new THREE.BoxGeometry(vol.width, vol.height, vol.depth * zSpacing);
-        geometry.translate(vol.width / 2, vol.height / 2, (vol.depth * zSpacing) / 2);
-
-        const uniforms: Record<string, THREE.IUniform> = {
-          volumeData: { value: texture },
-          threshold: { value: threshold },
-          opacity: { value: opacity },
-          steps: { value: 100.0 },
-          colormap: { value: colormap },
-          volumeSize: { value: new THREE.Vector3(vol.width, vol.height, vol.depth * zSpacing) },
-          cameraPos: { value: camera.position },
-        };
-        uniformsRef.current = uniforms;
-
-        const material = new THREE.RawShaderMaterial({
-          glslVersion: THREE.GLSL3,
-          uniforms,
-          vertexShader: `#version 300 es
-in vec3 position;
-uniform mat4 modelMatrix;
-uniform mat4 modelViewMatrix;
-uniform mat4 projectionMatrix;
-uniform vec3 cameraPos;
-uniform vec3 volumeSize;
-out vec3 vOrigin;
-out vec3 vDirection;
-out vec3 vLocal;
-void main() {
-  vec4 worldPos = modelMatrix * vec4(position, 1.0);
-  vLocal = position / volumeSize;
-  vOrigin = (inverse(modelMatrix) * vec4(cameraPos, 1.0)).xyz / volumeSize;
-  vDirection = (position / volumeSize) - vOrigin;
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-}`,
-          fragmentShader: `#version 300 es
-precision highp float;
-precision highp sampler3D;
-in vec3 vOrigin;
-in vec3 vDirection;
-in vec3 vLocal;
-out vec4 fragColor;
-uniform sampler3D volumeData;
-uniform float threshold;
-uniform float opacity;
-uniform float steps;
-uniform int colormap;
-
-${colormapGLSL}
-
-vec2 intersectBox(vec3 orig, vec3 dir) {
-  vec3 inv = 1.0 / dir;
-  vec3 t1 = (vec3(0.0) - orig) * inv;
-  vec3 t2 = (vec3(1.0) - orig) * inv;
-  vec3 tMin = min(t1, t2);
-  vec3 tMax = max(t1, t2);
-  return vec2(max(max(tMin.x, tMin.y), tMin.z), min(min(tMax.x, tMax.y), tMax.z));
-}
-
-void main() {
-  vec3 rd = normalize(vDirection);
-  vec2 b = intersectBox(vOrigin, rd);
-  if (b.x > b.y) discard;
-  b.x = max(b.x, 0.0);
-  float stepSize = 1.732 / steps;
-  vec3 pos = vOrigin + b.x * rd;
-  vec3 step = rd * stepSize;
-  vec4 col = vec4(0.0);
-  for (float t = b.x; t < b.y; t += stepSize) {
-    float v = texture(volumeData, pos).r;
-    if (v > threshold) {
-      vec3 c = applyColormap(v, colormap);
-      float a = v * opacity;
-      col.rgb += (1.0 - col.a) * a * c;
-      col.a += (1.0 - col.a) * a;
-      if (col.a > 0.95) break;
-    }
-    pos += step;
-  }
-  if (col.a < 0.01) discard;
-  fragColor = col;
-}`,
-          side: THREE.BackSide,
-          transparent: true,
+        const result = await api.getZStackMips(imageName, {
+          startFrame, endFrame, colormap, includeRotation: false,
         });
-
-        const mesh = new THREE.Mesh(geometry, material);
-        scene.add(mesh);
-        meshRef.current = mesh;
-
-        // Axes helper
-        if (showAxes) {
-          const axesHelper = new THREE.AxesHelper(Math.max(vol.width, vol.height, vol.depth) * 1.1);
-          axesHelper.name = "axes";
-          scene.add(axesHelper);
-          const gridHelper = new THREE.GridHelper(Math.max(vol.width, vol.height) * 1.5, 10, 0x666666, 0x333333);
-          gridHelper.name = "grid";
-          scene.add(gridHelper);
-        }
-
-        // Render loop
-        const animate = () => {
-          if (disposed) return;
-          requestAnimationFrame(animate);
-          uniforms.cameraPos.value.copy(camera.position);
-          controls.update();
-          renderer.render(scene, camera);
-        };
-        animate();
-
-        // Resize handler
-        const onResize = () => {
-          const w2 = canvas.clientWidth;
-          const h2 = canvas.clientHeight;
-          if (w2 > 0 && h2 > 0) {
-            camera.aspect = w2 / h2;
-            camera.updateProjectionMatrix();
-            renderer.setSize(w2, h2);
-          }
-        };
-        window.addEventListener("resize", onResize);
-
+        if (cancelled) return;
+        mipsRef.current = result;
+        setTick(t => t + 1);
+        setHasRotation(false);
         setLoading(false);
-
-        return () => {
-          disposed = true;
-          window.removeEventListener("resize", onResize);
-          controls.dispose();
-          renderer.dispose();
-          geometry.dispose();
-          material.dispose();
-          texture.dispose();
-        };
       } catch (e) {
-        if (!disposed) {
+        if (!cancelled) {
           setError(e instanceof Error ? e.message : String(e));
           setLoading(false);
         }
       }
-    };
+    })();
+    return () => { cancelled = true; };
+  }, [open, imageName, startFrame, endFrame, colormap]);
 
-    const cleanup = init();
-    return () => { disposed = true; cleanup?.then(fn => fn?.()); };
-  }, [open, imageName, startFrame, endFrame]); // eslint-disable-line
+  // Load rotation frames on-demand
+  const loadRotation = async () => {
+    setLoadingRotation(true);
+    try {
+      const result = await api.getZStackMips(imageName, {
+        startFrame, endFrame, colormap, includeRotation: true, rotationFrames: 36,
+      });
+      mipsRef.current = result;
+      setHasRotation(result.rotation_frames.length > 0);
+      setTick(t => t + 1);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+    setLoadingRotation(false);
+  };
 
-  // Update uniforms when sliders change
+  // Auto-play rotation
   useEffect(() => {
-    if (uniformsRef.current.threshold) uniformsRef.current.threshold.value = threshold;
-    if (uniformsRef.current.opacity) uniformsRef.current.opacity.value = opacity;
-    if (uniformsRef.current.colormap) uniformsRef.current.colormap.value = colormap;
-  }, [threshold, opacity, colormap]);
+    if (!playing || mode !== "rotate" || !hasRotation) return;
+    const interval = setInterval(() => {
+      setRotationIndex(i => (i + 1) % mipsRef.current.rotation_frames.length);
+    }, 100);
+    return () => clearInterval(interval);
+  }, [playing, mode, hasRotation]);
 
-  // Update z-spacing
-  useEffect(() => {
-    if (!meshRef.current || !uniformsRef.current.volumeSize) return;
-    const vs = uniformsRef.current.volumeSize.value as THREE.Vector3;
-    const newDepth = (vs.z / (meshRef.current.scale.z || 1)) * zSpacing;
-    // Simpler: just scale the mesh
-    meshRef.current.scale.z = zSpacing;
-  }, [zSpacing]);
-
-  // Show/hide axes
-  useEffect(() => {
-    if (!sceneRef.current) return;
-    const axes = sceneRef.current.getObjectByName("axes");
-    const grid = sceneRef.current.getObjectByName("grid");
-    if (axes) axes.visible = showAxes;
-    if (grid) grid.visible = showAxes;
-  }, [showAxes]);
-
-  const getCurrentViewParams = () => ({
-    startFrame, endFrame,
-    elev: 30, azim: -60, // will be replaced by camera-derived values
-    threshold, zSpacing,
-    colormap: CMAP_NAMES[colormap] ?? "gray",
-    showAxes, zoom: 1.0,
-  });
+  const currentImage = (() => {
+    const m = mipsRef.current;
+    if (mode === "mip_xy") return m.mip_xy;
+    if (mode === "mip_xz") return m.mip_xz;
+    if (mode === "mip_yz") return m.mip_yz;
+    if (mode === "rotate" && m.rotation_frames[rotationIndex]) return m.rotation_frames[rotationIndex];
+    return "";
+  })();
 
   const saveViewAsPng = () => {
-    if (!canvasRef.current || !rendererRef.current || !sceneRef.current || !cameraRef.current) return;
-    rendererRef.current.render(sceneRef.current, cameraRef.current);
+    if (!currentImage) return;
     const link = document.createElement("a");
-    link.href = canvasRef.current.toDataURL("image/png");
-    link.download = `volume_${imageName.replace(/\.\w+$/, "")}.png`;
+    link.href = `data:image/png;base64,${currentImage}`;
+    link.download = `volume_${imageName.replace(/\.\w+$/, "")}_${mode}.png`;
     link.click();
   };
 
@@ -317,14 +125,13 @@ void main() {
       const { save } = await import("@tauri-apps/plugin-dialog");
       const ext = saveFormat === "TIFF" ? "tiff" : saveFormat.toLowerCase();
       const path = await save({
-        defaultPath: `volume_${imageName.replace(/\.\w+$/, "")}.${ext}`,
+        defaultPath: `volume_${imageName.replace(/\.\w+$/, "")}_${mode}.${ext}`,
         filters: [{ name: saveFormat, extensions: [ext] }],
       });
       if (path) {
         setSavePath(path as string);
         setSaveOpen(true);
       } else {
-        // Fallback: save current canvas as PNG
         saveViewAsPng();
       }
     } catch {
@@ -336,27 +143,22 @@ void main() {
     if (!savePath) return;
     setSaving(true);
     try {
-      if (saveFormat === "PNG" && canvasRef.current) {
-        // Use canvas for PNG (client-side, instant)
-        const dataUrl = canvasRef.current.toDataURL("image/png");
-        const bin = atob(dataUrl.split(",")[1]);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        // Write via Rust command or fallback to download
+      if (saveFormat === "PNG" && currentImage) {
         try {
           const { invoke } = await import("@tauri-apps/api/core");
-          const b64 = btoa(String.fromCharCode(...bytes));
-          await invoke("save_base64_to_path", { path: savePath, dataB64: b64 });
+          await invoke("save_base64_to_path", { path: savePath, dataB64: currentImage });
         } catch {
           const link = document.createElement("a");
-          link.href = dataUrl;
+          link.href = `data:image/png;base64,${currentImage}`;
           link.download = savePath.split("/").pop() || "volume.png";
           link.click();
         }
       } else {
-        // Use server-side rendering for TIFF/JPEG (client canvas doesn't support them well)
+        // TIFF/JPEG: render via backend
+        const methodMap: Record<string, string> = { mip_xy: "mip_xy", mip_xz: "mip_xz", mip_yz: "mip_yz", rotate: "surface" };
         await api.saveVolumeRenderAsImage(imageName, {
-          ...getCurrentViewParams(),
+          startFrame, endFrame,
+          colormap, method: methodMap[mode] ?? "mip_xy",
           width: 1600, height: 1200,
           format: saveFormat, quality: saveQuality, filePath: savePath,
         });
@@ -371,10 +173,11 @@ void main() {
   const useAsPanel = async () => {
     if (panelRow == null || panelCol == null) return;
     try {
-      // Capture current canvas as PNG, use as panel via server
+      const methodMap: Record<string, string> = { mip_xy: "mip_xy", mip_xz: "mip_xz", mip_yz: "mip_yz", rotate: "surface" };
       await api.useVolumeAsPanel(imageName, panelRow, panelCol, {
-        ...getCurrentViewParams(),
-        method: "surface", width: 1600, height: 1200,
+        startFrame, endFrame, colormap,
+        method: methodMap[mode] ?? "mip_xy",
+        width: 1600, height: 1200,
       });
       await fetchImages();
       onClose();
@@ -391,10 +194,13 @@ void main() {
         <IconButton onClick={onClose} size="small"><CloseIcon /></IconButton>
       </DialogTitle>
       <DialogContent sx={{ p: 0, display: "flex", height: "100%", overflow: "hidden" }}>
-        <Box sx={{ flex: 1, position: "relative" }}>
-          <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
+        <Box sx={{ flex: 1, position: "relative", display: "flex", alignItems: "center", justifyContent: "center", bgcolor: "#1c1c1e" }}>
+          {currentImage && (
+            <img src={`data:image/png;base64,${currentImage}`} alt="Volume"
+              style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", userSelect: "none" }} draggable={false} />
+          )}
           {loading && (
-            <Box sx={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", bgcolor: "rgba(0,0,0,0.5)" }}>
+            <Box sx={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", bgcolor: "rgba(0,0,0,0.6)" }}>
               <Box sx={{ display: "flex", alignItems: "center", gap: 1, bgcolor: "background.paper", px: 2, py: 1, borderRadius: 1 }}>
                 <CircularProgress size={16} />
                 <Typography variant="caption">{loadingStage}</Typography>
@@ -408,56 +214,69 @@ void main() {
           )}
         </Box>
 
-        <Box sx={{ width: 240, flexShrink: 0, borderLeft: 1, borderColor: "divider", p: 2, display: "flex", flexDirection: "column", gap: 1.5, overflow: "auto" }}>
-          <Typography variant="caption" sx={{ fontWeight: 700, textTransform: "uppercase", letterSpacing: 1 }}>Controls</Typography>
+        <Box sx={{ width: 240, flexShrink: 0, borderLeft: 1, borderColor: "divider", p: 2, display: "flex", flexDirection: "column", gap: 2, overflow: "auto" }}>
+          <Typography variant="caption" sx={{ fontWeight: 700, textTransform: "uppercase", letterSpacing: 1 }}>View Mode</Typography>
 
-          <FormControlLabel
-            sx={{ ml: 0 }}
-            control={<Checkbox size="small" checked={showAxes} onChange={(e) => setShowAxes(e.target.checked)} sx={{ p: 0.25 }} />}
-            label={<Typography variant="caption" sx={{ fontSize: "0.6rem" }}>Show axes & grid</Typography>}
-          />
-
-          <Box>
-            <Typography variant="caption" sx={{ fontSize: "0.6rem" }}>Threshold: {threshold.toFixed(2)}</Typography>
-            <Slider size="small" value={threshold} min={0} max={1} step={0.01} onChange={(_, v) => setThreshold(v as number)} />
-          </Box>
+          <ToggleButtonGroup value={mode} exclusive onChange={(_, v) => { if (v) setMode(v); }} size="small" orientation="vertical">
+            <ToggleButton value="mip_xy" sx={{ fontSize: "0.65rem" }}>MIP XY (top)</ToggleButton>
+            <ToggleButton value="mip_xz" sx={{ fontSize: "0.65rem" }}>MIP XZ (front)</ToggleButton>
+            <ToggleButton value="mip_yz" sx={{ fontSize: "0.65rem" }}>MIP YZ (side)</ToggleButton>
+            <ToggleButton value="rotate" sx={{ fontSize: "0.65rem" }}>3D Rotation</ToggleButton>
+          </ToggleButtonGroup>
 
           <Box>
-            <Typography variant="caption" sx={{ fontSize: "0.6rem" }}>Opacity: {opacity.toFixed(2)}</Typography>
-            <Slider size="small" value={opacity} min={0.01} max={2} step={0.01} onChange={(_, v) => setOpacity(v as number)} />
-          </Box>
-
-          <Box>
-            <Typography variant="caption" sx={{ fontSize: "0.6rem" }}>Z Spacing: {zSpacing.toFixed(1)}</Typography>
-            <Slider size="small" value={zSpacing} min={0.1} max={5} step={0.1} onChange={(_, v) => setZSpacing(v as number)} />
-          </Box>
-
-          <Box>
-            <Typography variant="caption" sx={{ fontSize: "0.6rem" }}>Colormap</Typography>
-            <Select size="small" value={colormap} onChange={(e) => setColormap(Number(e.target.value))}
+            <Typography variant="caption" sx={{ fontSize: "0.6rem", mb: 0.5, display: "block" }}>Colormap</Typography>
+            <Select size="small" value={colormap} onChange={(e) => setColormap(e.target.value)}
               sx={{ fontSize: "0.65rem", width: "100%", "& .MuiSelect-select": { py: 0.3 } }}>
-              <MenuItem value={0} sx={{ fontSize: "0.65rem" }}>Grayscale</MenuItem>
-              <MenuItem value={1} sx={{ fontSize: "0.65rem" }}>Hot</MenuItem>
-              <MenuItem value={2} sx={{ fontSize: "0.65rem" }}>Cool</MenuItem>
-              <MenuItem value={3} sx={{ fontSize: "0.65rem" }}>Viridis</MenuItem>
-              <MenuItem value={4} sx={{ fontSize: "0.65rem" }}>Magma</MenuItem>
-              <MenuItem value={5} sx={{ fontSize: "0.65rem" }}>Inferno</MenuItem>
-              <MenuItem value={6} sx={{ fontSize: "0.65rem" }}>Plasma</MenuItem>
+              <MenuItem value="gray" sx={{ fontSize: "0.65rem" }}>Grayscale</MenuItem>
+              <MenuItem value="hot" sx={{ fontSize: "0.65rem" }}>Hot</MenuItem>
+              <MenuItem value="cool" sx={{ fontSize: "0.65rem" }}>Cool</MenuItem>
+              <MenuItem value="viridis" sx={{ fontSize: "0.65rem" }}>Viridis</MenuItem>
+              <MenuItem value="magma" sx={{ fontSize: "0.65rem" }}>Magma</MenuItem>
+              <MenuItem value="inferno" sx={{ fontSize: "0.65rem" }}>Inferno</MenuItem>
+              <MenuItem value="plasma" sx={{ fontSize: "0.65rem" }}>Plasma</MenuItem>
             </Select>
           </Box>
 
-          <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary" }}>
-            Drag to rotate. Scroll to zoom. Right-click to pan.
+          {mode === "rotate" && (
+            <Box>
+              {!hasRotation ? (
+                <Button size="small" variant="contained" fullWidth onClick={loadRotation} disabled={loadingRotation}
+                  sx={{ fontSize: "0.65rem", textTransform: "none" }}>
+                  {loadingRotation ? "Rendering 36 frames..." : "Generate 3D rotation"}
+                </Button>
+              ) : (
+                <>
+                  <Typography variant="caption" sx={{ fontSize: "0.6rem" }}>
+                    Angle: {Math.round(-180 + (360 * rotationIndex / 36))}°
+                  </Typography>
+                  <Slider size="small" value={rotationIndex} min={0} max={35} step={1}
+                    onChange={(_, v) => setRotationIndex(v as number)} />
+                  <Box sx={{ display: "flex", gap: 0.5, mt: 1 }}>
+                    <Button size="small" variant={playing ? "contained" : "outlined"} onClick={() => setPlaying(!playing)}
+                      sx={{ fontSize: "0.6rem", flex: 1 }}>
+                      {playing ? "⏸ Pause" : "▶ Play"}
+                    </Button>
+                    <Button size="small" variant="outlined" onClick={loadRotation}
+                      sx={{ fontSize: "0.6rem" }}>Re-render</Button>
+                  </Box>
+                </>
+              )}
+            </Box>
+          )}
+
+          <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", mt: 1 }}>
+            MIP = Maximum Intensity Projection. Shows the brightest voxels along each axis.
           </Typography>
 
           <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5, mt: 1 }}>
             <Button size="small" variant="outlined" onClick={openSaveDialog} startIcon={<SaveAltIcon sx={{ fontSize: 12 }} />}
-              sx={{ fontSize: "0.6rem", textTransform: "none" }}>
+              disabled={!currentImage} sx={{ fontSize: "0.6rem", textTransform: "none" }}>
               Save View...
             </Button>
             {panelRow != null && panelCol != null && (
               <Button size="small" variant="contained" color="primary" onClick={useAsPanel} startIcon={<ImageIcon sx={{ fontSize: 12 }} />}
-                sx={{ fontSize: "0.6rem", textTransform: "none" }}>
+                disabled={!currentImage} sx={{ fontSize: "0.6rem", textTransform: "none" }}>
                 Use as Panel Image
               </Button>
             )}
@@ -485,9 +304,6 @@ void main() {
               <Slider size="small" value={saveQuality} min={1} max={100} step={1} onChange={(_, v) => setSaveQuality(v as number)} />
             </Box>
           )}
-          <Typography variant="caption" sx={{ color: "text.secondary", fontSize: "0.65rem" }}>
-            {saveFormat === "PNG" ? "PNG uses the current live view (instant)." : "TIFF/JPEG render via backend at 1600x1200."}
-          </Typography>
         </Box>
       </DialogContent>
       <DialogActions>

@@ -581,6 +581,91 @@ def project_zstack(name: str, body: ZStackProjectRequest):
     }
 
 
+class ZStackMipsRequest(BaseModel):
+    start_frame: int = 0
+    end_frame: int = -1
+    colormap: str = "gray"
+    rotation_frames: int = 36       # number of rotation frames to render
+    include_rotation: bool = False  # pre-render rotation? (slower)
+    max_dim: int = 128
+
+
+@app.post("/api/zstack/{name}/mips")
+def get_zstack_mips(name: str, body: ZStackMipsRequest):
+    """Fast MIP views + optional rotation animation frames."""
+    if name not in loaded_zstacks:
+        raise HTTPException(404, f"Z-stack '{name}' not found")
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    vol = _load_volume(name, body.start_frame, body.end_frame, body.max_dim)
+    depth, height, width = vol.shape
+    norm = vol.astype(np.float32) / 255.0
+
+    def _render_2d(data: np.ndarray, title: str) -> str:
+        fig, ax = plt.subplots(figsize=(6, 6), dpi=100)
+        ax.imshow(data, cmap=body.colormap, vmin=0, vmax=1)
+        ax.set_title(title, fontsize=9, color="white")
+        ax.axis("off")
+        ax.set_facecolor("black")
+        fig.patch.set_facecolor("#1c1c1e")
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight",
+                    facecolor=fig.get_facecolor(), edgecolor="none")
+        plt.close(fig)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    # Fast MIPs
+    mip_xy = _render_2d(np.max(norm, axis=0), "MIP XY (top)")
+    mip_xz = _render_2d(np.max(norm, axis=1), "MIP XZ (front)")
+    mip_yz = _render_2d(np.max(norm, axis=2), "MIP YZ (side)")
+
+    result = {
+        "mip_xy": mip_xy,
+        "mip_xz": mip_xz,
+        "mip_yz": mip_yz,
+        "rotation_frames": [],
+    }
+
+    if body.include_rotation:
+        # Pre-render rotation frames (volume voxel scatter)
+        from mpl_toolkits.mplot3d import Axes3D  # noqa
+        mask = norm > 0.3
+        zz, yy, xx = np.where(mask)
+        max_points = 15000
+        if len(zz) > max_points:
+            idx = np.random.choice(len(zz), max_points, replace=False)
+            zz, yy, xx = zz[idx], yy[idx], xx[idx]
+        vals = norm[zz, yy, xx] if len(zz) > 0 else np.array([])
+        cmap = plt.get_cmap(body.colormap)
+
+        rotation_frames = []
+        n = body.rotation_frames
+        for i in range(n):
+            azim = -180 + (360 * i / n)
+            fig = plt.figure(figsize=(6, 6), dpi=80)
+            ax = fig.add_subplot(111, projection='3d')
+            if len(zz) > 0:
+                colors = cmap(vals)
+                colors[:, 3] = vals * 0.6
+                ax.scatter(xx, yy, zz, c=colors, s=2, depthshade=True)
+            ax.set_xlim(0, width); ax.set_ylim(0, height); ax.set_zlim(0, depth)
+            ax.view_init(elev=25, azim=azim)
+            ax.set_axis_off()
+            ax.set_facecolor("black")
+            fig.patch.set_facecolor("#1c1c1e")
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=80, bbox_inches="tight",
+                        facecolor=fig.get_facecolor(), edgecolor="none")
+            plt.close(fig)
+            rotation_frames.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+        result["rotation_frames"] = rotation_frames
+
+    return result
+
+
 class ZStackVolumeRenderRequest(BaseModel):
     start_frame: int = 0
     end_frame: int = -1
