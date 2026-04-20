@@ -2,6 +2,7 @@ use tauri::Manager;
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::process::CommandChild;
+use tauri_plugin_updater::UpdaterExt;
 use std::sync::{Arc, Mutex};
 
 #[tauri::command]
@@ -91,6 +92,32 @@ fn kill_sidecar_process(child_mutex: &Arc<Mutex<Option<CommandChild>>>) {
 }
 
 /// Fetch a URL and return its body as text (bypasses WebView CORS restrictions)
+#[tauri::command]
+async fn download_and_install_update(
+    app: tauri::AppHandle,
+    manifest_url: String,
+) -> Result<(), String> {
+    // Build a fresh updater with the specified endpoint
+    let url = url::Url::parse(&manifest_url)
+        .map_err(|e| format!("Invalid URL: {}", e))?;
+    let updater = app.updater_builder()
+        .endpoints(vec![url])
+        .map_err(|e| format!("Failed to set endpoints: {}", e))?
+        .build()
+        .map_err(|e| format!("Failed to build updater: {}", e))?;
+
+    let update = updater.check().await
+        .map_err(|e| format!("Update check failed: {}", e))?;
+
+    let update = update.ok_or_else(|| "No update available".to_string())?;
+
+    // Download and install
+    update.download_and_install(|_chunk, _total| {}, || {}).await
+        .map_err(|e| format!("Download/install failed: {}", e))?;
+
+    Ok(())
+}
+
 #[tauri::command]
 async fn fetch_url(url: String) -> Result<String, String> {
     let client = reqwest::Client::new();
@@ -363,7 +390,7 @@ pub fn run() {
       app.manage(SidecarChild(sidecar_child));
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, kill_sidecar])
+    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, download_and_install_update, kill_sidecar])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {
