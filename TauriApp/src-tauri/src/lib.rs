@@ -119,6 +119,13 @@ async fn download_and_install_update(
 }
 
 #[tauri::command]
+async fn save_base64_to_path(path: String, data_b64: String) -> Result<(), String> {
+    let bytes = base64_decode(&data_b64).map_err(|e| format!("Base64 decode: {}", e))?;
+    std::fs::write(&path, &bytes).map_err(|e| format!("Write failed: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn fetch_url(url: String) -> Result<String, String> {
     let client = reqwest::Client::new();
     let resp = client.get(&url).send().await
@@ -390,7 +397,7 @@ pub fn run() {
       app.manage(SidecarChild(sidecar_child));
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, download_and_install_update, kill_sidecar])
+    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, save_base64_to_path, download_and_install_update, kill_sidecar])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {

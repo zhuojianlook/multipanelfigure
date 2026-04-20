@@ -843,11 +843,26 @@ def use_volume_as_panel(name: str, body: ZStackVolumeAsPanelRequest):
     return {"ok": True, "image_name": volume_name}
 
 
-# Keep old endpoint for backward compat
+class ZStackVolumeDataRequest(BaseModel):
+    start_frame: int = 0
+    end_frame: int = -1
+    max_dim: int = 96   # small volume for client-side rendering
+
 @app.post("/api/zstack/{name}/volume")
-def get_volume_data(name: str):
-    """Deprecated — use /volume-render instead."""
-    return {"data": "", "width": 0, "height": 0, "depth": 0}
+def get_volume_data(name: str, body: ZStackVolumeDataRequest):
+    """Return z-stack as a raw 3D uint8 array for client-side rendering."""
+    if name not in loaded_zstacks:
+        raise HTTPException(404, f"Z-stack '{name}' not found")
+
+    vol = _load_volume(name, body.start_frame, body.end_frame, body.max_dim)
+    depth, height, width = vol.shape
+    data_b64 = base64.b64encode(vol.tobytes()).decode("ascii")
+    return {
+        "data": data_b64,
+        "width": width,
+        "height": height,
+        "depth": depth,
+    }
 
 
 @app.delete("/api/images/{name}")
