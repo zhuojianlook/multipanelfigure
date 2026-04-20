@@ -38,6 +38,7 @@ jobs:
             --hidden-import=uvicorn.lifespan.off \
             --hidden-import=multipart --hidden-import=multipart.multipart \
             --collect-all PIL --collect-all matplotlib --collect-all cv2 \
+            --collect-all tifffile --collect-all nibabel \
             --noconfirm api_server.py
         shell: bash
       - name: Copy sidecar binary

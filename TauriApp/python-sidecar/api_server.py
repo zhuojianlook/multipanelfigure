@@ -588,24 +588,41 @@ class ZStackNiftiRequest(BaseModel):
 
 @app.post("/api/zstack/{name}/nifti")
 def get_zstack_nifti(name: str, body: ZStackNiftiRequest):
-    """Return z-stack as NIfTI (.nii) bytes, base64-encoded. Uses tifffile for fast reading."""
+    """Return z-stack as NIfTI (.nii) bytes, base64-encoded."""
+    import sys
+    print(f"[nifti] Request for {name} range {body.start_frame}-{body.end_frame}", file=sys.stderr, flush=True)
+
     if name not in loaded_zstacks:
         raise HTTPException(404, f"Z-stack '{name}' not found")
-
     tiff_path = loaded_zstacks[name]
 
-    # Fast TIFF reading with tifffile (reads all frames as a 3D array in one call)
+    # Try tifffile first (fast), fall back to PIL loop
+    arr = None
     try:
         import tifffile
+        print(f"[nifti] Using tifffile to read {tiff_path}", file=sys.stderr, flush=True)
+        arr = tifffile.imread(tiff_path)
+        print(f"[nifti] tifffile read {arr.shape} {arr.dtype}", file=sys.stderr, flush=True)
+    except ImportError:
+        print(f"[nifti] tifffile not available, falling back to PIL", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[nifti] tifffile failed: {e}, falling back to PIL", file=sys.stderr, flush=True)
+
+    if arr is None:
+        # Fallback: read with PIL seek
+        print(f"[nifti] Reading with PIL seek loop", file=sys.stderr, flush=True)
+        img_obj = Image.open(tiff_path)
+        n = getattr(img_obj, "n_frames", 1)
+        frames = []
+        for i in range(n):
+            img_obj.seek(i)
+            frames.append(np.array(img_obj.convert("L"), dtype=np.uint8))
+        arr = np.stack(frames, axis=0) if frames else np.zeros((1, 64, 64), dtype=np.uint8)
+
+    try:
         import nibabel as nib
     except ImportError as e:
-        raise HTTPException(500, f"Missing Python dependency: {e}")
-
-    # Read full volume (fast via memory-mapping when possible)
-    try:
-        arr = tifffile.imread(tiff_path)
-    except Exception as e:
-        raise HTTPException(500, f"Failed to read TIFF: {e}")
+        raise HTTPException(500, f"nibabel not bundled: {e}")
 
     # Ensure 3D shape: (depth, height, width)
     if arr.ndim == 2:
