@@ -581,6 +581,96 @@ def project_zstack(name: str, body: ZStackProjectRequest):
     }
 
 
+class ZStackNiftiRequest(BaseModel):
+    start_frame: int = 0
+    end_frame: int = -1
+    max_dim: int = 256  # bigger ok for NiiVue (it's optimized)
+
+@app.post("/api/zstack/{name}/nifti")
+def get_zstack_nifti(name: str, body: ZStackNiftiRequest):
+    """Return z-stack as NIfTI (.nii) bytes, base64-encoded. Uses tifffile for fast reading."""
+    if name not in loaded_zstacks:
+        raise HTTPException(404, f"Z-stack '{name}' not found")
+
+    tiff_path = loaded_zstacks[name]
+
+    # Fast TIFF reading with tifffile (reads all frames as a 3D array in one call)
+    try:
+        import tifffile
+        import nibabel as nib
+    except ImportError as e:
+        raise HTTPException(500, f"Missing Python dependency: {e}")
+
+    # Read full volume (fast via memory-mapping when possible)
+    try:
+        arr = tifffile.imread(tiff_path)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to read TIFF: {e}")
+
+    # Ensure 3D shape: (depth, height, width)
+    if arr.ndim == 2:
+        arr = arr[np.newaxis, :, :]
+    elif arr.ndim == 4:
+        # Multi-channel: take first channel or max across channels
+        arr = arr.max(axis=-1) if arr.shape[-1] <= 4 else arr[..., 0]
+        if arr.ndim == 2:
+            arr = arr[np.newaxis, :, :]
+
+    depth = arr.shape[0]
+
+    # Slice to requested range
+    start = max(0, body.start_frame)
+    end = body.end_frame if body.end_frame >= 0 else depth - 1
+    end = min(end, depth - 1)
+    arr = arr[start:end + 1]
+
+    # Normalize to uint8
+    if arr.dtype != np.uint8:
+        if arr.max() > 0:
+            arr = ((arr - arr.min()) / (arr.max() - arr.min()) * 255).astype(np.uint8)
+        else:
+            arr = arr.astype(np.uint8)
+
+    # Downsample if needed
+    d, h, w = arr.shape
+    if max(w, h, d) > body.max_dim:
+        import cv2
+        scale = body.max_dim / max(w, h, d)
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        new_d = max(1, int(d * scale))
+        # Downsample depth by subsampling
+        z_step = max(1, d // new_d)
+        resized = []
+        for i in range(0, d, z_step):
+            if len(resized) >= new_d:
+                break
+            resized.append(cv2.resize(arr[i], (new_w, new_h), interpolation=cv2.INTER_AREA))
+        arr = np.stack(resized, axis=0)
+
+    # NiiVue expects (x, y, z) axis order — transpose from (z, y, x)
+    arr_nii = np.transpose(arr, (2, 1, 0))  # (w, h, d) → x, y, z
+
+    # Create NIfTI image
+    nii = nib.Nifti1Image(arr_nii, affine=np.eye(4))
+    nii.header.set_data_dtype(np.uint8)
+
+    # Serialize to bytes
+    buf = io.BytesIO()
+    file_map = nib.Nifti1Image.make_file_map({"image": buf, "header": buf})
+    nii.file_map = file_map
+    nii.to_file_map()
+    data_bytes = buf.getvalue()
+    data_b64 = base64.b64encode(data_bytes).decode("ascii")
+
+    return {
+        "data": data_b64,
+        "width": arr.shape[2],
+        "height": arr.shape[1],
+        "depth": arr.shape[0],
+    }
+
+
 class ZStackMipsRequest(BaseModel):
     start_frame: int = 0
     end_frame: int = -1
@@ -909,6 +999,25 @@ def save_volume_render(name: str, body: ZStackVolumeSaveRequest):
 class ZStackVolumeAsPanelRequest(ZStackVolumeRenderRequest):
     row: int = 0
     col: int = 0
+
+
+class CanvasAsPanelRequest(BaseModel):
+    image_name: str  # original z-stack name (for naming)
+    row: int
+    col: int
+    data_b64: str    # base64 PNG from canvas
+
+@app.post("/api/save-canvas-as-panel")
+def save_canvas_as_panel(body: CanvasAsPanelRequest):
+    """Save a base64 PNG (from canvas) and assign as panel image."""
+    data = base64.b64decode(body.data_b64)
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    panel_name = f"volume_3d_{body.image_name}_r{body.row}c{body.col}.png"
+    loaded_images[panel_name] = img
+    if body.row < cfg.rows and body.col < cfg.cols:
+        cfg.panels[body.row][body.col].image_name = panel_name
+    _recalc_min_dims()
+    return {"ok": True, "image_name": panel_name}
 
 
 @app.post("/api/zstack/{name}/volume-as-panel")

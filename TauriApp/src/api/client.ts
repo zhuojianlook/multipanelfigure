@@ -351,6 +351,21 @@ class ApiClient {
     return apiJson(`/api/zstack/${encodeURIComponent(name)}/volume`, "POST", JSON.stringify({ start_frame: startFrame, end_frame: endFrame, max_dim: maxDim }));
   }
 
+  async saveCanvasAsPanel(imageName: string, row: number, col: number, dataB64: string): Promise<{ ok: boolean; image_name: string }> {
+    return apiJson(`/api/save-canvas-as-panel`, "POST", JSON.stringify({
+      image_name: imageName, row, col, data_b64: dataB64,
+    }));
+  }
+
+  async getZStackNifti(name: string, opts: {
+    startFrame?: number; endFrame?: number; maxDim?: number;
+  } = {}): Promise<{ data: string; width: number; height: number; depth: number }> {
+    return apiJson(`/api/zstack/${encodeURIComponent(name)}/nifti`, "POST", JSON.stringify({
+      start_frame: opts.startFrame ?? 0, end_frame: opts.endFrame ?? -1,
+      max_dim: opts.maxDim ?? 256,
+    }));
+  }
+
   async getZStackMips(name: string, opts: {
     startFrame?: number; endFrame?: number; colormap?: string;
     rotationFrames?: number; includeRotation?: boolean; maxDim?: number;

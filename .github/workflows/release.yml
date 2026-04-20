@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install Python deps
-        run: pip install pillow numpy matplotlib opencv-python-headless fastapi uvicorn python-multipart pyinstaller
+        run: pip install pillow numpy matplotlib opencv-python-headless fastapi uvicorn python-multipart nibabel tifffile pyinstaller
       - name: Build sidecar
         working-directory: TauriApp/python-sidecar
         run: |
