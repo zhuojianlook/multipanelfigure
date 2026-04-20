@@ -1186,6 +1186,8 @@ function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, se
           imageName={imageName}
           startFrame={projRange[0]}
           endFrame={projRange[1]}
+          panelRow={panelRow}
+          panelCol={panelCol}
         />
       )}
     </Box>

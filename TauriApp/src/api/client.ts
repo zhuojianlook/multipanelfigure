@@ -355,6 +355,7 @@ class ApiClient {
     startFrame?: number; endFrame?: number; elev?: number; azim?: number;
     threshold?: number; zSpacing?: number; colormap?: string;
     width?: number; height?: number; method?: string;
+    showAxes?: boolean; zoom?: number; fast?: boolean;
   } = {}): Promise<{ image: string; width: number; height: number }> {
     return apiJson(`/api/zstack/${encodeURIComponent(name)}/volume-render`, "POST", JSON.stringify({
       start_frame: opts.startFrame ?? 0, end_frame: opts.endFrame ?? -1,
@@ -362,6 +363,41 @@ class ApiClient {
       threshold: opts.threshold ?? 0.3, z_spacing: opts.zSpacing ?? 1.0,
       colormap: opts.colormap ?? "gray", width: opts.width ?? 800, height: opts.height ?? 600,
       method: opts.method ?? "surface",
+      show_axes: opts.showAxes ?? true, zoom: opts.zoom ?? 1.0, fast: opts.fast ?? false,
+    }));
+  }
+
+  async saveVolumeRenderAsImage(name: string, opts: {
+    startFrame?: number; endFrame?: number; elev?: number; azim?: number;
+    threshold?: number; zSpacing?: number; colormap?: string;
+    width?: number; height?: number; method?: string;
+    showAxes?: boolean; zoom?: number;
+    format?: string; quality?: number; filePath: string;
+  }): Promise<{ ok: boolean; path: string }> {
+    return apiJson(`/api/zstack/${encodeURIComponent(name)}/volume-save`, "POST", JSON.stringify({
+      start_frame: opts.startFrame ?? 0, end_frame: opts.endFrame ?? -1,
+      elev: opts.elev ?? 30, azim: opts.azim ?? -60,
+      threshold: opts.threshold ?? 0.3, z_spacing: opts.zSpacing ?? 1.0,
+      colormap: opts.colormap ?? "gray", width: opts.width ?? 1600, height: opts.height ?? 1200,
+      method: opts.method ?? "surface",
+      show_axes: opts.showAxes ?? true, zoom: opts.zoom ?? 1.0,
+      format: opts.format ?? "PNG", quality: opts.quality ?? 95, path: opts.filePath,
+    }));
+  }
+
+  async useVolumeAsPanel(name: string, row: number, col: number, opts: {
+    startFrame?: number; endFrame?: number; elev?: number; azim?: number;
+    threshold?: number; zSpacing?: number; colormap?: string;
+    width?: number; height?: number; method?: string; showAxes?: boolean; zoom?: number;
+  } = {}): Promise<{ ok: boolean; image_name: string }> {
+    return apiJson(`/api/zstack/${encodeURIComponent(name)}/volume-as-panel`, "POST", JSON.stringify({
+      start_frame: opts.startFrame ?? 0, end_frame: opts.endFrame ?? -1,
+      elev: opts.elev ?? 30, azim: opts.azim ?? -60,
+      threshold: opts.threshold ?? 0.3, z_spacing: opts.zSpacing ?? 1.0,
+      colormap: opts.colormap ?? "gray", width: opts.width ?? 1600, height: opts.height ?? 1200,
+      method: opts.method ?? "surface",
+      show_axes: opts.showAxes ?? true, zoom: opts.zoom ?? 1.0,
+      row, col,
     }));
   }
 

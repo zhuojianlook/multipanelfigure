@@ -592,6 +592,9 @@ class ZStackVolumeRenderRequest(BaseModel):
     width: int = 800          # output image width
     height: int = 600         # output image height
     method: str = "surface"   # surface | mip_xy | mip_xz | mip_yz
+    show_axes: bool = True    # show 3D axes/gridlines
+    zoom: float = 1.0         # zoom factor (>1 = zoom in)
+    fast: bool = False        # low-res fast mode (for drag preview)
 
 # Cache the loaded volume to avoid re-reading on every render
 _volume_cache: Dict[str, np.ndarray] = {}
@@ -666,13 +669,16 @@ def render_volume(name: str, body: ZStackVolumeRenderRequest):
         ax.axis("off")
     else:
         # 3D isosurface-like rendering using voxel scatter
-        fig = plt.figure(figsize=(body.width / 100, body.height / 100), dpi=100)
+        # Fast mode: use lower resolution for responsive drag
+        render_scale = 0.5 if body.fast else 1.0
+        w_px = int(body.width * render_scale)
+        h_px = int(body.height * render_scale)
+        fig = plt.figure(figsize=(w_px / 100, h_px / 100), dpi=100)
         ax = fig.add_subplot(111, projection='3d')
 
         # Threshold and downsample for 3D scatter
         mask = norm_vol > body.threshold
-        # Further subsample if too many points
-        max_points = 50000
+        max_points = 15000 if body.fast else 50000
         zz, yy, xx = np.where(mask)
         if len(zz) > max_points:
             idx = np.random.choice(len(zz), max_points, replace=False)
@@ -682,25 +688,35 @@ def render_volume(name: str, body: ZStackVolumeRenderRequest):
             vals = norm_vol[zz, yy, xx]
             cmap = plt.get_cmap(body.colormap)
             colors = cmap(vals)
-            colors[:, 3] = vals * 0.6  # alpha proportional to intensity
-            ax.scatter(xx, yy, zz * body.z_spacing, c=colors, s=1, depthshade=True)
+            colors[:, 3] = vals * 0.6
+            ax.scatter(xx, yy, zz * body.z_spacing, c=colors,
+                       s=2 if body.fast else 1, depthshade=not body.fast)
 
-        ax.set_xlim(0, width)
-        ax.set_ylim(0, height)
-        ax.set_zlim(0, depth * body.z_spacing)
+        # Apply zoom by shrinking axis limits around center
+        cx, cy, cz = width / 2, height / 2, depth * body.z_spacing / 2
+        zoom = max(0.1, body.zoom)
+        hx, hy, hz = width / (2 * zoom), height / (2 * zoom), depth * body.z_spacing / (2 * zoom)
+        ax.set_xlim(cx - hx, cx + hx)
+        ax.set_ylim(cy - hy, cy + hy)
+        ax.set_zlim(cz - hz, cz + hz)
         ax.view_init(elev=body.elev, azim=body.azim)
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_zlabel("Z")
+
+        if body.show_axes:
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+            ax.set_zlabel("Z")
+            ax.tick_params(colors='white', labelsize=6)
+            ax.xaxis.label.set_color('white')
+            ax.yaxis.label.set_color('white')
+            ax.zaxis.label.set_color('white')
+        else:
+            ax.set_axis_off()
+
         ax.set_facecolor("black")
         fig.patch.set_facecolor("#1c1c1e")
         ax.xaxis.pane.fill = False
         ax.yaxis.pane.fill = False
         ax.zaxis.pane.fill = False
-        ax.tick_params(colors='white', labelsize=6)
-        ax.xaxis.label.set_color('white')
-        ax.yaxis.label.set_color('white')
-        ax.zaxis.label.set_color('white')
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=100, bbox_inches="tight",
@@ -710,6 +726,121 @@ def render_volume(name: str, body: ZStackVolumeRenderRequest):
     img_b64 = base64.b64encode(buf.read()).decode("ascii")
 
     return {"image": img_b64, "width": body.width, "height": body.height}
+
+
+class ZStackVolumeSaveRequest(ZStackVolumeRenderRequest):
+    format: str = "PNG"
+    quality: int = 95
+    path: str = ""
+
+
+def _render_volume_to_pil(name: str, body: ZStackVolumeRenderRequest) -> Image.Image:
+    """Render the volume and return a PIL Image (reused by save/as-panel endpoints)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa
+
+    vol = _load_volume(name, body.start_frame, body.end_frame)
+    depth, height, width = vol.shape
+    norm_vol = vol.astype(np.float32) / 255.0
+
+    if body.method in ("mip_xy", "mip_xz", "mip_yz"):
+        axis = {"mip_xy": 0, "mip_xz": 1, "mip_yz": 2}[body.method]
+        mip = np.max(norm_vol, axis=axis)
+        fig, ax = plt.subplots(figsize=(body.width / 100, body.height / 100), dpi=100)
+        aspect = body.z_spacing if body.method != "mip_xy" else "equal"
+        ax.imshow(mip, cmap=body.colormap, vmin=0, vmax=1, aspect=aspect)
+        if body.show_axes:
+            ax.set_title(f"MIP — {body.method.upper().replace('MIP_', '')}", fontsize=10)
+        else:
+            ax.axis("off")
+    else:
+        fig = plt.figure(figsize=(body.width / 100, body.height / 100), dpi=100)
+        ax = fig.add_subplot(111, projection='3d')
+        mask = norm_vol > body.threshold
+        max_points = 50000
+        zz, yy, xx = np.where(mask)
+        if len(zz) > max_points:
+            idx = np.random.choice(len(zz), max_points, replace=False)
+            zz, yy, xx = zz[idx], yy[idx], xx[idx]
+        if len(zz) > 0:
+            vals = norm_vol[zz, yy, xx]
+            cmap = plt.get_cmap(body.colormap)
+            colors = cmap(vals)
+            colors[:, 3] = vals * 0.6
+            ax.scatter(xx, yy, zz * body.z_spacing, c=colors, s=1, depthshade=True)
+
+        cx, cy, cz = width / 2, height / 2, depth * body.z_spacing / 2
+        zoom = max(0.1, body.zoom)
+        hx, hy, hz = width / (2 * zoom), height / (2 * zoom), depth * body.z_spacing / (2 * zoom)
+        ax.set_xlim(cx - hx, cx + hx)
+        ax.set_ylim(cy - hy, cy + hy)
+        ax.set_zlim(cz - hz, cz + hz)
+        ax.view_init(elev=body.elev, azim=body.azim)
+
+        if body.show_axes:
+            ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+            ax.tick_params(colors='white', labelsize=6)
+            ax.xaxis.label.set_color('white'); ax.yaxis.label.set_color('white'); ax.zaxis.label.set_color('white')
+        else:
+            ax.set_axis_off()
+
+        ax.set_facecolor("black")
+        fig.patch.set_facecolor("#1c1c1e" if body.show_axes else "white")
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight",
+                facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    return Image.open(buf).convert("RGB").copy()
+
+
+@app.post("/api/zstack/{name}/volume-save")
+def save_volume_render(name: str, body: ZStackVolumeSaveRequest):
+    """Render and save the volume to disk in the specified format."""
+    if name not in loaded_zstacks:
+        raise HTTPException(404, f"Z-stack '{name}' not found")
+    if not body.path:
+        raise HTTPException(400, "Path is required")
+
+    img = _render_volume_to_pil(name, body)
+    fmt = body.format.upper()
+    save_kwargs: dict = {}
+    if fmt == "JPEG":
+        save_kwargs["quality"] = max(1, min(100, body.quality))
+        img.save(body.path, format="JPEG", **save_kwargs)
+    elif fmt == "TIFF":
+        img.save(body.path, format="TIFF", compression="tiff_lzw")
+    else:
+        img.save(body.path, format="PNG")
+    return {"ok": True, "path": body.path}
+
+
+class ZStackVolumeAsPanelRequest(ZStackVolumeRenderRequest):
+    row: int = 0
+    col: int = 0
+
+
+@app.post("/api/zstack/{name}/volume-as-panel")
+def use_volume_as_panel(name: str, body: ZStackVolumeAsPanelRequest):
+    """Render the volume and assign it as a panel image."""
+    if name not in loaded_zstacks:
+        raise HTTPException(404, f"Z-stack '{name}' not found")
+
+    img = _render_volume_to_pil(name, body)
+    # Create a unique image name for this volume render
+    volume_name = f"volume_{name}_r{body.row}c{body.col}_{body.method}.png"
+    loaded_images[volume_name] = img
+    # Assign to panel
+    if body.row < cfg.rows and body.col < cfg.cols:
+        cfg.panels[body.row][body.col].image_name = volume_name
+    _recalc_min_dims()
+    return {"ok": True, "image_name": volume_name}
 
 
 # Keep old endpoint for backward compat
