@@ -135,6 +135,10 @@ async def health():
 cfg = FigureConfig()
 cfg.ensure_grid()
 loaded_images: Dict[str, Image.Image] = {}
+# Panel-internal images (e.g. 3D-volume renders assigned to a panel) that
+# should NOT appear in the user-facing media timeline. Still editable through
+# the panel itself.
+hidden_images: set = set()
 min_dims = (512, 512)
 custom_fonts: Dict[str, bytes] = {}
 
@@ -315,9 +319,12 @@ def list_images():
             name = cfg.panels[r][c].image_name
             if name:
                 used.add(name)
+    # Filter out panel-internal (hidden) images from the timeline listing.
+    visible_names = [n for n in loaded_images.keys() if n not in hidden_images]
     return {
-        "names": list(loaded_images.keys()),
+        "names": visible_names,
         "used": list(used),
+        "hidden": list(hidden_images),
     }
 
 
@@ -585,6 +592,7 @@ class ZStackNiftiRequest(BaseModel):
     start_frame: int = 0
     end_frame: int = -1
     max_dim: int = 256  # bigger ok for NiiVue (it's optimized)
+    z_spacing: float = 1.0  # z-axis voxel spacing relative to x/y (e.g. 2.0 = thicker slices)
 
 @app.post("/api/zstack/{name}/nifti")
 def get_zstack_nifti(name: str, body: ZStackNiftiRequest):
@@ -668,9 +676,18 @@ def get_zstack_nifti(name: str, body: ZStackNiftiRequest):
     # NiiVue expects (x, y, z) axis order — transpose from (z, y, x)
     arr_nii = np.transpose(arr, (2, 1, 0))  # (w, h, d) → x, y, z
 
+    # Build affine with requested z-spacing so NiiVue renders the volume
+    # with user-specified z-step thickness.
+    z_spacing = max(0.05, float(body.z_spacing))
+    affine = np.diag([1.0, 1.0, z_spacing, 1.0]).astype(np.float32)
+
     # Create NIfTI image
-    nii = nib.Nifti1Image(arr_nii, affine=np.eye(4))
+    nii = nib.Nifti1Image(arr_nii, affine=affine)
     nii.header.set_data_dtype(np.uint8)
+    # Explicitly set pixdim for x, y, z
+    nii.header["pixdim"][1] = 1.0
+    nii.header["pixdim"][2] = 1.0
+    nii.header["pixdim"][3] = z_spacing
 
     # Serialize to bytes
     buf = io.BytesIO()
@@ -1023,18 +1040,38 @@ class CanvasAsPanelRequest(BaseModel):
     row: int
     col: int
     data_b64: str    # base64 PNG from canvas
+    hidden: bool = True  # keep out of the media timeline by default
 
 @app.post("/api/save-canvas-as-panel")
 def save_canvas_as_panel(body: CanvasAsPanelRequest):
-    """Save a base64 PNG (from canvas) and assign as panel image."""
+    """Save a base64 PNG (from canvas) and assign as panel image.
+
+    By default the saved image is marked 'hidden' so it does NOT show up in
+    the media-timeline, but the panel still references it — subsequent edits
+    (crop, adjust, etc.) applied to the panel operate on this 3D-rendered
+    image rather than the original z-stack.
+    """
     data = base64.b64decode(body.data_b64)
     img = Image.open(io.BytesIO(data)).convert("RGB")
     panel_name = f"volume_3d_{body.image_name}_r{body.row}c{body.col}.png"
+
+    # If this panel already had a hidden panel-internal image, clean it up so
+    # we don't accumulate stale entries each time the user re-renders.
+    if body.row < cfg.rows and body.col < cfg.cols:
+        prev_name = cfg.panels[body.row][body.col].image_name
+        if prev_name and prev_name in hidden_images and prev_name != panel_name:
+            loaded_images.pop(prev_name, None)
+            hidden_images.discard(prev_name)
+
     loaded_images[panel_name] = img
+    if body.hidden:
+        hidden_images.add(panel_name)
+    else:
+        hidden_images.discard(panel_name)
     if body.row < cfg.rows and body.col < cfg.cols:
         cfg.panels[body.row][body.col].image_name = panel_name
     _recalc_min_dims()
-    return {"ok": True, "image_name": panel_name}
+    return {"ok": True, "image_name": panel_name, "hidden": body.hidden}
 
 
 @app.post("/api/zstack/{name}/volume-as-panel")
@@ -1080,6 +1117,7 @@ def get_volume_data(name: str, body: ZStackVolumeDataRequest):
 def delete_image(name: str):
     if name in loaded_images:
         del loaded_images[name]
+        hidden_images.discard(name)
         # Clean up z-stack temp file if present
         if name in loaded_zstacks:
             try:

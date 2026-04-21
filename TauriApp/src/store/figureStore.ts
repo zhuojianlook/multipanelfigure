@@ -37,6 +37,7 @@ interface FigureState {
   drawerPanels: PanelInfo[];
   drawerThumbnails: Record<number, string>;  // drawerIdx → processed base64 PNG
   imageGroups: ImageGroup[];
+  pendingUploads: string[];  // filenames currently being uploaded/processed
 
   // ── actions ────────────────────────────────────────────
   fetchConfig: () => Promise<void>;
@@ -254,6 +255,7 @@ export const useFigureStore = create<FigureState>()(
     drawerPanels: [],
     drawerThumbnails: {},
     imageGroups: [],
+    pendingUploads: [],
 
     // ── Fetch initial state from backend ──────────────────
 
@@ -958,6 +960,10 @@ export const useFigureStore = create<FigureState>()(
     // ── Image management ──────────────────────────────────
 
     uploadImages: async (files) => {
+      const pendingNames = files.map((f) => f.name);
+      set((s) => {
+        s.pendingUploads.push(...pendingNames);
+      });
       try {
         const { names, thumbnails } = await api.uploadImages(files);
         set((s) => {
@@ -974,10 +980,22 @@ export const useFigureStore = create<FigureState>()(
         console.error("Upload failed", err);
         const msg = err instanceof Error ? err.message : String(err);
         set((s) => { s.apiError = `Image upload failed: ${msg}`; });
+      } finally {
+        set((s) => {
+          s.pendingUploads = s.pendingUploads.filter((n) => !pendingNames.includes(n));
+        });
       }
     },
 
     uploadImagesFromPaths: async (filePaths) => {
+      const pendingNames = filePaths.map((p) => {
+        // Extract filename from path (works for both / and \ separators)
+        const parts = p.split(/[\\/]/);
+        return parts[parts.length - 1] || p;
+      });
+      set((s) => {
+        s.pendingUploads.push(...pendingNames);
+      });
       try {
         const { names, thumbnails } = await api.uploadImagesFromPaths(filePaths);
         set((s) => {
@@ -994,6 +1012,10 @@ export const useFigureStore = create<FigureState>()(
         console.error("Upload from paths failed", err);
         const msg = err instanceof Error ? err.message : String(err);
         set((s) => { s.apiError = `Image upload failed: ${msg}`; });
+      } finally {
+        set((s) => {
+          s.pendingUploads = s.pendingUploads.filter((n) => !pendingNames.includes(n));
+        });
       }
     },
 

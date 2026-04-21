@@ -6,7 +6,7 @@
    ────────────────────────────────────────────────────────── */
 
 import { useState, useEffect, useRef } from "react";
-import { Tooltip, IconButton } from "@mui/material";
+import { Tooltip, IconButton, CircularProgress } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
@@ -32,6 +32,38 @@ export function useSelectedImage() {
     return () => { _listeners = _listeners.filter(f => f !== fn); };
   }, []);
   return _selectedImageName;
+}
+
+/** Placeholder tile shown while an image is still uploading/processing */
+function LoadingTile({ name }: { name: string }) {
+  return (
+    <Tooltip title={`Loading ${name}…`} placement="bottom" arrow enterDelay={200}>
+      <div
+        className="relative flex-none flex flex-col items-center gap-0.5 rounded border p-1"
+        style={{
+          borderColor: "var(--c-border)",
+          backgroundColor: "var(--c-surface)",
+          borderWidth: 1,
+          borderStyle: "dashed",
+          opacity: 0.85,
+        }}
+      >
+        <div
+          className="w-12 h-12 flex items-center justify-center rounded"
+          style={{ backgroundColor: "rgba(255,255,255,0.04)" }}
+        >
+          <CircularProgress size={22} thickness={5} />
+        </div>
+        <span
+          className="text-[9px] max-w-[56px] truncate"
+          style={{ color: "var(--c-text-dim)", fontStyle: "italic" }}
+          title={name}
+        >
+          {name}
+        </span>
+      </div>
+    </Tooltip>
+  );
 }
 
 /** Reusable image thumbnail tile */
@@ -145,6 +177,7 @@ export function ImageStrip() {
   const deleteImageGroup = useFigureStore((s) => s.deleteImageGroup);
   const moveImageToGroup = useFigureStore((s) => s.moveImageToGroup);
   const moveImageToTimeline = useFigureStore((s) => s.moveImageToTimeline);
+  const pendingUploads = useFigureStore((s) => s.pendingUploads);
   const selectedImage = useSelectedImage();
   const [groupsExpanded, setGroupsExpanded] = useState(true);
   const [timelineDragOver, setTimelineDragOver] = useState(false);
@@ -152,6 +185,10 @@ export function ImageStrip() {
   const entries = Object.values(loadedImages);
   const groupedNames = new Set(imageGroups.flatMap(g => g.imageNames));
   const timelineEntries = entries.filter(img => !groupedNames.has(img.name));
+  // Only show a placeholder for uploads whose filename isn't already present
+  // as a loaded image (handles both name collisions and race conditions).
+  const loadedNames = new Set(entries.map((e) => e.name));
+  const visiblePendingUploads = pendingUploads.filter((n) => !loadedNames.has(n));
 
   const usedNames = new Set<string>();
   if (config) {
@@ -163,7 +200,7 @@ export function ImageStrip() {
     }
   }
 
-  if (entries.length === 0) {
+  if (entries.length === 0 && visiblePendingUploads.length === 0) {
     return (
       <div
         className="flex items-center px-3 py-2 text-[11px] border-b flex-none"
@@ -198,20 +235,25 @@ export function ImageStrip() {
           }
         }}
       >
-        {timelineEntries.length === 0 ? (
+        {timelineEntries.length === 0 && visiblePendingUploads.length === 0 ? (
           <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>
             All images are in groups. Drag here to return to timeline.
           </span>
         ) : (
-          timelineEntries.map((img) => (
-            <ImageTile
-              key={img.name}
-              img={img}
-              inUse={usedNames.has(img.name)}
-              isSelected={selectedImage === img.name}
-              onRemove={() => removeImage(img.name)}
-            />
-          ))
+          <>
+            {timelineEntries.map((img) => (
+              <ImageTile
+                key={img.name}
+                img={img}
+                inUse={usedNames.has(img.name)}
+                isSelected={selectedImage === img.name}
+                onRemove={() => removeImage(img.name)}
+              />
+            ))}
+            {visiblePendingUploads.map((name, i) => (
+              <LoadingTile key={`pending-${name}-${i}`} name={name} />
+            ))}
+          </>
         )}
         {selectedImage && (
           <button

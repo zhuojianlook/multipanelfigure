@@ -24,11 +24,17 @@ interface Props {
   endFrame: number;
   panelRow?: number;
   panelCol?: number;
+  /**
+   * Fired after the 3D render is successfully applied to the panel.
+   * Parent dialogs (e.g. EditPanelDialog) can listen to this to close
+   * themselves so the user re-opens the editor on the updated image.
+   */
+  onAppliedToPanel?: () => void;
 }
 
 const COLORMAPS = ["gray", "hot", "cool", "viridis", "magma", "inferno", "plasma", "bone", "blues", "greens"];
 
-export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFrame, panelRow, panelCol }: Props) {
+export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFrame, panelRow, panelCol, onAppliedToPanel }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const nvRef = useRef<Niivue | null>(null);
   const [loading, setLoading] = useState(true);
@@ -39,6 +45,11 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
   const [opacity, setOpacity] = useState(1.0);
   const [showCrosshairs, setShowCrosshairs] = useState(false);
   const [showOrientationCube, setShowOrientationCube] = useState(true);
+  // New: z-step thickness (relative voxel spacing) and interpolation mode
+  const [zThickness, setZThickness] = useState(1.0);
+  const [interpolation, setInterpolation] = useState<"linear" | "nearest">("linear");
+  // Debounced z-spacing that actually triggers a backend refetch
+  const [appliedZThickness, setAppliedZThickness] = useState(1.0);
 
   // Save dialog
   const [saveOpen, setSaveOpen] = useState(false);
@@ -47,6 +58,8 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
   const [savePath, setSavePath] = useState("");
   const [saving, setSaving] = useState(false);
   const fetchImages = useFigureStore((s) => s.fetchImages);
+  const refreshPanelThumbnail = useFigureStore((s) => s.refreshPanelThumbnail);
+  const requestPreview = useFigureStore((s) => s.requestPreview);
 
   // Initialize NiiVue and load volume
   useEffect(() => {
@@ -76,8 +89,8 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
       try {
         setLoadingStage("Reading TIFF (fast)...");
         const t0 = performance.now();
-        const resp = await api.getZStackNifti(imageName, { startFrame, endFrame, maxDim: 256 });
-        console.log(`[VolumeViewer] NIfTI fetched (${resp.width}×${resp.height}×${resp.depth}) in ${(performance.now() - t0).toFixed(0)}ms`);
+        const resp = await api.getZStackNifti(imageName, { startFrame, endFrame, maxDim: 256, zSpacing: appliedZThickness });
+        console.log(`[VolumeViewer] NIfTI fetched (${resp.width}×${resp.height}×${resp.depth}, z=${appliedZThickness}) in ${(performance.now() - t0).toFixed(0)}ms`);
         if (disposed) return;
 
         setLoadingStage("Decoding volume...");
@@ -107,6 +120,11 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
           nv.updateGLVolume();
         }
 
+        // Apply current interpolation (nearest vs linear)
+        try {
+          nv.setInterpolation(interpolation === "nearest");
+        } catch { /* ignore */ }
+
         nvRef.current = nv;
         setLoading(false);
       } catch (e) {
@@ -128,7 +146,7 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
         } catch { /* ignore */ }
       }
     };
-  }, [open, imageName, startFrame, endFrame]); // eslint-disable-line
+  }, [open, imageName, startFrame, endFrame, appliedZThickness]); // eslint-disable-line
 
   // Update slice type when changed
   useEffect(() => {
@@ -168,6 +186,24 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
       nvRef.current.drawScene();
     }
   }, [showCrosshairs]);
+
+  // Update interpolation (nearest vs linear) without reloading the volume.
+  useEffect(() => {
+    if (nvRef.current) {
+      try {
+        nvRef.current.setInterpolation(interpolation === "nearest");
+        nvRef.current.drawScene();
+      } catch { /* ignore */ }
+    }
+  }, [interpolation]);
+
+  // Debounce z-thickness slider: only re-fetch once the user stops sliding.
+  useEffect(() => {
+    if (!open) return;
+    if (zThickness === appliedZThickness) return;
+    const h = setTimeout(() => setAppliedZThickness(zThickness), 350);
+    return () => clearTimeout(h);
+  }, [zThickness, appliedZThickness, open]);
 
   const canvasToPngDataUrl = (): string | null => {
     if (!canvasRef.current || !nvRef.current) return null;
@@ -243,9 +279,21 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
       const dataUrl = canvasToPngDataUrl();
       if (!dataUrl) throw new Error("Canvas not ready");
       const b64 = dataUrl.split(",")[1];
+      // Backend will store the render as a hidden, panel-internal image
+      // (not visible in the media timeline) and assign it to this panel.
       await api.saveCanvasAsPanel(imageName, panelRow, panelCol, b64);
+      // fetchImages() will refresh the timeline — because the new image is
+      // hidden on the backend, the timeline stays clean.
       await fetchImages();
+      // Refresh the panel thumbnail so the editor sees the new 3D image,
+      // and request a preview so the main canvas updates.
+      try { await refreshPanelThumbnail(panelRow, panelCol); } catch { /* ignore */ }
+      requestPreview();
+      // Close the 3D dialog AND notify the parent (e.g. EditPanelDialog) that
+      // the panel's underlying image has been replaced. The user will re-open
+      // the edit panel on the updated image to continue cropping/adjusting.
       onClose();
+      if (onAppliedToPanel) onAppliedToPanel();
     } catch (e) {
       setError("Failed to set as panel: " + (e instanceof Error ? e.message : String(e)));
     }
@@ -302,6 +350,40 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
             <Slider size="small" value={opacity} min={0.05} max={1.0} step={0.01} onChange={(_, v) => setOpacity(v as number)} />
           </Box>
 
+          <Box>
+            <Typography variant="caption" sx={{ fontSize: "0.6rem" }}>
+              Z-step thickness: {zThickness.toFixed(2)}×
+              {zThickness !== appliedZThickness && " (applying…)"}
+            </Typography>
+            <Slider
+              size="small"
+              value={zThickness}
+              min={0.25}
+              max={5.0}
+              step={0.05}
+              marks={[{ value: 1, label: "" }]}
+              onChange={(_, v) => setZThickness(v as number)}
+            />
+          </Box>
+
+          <Box>
+            <Typography variant="caption" sx={{ fontSize: "0.6rem" }}>Interpolation</Typography>
+            <ToggleButtonGroup
+              value={interpolation}
+              exclusive
+              size="small"
+              onChange={(_, v) => { if (v) setInterpolation(v); }}
+              sx={{ mt: 0.25 }}
+              fullWidth
+            >
+              <ToggleButton value="linear" sx={{ fontSize: "0.6rem", py: 0.25 }}>Linear</ToggleButton>
+              <ToggleButton value="nearest" sx={{ fontSize: "0.6rem", py: 0.25 }}>Nearest</ToggleButton>
+            </ToggleButtonGroup>
+            <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", display: "block", mt: 0.25 }}>
+              Nearest = sharp voxels · Linear = smooth
+            </Typography>
+          </Box>
+
           <FormControlLabel sx={{ ml: 0 }}
             control={<Checkbox size="small" checked={showOrientationCube} onChange={(e) => setShowOrientationCube(e.target.checked)} sx={{ p: 0.25 }} />}
             label={<Typography variant="caption" sx={{ fontSize: "0.6rem" }}>Orientation cube</Typography>}
@@ -322,8 +404,9 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
             </Button>
             {panelRow != null && panelCol != null && (
               <Button size="small" variant="contained" color="primary" onClick={useAsPanel} startIcon={<ImageIcon sx={{ fontSize: 12 }} />}
-                disabled={loading} sx={{ fontSize: "0.6rem", textTransform: "none" }}>
-                Use as Panel Image
+                disabled={loading} sx={{ fontSize: "0.6rem", textTransform: "none" }}
+                title="Replace this panel's image with the current 3D view. You can continue cropping/adjusting it afterwards.">
+                Apply to Panel
               </Button>
             )}
           </Box>

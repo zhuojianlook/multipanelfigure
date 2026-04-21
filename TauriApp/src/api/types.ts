@@ -259,6 +259,7 @@ export interface UploadResponse {
 export interface ImagesListResponse {
   names: string[];
   used: string[];
+  hidden?: string[];
 }
 
 export interface PreviewResponse {

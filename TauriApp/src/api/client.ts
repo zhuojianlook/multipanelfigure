@@ -358,11 +358,12 @@ class ApiClient {
   }
 
   async getZStackNifti(name: string, opts: {
-    startFrame?: number; endFrame?: number; maxDim?: number;
+    startFrame?: number; endFrame?: number; maxDim?: number; zSpacing?: number;
   } = {}): Promise<{ data: string; width: number; height: number; depth: number }> {
     return apiJson(`/api/zstack/${encodeURIComponent(name)}/nifti`, "POST", JSON.stringify({
       start_frame: opts.startFrame ?? 0, end_frame: opts.endFrame ?? -1,
       max_dim: opts.maxDim ?? 256,
+      z_spacing: opts.zSpacing ?? 1.0,
     }));
   }
 

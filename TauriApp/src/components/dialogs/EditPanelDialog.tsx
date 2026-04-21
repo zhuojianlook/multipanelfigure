@@ -1063,7 +1063,7 @@ function VideoFrameSelector({ imageName, onFrameChange, onFrameImage, frame, set
 
 
 // ── Z-Stack TIFF Frame Selector Component ─────────────────────────────
-function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, setFrame, panelRow, panelCol }: { imageName: string; onFrameChange: () => void; onFrameImage?: (b64: string) => void; frame: number; setFrame: (f: number) => void; panelRow?: number; panelCol?: number }) {
+function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, setFrame, panelRow, panelCol, onAppliedToPanel }: { imageName: string; onFrameChange: () => void; onFrameImage?: (b64: string) => void; frame: number; setFrame: (f: number) => void; panelRow?: number; panelCol?: number; onAppliedToPanel?: () => void }) {
   const [info, setInfo] = useState<{ frame_count: number; width: number; height: number } | null>(null);
   const [loading, setLoading] = useState(false);
   const [projRange, setProjRange] = useState<[number, number]>([0, 0]);
@@ -1188,6 +1188,7 @@ function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, se
           endFrame={projRange[1]}
           panelRow={panelRow}
           panelCol={panelCol}
+          onAppliedToPanel={onAppliedToPanel}
         />
       )}
     </Box>
@@ -1846,6 +1847,11 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 refreshPreview();
               }} onFrameImage={(b64) => {
                 setPreviewB64(b64);
+              }} onAppliedToPanel={() => {
+                // 3D volume was applied as the panel image — close the edit
+                // dialog so the user re-opens it on the updated image (which
+                // loads the correct frame/adjustment state for the new PNG).
+                onClose();
               }} />
             </Box>
           </TabPanel>
