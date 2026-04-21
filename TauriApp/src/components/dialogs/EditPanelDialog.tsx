@@ -891,8 +891,13 @@ function CropPixelFields({ cropRect, imgNatW, imgNatH, origFullW, origFullH, dis
 }) {
   const scaleW = origFullW > 0 && imgNatW > 0 ? origFullW / imgNatW : 1;
   const scaleH = origFullH > 0 && imgNatH > 0 ? origFullH / imgNatH : 1;
-  const fullW = Math.round(cropRect.w * scaleW);
-  const fullH = Math.round(cropRect.h * scaleH);
+  // Defensively coerce any non-finite values (NaN / Infinity / undefined)
+  // back to 0 so the pixel fields never render as blank boxes with a
+  // "Position: NaN, NaN" footer underneath.
+  const safeCropW = Number.isFinite(cropRect.w) ? cropRect.w : 0;
+  const safeCropH = Number.isFinite(cropRect.h) ? cropRect.h : 0;
+  const fullW = Math.max(0, Math.round(safeCropW * scaleW));
+  const fullH = Math.max(0, Math.round(safeCropH * scaleH));
 
   const [editW, setEditW] = useState(String(fullW));
   const [editH, setEditH] = useState(String(fullH));
@@ -1233,77 +1238,49 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   const setTabIdx = (v: number) => { _lastTabIdx = v; _setTabIdx(v); };
   const [local, setLocal] = useState<PanelInfo | null>(null);
 
-  // ── Undo / Redo history ─────────────────────────────────────
-  // Keeps a stack of full panel snapshots so every edit — crop, rotate,
-  // colour adjustment, label tweak, etc. — can be stepped through in both
-  // directions. Pushes are debounced so slider-drag doesn't explode the
-  // stack with hundreds of intermediate frames.
-  const historyRef = useRef<{ stack: PanelInfo[]; idx: number }>({ stack: [], idx: -1 });
+  // Tab-ownership types (used by the per-tab undo/redo block further below,
+  // which needs `tabIdx + tOff` from after the z-stack / video tab has been
+  // resolved, so the actual history setup is deferred until after TAB_*
+  // constants are in scope).
+  type TabKey = "crop" | "adj" | "labels" | "scale" | "annot" | "zoom";
+  const TAB_FIELDS: Record<TabKey, (keyof PanelInfo)[]> = {
+    crop: [
+      "rotation", "flip_horizontal", "flip_vertical",
+      "crop", "crop_image", "aspect_ratio_str",
+      "final_resize", "final_width", "final_height",
+    ] as unknown as (keyof PanelInfo)[],
+    adj: [
+      "brightness", "contrast", "hue", "saturation", "gamma",
+      "exposure", "vibrance", "color_temperature", "tint",
+      "sharpen", "blur", "denoise",
+      "highlights", "shadows", "midtones",
+      "input_black_r", "input_white_r",
+      "input_black_g", "input_white_g",
+      "input_black_b", "input_white_b",
+      "invert", "grayscale", "pseudocolor",
+    ] as unknown as (keyof PanelInfo)[],
+    labels: ["labels"] as unknown as (keyof PanelInfo)[],
+    scale: ["scale_bar", "add_scale_bar"] as unknown as (keyof PanelInfo)[],
+    annot: ["symbols", "lines", "areas"] as unknown as (keyof PanelInfo)[],
+    zoom: ["zoom_inset", "add_zoom_inset"] as unknown as (keyof PanelInfo)[],
+  };
+  const historyRef = useRef<Record<TabKey, { stack: Partial<PanelInfo>[]; idx: number }>>({
+    crop: { stack: [], idx: -1 },
+    adj: { stack: [], idx: -1 },
+    labels: { stack: [], idx: -1 },
+    scale: { stack: [], idx: -1 },
+    annot: { stack: [], idx: -1 },
+    zoom: { stack: [], idx: -1 },
+  });
   const historyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [historyVersion, setHistoryVersion] = useState(0);
   const isRestoringRef = useRef(false);
-
-  const pushHistory = useCallback((snapshot: PanelInfo) => {
-    if (isRestoringRef.current) return;
-    if (historyTimerRef.current) clearTimeout(historyTimerRef.current);
-    historyTimerRef.current = setTimeout(() => {
-      const h = historyRef.current;
-      // Drop any redo-future once the user makes a new edit.
-      h.stack = h.stack.slice(0, h.idx + 1);
-      const last = h.stack[h.idx];
-      const serialized = JSON.stringify(snapshot);
-      if (last && JSON.stringify(last) === serialized) return;
-      h.stack.push(JSON.parse(serialized));
-      // Cap history depth.
-      const MAX = 60;
-      if (h.stack.length > MAX) {
-        h.stack.splice(0, h.stack.length - MAX);
-        h.idx = h.stack.length - 1;
-      } else {
-        h.idx = h.stack.length - 1;
-      }
-      setHistoryVersion((v) => v + 1);
-    }, 350);
-  }, []);
-
-  const applySnapshot = useCallback((snap: PanelInfo) => {
-    isRestoringRef.current = true;
-    const copy: PanelInfo = JSON.parse(JSON.stringify(snap));
-    setLocal(copy);
-    localRef.current = copy;
-    // Sync dependent UI state that's derived from `local`.
-    const rot = copy.rotation ?? 0;
-    setDisplayRotation(rot > 180 ? rot - 360 : rot);
-    const preset = ratioStrToPreset(copy.aspect_ratio_str);
-    setAspectPreset(preset);
-    if (preset === "Custom" && copy.aspect_ratio_str) setCustomRatioStr(copy.aspect_ratio_str);
-    // Give React a tick to apply state before we clear the guard so the
-    // debounced history push for this snapshot is swallowed.
-    setTimeout(() => { isRestoringRef.current = false; }, 50);
-    setTimeout(() => { refreshPreview(); }, 0);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const doUndo = useCallback(() => {
-    const h = historyRef.current;
-    if (h.idx <= 0) return;
-    h.idx -= 1;
-    setHistoryVersion((v) => v + 1);
-    applySnapshot(h.stack[h.idx]);
-  }, [applySnapshot]);
-
-  const doRedo = useCallback(() => {
-    const h = historyRef.current;
-    if (h.idx >= h.stack.length - 1) return;
-    h.idx += 1;
-    setHistoryVersion((v) => v + 1);
-    applySnapshot(h.stack[h.idx]);
-  }, [applySnapshot]);
-
-  const canUndo = historyRef.current.idx > 0;
-  const canRedo = historyRef.current.idx < historyRef.current.stack.length - 1;
-  // Ensure the variable is referenced so it participates in re-renders
-  // when history changes (the ref alone wouldn't trigger one).
-  void historyVersion;
+  const extractTabFields = (panelState: PanelInfo, key: TabKey): Partial<PanelInfo> => {
+    const fields = TAB_FIELDS[key];
+    const out: Record<string, unknown> = {};
+    for (const f of fields) out[f as string] = (panelState as unknown as Record<string, unknown>)[f as string];
+    return out as Partial<PanelInfo>;
+  };
 
   // Detect if current panel has a video file
   const VIDEO_EXTS = ['.mp4','.avi','.mov','.mkv','.webm','.wmv','.flv','.m4v','.mpg','.mpeg','.3gp','.ts','.mts'];
@@ -1340,6 +1317,91 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   const TAB_ANNOT = 4 + tOff;
   const TAB_ZOOM = 5 + tOff;
   const OVERLAY_TABS = [TAB_ADJ, TAB_LABELS, TAB_SCALE, TAB_ANNOT, TAB_ZOOM];
+
+  // ── Per-tab undo / redo ──────────────────────────────────────
+  // Each tab has its own history stack; undo/redo only affects fields
+  // owned by the currently-active tab, leaving other tabs untouched.
+  const currentTabKey = (): TabKey => {
+    if (tabIdx === TAB_CROP) return "crop";
+    if (tabIdx === TAB_ADJ) return "adj";
+    if (tabIdx === TAB_LABELS) return "labels";
+    if (tabIdx === TAB_SCALE) return "scale";
+    if (tabIdx === TAB_ANNOT) return "annot";
+    if (tabIdx === TAB_ZOOM) return "zoom";
+    return "crop";
+  };
+  const pushHistory = useCallback((snapshot: PanelInfo) => {
+    if (isRestoringRef.current) return;
+    const key = currentTabKey();
+    if (historyTimerRef.current) clearTimeout(historyTimerRef.current);
+    historyTimerRef.current = setTimeout(() => {
+      const h = historyRef.current[key];
+      const fields = extractTabFields(snapshot, key);
+      const serialized = JSON.stringify(fields);
+      const last = h.stack[h.idx];
+      if (last && JSON.stringify(last) === serialized) return;
+      h.stack = h.stack.slice(0, h.idx + 1);
+      h.stack.push(JSON.parse(serialized));
+      const MAX = 60;
+      if (h.stack.length > MAX) h.stack.splice(0, h.stack.length - MAX);
+      h.idx = h.stack.length - 1;
+      setHistoryVersion((v) => v + 1);
+    }, 350);
+  }, [tabIdx]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const applyPartialSnapshot = useCallback((partial: Partial<PanelInfo>) => {
+    isRestoringRef.current = true;
+    setLocal((prev) => {
+      if (!prev) return prev;
+      const next: PanelInfo = { ...prev, ...partial } as PanelInfo;
+      localRef.current = next;
+      if ("rotation" in partial) {
+        const rot = (partial.rotation as number | undefined) ?? 0;
+        setDisplayRotation(rot > 180 ? rot - 360 : rot);
+      }
+      if ("aspect_ratio_str" in partial) {
+        const preset = ratioStrToPreset((partial.aspect_ratio_str as string) ?? "");
+        setAspectPreset(preset);
+        if (preset === "Custom" && partial.aspect_ratio_str) setCustomRatioStr(partial.aspect_ratio_str as string);
+      }
+      return next;
+    });
+    setTimeout(() => { isRestoringRef.current = false; }, 50);
+    setTimeout(() => { refreshPreview(); }, 0);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const doUndo = useCallback(() => {
+    const key = currentTabKey();
+    const h = historyRef.current[key];
+    if (h.idx <= 0) return;
+    h.idx -= 1;
+    setHistoryVersion((v) => v + 1);
+    applyPartialSnapshot(h.stack[h.idx]);
+  }, [applyPartialSnapshot, tabIdx]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const doRedo = useCallback(() => {
+    const key = currentTabKey();
+    const h = historyRef.current[key];
+    if (h.idx >= h.stack.length - 1) return;
+    h.idx += 1;
+    setHistoryVersion((v) => v + 1);
+    applyPartialSnapshot(h.stack[h.idx]);
+  }, [applyPartialSnapshot, tabIdx]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const activeHistory = (() => {
+    const key: TabKey =
+      tabIdx === TAB_CROP ? "crop" :
+      tabIdx === TAB_ADJ ? "adj" :
+      tabIdx === TAB_LABELS ? "labels" :
+      tabIdx === TAB_SCALE ? "scale" :
+      tabIdx === TAB_ANNOT ? "annot" :
+      tabIdx === TAB_ZOOM ? "zoom" : "crop";
+    return historyRef.current[key];
+  })();
+  const canUndo = activeHistory.idx > 0;
+  const canRedo = activeHistory.idx < activeHistory.stack.length - 1;
+  void historyVersion;
+
   const [previewB64, setPreviewB64] = useState<string>("");
   const [processedW, setProcessedW] = useState(0);
   const [processedH, setProcessedH] = useState(0);
@@ -1403,9 +1465,17 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       if (pu.input_black !== undefined) { pu.input_black_r = pu.input_black; pu.input_black_g = pu.input_black; pu.input_black_b = pu.input_black; delete pu.input_black; }
       if (pu.input_white !== undefined) { pu.input_white_r = pu.input_white; pu.input_white_g = pu.input_white; pu.input_white_b = pu.input_white; delete pu.input_white; }
       setLocal(p);
-      // Reset undo/redo history to just the initial snapshot so each panel
-      // edit session starts clean.
-      historyRef.current = { stack: [JSON.parse(JSON.stringify(p))], idx: 0 };
+      // Reset per-tab undo/redo history to just the initial snapshot of
+      // each tab's fields so each panel edit session starts clean.
+      const fresh: Record<TabKey, { stack: Partial<PanelInfo>[]; idx: number }> = {
+        crop: { stack: [extractTabFields(p, "crop")], idx: 0 },
+        adj: { stack: [extractTabFields(p, "adj")], idx: 0 },
+        labels: { stack: [extractTabFields(p, "labels")], idx: 0 },
+        scale: { stack: [extractTabFields(p, "scale")], idx: 0 },
+        annot: { stack: [extractTabFields(p, "annot")], idx: 0 },
+        zoom: { stack: [extractTabFields(p, "zoom")], idx: 0 },
+      };
+      historyRef.current = fresh;
       setHistoryVersion((v) => v + 1);
       // Restore last-used tab (don't reset to 0)
       _setTabIdx(_lastTabIdx);
@@ -1498,31 +1568,76 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       const rot = savedRotation;
       const { rotW, rotH } = computeRotatedDims(natW, natH, rot);
 
-      const info = await infoPromise;
-      if (info) {
-        setOrigFullW(info.width);
-        setOrigFullH(info.height);
+      // Sanitizer — guard every coordinate so a malformed saved crop (null,
+      // undefined or NaN values from an older save) can never propagate
+      // into cropRect as NaN (which then shows up as "Position: NaN, NaN"
+      // and blank W/H boxes in the pixel fields).
+      const finite = (n: unknown): number => {
+        const v = typeof n === "number" ? n : Number(n);
+        return Number.isFinite(v) ? v : 0;
+      };
 
-        if (savedCrop && info.width > 0) {
-          const scaleToThumb = natW / info.width;
-          const [left, top, right, bottom] = savedCrop;
-          setCropRect({
-            x: Math.round(left * scaleToThumb),
-            y: Math.round(top * scaleToThumb),
-            w: Math.round((right - left) * scaleToThumb),
-            h: Math.round((bottom - top) * scaleToThumb),
-          });
-        } else {
-          setCropRect({ x: 0, y: 0, w: rotW, h: rotH });
-        }
-      } else {
-        setCropRect({ x: 0, y: 0, w: rotW, h: rotH });
+      const info = await infoPromise;
+      const fullW = info ? finite(info.width) : 0;
+      const fullH = info ? finite(info.height) : 0;
+      if (info) {
+        setOrigFullW(fullW);
+        setOrigFullH(fullH);
       }
+
+      // Helper that derives the on-canvas crop rectangle from whichever
+      // saved state we have: explicit crop coords → aspect-ratio preset →
+      // whole (rotated) image. Centralized so we never end up with a stale
+      // full-image rect when the user actually had an aspect crop applied.
+      const computeCropRectFromSaved = (): { x: number; y: number; w: number; h: number } => {
+        if (savedCrop && fullW > 0 && natW > 0) {
+          const scaleToThumb = natW / fullW;
+          const left = finite(savedCrop[0]);
+          const top = finite(savedCrop[1]);
+          const right = finite(savedCrop[2]);
+          const bottom = finite(savedCrop[3]);
+          const x = Math.round(left * scaleToThumb);
+          const y = Math.round(top * scaleToThumb);
+          const w = Math.max(1, Math.round((right - left) * scaleToThumb));
+          const h = Math.max(1, Math.round((bottom - top) * scaleToThumb));
+          // Reject a degenerate / zero crop (shouldn't happen but defensive).
+          if (w > 0 && h > 0) return { x, y, w, h };
+        }
+
+        // No explicit crop but an aspect-ratio preset is saved → materialize
+        // it. This is the fix for "crop area disappears on reopen": the
+        // aspect-preset path in applyCropRatio may have skipped saving the
+        // crop array when dimensions weren't ready, so on reopen we
+        // recompute from the ratio now that they are.
+        const aspectStr = panel?.aspect_ratio_str || "";
+        const ratio = aspectStr === "1:1" ? 1
+          : aspectStr === "4:3" ? 4 / 3
+          : aspectStr === "16:9" ? 16 / 9
+          : (() => {
+              const m = aspectStr.match(/^(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)$/);
+              if (!m) return null;
+              const rw = parseFloat(m[1]); const rh = parseFloat(m[2]);
+              return rh > 0 ? rw / rh : null;
+            })();
+        if (ratio && rotW > 0 && rotH > 0) {
+          let rw = rotW;
+          let rh = Math.round(rw / ratio);
+          if (rh > rotH) { rh = rotH; rw = Math.round(rh * ratio); }
+          const rx = Math.round((rotW - rw) / 2);
+          const ry = Math.round((rotH - rh) / 2);
+          return { x: rx, y: ry, w: rw, h: rh };
+        }
+
+        // Fallback: whole rotated image.
+        return { x: 0, y: 0, w: Math.max(1, rotW), h: Math.max(1, rotH) };
+      };
+
+      setCropRect(computeCropRectFromSaved());
 
       setOrigImgSrc(src);
     };
     img.src = src;
-  }, [open, panel?.image_name, panel?.crop]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [open, panel?.image_name, panel?.crop, panel?.aspect_ratio_str, panel?.rotation]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Load thumbnail image for client-side preview generation
   useEffect(() => {
@@ -1861,11 +1976,14 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     const ry = Math.round((rotH - rh) / 2);
     setCropRect({ x: rx, y: ry, w: rw, h: rh });
     const rect = { x: rx, y: ry, w: rw, h: rh };
-    if (origFullW > 0 && imgNatW > 0) {
+    if (origFullW > 0 && imgNatW > 0 && rw > 0 && rh > 0) {
       const s = origFullW / imgNatW;
       updateLocal({ aspect_ratio_str: ratioLabel, crop_image: true, crop: [Math.round(rect.x * s), Math.round(rect.y * s), Math.round((rect.x + rect.w) * s), Math.round((rect.y + rect.h) * s)] });
     } else {
-      updateLocal({ aspect_ratio_str: ratioLabel, crop_image: true });
+      // Can't compute an accurate full-res crop yet. Still record the
+      // aspect-ratio preset so a future reopen can reconstruct the rect
+      // from it (see computeCropRectFromSaved), and leave crop null.
+      updateLocal({ aspect_ratio_str: ratioLabel, crop_image: true, crop: null });
     }
   };
 
@@ -2320,7 +2438,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   onCommit={handleCropCommit}
                 />
                 <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: "block" }}>
-                  Position: {cropRect.x}, {cropRect.y}
+                  Position: {Number.isFinite(cropRect.x) ? cropRect.x : 0}, {Number.isFinite(cropRect.y) ? cropRect.y : 0}
                 </Typography>
               </Box>
             )}

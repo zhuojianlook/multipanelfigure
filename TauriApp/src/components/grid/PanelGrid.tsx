@@ -668,7 +668,22 @@ export function PanelGrid() {
   const handleToolbarFontSizeChange = (size: number) => {
     if (!toolbarTarget) return;
     if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
-      updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { font_size: size });
+      const sel = toolbarSelectionRef.current;
+      if (sel) {
+        const headers = toolbarTarget.axis === "col" ? column_headers : row_headers;
+        const group = headers[toolbarTarget.level]?.headers[toolbarTarget.groupIdx];
+        if (!group) return;
+        const nextSegs = applySegmentPatch(
+          group.text || "",
+          (group.styled_segments as HeaderStyledSegment[]) || [],
+          sel,
+          group.default_color || "#000000",
+          { font_size: size },
+        );
+        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { styled_segments: nextSegs });
+      } else {
+        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { font_size: size });
+      }
     } else if ((toolbarTarget.type === "colLabel" || toolbarTarget.type === "rowLabel") && toolbarTarget.index !== undefined) {
       updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { font_size: size });
     }
@@ -677,7 +692,22 @@ export function PanelGrid() {
   const handleToolbarFontNameChange = (name: string) => {
     if (!toolbarTarget) return;
     if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
-      updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { font_name: name });
+      const sel = toolbarSelectionRef.current;
+      if (sel) {
+        const headers = toolbarTarget.axis === "col" ? column_headers : row_headers;
+        const group = headers[toolbarTarget.level]?.headers[toolbarTarget.groupIdx];
+        if (!group) return;
+        const nextSegs = applySegmentPatch(
+          group.text || "",
+          (group.styled_segments as HeaderStyledSegment[]) || [],
+          sel,
+          group.default_color || "#000000",
+          { font_name: name },
+        );
+        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { styled_segments: nextSegs });
+      } else {
+        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { font_name: name });
+      }
     } else if ((toolbarTarget.type === "colLabel" || toolbarTarget.type === "rowLabel") && toolbarTarget.index !== undefined) {
       updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { font_name: name });
     }
@@ -690,16 +720,130 @@ export function PanelGrid() {
     if (idx >= 0) current.splice(idx, 1);
     else current.push(style);
     if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
-      updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { font_style: current });
+      const sel = toolbarSelectionRef.current;
+      if (sel) {
+        const headers = toolbarTarget.axis === "col" ? column_headers : row_headers;
+        const group = headers[toolbarTarget.level]?.headers[toolbarTarget.groupIdx];
+        if (!group) return;
+        const nextSegs = applySegmentPatch(
+          group.text || "",
+          (group.styled_segments as HeaderStyledSegment[]) || [],
+          sel,
+          group.default_color || "#000000",
+          { font_style: current },
+        );
+        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { styled_segments: nextSegs });
+      } else {
+        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { font_style: current });
+      }
     } else if ((toolbarTarget.type === "colLabel" || toolbarTarget.type === "rowLabel") && toolbarTarget.index !== undefined) {
       updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { font_style: current });
     }
   };
 
+  // Tracks the text selection inside the currently-focused header / label
+  // textarea so toolbar actions (colour, font, size, style) can be scoped
+  // to just the selected range instead of overwriting the whole string.
+  // { start, end } are character offsets into the full text; if start === end
+  // there is no selection and the action applies to the whole element.
+  const toolbarSelectionRef = useRef<{ start: number; end: number } | null>(null);
+  const handleToolbarSelectionChange = (start: number, end: number) => {
+    toolbarSelectionRef.current = start === end ? null : { start, end };
+  };
+
+  // Build a styled_segments array given the current full text, an existing
+  // segments array (may be empty), a [start,end) selection and a patch to
+  // apply to the selected span.
+  const applySegmentPatch = (
+    fullText: string,
+    existing: HeaderStyledSegment[] | undefined,
+    selection: { start: number; end: number },
+    defaultColor: string,
+    patch: Partial<Pick<HeaderStyledSegment, "color" | "font_name" | "font_size" | "font_style">>,
+  ): HeaderStyledSegment[] => {
+    // Flatten existing segments into per-character style array, falling back
+    // to default_color when no segments are defined.
+    const flat: Array<{ char: string; color: string; font_name?: string; font_size?: number; font_style?: string[] }> = [];
+    if (!existing || existing.length === 0) {
+      for (const ch of fullText) flat.push({ char: ch, color: defaultColor });
+    } else {
+      for (const seg of existing) {
+        for (const ch of seg.text) {
+          flat.push({
+            char: ch,
+            color: seg.color || defaultColor,
+            font_name: seg.font_name,
+            font_size: seg.font_size,
+            font_style: seg.font_style,
+          });
+        }
+      }
+      // If the textarea has diverged from the concatenated segments (e.g.
+      // user edited the plain text afterwards), re-sync to plain text.
+      const concat = flat.map((f) => f.char).join("");
+      if (concat !== fullText) {
+        flat.length = 0;
+        for (const ch of fullText) flat.push({ char: ch, color: defaultColor });
+      }
+    }
+
+    // Apply the patch to characters in the selection range.
+    const lo = Math.max(0, Math.min(selection.start, selection.end));
+    const hi = Math.min(flat.length, Math.max(selection.start, selection.end));
+    for (let i = lo; i < hi; i++) {
+      if (patch.color !== undefined) flat[i].color = patch.color;
+      if (patch.font_name !== undefined) flat[i].font_name = patch.font_name;
+      if (patch.font_size !== undefined) flat[i].font_size = patch.font_size;
+      if (patch.font_style !== undefined) flat[i].font_style = patch.font_style;
+    }
+
+    // Re-group adjacent chars with identical styling back into segments.
+    const out: HeaderStyledSegment[] = [];
+    for (const f of flat) {
+      const last = out[out.length - 1];
+      const sameStyle =
+        last &&
+        last.color === f.color &&
+        last.font_name === f.font_name &&
+        last.font_size === f.font_size &&
+        JSON.stringify(last.font_style) === JSON.stringify(f.font_style);
+      if (sameStyle) {
+        last!.text += f.char;
+      } else {
+        out.push({
+          text: f.char,
+          color: f.color,
+          font_name: f.font_name,
+          font_size: f.font_size,
+          font_style: f.font_style,
+        });
+      }
+    }
+    return out;
+  };
+
   const handleToolbarColorChange = (color: string) => {
     if (!toolbarTarget) return;
     if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
-      updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { default_color: color });
+      const sel = toolbarSelectionRef.current;
+      if (sel) {
+        // Scope to selection: build styled_segments over just the selected range.
+        const headers = toolbarTarget.axis === "col" ? column_headers : row_headers;
+        const group = headers[toolbarTarget.level]?.headers[toolbarTarget.groupIdx];
+        if (!group) return;
+        const nextSegs = applySegmentPatch(
+          group.text || "",
+          (group.styled_segments as HeaderStyledSegment[]) || [],
+          sel,
+          group.default_color || "#000000",
+          { color },
+        );
+        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { styled_segments: nextSegs });
+      } else {
+        // No selection → apply as the group default colour. Clear any
+        // per-segment overrides so the new default actually shows up.
+        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { default_color: color, styled_segments: [] });
+      }
     } else if ((toolbarTarget.type === "colLabel" || toolbarTarget.type === "rowLabel") && toolbarTarget.index !== undefined) {
       updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { default_color: color });
     }
@@ -1012,6 +1156,10 @@ export function PanelGrid() {
                       (e.currentTarget as HTMLTextAreaElement).blur();
                     }
                   }}
+                  onSelect={(e) => {
+                    const ta = e.currentTarget as HTMLTextAreaElement;
+                    handleToolbarSelectionChange(ta.selectionStart ?? 0, ta.selectionEnd ?? 0);
+                  }}
                   placeholder="Header"
                   aria-label={`Column header level ${li + 1} group ${gi + 1}`}
                   onClick={(e) => e.stopPropagation()}
@@ -1022,6 +1170,11 @@ export function PanelGrid() {
                       setToolbarTarget({ type: "header", axis: "col", level: li, groupIdx: gi });
                     }
                   }}
+                  // Note: we deliberately do NOT clear the selection on blur.
+                  // The user needs to click the toolbar's colour / font
+                  // controls (which pulls focus off the textarea) while the
+                  // selection is still captured, so the toolbar action can
+                  // still see the highlighted range.
                 />
 
                 {/* Always-visible edit button */}
@@ -1340,6 +1493,10 @@ export function PanelGrid() {
                         e.preventDefault();
                         (e.currentTarget as HTMLTextAreaElement).blur();
                       }
+                    }}
+                    onSelect={(e) => {
+                      const ta = e.currentTarget as HTMLTextAreaElement;
+                      handleToolbarSelectionChange(ta.selectionStart ?? 0, ta.selectionEnd ?? 0);
                     }}
                     placeholder="Header"
                     aria-label={`Row header level ${li + 1} group ${gi + 1}`}

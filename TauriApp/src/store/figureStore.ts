@@ -529,7 +529,18 @@ export const useFigureStore = create<FigureState>()(
         if (!s.config) return;
         const headers = axis === "col" ? s.config.column_headers : s.config.row_headers;
         if (level < headers.length && groupIdx < headers[level].headers.length) {
-          headers[level].headers[groupIdx].text = text;
+          const group = headers[level].headers[groupIdx];
+          group.text = text;
+          // If per-character styled segments existed but the plain text has
+          // been edited, the segments would now render stale. Clear them so
+          // the whole string falls back to the group default colour until
+          // the user re-applies colour/font to a selection.
+          if (group.styled_segments && group.styled_segments.length > 0) {
+            const concat = group.styled_segments.map((seg: any) => seg.text).join("");
+            if (concat !== text) {
+              group.styled_segments = [];
+            }
+          }
           s.configDirty = true;
         }
       });
