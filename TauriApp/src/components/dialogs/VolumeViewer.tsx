@@ -50,10 +50,27 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
 
   // Initialize NiiVue and load volume
   useEffect(() => {
-    if (!open || !canvasRef.current) return;
+    if (!open) return;
     let disposed = false;
 
     const init = async () => {
+      // Wait for canvas to be mounted (Dialog may not mount children immediately)
+      setLoadingStage("Waiting for canvas...");
+      const waitForCanvas = async (maxWait = 3000) => {
+        const start = Date.now();
+        while (!canvasRef.current && Date.now() - start < maxWait) {
+          await new Promise(r => setTimeout(r, 50));
+        }
+        return canvasRef.current != null;
+      };
+      const hasCanvas = await waitForCanvas();
+      if (disposed) return;
+      if (!hasCanvas) {
+        setError("Canvas element did not mount");
+        setLoading(false);
+        return;
+      }
+
       setLoading(true);
       setError("");
       try {
