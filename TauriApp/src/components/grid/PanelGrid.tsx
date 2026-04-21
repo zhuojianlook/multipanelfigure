@@ -9,7 +9,7 @@
    - Right-click context menus for header manipulation
    ────────────────────────────────────────────────────────── */
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import {
   Menu,
   MenuItem,
@@ -747,27 +747,56 @@ export function PanelGrid() {
   // { start, end } are character offsets into the full text; if start === end
   // there is no selection and the action applies to the whole element.
   // Tracks (a) the textarea the user is currently editing, and (b) the last
-  // *non-empty* selection range the user made inside it. When the user then
-  // clicks a toolbar control, focus moves to the button and the textarea
-  // would otherwise report a collapsed caret — so we re-read the selection
-  // at toolbar-action time directly from the DOM element, falling back to
-  // the last remembered range if the browser has already cleared it.
+  // *non-empty* selection range the user made inside it.
+  //
+  // Relying on React synthetic `onSelect` and on live DOM reads at click
+  // time was fragile — in several browsers, the moment the user clicks a
+  // toolbar control the textarea's selection collapses before any handler
+  // runs. The reliable source of truth is the document-level
+  // `selectionchange` event, which fires every time the textarea's
+  // selection changes (including caret moves). We listen globally and
+  // cache only *non-empty* ranges, so the ref still holds the user's last
+  // real selection when the toolbar handler finally fires.
   const toolbarTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const toolbarSelectionRef = useRef<{ start: number; end: number } | null>(null);
   const handleToolbarSelectionChange = (start: number, end: number) => {
     if (start !== end) toolbarSelectionRef.current = { start, end };
   };
-  // Resolve the selection at toolbar-action time (preferred: live from the
-  // DOM textarea; fallback: remembered range from the last onSelect).
+  useEffect(() => {
+    const handler = () => {
+      const ae = document.activeElement as HTMLElement | null;
+      if (ae && ae.tagName === "TEXTAREA") {
+        const ta = ae as HTMLTextAreaElement;
+        // Only track textareas we care about (headers/labels). The parent
+        // <div> of our header textareas has aria-label starting with
+        // "Column header" or "Row header"; easier to just test the
+        // textarea's own aria-label.
+        const a = ta.getAttribute("aria-label") || "";
+        if (a.startsWith("Column header") || a.startsWith("Row header")) {
+          toolbarTextareaRef.current = ta;
+          const s = ta.selectionStart ?? 0;
+          const en = ta.selectionEnd ?? 0;
+          if (s !== en) toolbarSelectionRef.current = { start: s, end: en };
+        }
+      }
+    };
+    document.addEventListener("selectionchange", handler);
+    return () => document.removeEventListener("selectionchange", handler);
+  }, []);
+
+  // Resolve the selection at toolbar-action time: prefer the cached range
+  // (captured by the selectionchange listener above right when the user
+  // made the selection), falling back to a live DOM read.
   const resolveSelection = (): { start: number; end: number } | null => {
+    const cached = toolbarSelectionRef.current;
+    if (cached && cached.start !== cached.end) return cached;
     const ta = toolbarTextareaRef.current;
     if (ta) {
       const s = ta.selectionStart ?? 0;
       const e = ta.selectionEnd ?? 0;
       if (s !== e) return { start: s, end: e };
     }
-    const cached = toolbarSelectionRef.current;
-    return cached && cached.start !== cached.end ? cached : null;
+    return null;
   };
 
   // Build a styled_segments array given the current full text, an existing
@@ -1165,9 +1194,12 @@ export function PanelGrid() {
                     lineHeight: 1.2,
                   }}
                   value={group.text}
-                  onChange={(e) =>
-                    updateHeaderGroupText("col", li, gi, e.target.value)
-                  }
+                  onChange={(e) => {
+                    // Typing invalidates any cached selection — the indices
+                    // would now point at different characters.
+                    toolbarSelectionRef.current = null;
+                    updateHeaderGroupText("col", li, gi, e.target.value);
+                  }}
                   onKeyDown={(e) => {
                     // Plain Enter commits (blurs); Shift+Enter inserts a newline.
                     if (e.key === "Enter" && !e.shiftKey) {
@@ -1506,9 +1538,10 @@ export function PanelGrid() {
                       lineHeight: 1.2,
                     }}
                     value={group.text}
-                    onChange={(e) =>
-                      updateHeaderGroupText("row", li, gi, e.target.value)
-                    }
+                    onChange={(e) => {
+                      toolbarSelectionRef.current = null;
+                      updateHeaderGroupText("row", li, gi, e.target.value);
+                    }}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && !e.shiftKey) {
                         e.preventDefault();

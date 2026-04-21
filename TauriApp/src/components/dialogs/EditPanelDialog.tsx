@@ -269,6 +269,7 @@ interface CropCanvasProps {
   rotation: number;           // degrees (0-360)
   flipH?: boolean;            // horizontal flip
   flipV?: boolean;            // vertical flip
+  active?: boolean;           // true when the hosting tab is currently visible
   onChange: (rect: { x: number; y: number; w: number; h: number }) => void;
   onCommit?: (rect: { x: number; y: number; w: number; h: number }) => void;
 }
@@ -277,17 +278,38 @@ const HANDLE_SIZE = 10;
 
 type DragMode = "none" | "move" | "nw" | "ne" | "sw" | "se" | "n" | "s" | "e" | "w";
 
-function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, imgNatH, rotation, flipH, flipV, onChange, onCommit }: CropCanvasProps) {
+function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, imgNatH, rotation, flipH, flipV, active = true, onChange, onCommit }: CropCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [canvasW, setCanvasW] = useState(256);
+  // Bumped every time the tab transitions to active. Forces the draw
+  // useEffect to re-run so the overlay is re-painted on the canvas
+  // even if none of its real inputs have changed — the underlying
+  // reason some browsers clear canvas bitmaps when the element's
+  // container is display:none'd.
+  const [drawTick, setDrawTick] = useState(0);
   const dragRef = useRef<{ mode: DragMode; startMx: number; startMy: number; startRect: typeof cropRect }>({
     mode: "none", startMx: 0, startMy: 0, startRect: cropRect,
   });
   const latestRectRef = useRef(cropRect);
   latestRectRef.current = cropRect;
+
+  // Whenever the tab becomes active, re-measure container width (it was 0
+  // while display:none'd) AND bump drawTick so the canvas is repainted.
+  useEffect(() => {
+    if (!active) return;
+    const el = containerRef.current;
+    if (el) {
+      const w = Math.floor(el.clientWidth);
+      if (w > 0) {
+        setCanvasW((cur) => (Math.abs(w - cur) >= 1 ? w : cur));
+      }
+    }
+    // Always bump — canvas may have been cleared by the browser while hidden.
+    setDrawTick((t) => t + 1);
+  }, [active]);
 
   // Measure container width so canvas always fits.
   // Debounce via rAF and ignore sub-pixel jitter to avoid a ResizeObserver →
@@ -419,7 +441,7 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
     for (const [ex, ey] of edges) {
       ctx.fillRect(ex, ey, ehs, ehs);
     }
-  }, [loaded, cropRect, scale, canvasW, canvasH, rotation, rad, imgNatW, imgNatH, flipH, flipV]);
+  }, [loaded, cropRect, scale, canvasW, canvasH, rotation, rad, imgNatW, imgNatH, flipH, flipV, drawTick]);
 
   // Hit-test for drag mode — prioritises corners > edges > move
   // Grab zones scale with crop size (min 14px, max 20px) for reliable interaction
@@ -2449,6 +2471,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   rotation={displayRotation}
                   flipH={local.flip_horizontal}
                   flipV={local.flip_vertical}
+                  active={tabIdx === TAB_CROP}
                   onChange={handleCropRectChange}
                   onCommit={handleCropCommit}
                 />
