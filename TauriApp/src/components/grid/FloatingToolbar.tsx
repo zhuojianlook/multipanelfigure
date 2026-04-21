@@ -81,19 +81,35 @@ export function FloatingToolbar({
       onClose={onClose}
       anchorOrigin={{ vertical: "top", horizontal: "center" }}
       transformOrigin={{ vertical: "bottom", horizontal: "center" }}
+      // hideBackdrop is critical — Popover wraps Modal, which by default
+      // renders an (invisible) Backdrop that catches every click on the
+      // page to close the popover. That backdrop was also swallowing the
+      // user's mousedown-to-start-selection in the header textarea below,
+      // so drag-selecting individual characters was impossible.
+      hideBackdrop
+      disableScrollLock
       slotProps={{
+        root: {
+          // Even without the backdrop, Modal's root container still spans
+          // the viewport and can swallow pointer events. Make the root
+          // completely click-through; only the paper (toolbar itself)
+          // stays interactive.
+          sx: { pointerEvents: "none" },
+        },
         paper: {
           sx: {
             mt: -0.5,
             overflow: "auto",
             boxShadow: 3,
             maxWidth: "90vw",
+            pointerEvents: "auto",
           },
         },
       }}
       // Don't steal focus from the text input
       disableAutoFocus
       disableEnforceFocus
+      disableRestoreFocus
     >
       <Box
         sx={{

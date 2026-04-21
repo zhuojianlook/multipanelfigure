@@ -360,12 +360,38 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
   const aspectPresetRef = useRef(aspectPreset);
   aspectPresetRef.current = aspectPreset;
 
-  // Load image element once
+  // Load image element once. Cover every known edge case:
+  // - async onload for non-cached URLs
+  // - already-complete (cached / data URL) images where onload may not fire
+  //   before useLayoutEffect runs on the next render
+  // - decode errors → log but don't hang in a loading state
   useEffect(() => {
+    if (!imageSrc) return;
     const img = new window.Image();
-    img.onload = () => { imgRef.current = img; setLoaded(true); };
+    const markLoaded = () => {
+      imgRef.current = img;
+      setLoaded(true);
+    };
+    img.onload = markLoaded;
+    img.onerror = () => {
+      console.warn("[CropCanvas] failed to load image", imageSrc.slice(0, 64));
+    };
     img.src = imageSrc;
+    // Synchronous path for images already decoded (browsers differ on
+    // whether onload fires for data URLs that are already ready).
+    if (img.complete && img.naturalWidth > 0) {
+      markLoaded();
+    }
   }, [imageSrc]);
+
+  // Every time the image becomes loaded, schedule an extra draw on the
+  // next animation frame. useLayoutEffect (no deps, below) will usually
+  // pick this up, but this is a belt-and-suspenders guarantee.
+  useEffect(() => {
+    if (!loaded) return;
+    const id = requestAnimationFrame(() => drawRef.current());
+    return () => cancelAnimationFrame(id);
+  }, [loaded]);
 
   // Draw — extracted into a ref'd function so it can be called from multiple
   // places (layout effect, rAF tick, active-change effect). Canvas bitmaps
