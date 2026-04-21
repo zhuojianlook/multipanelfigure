@@ -668,7 +668,7 @@ export function PanelGrid() {
   const handleToolbarFontSizeChange = (size: number) => {
     if (!toolbarTarget) return;
     if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
-      const sel = toolbarSelectionRef.current;
+      const sel = resolveSelection();
       if (sel) {
         const headers = toolbarTarget.axis === "col" ? column_headers : row_headers;
         const group = headers[toolbarTarget.level]?.headers[toolbarTarget.groupIdx];
@@ -692,7 +692,7 @@ export function PanelGrid() {
   const handleToolbarFontNameChange = (name: string) => {
     if (!toolbarTarget) return;
     if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
-      const sel = toolbarSelectionRef.current;
+      const sel = resolveSelection();
       if (sel) {
         const headers = toolbarTarget.axis === "col" ? column_headers : row_headers;
         const group = headers[toolbarTarget.level]?.headers[toolbarTarget.groupIdx];
@@ -720,7 +720,7 @@ export function PanelGrid() {
     if (idx >= 0) current.splice(idx, 1);
     else current.push(style);
     if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
-      const sel = toolbarSelectionRef.current;
+      const sel = resolveSelection();
       if (sel) {
         const headers = toolbarTarget.axis === "col" ? column_headers : row_headers;
         const group = headers[toolbarTarget.level]?.headers[toolbarTarget.groupIdx];
@@ -746,9 +746,28 @@ export function PanelGrid() {
   // to just the selected range instead of overwriting the whole string.
   // { start, end } are character offsets into the full text; if start === end
   // there is no selection and the action applies to the whole element.
+  // Tracks (a) the textarea the user is currently editing, and (b) the last
+  // *non-empty* selection range the user made inside it. When the user then
+  // clicks a toolbar control, focus moves to the button and the textarea
+  // would otherwise report a collapsed caret — so we re-read the selection
+  // at toolbar-action time directly from the DOM element, falling back to
+  // the last remembered range if the browser has already cleared it.
+  const toolbarTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const toolbarSelectionRef = useRef<{ start: number; end: number } | null>(null);
   const handleToolbarSelectionChange = (start: number, end: number) => {
-    toolbarSelectionRef.current = start === end ? null : { start, end };
+    if (start !== end) toolbarSelectionRef.current = { start, end };
+  };
+  // Resolve the selection at toolbar-action time (preferred: live from the
+  // DOM textarea; fallback: remembered range from the last onSelect).
+  const resolveSelection = (): { start: number; end: number } | null => {
+    const ta = toolbarTextareaRef.current;
+    if (ta) {
+      const s = ta.selectionStart ?? 0;
+      const e = ta.selectionEnd ?? 0;
+      if (s !== e) return { start: s, end: e };
+    }
+    const cached = toolbarSelectionRef.current;
+    return cached && cached.start !== cached.end ? cached : null;
   };
 
   // Build a styled_segments array given the current full text, an existing
@@ -825,7 +844,7 @@ export function PanelGrid() {
   const handleToolbarColorChange = (color: string) => {
     if (!toolbarTarget) return;
     if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
-      const sel = toolbarSelectionRef.current;
+      const sel = resolveSelection();
       if (sel) {
         // Scope to selection: build styled_segments over just the selected range.
         const headers = toolbarTarget.axis === "col" ? column_headers : row_headers;
@@ -1164,17 +1183,19 @@ export function PanelGrid() {
                   aria-label={`Column header level ${li + 1} group ${gi + 1}`}
                   onClick={(e) => e.stopPropagation()}
                   onFocus={(e) => {
+                    toolbarTextareaRef.current = e.currentTarget as HTMLTextAreaElement;
+                    toolbarSelectionRef.current = null;
                     const parent = e.currentTarget.parentElement;
                     if (parent) {
                       setToolbarAnchor(parent);
                       setToolbarTarget({ type: "header", axis: "col", level: li, groupIdx: gi });
                     }
                   }}
-                  // Note: we deliberately do NOT clear the selection on blur.
-                  // The user needs to click the toolbar's colour / font
-                  // controls (which pulls focus off the textarea) while the
-                  // selection is still captured, so the toolbar action can
-                  // still see the highlighted range.
+                  // Note: we deliberately do NOT clear the textarea ref or
+                  // selection on blur. When the user clicks the toolbar
+                  // (colour, bold, italic, …), the textarea blurs but we
+                  // still need to know which element was being edited so
+                  // resolveSelection() can pull the range off that element.
                 />
 
                 {/* Always-visible edit button */}
@@ -1502,6 +1523,8 @@ export function PanelGrid() {
                     aria-label={`Row header level ${li + 1} group ${gi + 1}`}
                     onClick={(e) => e.stopPropagation()}
                     onFocus={(e) => {
+                      toolbarTextareaRef.current = e.currentTarget as HTMLTextAreaElement;
+                      toolbarSelectionRef.current = null;
                       const parent = e.currentTarget.parentElement?.parentElement;
                       if (parent) {
                         setToolbarAnchor(parent);
@@ -2260,6 +2283,22 @@ export function PanelGrid() {
         onFontNameChange={handleToolbarFontNameChange}
         onFontStyleToggle={handleToolbarFontStyleToggle}
         onColorChange={handleToolbarColorChange}
+        onBeforeAction={() => {
+          // Snapshot the currently-focused textarea's selection BEFORE
+          // focus moves to a toolbar button, so resolveSelection() can
+          // still see it when the handler fires. We read from
+          // document.activeElement to cover cases where toolbarTextareaRef
+          // wasn't set (e.g. user opened the toolbar via a previous focus
+          // and focused another element before clicking the button).
+          const ae = document.activeElement as HTMLTextAreaElement | null;
+          const target = ae && ae.tagName === "TEXTAREA" ? ae : toolbarTextareaRef.current;
+          if (target) {
+            toolbarTextareaRef.current = target;
+            const s = target.selectionStart ?? 0;
+            const en = target.selectionEnd ?? 0;
+            if (s !== en) toolbarSelectionRef.current = { start: s, end: en };
+          }
+        }}
       />
     </div>
   );

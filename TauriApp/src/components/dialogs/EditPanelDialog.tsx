@@ -71,7 +71,22 @@ interface Props {
 }
 
 function TabPanel({ children, value, index }: { children: React.ReactNode; value: number; index: number }) {
-  return value === index ? <Box sx={{ py: 2 }}>{children}</Box> : null;
+  // Keep every tab mounted but hide inactive ones. Unmounting on tab switch
+  // threw away CropCanvas state (image ref, `loaded` flag, canvas bitmap),
+  // leaving the crop overlay invisible on the first render after a switch.
+  // With CSS hiding, the canvas keeps its pixels and its drawn overlay is
+  // preserved across tab changes.
+  const active = value === index;
+  return (
+    <Box
+      role="tabpanel"
+      hidden={!active}
+      aria-hidden={!active}
+      sx={{ py: active ? 2 : 0, display: active ? "block" : "none" }}
+    >
+      {children}
+    </Box>
+  );
 }
 
 // Position presets (percentage 0-100)

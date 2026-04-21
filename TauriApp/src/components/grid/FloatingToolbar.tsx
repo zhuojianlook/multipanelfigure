@@ -36,6 +36,11 @@ interface Props {
   onFontNameChange: (name: string) => void;
   onFontStyleToggle: (style: string) => void;
   onColorChange: (color: string) => void;
+  /** Fired on mousedown anywhere in the toolbar, BEFORE focus moves off
+   *  the source textarea. Lets the parent snapshot the current text
+   *  selection so it can be applied later when the toolbar action
+   *  actually fires. */
+  onBeforeAction?: () => void;
 }
 
 export function FloatingToolbar({
@@ -51,6 +56,7 @@ export function FloatingToolbar({
   onFontNameChange,
   onFontStyleToggle,
   onColorChange,
+  onBeforeAction,
 }: Props) {
   // Normalize fonts to an array of strings
   const fontList: string[] = Array.isArray(fonts)
@@ -92,8 +98,23 @@ export function FloatingToolbar({
           px: 0.75,
           py: 0.5,
         }}
-        // Prevent toolbar clicks from propagating and closing it
-        onMouseDown={(e) => e.stopPropagation()}
+        // Pointer-down bubbles to this wrapper from every toolbar control
+        // (buttons, dropdowns, color picker). At this moment focus is still
+        // on the source textarea, so onBeforeAction can snapshot the live
+        // selection. stopPropagation prevents the outer popover from
+        // auto-closing on the click.
+        onMouseDown={(e) => {
+          if (onBeforeAction) onBeforeAction();
+          e.stopPropagation();
+          // preventDefault is applied ONLY to targets that don't need focus
+          // — buttons/dropdowns. The native color input needs focus so the
+          // OS colour picker opens, so we leave those alone.
+          const t = e.target as HTMLElement | null;
+          if (t && t.tagName !== "INPUT") {
+            // Keep text selection in the source textarea alive.
+            e.preventDefault();
+          }
+        }}
       >
         {/* Bold */}
         <Tooltip title="Bold" arrow>
