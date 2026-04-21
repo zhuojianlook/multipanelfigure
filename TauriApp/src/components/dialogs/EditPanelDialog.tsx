@@ -50,6 +50,8 @@ import CropSquareIcon from "@mui/icons-material/CropSquare";
 import { symbolToSvgPoints } from "../../utils/symbolDefs";
 import CircleIcon from "@mui/icons-material/Circle";
 import CloseIcon from "@mui/icons-material/Close";
+import UndoIcon from "@mui/icons-material/Undo";
+import RedoIcon from "@mui/icons-material/Redo";
 import { VolumeViewerDialog } from "./VolumeViewer";
 import { useFigureStore } from "../../store/figureStore";
 import { api } from "../../api/client";
@@ -272,20 +274,39 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
   const latestRectRef = useRef(cropRect);
   latestRectRef.current = cropRect;
 
-  // Measure container width so canvas always fits
+  // Measure container width so canvas always fits.
+  // Debounce via rAF and ignore sub-pixel jitter to avoid a ResizeObserver →
+  // state → re-render → ResizeObserver feedback loop that shows up on
+  // Windows/WebView2 as a "ghost" rapid resize when the user switches
+  // aspect-ratio presets.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
+    let raf = 0;
+    let pending: number | null = null;
+    const applyPending = () => {
+      raf = 0;
+      if (pending != null) {
+        setCanvasW((cur) => (Math.abs(pending! - cur) >= 1 ? pending! : cur));
+        pending = null;
+      }
+    };
     const ro = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const w = Math.floor(entry.contentRect.width);
-        if (w > 0) setCanvasW(w);
+        if (w > 0) {
+          pending = w;
+          if (!raf) raf = requestAnimationFrame(applyPending);
+        }
       }
     });
     ro.observe(el);
     // Set initial width
     setCanvasW(Math.floor(el.clientWidth) || 256);
-    return () => ro.disconnect();
+    return () => {
+      ro.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
   }, []);
 
   // Compute rotated bounding box
@@ -1212,6 +1233,78 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   const setTabIdx = (v: number) => { _lastTabIdx = v; _setTabIdx(v); };
   const [local, setLocal] = useState<PanelInfo | null>(null);
 
+  // ── Undo / Redo history ─────────────────────────────────────
+  // Keeps a stack of full panel snapshots so every edit — crop, rotate,
+  // colour adjustment, label tweak, etc. — can be stepped through in both
+  // directions. Pushes are debounced so slider-drag doesn't explode the
+  // stack with hundreds of intermediate frames.
+  const historyRef = useRef<{ stack: PanelInfo[]; idx: number }>({ stack: [], idx: -1 });
+  const historyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [historyVersion, setHistoryVersion] = useState(0);
+  const isRestoringRef = useRef(false);
+
+  const pushHistory = useCallback((snapshot: PanelInfo) => {
+    if (isRestoringRef.current) return;
+    if (historyTimerRef.current) clearTimeout(historyTimerRef.current);
+    historyTimerRef.current = setTimeout(() => {
+      const h = historyRef.current;
+      // Drop any redo-future once the user makes a new edit.
+      h.stack = h.stack.slice(0, h.idx + 1);
+      const last = h.stack[h.idx];
+      const serialized = JSON.stringify(snapshot);
+      if (last && JSON.stringify(last) === serialized) return;
+      h.stack.push(JSON.parse(serialized));
+      // Cap history depth.
+      const MAX = 60;
+      if (h.stack.length > MAX) {
+        h.stack.splice(0, h.stack.length - MAX);
+        h.idx = h.stack.length - 1;
+      } else {
+        h.idx = h.stack.length - 1;
+      }
+      setHistoryVersion((v) => v + 1);
+    }, 350);
+  }, []);
+
+  const applySnapshot = useCallback((snap: PanelInfo) => {
+    isRestoringRef.current = true;
+    const copy: PanelInfo = JSON.parse(JSON.stringify(snap));
+    setLocal(copy);
+    localRef.current = copy;
+    // Sync dependent UI state that's derived from `local`.
+    const rot = copy.rotation ?? 0;
+    setDisplayRotation(rot > 180 ? rot - 360 : rot);
+    const preset = ratioStrToPreset(copy.aspect_ratio_str);
+    setAspectPreset(preset);
+    if (preset === "Custom" && copy.aspect_ratio_str) setCustomRatioStr(copy.aspect_ratio_str);
+    // Give React a tick to apply state before we clear the guard so the
+    // debounced history push for this snapshot is swallowed.
+    setTimeout(() => { isRestoringRef.current = false; }, 50);
+    setTimeout(() => { refreshPreview(); }, 0);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const doUndo = useCallback(() => {
+    const h = historyRef.current;
+    if (h.idx <= 0) return;
+    h.idx -= 1;
+    setHistoryVersion((v) => v + 1);
+    applySnapshot(h.stack[h.idx]);
+  }, [applySnapshot]);
+
+  const doRedo = useCallback(() => {
+    const h = historyRef.current;
+    if (h.idx >= h.stack.length - 1) return;
+    h.idx += 1;
+    setHistoryVersion((v) => v + 1);
+    applySnapshot(h.stack[h.idx]);
+  }, [applySnapshot]);
+
+  const canUndo = historyRef.current.idx > 0;
+  const canRedo = historyRef.current.idx < historyRef.current.stack.length - 1;
+  // Ensure the variable is referenced so it participates in re-renders
+  // when history changes (the ref alone wouldn't trigger one).
+  void historyVersion;
+
   // Detect if current panel has a video file
   const VIDEO_EXTS = ['.mp4','.avi','.mov','.mkv','.webm','.wmv','.flv','.m4v','.mpg','.mpeg','.3gp','.ts','.mts'];
   const isVideoPanel = VIDEO_EXTS.some(ext => (local?.image_name || "").toLowerCase().endsWith(ext));
@@ -1310,6 +1403,10 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       if (pu.input_black !== undefined) { pu.input_black_r = pu.input_black; pu.input_black_g = pu.input_black; pu.input_black_b = pu.input_black; delete pu.input_black; }
       if (pu.input_white !== undefined) { pu.input_white_r = pu.input_white; pu.input_white_g = pu.input_white; pu.input_white_b = pu.input_white; delete pu.input_white; }
       setLocal(p);
+      // Reset undo/redo history to just the initial snapshot so each panel
+      // edit session starts clean.
+      historyRef.current = { stack: [JSON.parse(JSON.stringify(p))], idx: 0 };
+      setHistoryVersion((v) => v + 1);
       // Restore last-used tab (don't reset to 0)
       _setTabIdx(_lastTabIdx);
       setPreviewB64("");
@@ -1321,6 +1418,31 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       setDisplayRotation(rot > 180 ? rot - 360 : rot);
     }
   }, [panel, open]);
+
+  // Hook undo/redo into every local-state mutation. We watch `local` itself
+  // (not the updateLocal fn) so direct setLocal calls and slider updates
+  // are all captured via the same debounced push.
+  useEffect(() => {
+    if (local && open) pushHistory(local);
+  }, [local, open, pushHistory]);
+
+  // Keyboard shortcuts: Cmd/Ctrl+Z = undo, Cmd/Ctrl+Shift+Z or Cmd/Ctrl+Y = redo.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      const meta = e.metaKey || e.ctrlKey;
+      if (!meta) return;
+      const k = e.key.toLowerCase();
+      const target = e.target as HTMLElement | null;
+      // Don't hijack while the user is typing in a text input/textarea.
+      const isTyping = !!target && ["INPUT", "TEXTAREA"].includes(target.tagName) && !target.getAttribute("readonly");
+      if (isTyping) return;
+      if (k === "z" && !e.shiftKey) { e.preventDefault(); doUndo(); }
+      else if ((k === "z" && e.shiftKey) || k === "y") { e.preventDefault(); doRedo(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, doUndo, doRedo]);
 
   // Fetch preview image on open — use panel from store (not local which may not be set yet)
   const panelImageName = panel?.image_name ?? "";
@@ -1609,15 +1731,22 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     // Use global font from config (first column label's font) instead of hardcoded arial
     const globalFont = config?.column_labels?.[0]?.font_name || "arial.ttf";
     const globalFontSize = config?.column_labels?.[0]?.font_size || 12;
+    let addedIdx = -1;
     setLocal((prev) => {
       if (!prev) return prev;
       const lbl = defaultLabel();
       lbl.font_name = globalFont;
       lbl.font_size = globalFontSize;
+      addedIdx = prev.labels.length;
       const next = { ...prev, labels: [...prev.labels, lbl] };
       localRef.current = next;
       return next;
     });
+    // Select the newly-added label and refresh the server-rendered preview
+    // so the label is baked in (otherwise the CSS overlay stays invisible
+    // because it keys off whether a rendered preview exists).
+    if (addedIdx >= 0) setSelectedLabelIdx(addedIdx);
+    setTimeout(() => refreshPreview(), 0);
   };
 
   const removeLabel = (idx: number) => {
@@ -1795,8 +1924,26 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="lg" fullWidth>
-      <DialogTitle>
-        Edit Panel R{row + 1} C{col + 1}
+      <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", py: 1 }}>
+        <Box component="span">Edit Panel R{row + 1} C{col + 1}</Box>
+        {/* Undo / Redo — applies to every tab (crop, resize, adjustments,
+            labels, scale bar, …). Hotkeys: Cmd/Ctrl+Z, Cmd/Ctrl+Shift+Z. */}
+        <Box sx={{ display: "flex", gap: 0.5 }}>
+          <Tooltip title="Undo (⌘/Ctrl+Z)">
+            <span>
+              <IconButton size="small" disabled={!canUndo} onClick={doUndo}>
+                <UndoIcon fontSize="small" />
+              </IconButton>
+            </span>
+          </Tooltip>
+          <Tooltip title="Redo (⌘/Ctrl+⇧+Z)">
+            <span>
+              <IconButton size="small" disabled={!canRedo} onClick={doRedo}>
+                <RedoIcon fontSize="small" />
+              </IconButton>
+            </span>
+          </Tooltip>
+        </Box>
       </DialogTitle>
       <DialogContent>
         <Box sx={{ display: "flex", gap: 2, minHeight: 400 }}>
@@ -1951,6 +2098,45 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 <RestartAltIcon sx={{ fontSize: 16 }} />
               </IconButton>
             </Box>
+
+            {/* Copy rotation TO row / column — parallel to copy-crop below.
+                Only offered when other panels with images exist in the row/col. */}
+            {config && local && (
+              <Box sx={{ display: "flex", gap: 0.5 }}>
+                <Button size="small" variant="outlined" sx={{ fontSize: "0.6rem", textTransform: "none" }}
+                  onClick={() => {
+                    if (!config || !local) return;
+                    const updatePanel = useFigureStore.getState().updatePanel;
+                    const rot = local.rotation ?? 0;
+                    let applied = 0;
+                    for (let c2 = 0; c2 < config.cols; c2++) {
+                      if (c2 === col) continue;
+                      const p2 = config.panels[row]?.[c2];
+                      if (!p2?.image_name) continue;
+                      updatePanel(row, c2, { rotation: rot });
+                      applied++;
+                    }
+                    if (applied === 0) alert("No other panels in this row have images assigned.");
+                  }}
+                >Copy rotation to row</Button>
+                <Button size="small" variant="outlined" sx={{ fontSize: "0.6rem", textTransform: "none" }}
+                  onClick={() => {
+                    if (!config || !local) return;
+                    const updatePanel = useFigureStore.getState().updatePanel;
+                    const rot = local.rotation ?? 0;
+                    let applied = 0;
+                    for (let r2 = 0; r2 < config.rows; r2++) {
+                      if (r2 === row) continue;
+                      const p2 = config.panels[r2]?.[col];
+                      if (!p2?.image_name) continue;
+                      updatePanel(r2, col, { rotation: rot });
+                      applied++;
+                    }
+                    if (applied === 0) alert("No other panels in this column have images assigned.");
+                  }}
+                >Copy rotation to column</Button>
+              </Box>
+            )}
 
             {/* Flip buttons */}
             <Box>
@@ -3869,8 +4055,13 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   };
                   const fontFamily = fontFamilyMap[lbl.font_name] || lbl.font_name.replace(/\.ttf$/i, "") + ", sans-serif";
                   // When rendered preview is active, labels are baked in.
-                  // CSS overlays serve as invisible drag hitboxes only.
+                  // CSS overlays serve as invisible drag hitboxes only —
+                  // EXCEPT the currently-selected label, which we keep
+                  // visible so the user sees what they are dragging (fixes
+                  // the "new label invisible while dragging" bug).
                   const hasRendered = !!renderedPreviewB64;
+                  const isSelected = selectedLabelIdx === i;
+                  const hideText = hasRendered && !isSelected;
                   return (
                     <Box
                       key={`label-${i}`}
@@ -3882,8 +4073,8 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         cursor: isDraggable ? "grab" : "default",
                         userSelect: "none",
                         px: 0.5, py: 0.25,
-                        bgcolor: isDraggable && selectedLabelIdx === i ? "rgba(33,150,243,0.3)" : "transparent",
-                        color: hasRendered ? "transparent" : (lbl.color || "#fff"),
+                        bgcolor: isDraggable && isSelected ? "rgba(33,150,243,0.3)" : "transparent",
+                        color: hideText ? "transparent" : (lbl.color || "#fff"),
                         borderRadius: 0.5,
                         fontSize: `${scaledSize}px`,
                         fontFamily: fontFamily,
@@ -3891,10 +4082,10 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         fontStyle: isItalic ? "italic" : "normal",
                         textDecoration: hasStrike ? "line-through" : "none",
                         verticalAlign: hasSup ? "super" : hasSub ? "sub" : "baseline",
-                        border: isLabelsTab && selectedLabelIdx === i ? "1px solid rgba(255,255,255,0.5)" : "1px solid transparent",
+                        border: isLabelsTab && isSelected ? "1px solid rgba(255,255,255,0.5)" : "1px solid transparent",
                         whiteSpace: "nowrap",
-                        zIndex: isLabelsTab && selectedLabelIdx === i ? 10 : 1,
-                        textShadow: hasRendered ? "none" : "0 1px 3px rgba(0,0,0,0.8)",
+                        zIndex: isLabelsTab && isSelected ? 10 : 1,
+                        textShadow: hideText ? "none" : "0 1px 3px rgba(0,0,0,0.8)",
                         pointerEvents: isDraggable ? "auto" : "none",
                         "&:hover": isDraggable ? { border: "1px solid rgba(255,255,255,0.5)" } : {},
                       }}

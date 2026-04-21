@@ -212,6 +212,45 @@ def _resolve_font_path(font_name: str) -> Optional[str]:
                     return result
         except (PermissionError, OSError):
             continue
+
+    # Fallback 1 — strip the extension and look for any ttf/otf/ttc variant.
+    # Helps on Windows where a user picks "arial.ttf" but the installed file
+    # is actually "Arial.TTF" or Arial is only present as part of "ArialMT.ttc".
+    stem_lower = os.path.splitext(font_lower)[0]
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for fn in os.listdir(d):
+                fn_lower = fn.lower()
+                if not fn_lower.endswith((".ttf", ".otf", ".ttc")):
+                    continue
+                fn_stem = os.path.splitext(fn_lower)[0]
+                if fn_stem == stem_lower:
+                    result = os.path.join(d, fn)
+                    if os.path.isfile(result):
+                        _font_path_cache[font_name] = result
+                        return result
+        except (PermissionError, OSError):
+            continue
+
+    # Fallback 2 — ask matplotlib's font_manager. It caches system fonts
+    # across every supported platform and understands family names. Useful
+    # when the selected filename is just a family name ("Arial") without
+    # the extension, or when Windows reports a different filename than
+    # what's on disk.
+    try:
+        from matplotlib import font_manager as _fm
+        family = os.path.splitext(font_name)[0]
+        found = _fm.findfont(family, fallback_to_default=False)
+        if found and os.path.isfile(found):
+            _font_path_cache[font_name] = found
+            return found
+    except Exception:
+        pass
+
+    import sys
+    print(f"[fonts] Could not resolve '{font_name}' — falling back to matplotlib default", file=sys.stderr, flush=True)
     _font_path_cache[font_name] = None
     return None
 

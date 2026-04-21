@@ -81,7 +81,7 @@ interface FigureState {
     axis: "col" | "row",
     level: number,
     groupIdx: number,
-    patch: Partial<Pick<HeaderGroup, "font_size" | "font_name" | "font_style" | "default_color" | "position">>,
+    patch: Partial<Pick<HeaderGroup, "font_size" | "font_name" | "font_style" | "default_color" | "position" | "styled_segments">>,
   ) => void;
   updateLabelFormatting: (
     axis: "col" | "row",

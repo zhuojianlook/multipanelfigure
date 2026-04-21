@@ -1822,6 +1822,19 @@ def load_proj(body: ProjectLoadRequest):
 @app.get("/api/fonts")
 def list_fonts():
     fonts = find_fonts()
+    # Also pick up every font matplotlib's font_manager has indexed (it walks
+    # the registry on Windows and GTK/fontconfig on Linux, which catches
+    # a lot that bare os.listdir misses, especially on Windows where
+    # C:\Windows\Fonts is a protected shell namespace).
+    try:
+        from matplotlib import font_manager as _fm
+        for ttf in _fm.findSystemFonts(fontext="ttf") + _fm.findSystemFonts(fontext="otf"):
+            fn = os.path.basename(ttf)
+            if fn.lower().endswith((".ttf", ".otf", ".ttc")) and fn not in fonts:
+                fonts[fn] = ttf
+    except Exception as _e:
+        import sys
+        print(f"[fonts] matplotlib font_manager lookup failed: {_e}", file=sys.stderr, flush=True)
     return {"fonts": fonts}
 
 
@@ -1854,6 +1867,13 @@ async def upload_fonts(files: List[UploadFile] = File(...)):
         except Exception as e:
             print(f"Warning: Could not save font {f.filename}: {e}")
         names.append(f.filename)
+    # Invalidate the cached font-path lookups so newly uploaded fonts
+    # are resolvable on the very next render.
+    try:
+        from figure_builder import _font_path_cache
+        _font_path_cache.clear()
+    except Exception:
+        pass
     return {"names": names, "total": len(find_fonts())}
 
 

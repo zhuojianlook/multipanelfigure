@@ -32,6 +32,7 @@ import {
   InputLabel,
   Tooltip,
   Switch,
+  IconButton,
 } from "@mui/material";
 import ArrowForwardIcon from "@mui/icons-material/ArrowForward";
 import ArrowBackIcon from "@mui/icons-material/ArrowBack";
@@ -69,6 +70,14 @@ interface SpanDialogState {
   selectedIndices: number[];
 }
 
+interface HeaderStyledSegment {
+  text: string;
+  color: string;
+  font_name?: string;
+  font_size?: number;
+  font_style?: string[];
+}
+
 interface HeaderPropsDialogState {
   axis: "col" | "row";
   level: number;
@@ -81,6 +90,9 @@ interface HeaderPropsDialogState {
   position: string;
   showLine: boolean;
   endCaps: boolean;
+  defaultColor: string;
+  styledSegments: HeaderStyledSegment[];
+  headerText: string;  // full header text for reference when building segments
 }
 
 interface LabelPropsDialogState {
@@ -504,12 +516,21 @@ export function PanelGrid() {
       position: group.position,
       showLine: (group.line_width ?? 1) > 0,
       endCaps: (group as any).end_caps ?? false,
+      defaultColor: group.default_color || "#000000",
+      styledSegments: (group.styled_segments || []).map((s: any) => ({
+        text: s.text || "",
+        color: s.color || group.default_color || "#000000",
+        font_name: s.font_name,
+        font_size: s.font_size,
+        font_style: s.font_style,
+      })),
+      headerText: group.text || "",
     });
   };
 
   const applyHeaderPropsDialog = () => {
     if (!headerPropsDialog || !config) return;
-    const { axis, level, groupIdx, distance, lineColor, lineWidth, lineStyle, lineLength, position, showLine, endCaps } = headerPropsDialog;
+    const { axis, level, groupIdx, distance, lineColor, lineWidth, lineStyle, lineLength, position, showLine, endCaps, defaultColor, styledSegments } = headerPropsDialog;
     // Deep clone to avoid mutating Zustand state directly
     const headers = JSON.parse(JSON.stringify(axis === "col" ? config.column_headers : config.row_headers));
     const group = headers[level].headers[groupIdx];
@@ -520,6 +541,16 @@ export function PanelGrid() {
     group.line_length = lineLength;
     group.position = position;
     group.end_caps = endCaps;
+    group.default_color = defaultColor;
+    // Filter out empty segments; when no segments are defined, the full
+    // header text renders in the default colour (as before).
+    const cleanSegs = (styledSegments || []).filter((s) => s.text && s.text.length > 0);
+    group.styled_segments = cleanSegs;
+    // Keep header.text in sync with the segment concatenation so downstream
+    // logic (width measurement, plain-text fallback) stays coherent.
+    if (cleanSegs.length > 0) {
+      group.text = cleanSegs.map((s) => s.text).join("");
+    }
     // Update store and backend
     const setConfig = useFigureStore.getState().setConfig;
     if (axis === "col") {
@@ -953,21 +984,34 @@ export function PanelGrid() {
                 {/* Left drag handle */}
                 {renderDragHandle("col", li, gi, "start", groupCols)}
 
-                <input
+                <textarea
                   className="bg-transparent text-center text-[10px] flex-1 min-w-0 outline-none
-                             rounded px-1 py-0.5 hover:ring-1 hover:ring-blue-400/40 transition-shadow"
+                             rounded px-1 py-0.5 hover:ring-1 hover:ring-blue-400/40 transition-shadow
+                             resize-none"
+                  rows={group.text.includes("\n") ? Math.min(4, group.text.split("\n").length) : 1}
                   style={{
                     color: group.default_color || "var(--c-text-dim)",
                     backgroundColor: isBeingDragged ? "var(--c-accent)" : "rgba(255,255,255,0.15)",
-                    height: "28px",
+                    minHeight: "28px",
                     borderBottom: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
                     fontWeight: group.font_style?.includes("Bold") ? 700 : 400,
                     fontStyle: group.font_style?.includes("Italic") ? "italic" : "normal",
+                    overflow: "hidden",
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                    lineHeight: 1.2,
                   }}
                   value={group.text}
                   onChange={(e) =>
                     updateHeaderGroupText("col", li, gi, e.target.value)
                   }
+                  onKeyDown={(e) => {
+                    // Plain Enter commits (blurs); Shift+Enter inserts a newline.
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      (e.currentTarget as HTMLTextAreaElement).blur();
+                    }
+                  }}
                   placeholder="Header"
                   aria-label={`Column header level ${li + 1} group ${gi + 1}`}
                   onClick={(e) => e.stopPropagation()}
@@ -1270,21 +1314,33 @@ export function PanelGrid() {
                     flex: 1,
                     minHeight: 0,
                   }}>
-                  <input
+                  <textarea
                     className="bg-transparent text-center text-[10px] outline-none
-                               rounded px-0.5 py-1 hover:ring-1 hover:ring-blue-400/40 transition-shadow"
+                               rounded px-0.5 py-1 hover:ring-1 hover:ring-blue-400/40 transition-shadow
+                               resize-none"
+                    rows={group.text.includes("\n") ? Math.min(4, group.text.split("\n").length) : 1}
                     style={{
                       color: group.default_color || "var(--c-text-dim)",
                       backgroundColor: isBeingDragged ? "var(--c-accent)" : "rgba(255,255,255,0.15)",
                       borderRight: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
-                      ...(isRotated ? { writingMode: "vertical-rl" as const, width: "28px", height: "100%" } : { height: "28px" }),
+                      ...(isRotated ? { writingMode: "vertical-rl" as const, width: "28px", height: "100%" } : { minHeight: "28px" }),
                       fontWeight: group.font_style?.includes("Bold") ? 700 : 400,
                       fontStyle: group.font_style?.includes("Italic") ? "italic" : "normal",
+                      overflow: "hidden",
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                      lineHeight: 1.2,
                     }}
                     value={group.text}
                     onChange={(e) =>
                       updateHeaderGroupText("row", li, gi, e.target.value)
                     }
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        (e.currentTarget as HTMLTextAreaElement).blur();
+                      }
+                    }}
                     placeholder="Header"
                     aria-label={`Row header level ${li + 1} group ${gi + 1}`}
                     onClick={(e) => e.stopPropagation()}
@@ -1851,6 +1907,93 @@ export function PanelGrid() {
                   />
                 </>
               )}
+
+              {/* ── Per-character styling (styled segments) ───────── */}
+              <Typography variant="caption" sx={{ fontWeight: 600, mt: 1 }}>Per-character styling</Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ fontSize: "0.65rem" }}>
+                Split the header into segments so parts like "DAPI" and "GFP" in "DAPI/GFP" can each take their own colour / font / size.
+                Leave empty to render the whole header in the default colour.
+              </Typography>
+
+              <TextField
+                label="Default colour"
+                type="color"
+                value={headerPropsDialog.defaultColor}
+                onChange={(e) => setHeaderPropsDialog((prev) => prev ? { ...prev, defaultColor: e.target.value } : prev)}
+                size="small"
+                sx={{ "& input": { cursor: "pointer" } }}
+              />
+
+              {headerPropsDialog.styledSegments.map((seg, i) => (
+                <Box key={i} sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
+                  <TextField
+                    label={`#${i + 1}`}
+                    value={seg.text}
+                    size="small"
+                    onChange={(e) => setHeaderPropsDialog((prev) => {
+                      if (!prev) return prev;
+                      const segs = [...prev.styledSegments];
+                      segs[i] = { ...segs[i], text: e.target.value };
+                      return { ...prev, styledSegments: segs };
+                    })}
+                    sx={{ flex: 1, "& input": { fontSize: "0.7rem" } }}
+                  />
+                  <TextField
+                    type="color"
+                    value={seg.color}
+                    size="small"
+                    onChange={(e) => setHeaderPropsDialog((prev) => {
+                      if (!prev) return prev;
+                      const segs = [...prev.styledSegments];
+                      segs[i] = { ...segs[i], color: e.target.value };
+                      return { ...prev, styledSegments: segs };
+                    })}
+                    sx={{ width: 48, "& input": { cursor: "pointer", p: 0.25 } }}
+                  />
+                  <TextField
+                    type="number"
+                    value={seg.font_size ?? ""}
+                    placeholder="sz"
+                    size="small"
+                    onChange={(e) => setHeaderPropsDialog((prev) => {
+                      if (!prev) return prev;
+                      const segs = [...prev.styledSegments];
+                      const v = e.target.value === "" ? undefined : Number(e.target.value);
+                      segs[i] = { ...segs[i], font_size: v };
+                      return { ...prev, styledSegments: segs };
+                    })}
+                    inputProps={{ min: 4, max: 200, step: 1 }}
+                    sx={{ width: 52, "& input": { fontSize: "0.65rem", textAlign: "center" } }}
+                  />
+                  <IconButton size="small" title="Remove segment" onClick={() => setHeaderPropsDialog((prev) => {
+                    if (!prev) return prev;
+                    const segs = prev.styledSegments.filter((_, j) => j !== i);
+                    return { ...prev, styledSegments: segs };
+                  })}>
+                    <DeleteIcon sx={{ fontSize: 14 }} />
+                  </IconButton>
+                </Box>
+              ))}
+
+              <Box sx={{ display: "flex", gap: 0.5 }}>
+                <Button size="small" variant="outlined" startIcon={<AddIcon />} onClick={() => setHeaderPropsDialog((prev) => {
+                  if (!prev) return prev;
+                  const defColor = prev.defaultColor || "#000000";
+                  // First segment prepopulates with the full current header text
+                  // so the user can split it immediately.
+                  const initial: HeaderStyledSegment = prev.styledSegments.length === 0
+                    ? { text: prev.headerText || "", color: defColor }
+                    : { text: "", color: defColor };
+                  return { ...prev, styledSegments: [...prev.styledSegments, initial] };
+                })}>
+                  Add segment
+                </Button>
+                {headerPropsDialog.styledSegments.length > 0 && (
+                  <Button size="small" onClick={() => setHeaderPropsDialog((prev) => prev ? { ...prev, styledSegments: [] } : prev)}>
+                    Clear
+                  </Button>
+                )}
+              </Box>
             </Box>
           )}
         </DialogContent>

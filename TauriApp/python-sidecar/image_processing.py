@@ -881,6 +881,11 @@ def _apply_gamma(img, gamma):
 
 def _apply_color_temperature(img, temp):
     if abs(temp) < 0.5: return img
+    # Color-temperature only makes sense on multi-channel images. For single-
+    # channel (L / I) modes promote to RGB so the shift is applied without
+    # crashing on 2-D arrays.
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
     arr = np.array(img, dtype=np.float32)
     f = temp / 100.0
     arr[:,:,0] = np.clip(arr[:,:,0] + f * 30, 0, 255)
@@ -889,14 +894,21 @@ def _apply_color_temperature(img, temp):
 
 def _apply_tint(img, tint_val):
     if abs(tint_val) < 0.5: return img
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
     arr = np.array(img, dtype=np.float32)
     arr[:,:,1] = np.clip(arr[:,:,1] - tint_val / 100.0 * 30, 0, 255)
     return Image.fromarray(arr.astype(np.uint8), img.mode)
 
 def _apply_exposure(img, ev):
     if abs(ev) < 0.01: return img
+    # Exposure multiplication works on any mode; handle single-channel
+    # (2-D) arrays without slicing a non-existent RGB axis.
     arr = np.array(img, dtype=np.float32)
-    arr[:,:,:3] = np.clip(arr[:,:,:3] * (2.0 ** ev), 0, 255)
+    if arr.ndim == 2:
+        arr = np.clip(arr * (2.0 ** ev), 0, 255)
+    else:
+        arr[:,:,:3] = np.clip(arr[:,:,:3] * (2.0 ** ev), 0, 255)
     return Image.fromarray(arr.astype(np.uint8), img.mode)
 
 def _apply_vibrance(img, amount):
@@ -1043,8 +1055,24 @@ def process_panel(image: Image.Image, panel: PanelInfo,
     pseudocolor = getattr(panel, 'pseudocolor', '') or ''
     if pseudocolor:
         import matplotlib.cm as cm
-        gray = ImageOps.grayscale(img)
-        arr = np.array(gray, dtype=np.float32) / 255.0
+        # Handle every source mode robustly — 8-bit L, 16-bit I;16, 32-bit I,
+        # P/palette, RGB(A), or bi-level "1". For high-bit-depth modes we
+        # normalize from the actual data range instead of dividing by 255,
+        # which would otherwise turn most of a 16-bit image black.
+        src_mode = img.mode
+        if src_mode in ("I", "I;16", "F"):
+            raw = np.array(img, dtype=np.float32)
+            mn, mx = float(raw.min()), float(raw.max())
+            arr = (raw - mn) / (mx - mn) if mx > mn else np.zeros_like(raw)
+        elif src_mode in ("L", "LA", "1"):
+            # "1" (bi-level) → L; "LA" drop alpha.
+            gray = img.convert("L")
+            arr = np.array(gray, dtype=np.float32) / 255.0
+        else:
+            # RGB/RGBA/P/… → luminance.
+            gray = ImageOps.grayscale(img.convert("RGB") if src_mode == "P" else img)
+            arr = np.array(gray, dtype=np.float32) / 255.0
+
         # Simple colormaps
         SIMPLE_CMAPS = {
             "green": lambda v: np.stack([np.zeros_like(v), v, np.zeros_like(v)], axis=-1),
@@ -1054,17 +1082,17 @@ def process_panel(image: Image.Image, panel: PanelInfo,
             "magenta": lambda v: np.stack([v, np.zeros_like(v), v], axis=-1),
             "yellow": lambda v: np.stack([v, v, np.zeros_like(v)], axis=-1),
         }
-        if pseudocolor in SIMPLE_CMAPS:
-            rgb = SIMPLE_CMAPS[pseudocolor](arr)
-            img = Image.fromarray((rgb * 255).astype(np.uint8), "RGB")
-        else:
-            # Use matplotlib colormaps
-            try:
+        try:
+            if pseudocolor in SIMPLE_CMAPS:
+                rgb = SIMPLE_CMAPS[pseudocolor](arr)
+                img = Image.fromarray((np.clip(rgb, 0, 1) * 255).astype(np.uint8), "RGB")
+            else:
                 cmap = cm.get_cmap(pseudocolor)
-                mapped = cmap(arr)[:, :, :3]  # drop alpha
+                mapped = cmap(np.clip(arr, 0, 1))[:, :, :3]  # drop alpha
                 img = Image.fromarray((mapped * 255).astype(np.uint8), "RGB")
-            except ValueError:
-                pass  # unknown colormap, skip
+        except (ValueError, AttributeError) as e:
+            import sys
+            print(f"[pseudocolor] Failed to apply '{pseudocolor}' to mode={src_mode}: {e}", file=sys.stderr, flush=True)
 
     # 6) Crop
     if not _direct_crop and panel.crop_image:

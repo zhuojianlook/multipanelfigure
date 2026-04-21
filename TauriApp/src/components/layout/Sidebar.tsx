@@ -129,6 +129,9 @@ export function Sidebar() {
 
   // Analysis dialog
   const [analysisOpen, setAnalysisOpen] = useState(false);
+  // When true, the user enters the scale-bar value as pixels per unit and we
+  // invert it to units per pixel before storing.
+  const [scaleInverted, setScaleInverted] = useState(false);
 
   // Computed measurements from backend
   const [computedMeasurements, setComputedMeasurements] = useState<Array<{ panel: string; name: string; type: string; value: string }>>([]);
@@ -149,7 +152,9 @@ export function Sidebar() {
 
   if (!config) return null;
 
-  const spacingPx = Math.round((config.spacing || 0.02) * 2000);
+  // Use nullish coalescing so a genuine `0` spacing stays at 0 instead of
+  // being snapped back to the default 0.02 (which displayed as 40 px).
+  const spacingPx = Math.round((config.spacing ?? 0.02) * 2000);
 
   const handleGridResize = (newRows: number, newCols: number) => {
     const conflicts = checkGridResizeConflict(newRows, newCols);
@@ -198,15 +203,16 @@ export function Sidebar() {
       </Field>
 
       <Field label="Spacing">
-        <Box sx={{ display: "flex", alignItems: "center", gap: 1, width: 140 }}>
+        <Box sx={{ display: "flex", alignItems: "center", gap: 1, width: 160 }}>
           <Slider
             value={spacingPx}
             min={0}
-            max={100}
+            max={250}
+            step={1}
             onChange={(_, val) => setSpacing((val as number) / 2000)}
             sx={{ flex: 1 }}
           />
-          <Typography variant="caption" sx={{ width: 40, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
+          <Typography variant="caption" sx={{ width: 44, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
             {spacingPx} px
           </Typography>
         </Box>
@@ -241,7 +247,7 @@ export function Sidebar() {
             </Box>
           );
         })}
-        {/* Add new scale bar: Name, Value, Unit */}
+        {/* Add new scale bar: Name, Value, Unit, direction toggle */}
         <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, alignItems: "center" }}>
           <TextField
             placeholder="Name"
@@ -250,11 +256,11 @@ export function Sidebar() {
             id="scale-name-input"
           />
           <TextField
-            placeholder="val/px"
+            placeholder={scaleInverted ? "px/unit" : "unit/px"}
             type="number"
             size="small"
             sx={{
-              flex: "0 0 50px", width: 50,
+              flex: "0 0 60px", width: 60,
               "& input": { fontSize: "0.65rem", py: 0.25, px: 0.5, MozAppearance: "textfield" },
               "& input::-webkit-outer-spin-button, & input::-webkit-inner-spin-button": { WebkitAppearance: "none", margin: 0 },
             }}
@@ -285,15 +291,28 @@ export function Sidebar() {
             <option value="nm">nm</option>
             <option value="pm">pm</option>
           </select>
+          <Button
+            size="small"
+            variant={scaleInverted ? "contained" : "outlined"}
+            onClick={() => setScaleInverted(!scaleInverted)}
+            title={scaleInverted ? "Input is pixels per unit — click to switch to units per pixel" : "Input is units per pixel — click to switch to pixels per unit"}
+            sx={{ fontSize: "0.5rem", textTransform: "none", px: 0.5, py: 0, minWidth: 38, height: 22, flexShrink: 0 }}
+          >
+            {scaleInverted ? "px/u" : "u/px"}
+          </Button>
           <IconButton size="small" onClick={() => {
             const nameEl = document.getElementById("scale-name-input") as HTMLInputElement;
             const valEl = document.getElementById("scale-value-input") as HTMLInputElement;
             const unitEl = document.getElementById("scale-unit-input") as HTMLSelectElement;
             if (nameEl?.value && valEl?.value) {
               const unit = unitEl?.value || "um";
+              const rawValue = Number(valEl.value);
+              if (!isFinite(rawValue) || rawValue <= 0) return;
+              // If user is in "px/unit" mode, invert to get "unit/px" for storage.
+              const valuePerPx = scaleInverted ? 1 / rawValue : rawValue;
               // Convert to μm/px for internal storage, store unit in key suffix
               const conversionToUm: Record<string, number> = { km: 1e9, m: 1e6, cm: 10000, mm: 1000, um: 1, nm: 0.001, pm: 1e-6 };
-              const valueInUm = Number(valEl.value) * (conversionToUm[unit] || 1);
+              const valueInUm = valuePerPx * (conversionToUm[unit] || 1);
               const key = `${nameEl.value}|${unit}`;
               const entries = { ...config.resolution_entries, [key]: valueInUm };
               setConfig({ ...config, resolution_entries: entries });
@@ -363,6 +382,56 @@ export function Sidebar() {
             Apply
           </Button>
           </Box>
+        </Box>
+
+        {/* Global header font size — applies one size across every header
+            so they line up in a collage / poster builder context. */}
+        <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+          <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary", flex: 1 }}>
+            Header size
+          </Typography>
+          <TextField
+            type="number"
+            size="small"
+            id="global-header-size-input"
+            defaultValue={config?.column_headers?.[0]?.headers?.[0]?.font_size ?? 14}
+            key={`hdr-size-${config?.column_headers?.length ?? 0}-${config?.row_headers?.length ?? 0}`}
+            inputProps={{ min: 4, max: 200, step: 1 }}
+            sx={{ width: 56, "& input": { fontSize: "0.65rem", py: 0.25, px: 0.5 } }}
+          />
+          <Button
+            variant="contained"
+            size="small"
+            sx={{ fontSize: "0.55rem", textTransform: "none", px: 1, py: 0.25, minWidth: 0, flexShrink: 0 }}
+            onClick={() => {
+              if (!config) return;
+              const el = document.getElementById("global-header-size-input") as HTMLInputElement;
+              if (!el) return;
+              const n = Number(el.value);
+              if (!isFinite(n) || n < 4) return;
+              const colHeaders = config.column_headers.map((level: any) => ({
+                ...level,
+                headers: level.headers.map((h: any) => ({
+                  ...h,
+                  font_size: n,
+                  // Clear any per-segment size overrides so the global size
+                  // actually wins for every character.
+                  styled_segments: (h.styled_segments || []).map((seg: any) => ({ ...seg, font_size: undefined })),
+                })),
+              }));
+              const rowHeaders = config.row_headers.map((level: any) => ({
+                ...level,
+                headers: level.headers.map((h: any) => ({
+                  ...h,
+                  font_size: n,
+                  styled_segments: (h.styled_segments || []).map((seg: any) => ({ ...seg, font_size: undefined })),
+                })),
+              }));
+              setConfig({ ...config, column_headers: colHeaders, row_headers: rowHeaders });
+            }}
+          >
+            Apply
+          </Button>
         </Box>
         {/* Upload custom font */}
         <input
