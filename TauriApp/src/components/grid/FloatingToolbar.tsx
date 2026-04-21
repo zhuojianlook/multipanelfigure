@@ -41,6 +41,10 @@ interface Props {
    *  selection so it can be applied later when the toolbar action
    *  actually fires. */
   onBeforeAction?: () => void;
+  /** Optional label rendered in the toolbar indicating the current
+   *  selected substring (if any). Lets the user see what their next
+   *  style change will apply to. */
+  selectionPreview?: string;
 }
 
 export function FloatingToolbar({
@@ -57,6 +61,7 @@ export function FloatingToolbar({
   onFontStyleToggle,
   onColorChange,
   onBeforeAction,
+  selectionPreview,
 }: Props) {
   // Normalize fonts to an array of strings
   const fontList: string[] = Array.isArray(fonts)
@@ -101,8 +106,9 @@ export function FloatingToolbar({
         // Pointer-down bubbles to this wrapper from every toolbar control
         // (buttons, dropdowns, color picker). At this moment focus is still
         // on the source textarea, so onBeforeAction can snapshot the live
-        // selection. stopPropagation prevents the outer popover from
-        // auto-closing on the click.
+        // selection. We fire it on BOTH the capture and bubble phases so
+        // it runs before any child handler has a chance to change focus.
+        onMouseDownCapture={() => { if (onBeforeAction) onBeforeAction(); }}
         onMouseDown={(e) => {
           if (onBeforeAction) onBeforeAction();
           e.stopPropagation();
@@ -288,6 +294,31 @@ export function FloatingToolbar({
             }}
           />
         </Tooltip>
+
+        {/* Visual hint: shows what substring will be styled by the next
+            action. Empty = the whole header is targeted. */}
+        {selectionPreview ? (
+          <Box
+            sx={{
+              ml: 0.5,
+              px: 0.5,
+              py: 0.1,
+              fontSize: "0.55rem",
+              bgcolor: "action.selected",
+              borderRadius: 0.5,
+              maxWidth: 100,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              color: "text.secondary",
+            }}
+            title={`Styling will apply to: "${selectionPreview}"`}
+          >
+            "{selectionPreview.length > 12 ? selectionPreview.slice(0, 12) + "…" : selectionPreview}"
+          </Box>
+        ) : (
+          <Box sx={{ ml: 0.5, fontSize: "0.55rem", color: "text.disabled" }}>whole</Box>
+        )}
       </Box>
     </Popover>
   );

@@ -7,7 +7,7 @@
    that updates via debounced fetch to /api/panel-preview.
    ------------------------------------------------------------------ */
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useLayoutEffect } from "react";
 import {
   Dialog,
   DialogTitle,
@@ -284,20 +284,14 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
   const imgRef = useRef<HTMLImageElement | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [canvasW, setCanvasW] = useState(256);
-  // Bumped every time the tab transitions to active. Forces the draw
-  // useEffect to re-run so the overlay is re-painted on the canvas
-  // even if none of its real inputs have changed — the underlying
-  // reason some browsers clear canvas bitmaps when the element's
-  // container is display:none'd.
-  const [drawTick, setDrawTick] = useState(0);
   const dragRef = useRef<{ mode: DragMode; startMx: number; startMy: number; startRect: typeof cropRect }>({
     mode: "none", startMx: 0, startMy: 0, startRect: cropRect,
   });
   const latestRectRef = useRef(cropRect);
   latestRectRef.current = cropRect;
 
-  // Whenever the tab becomes active, re-measure container width (it was 0
-  // while display:none'd) AND bump drawTick so the canvas is repainted.
+  // When the tab becomes active, re-measure container width (it was 0
+  // while display:none'd). The rAF-based redraw below handles repainting.
   useEffect(() => {
     if (!active) return;
     const el = containerRef.current;
@@ -307,8 +301,6 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
         setCanvasW((cur) => (Math.abs(w - cur) >= 1 ? w : cur));
       }
     }
-    // Always bump — canvas may have been cleared by the browser while hidden.
-    setDrawTick((t) => t + 1);
   }, [active]);
 
   // Measure container width so canvas always fits.
@@ -375,8 +367,12 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
     img.src = imageSrc;
   }, [imageSrc]);
 
-  // Draw
-  useEffect(() => {
+  // Draw — extracted into a ref'd function so it can be called from multiple
+  // places (layout effect, rAF tick, active-change effect). Canvas bitmaps
+  // can be discarded by the browser in a display:none'd tab, so we rely on
+  // multiple triggers to guarantee a repaint whenever the tab is shown.
+  const drawRef = useRef<() => void>(() => {});
+  drawRef.current = () => {
     const canvas = canvasRef.current;
     const img = imgRef.current;
     if (!canvas || !img || !loaded) return;
@@ -441,7 +437,36 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
     for (const [ex, ey] of edges) {
       ctx.fillRect(ex, ey, ehs, ehs);
     }
-  }, [loaded, cropRect, scale, canvasW, canvasH, rotation, rad, imgNatW, imgNatH, flipH, flipV, drawTick]);
+  };
+
+  // Trigger 1 — synchronous after every render (catches the common case
+  // where cropRect / canvas size / rotation etc. change).
+  useLayoutEffect(() => {
+    drawRef.current();
+  }); // no deps: every render
+
+  // Trigger 2 — when the hosting tab becomes active, run several rAF
+  // passes. Some browsers (notably WKWebView) throw away the canvas
+  // bitmap while the container is display:none'd; rAF-ing after the
+  // DOM re-shows lets us repaint AFTER the browser has re-allocated
+  // the canvas surface.
+  useEffect(() => {
+    if (!active) return;
+    let cancelled = false;
+    const frames: number[] = [];
+    const schedule = (n: number) => {
+      if (n <= 0 || cancelled) return;
+      frames.push(requestAnimationFrame(() => {
+        drawRef.current();
+        schedule(n - 1);
+      }));
+    };
+    schedule(3); // 3 consecutive frames
+    return () => {
+      cancelled = true;
+      for (const f of frames) cancelAnimationFrame(f);
+    };
+  }, [active, loaded]);
 
   // Hit-test for drag mode — prioritises corners > edges > move
   // Grab zones scale with crop size (min 14px, max 20px) for reliable interaction

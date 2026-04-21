@@ -759,6 +759,14 @@ export function PanelGrid() {
   // real selection when the toolbar handler finally fires.
   const toolbarTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const toolbarSelectionRef = useRef<{ start: number; end: number } | null>(null);
+  // Mirror the cached selection into reactive state so the toolbar can
+  // display a preview of what substring will be styled next.
+  const [selectionPreview, setSelectionPreview] = useState<string>("");
+  const updateSelectionPreview = (ta: HTMLTextAreaElement, start: number, end: number) => {
+    if (start === end) return;
+    const text = (ta.value || "").slice(Math.min(start, end), Math.max(start, end));
+    setSelectionPreview(text);
+  };
   const handleToolbarSelectionChange = (start: number, end: number) => {
     if (start !== end) toolbarSelectionRef.current = { start, end };
   };
@@ -776,7 +784,10 @@ export function PanelGrid() {
           toolbarTextareaRef.current = ta;
           const s = ta.selectionStart ?? 0;
           const en = ta.selectionEnd ?? 0;
-          if (s !== en) toolbarSelectionRef.current = { start: s, end: en };
+          if (s !== en) {
+            toolbarSelectionRef.current = { start: s, end: en };
+            updateSelectionPreview(ta, s, en);
+          }
         }
       }
     };
@@ -1198,6 +1209,7 @@ export function PanelGrid() {
                     // Typing invalidates any cached selection — the indices
                     // would now point at different characters.
                     toolbarSelectionRef.current = null;
+                    setSelectionPreview("");
                     updateHeaderGroupText("col", li, gi, e.target.value);
                   }}
                   onKeyDown={(e) => {
@@ -1211,12 +1223,33 @@ export function PanelGrid() {
                     const ta = e.currentTarget as HTMLTextAreaElement;
                     handleToolbarSelectionChange(ta.selectionStart ?? 0, ta.selectionEnd ?? 0);
                   }}
+                  onMouseUp={(e) => {
+                    // Drag-to-select completes on mouseup; snapshot the
+                    // final range immediately (some browsers fire the
+                    // onSelect/selectionchange event asynchronously, so the
+                    // ref may otherwise hold a mid-drag range when a
+                    // toolbar action fires next).
+                    const ta = e.currentTarget as HTMLTextAreaElement;
+                    const s = ta.selectionStart ?? 0;
+                    const en = ta.selectionEnd ?? 0;
+                    toolbarTextareaRef.current = ta;
+                    if (s !== en) toolbarSelectionRef.current = { start: s, end: en };
+                  }}
+                  onKeyUp={(e) => {
+                    // Keyboard selections (Shift+Arrow etc.) — same story.
+                    const ta = e.currentTarget as HTMLTextAreaElement;
+                    const s = ta.selectionStart ?? 0;
+                    const en = ta.selectionEnd ?? 0;
+                    toolbarTextareaRef.current = ta;
+                    if (s !== en) toolbarSelectionRef.current = { start: s, end: en };
+                  }}
                   placeholder="Header"
                   aria-label={`Column header level ${li + 1} group ${gi + 1}`}
                   onClick={(e) => e.stopPropagation()}
                   onFocus={(e) => {
                     toolbarTextareaRef.current = e.currentTarget as HTMLTextAreaElement;
                     toolbarSelectionRef.current = null;
+                    setSelectionPreview("");
                     const parent = e.currentTarget.parentElement;
                     if (parent) {
                       setToolbarAnchor(parent);
@@ -1551,6 +1584,26 @@ export function PanelGrid() {
                     onSelect={(e) => {
                       const ta = e.currentTarget as HTMLTextAreaElement;
                       handleToolbarSelectionChange(ta.selectionStart ?? 0, ta.selectionEnd ?? 0);
+                    }}
+                    onMouseUp={(e) => {
+                      const ta = e.currentTarget as HTMLTextAreaElement;
+                      const s = ta.selectionStart ?? 0;
+                      const en = ta.selectionEnd ?? 0;
+                      toolbarTextareaRef.current = ta;
+                      if (s !== en) {
+                        toolbarSelectionRef.current = { start: s, end: en };
+                        updateSelectionPreview(ta, s, en);
+                      }
+                    }}
+                    onKeyUp={(e) => {
+                      const ta = e.currentTarget as HTMLTextAreaElement;
+                      const s = ta.selectionStart ?? 0;
+                      const en = ta.selectionEnd ?? 0;
+                      toolbarTextareaRef.current = ta;
+                      if (s !== en) {
+                        toolbarSelectionRef.current = { start: s, end: en };
+                        updateSelectionPreview(ta, s, en);
+                      }
                     }}
                     placeholder="Header"
                     aria-label={`Row header level ${li + 1} group ${gi + 1}`}
@@ -2329,9 +2382,13 @@ export function PanelGrid() {
             toolbarTextareaRef.current = target;
             const s = target.selectionStart ?? 0;
             const en = target.selectionEnd ?? 0;
-            if (s !== en) toolbarSelectionRef.current = { start: s, end: en };
+            if (s !== en) {
+              toolbarSelectionRef.current = { start: s, end: en };
+              updateSelectionPreview(target, s, en);
+            }
           }
         }}
+        selectionPreview={selectionPreview}
       />
     </div>
   );
