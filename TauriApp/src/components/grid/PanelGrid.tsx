@@ -756,6 +756,12 @@ export function PanelGrid() {
   // Mirror the cached selection into reactive state so the toolbar can
   // display a preview of what substring will be styled next.
   const [selectionPreview, setSelectionPreview] = useState<string>("");
+  // Key of the currently-focused header / label textarea (so we can hide
+  // the styled-segment overlay for the one the user is editing — the
+  // overlay was causing reports of "deletion doesn't register" and
+  // "Shift+Enter does nothing" because the transparent-text textarea
+  // beneath it was hard to interact with).
+  const [focusedKey, setFocusedKey] = useState<string>("");
   const updateSelectionPreview = (ta: HTMLTextAreaElement, start: number, end: number) => {
     if (start === end) return;
     const text = (ta.value || "").slice(Math.min(start, end), Math.max(start, end));
@@ -1237,8 +1243,13 @@ export function PanelGrid() {
                 {/* Left drag handle */}
                 {renderDragHandle("col", li, gi, "start", groupCols)}
 
+                {(() => {
+                  const thisKey = `col-${li}-${gi}`;
+                  const isEditing = focusedKey === thisKey;
+                  const showOverlay = !isEditing && group.styled_segments && group.styled_segments.length > 0;
+                  return (
                 <div style={{ position: "relative", flex: 1, minWidth: 0 }}>
-                {group.styled_segments && group.styled_segments.length > 0 && (
+                {showOverlay && (
                   <div
                     aria-hidden
                     className="text-center text-[10px] rounded px-1 py-0.5"
@@ -1291,11 +1302,13 @@ export function PanelGrid() {
                     Math.min(4, Math.max(1, Math.ceil(group.text.length / 18))),
                   )}
                   style={{
-                    // When per-character styled segments exist, make the
-                    // textarea's own text transparent so only the styled
-                    // overlay above is visible. caretColor keeps the cursor
-                    // visible for editing.
-                    color: (group.styled_segments && group.styled_segments.length > 0)
+                    // Text color: transparent only when the overlay is
+                    // actively showing (i.e. segments exist AND this
+                    // textarea isn't the one the user is currently
+                    // editing). While editing, keep the text visible so
+                    // keyboard input (Backspace, Shift+Enter, etc.) shows
+                    // up normally.
+                    color: showOverlay
                       ? "transparent"
                       : (group.default_color || "var(--c-text-dim)"),
                     caretColor: group.default_color || "var(--c-text-dim)",
@@ -1364,19 +1377,23 @@ export function PanelGrid() {
                     toolbarTextareaRef.current = e.currentTarget as HTMLTextAreaElement;
                     toolbarSelectionRef.current = null;
                     setSelectionPreview("");
+                    setFocusedKey(thisKey);
                     const parent = e.currentTarget.parentElement;
                     if (parent) {
                       setToolbarAnchor(parent);
                       setToolbarTarget({ type: "header", axis: "col", level: li, groupIdx: gi });
                     }
                   }}
-                  // Note: we deliberately do NOT clear the textarea ref or
-                  // selection on blur. When the user clicks the toolbar
-                  // (colour, bold, italic, …), the textarea blurs but we
-                  // still need to know which element was being edited so
-                  // resolveSelection() can pull the range off that element.
+                  onBlur={() => {
+                    // Only clear the focused flag — leave toolbar refs
+                    // intact so toolbar button clicks can still resolve
+                    // the selection.
+                    setFocusedKey((cur) => (cur === thisKey ? "" : cur));
+                  }}
                 />
                 </div>
+                );
+                })()}
 
                 {/* Always-visible edit button */}
                 <Tooltip title="Edit header properties" placement="right" arrow>
