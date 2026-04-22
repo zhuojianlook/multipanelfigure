@@ -1730,21 +1730,24 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   }, [open, row, col, panelImageName]);
 
   // Load original image for the crop canvas (thumbnail) + fetch original dimensions.
-  // Uses an open-counter to ensure we always re-init when the dialog opens,
-  // even if it's the same image (crop may have changed via Apply).
-  const openCountRef = useRef(0);
-  const lastInitCountRef = useRef(0);
+  // Runs on every dialog-open transition. When the dialog is closed we
+  // also reset the crop-related state back to defaults so reopening goes
+  // through a clean init path (otherwise stale imgNatW / cropRect values
+  // from a previous session could linger and cause "overlay disappears
+  // after Apply then reopen" symptoms).
   useEffect(() => {
-    if (open) openCountRef.current++;
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      // Reset on close so the next open is fresh.
+      setImgNatW(0);
+      setImgNatH(0);
+      setOrigFullW(0);
+      setOrigFullH(0);
+      setOrigImgSrc("");
+      setCropRect({ x: 0, y: 0, w: 100, h: 100 });
+      return;
+    }
     const panelImageName = panel?.image_name;
     if (!panelImageName) return;
-    // Only init once per dialog open (openCount tracks each open)
-    if (lastInitCountRef.current === openCountRef.current) return;
-    lastInitCountRef.current = openCountRef.current;
 
     const thumbObj = loadedImages[panelImageName];
     if (!thumbObj?.thumbnailB64) return;
@@ -1837,8 +1840,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
 
       setOrigImgSrc(src);
     };
+    img.onerror = () => {
+      console.warn("[EditPanelDialog] failed to load thumbnail for", panelImageName);
+    };
     img.src = src;
-  }, [open, panel?.image_name, panel?.crop, panel?.aspect_ratio_str, panel?.rotation]); // eslint-disable-line react-hooks/exhaustive-deps
+    // Fire onload synchronously for already-decoded (cached / data URL)
+    // images — matches the behaviour in CropCanvas.
+    if (img.complete && img.naturalWidth > 0) {
+      img.onload && (img.onload as () => void)(/* synthetic */);
+    }
+  }, [open, panel?.image_name]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Load thumbnail image for client-side preview generation
   useEffect(() => {

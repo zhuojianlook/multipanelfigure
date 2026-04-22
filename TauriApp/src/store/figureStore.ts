@@ -86,7 +86,7 @@ interface FigureState {
   updateLabelFormatting: (
     axis: "col" | "row",
     index: number,
-    patch: Partial<Pick<import("../api/types").AxisLabel, "font_size" | "font_name" | "font_style" | "default_color" | "position" | "distance" | "rotation">>,
+    patch: Partial<Pick<import("../api/types").AxisLabel, "font_size" | "font_name" | "font_style" | "default_color" | "position" | "distance" | "rotation" | "styled_segments">>,
   ) => void;
 
   // Header level swapping
