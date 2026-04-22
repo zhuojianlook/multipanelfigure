@@ -239,6 +239,10 @@ function buildDefaultConfig(rows: number, cols: number): FigureConfig {
 
 let previewTimer: ReturnType<typeof setTimeout> | null = null;
 let syncTimer: ReturnType<typeof setTimeout> | null = null;
+// Monotonic sequence for preview requests so an older in-flight GET
+// response can't overwrite a newer one (race condition seen as a
+// "ghost" of the previous header state appearing in the preview).
+let previewSeq = 0;
 
 // ── Store ────────────────────────────────────────────────
 
@@ -548,14 +552,20 @@ export const useFigureStore = create<FigureState>()(
         }
       });
       if (syncTimer) clearTimeout(syncTimer);
-      syncTimer = setTimeout(() => {
+      syncTimer = setTimeout(async () => {
         const cfg = get().config;
-        if (cfg) {
+        if (!cfg) return;
+        // Await the header patch before kicking off the preview so the
+        // backend is guaranteed to have the new (possibly-cleared) text
+        // AND segments when the preview is rendered.
+        try {
           const patchFn = axis === "col" ? api.patchColumnHeaders : api.patchRowHeaders;
           const headers = axis === "col" ? cfg.column_headers : cfg.row_headers;
-          patchFn.call(api, headers).catch(console.error);
-          get().requestPreview();
+          await patchFn.call(api, headers);
+        } catch (e) {
+          console.error(e);
         }
+        get().requestPreview();
       }, 500);
     },
 
@@ -833,20 +843,28 @@ export const useFigureStore = create<FigureState>()(
         }
       });
       if (syncTimer) clearTimeout(syncTimer);
-      syncTimer = setTimeout(() => {
+      syncTimer = setTimeout(async () => {
         const cfg = get().config;
-        if (cfg) {
-          // When font_size syncs across both axes at level 0, patch both
+        if (!cfg) return;
+        // AWAIT the patch so the backend definitely has the latest state
+        // before we ask for a new preview. Without the await, the preview
+        // GET can race with the patch POST and render with stale state —
+        // the user's reported "old header ghost reappears in preview".
+        try {
           if (patch.font_size !== undefined && level === 0) {
-            api.patchColumnHeaders(cfg.column_headers).catch(console.error);
-            api.patchRowHeaders(cfg.row_headers).catch(console.error);
+            await Promise.all([
+              api.patchColumnHeaders(cfg.column_headers),
+              api.patchRowHeaders(cfg.row_headers),
+            ]);
           } else {
             const patchFn = axis === "col" ? api.patchColumnHeaders : api.patchRowHeaders;
             const headers = axis === "col" ? cfg.column_headers : cfg.row_headers;
-            patchFn.call(api, headers).catch(console.error);
+            await patchFn.call(api, headers);
           }
-          get().requestPreview();
+        } catch (e) {
+          console.error(e);
         }
+        get().requestPreview();
       }, 300);
     },
 
@@ -1108,11 +1126,17 @@ export const useFigureStore = create<FigureState>()(
     requestPreview: () => {
       if (previewTimer) clearTimeout(previewTimer);
       previewTimer = setTimeout(async () => {
+        const mySeq = ++previewSeq;
         set((s) => {
           s.previewLoading = true;
         });
         try {
           const resp = await api.getPreview();
+          // Discard this response if a newer preview request has been
+          // started since we fired this one — prevents a slow older
+          // render from clobbering a fresher one (the reported "ghost
+          // old header in preview" symptom).
+          if (mySeq !== previewSeq) return;
           set((s) => {
             s.previewImageB64 = resp.image;
             s.previewLoading = false;

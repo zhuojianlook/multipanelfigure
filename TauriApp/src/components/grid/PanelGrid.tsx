@@ -1281,7 +1281,15 @@ export function PanelGrid() {
                   className="bg-transparent text-center text-[10px] w-full min-w-0 outline-none
                              rounded px-1 py-0.5 hover:ring-1 hover:ring-blue-400/40 transition-shadow
                              resize-none"
-                  rows={group.text.includes("\n") ? Math.min(4, group.text.split("\n").length) : 1}
+                  rows={Math.max(
+                    // Explicit newlines the user typed via Shift+Enter.
+                    group.text.includes("\n") ? Math.min(4, group.text.split("\n").length) : 1,
+                    // Plus a length-based auto-grow estimate — roughly
+                    // 18 characters per visible line at the 10-px font
+                    // size used for headers. Capped at 4 rows so a very
+                    // long header doesn't push the grid around.
+                    Math.min(4, Math.max(1, Math.ceil(group.text.length / 18))),
+                  )}
                   style={{
                     // When per-character styled segments exist, make the
                     // textarea's own text transparent so only the styled
@@ -1664,7 +1672,10 @@ export function PanelGrid() {
                     className="bg-transparent text-center text-[10px] outline-none
                                rounded px-0.5 py-1 hover:ring-1 hover:ring-blue-400/40 transition-shadow
                                resize-none"
-                    rows={group.text.includes("\n") ? Math.min(4, group.text.split("\n").length) : 1}
+                    rows={Math.max(
+                      group.text.includes("\n") ? Math.min(4, group.text.split("\n").length) : 1,
+                      Math.min(4, Math.max(1, Math.ceil(group.text.length / 18))),
+                    )}
                     style={{
                       color: group.default_color || "var(--c-text-dim)",
                       backgroundColor: isBeingDragged ? "var(--c-accent)" : "rgba(255,255,255,0.15)",
