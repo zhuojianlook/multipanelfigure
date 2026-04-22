@@ -20,6 +20,7 @@ import FormatUnderlinedIcon from "@mui/icons-material/FormatUnderlined";
 import StrikethroughSIcon from "@mui/icons-material/StrikethroughS";
 import SuperscriptIcon from "@mui/icons-material/Superscript";
 import SubscriptIcon from "@mui/icons-material/Subscript";
+import SubdirectoryArrowLeftIcon from "@mui/icons-material/SubdirectoryArrowLeft";
 
 interface Props {
   anchorEl: HTMLElement | null;
@@ -45,6 +46,10 @@ interface Props {
    *  selected substring (if any). Lets the user see what their next
    *  style change will apply to. */
   selectionPreview?: string;
+  /** Click handler for the "insert line break" button — works as a
+   *  keyboard-independent alternative to Shift+Enter for users on
+   *  environments where that key combo doesn't reach the textarea. */
+  onInsertLineBreak?: () => void;
 }
 
 export function FloatingToolbar({
@@ -62,6 +67,7 @@ export function FloatingToolbar({
   onColorChange,
   onBeforeAction,
   selectionPreview,
+  onInsertLineBreak,
 }: Props) {
   // Normalize fonts to an array of strings
   const fontList: string[] = Array.isArray(fonts)
@@ -227,6 +233,21 @@ export function FloatingToolbar({
             <SubscriptIcon sx={{ fontSize: 16 }} />
           </IconButton>
         </Tooltip>
+
+        {/* Insert line break — keyboard-independent alternative to
+            Shift+Enter, which doesn't always reach the textarea in
+            WKWebView / WebView2 environments. */}
+        {onInsertLineBreak && (
+          <Tooltip title="Insert line break (same as Shift+Enter)" arrow>
+            <IconButton
+              size="small"
+              onClick={onInsertLineBreak}
+              sx={{ width: 28, height: 28 }}
+            >
+              <SubdirectoryArrowLeftIcon sx={{ fontSize: 16 }} />
+            </IconButton>
+          </Tooltip>
+        )}
 
         {/* Separator */}
         <Box

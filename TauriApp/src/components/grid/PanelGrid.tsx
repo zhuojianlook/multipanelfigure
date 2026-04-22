@@ -804,15 +804,47 @@ export function PanelGrid() {
       const t = e.target as HTMLElement | null;
       console.log("[mpf-global] keydown", {
         key: e.key,
+        code: e.code,
         shift: e.shiftKey,
         ctrl: e.ctrlKey,
         meta: e.metaKey,
+        alt: e.altKey,
         targetTag: t?.tagName,
         targetAria: t?.getAttribute?.("aria-label") || "",
         activeTag: (document.activeElement as HTMLElement | null)?.tagName,
         activeAria: (document.activeElement as HTMLElement | null)?.getAttribute?.("aria-label") || "",
       });
     };
+    const onAnyKeyWindow = (e: KeyboardEvent) => {
+      console.log("[mpf-window] keydown", { key: e.key, code: e.code, shift: e.shiftKey });
+    };
+    const onAnyKeyUp = (e: KeyboardEvent) => {
+      console.log("[mpf-global] keyup", { key: e.key, code: e.code, shift: e.shiftKey });
+    };
+    const onBeforeInput = (e: Event) => {
+      const t = e.target as HTMLElement | null;
+      const a = t?.getAttribute?.("aria-label") || "";
+      if (/\b(header|label)\b/i.test(a)) {
+        console.log("[mpf-global] beforeinput", {
+          tag: t?.tagName,
+          aria: a,
+          inputType: (e as unknown as { inputType?: string }).inputType,
+          data: (e as unknown as { data?: string }).data,
+        });
+      }
+    };
+    const onFocusChange = () => {
+      const ae = document.activeElement as HTMLElement | null;
+      console.log("[mpf-global] focuschange", {
+        tag: ae?.tagName,
+        aria: ae?.getAttribute?.("aria-label") || "",
+      });
+    };
+    document.addEventListener("focusin", onFocusChange);
+    document.addEventListener("focusout", onFocusChange);
+    document.addEventListener("keyup", onAnyKeyUp, true);
+    document.addEventListener("beforeinput", onBeforeInput, true);
+    window.addEventListener("keydown", onAnyKeyWindow, true);
     const onAnyInput = (e: Event) => {
       const t = e.target as HTMLTextAreaElement | HTMLInputElement | null;
       const a = t?.getAttribute?.("aria-label") || "";
@@ -838,6 +870,11 @@ export function PanelGrid() {
     // while the user is still holding it.
     const pollId = window.setInterval(captureSelectionFromActive, 100);
     return () => {
+      document.removeEventListener("focusin", onFocusChange);
+      document.removeEventListener("focusout", onFocusChange);
+      document.removeEventListener("keyup", onAnyKeyUp, true);
+      document.removeEventListener("beforeinput", onBeforeInput, true);
+      window.removeEventListener("keydown", onAnyKeyWindow, true);
       document.removeEventListener("keydown", onAnyKey, true);
       document.removeEventListener("input", onAnyInput, true);
       document.removeEventListener("selectionchange", captureSelectionFromActive);
@@ -2564,6 +2601,34 @@ export function PanelGrid() {
           }
         }}
         selectionPreview={selectionPreview}
+        onInsertLineBreak={() => {
+          // Insert a newline at the current cursor of whichever
+          // header/label field the toolbar is anchored to. Bypasses the
+          // Shift+Enter keystroke, which doesn't reach the textarea in
+          // some WKWebView builds.
+          const ta = toolbarTextareaRef.current as HTMLTextAreaElement | null;
+          if (!ta || !toolbarTarget) return;
+          const start = ta.selectionStart ?? ta.value.length;
+          const end = ta.selectionEnd ?? ta.value.length;
+          const before = ta.value.slice(0, start);
+          const after = ta.value.slice(end);
+          const newText = before + "\n" + after;
+          // Update the store via the appropriate path
+          if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
+            updateHeaderGroupText(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, newText);
+          } else if (toolbarTarget.type === "colLabel" && toolbarTarget.index !== undefined) {
+            updateColumnLabel(toolbarTarget.index, newText);
+          } else if (toolbarTarget.type === "rowLabel" && toolbarTarget.index !== undefined) {
+            updateRowLabel(toolbarTarget.index, newText);
+          }
+          // Restore cursor position right after the inserted newline.
+          requestAnimationFrame(() => {
+            try {
+              ta.focus();
+              ta.setSelectionRange(start + 1, start + 1);
+            } catch { /* ignore */ }
+          });
+        }}
       />
     </div>
   );

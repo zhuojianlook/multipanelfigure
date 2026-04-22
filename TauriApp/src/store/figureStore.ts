@@ -1138,6 +1138,13 @@ export const useFigureStore = create<FigureState>()(
     // ── Preview ───────────────────────────────────────────
 
     requestPreview: () => {
+      // Keep the top frame of the stack so we can see what code path
+      // triggered this preview refresh. Useful for diagnosing "why did a
+      // preview fetch happen when I didn't type anything" symptoms.
+      try {
+        const stack = (new Error().stack || "").split("\n").slice(2, 5).join(" | ");
+        console.log("[mpf] requestPreview called", stack);
+      } catch { /* noop */ }
       if (previewTimer) clearTimeout(previewTimer);
       // Short debounce — the upstream syncTimer already batches typing, so
       // we only need enough here to coalesce multiple near-simultaneous
