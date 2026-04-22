@@ -566,7 +566,7 @@ export const useFigureStore = create<FigureState>()(
           console.error(e);
         }
         get().requestPreview();
-      }, 500);
+      }, 200);
     },
 
     addRowHeaderLevel: () => {
@@ -865,7 +865,7 @@ export const useFigureStore = create<FigureState>()(
           console.error(e);
         }
         get().requestPreview();
-      }, 300);
+      }, 150);
     },
 
     updateLabelFormatting: (axis, index, patch) => {
@@ -885,15 +885,21 @@ export const useFigureStore = create<FigureState>()(
         }
       });
       if (syncTimer) clearTimeout(syncTimer);
-      syncTimer = setTimeout(() => {
+      syncTimer = setTimeout(async () => {
         const cfg = get().config;
-        if (cfg) {
-          // Sync both axes when font_size changes
-          api.patchColumnLabels(cfg.column_labels).catch(console.error);
-          api.patchRowLabels(cfg.row_labels).catch(console.error);
-          get().requestPreview();
+        if (!cfg) return;
+        // Await label patch so the backend has the latest labels before
+        // we ask for a preview (same race that caused header ghosts).
+        try {
+          await Promise.all([
+            api.patchColumnLabels(cfg.column_labels),
+            api.patchRowLabels(cfg.row_labels),
+          ]);
+        } catch (e) {
+          console.error(e);
         }
-      }, 300);
+        get().requestPreview();
+      }, 200);
     },
 
     // ── Panel drag-and-drop ─────────────────────────────────
@@ -1125,6 +1131,10 @@ export const useFigureStore = create<FigureState>()(
 
     requestPreview: () => {
       if (previewTimer) clearTimeout(previewTimer);
+      // Short debounce — the upstream syncTimer already batches typing, so
+      // we only need enough here to coalesce multiple near-simultaneous
+      // `get().requestPreview()` calls (e.g., when several headers are
+      // updated at once).
       previewTimer = setTimeout(async () => {
         const mySeq = ++previewSeq;
         set((s) => {
@@ -1147,7 +1157,7 @@ export const useFigureStore = create<FigureState>()(
             s.previewLoading = false;
           });
         }
-      }, 400);
+      }, 100);
     },
 
     // ── Full config sync ──────────────────────────────────
