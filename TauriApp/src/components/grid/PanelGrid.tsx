@@ -332,7 +332,34 @@ export function PanelGrid() {
   const closeToolbar = () => {
     setToolbarAnchor(null);
     setToolbarTarget(null);
+    setSelectionPreview("");
   };
+
+  // Close the floating toolbar when the user clicks anywhere that isn't
+  // the toolbar itself or the textarea/input it's anchored to. Required
+  // because hideBackdrop+pointerEvents:none on the Popover (which was
+  // necessary to keep textarea drag-selection working) also disabled
+  // MUI's native click-outside-to-close behaviour.
+  useEffect(() => {
+    if (!toolbarAnchor) return;
+    const onDocMouseDown = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (!t) return;
+      // Inside the toolbar popover (paper or any descendant) — don't close.
+      if (t.closest('.MuiPopover-paper')) return;
+      // Inside the anchor element (the textarea / input's wrapper) — don't close.
+      if (toolbarAnchor.contains(t)) return;
+      // Inside ANY header / label textarea / input (user is switching
+      // between adjacent editable fields — new onFocus will re-anchor).
+      if (t.tagName === "TEXTAREA" || t.tagName === "INPUT") {
+        const a = t.getAttribute("aria-label") || "";
+        if (/\b(header|label)\b/i.test(a)) return;
+      }
+      closeToolbar();
+    };
+    document.addEventListener("mousedown", onDocMouseDown);
+    return () => document.removeEventListener("mousedown", onDocMouseDown);
+  }, [toolbarAnchor]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ── Drag-to-resize handlers ────────────────────────── */
 
@@ -729,10 +756,6 @@ export function PanelGrid() {
   // Mirror the cached selection into reactive state so the toolbar can
   // display a preview of what substring will be styled next.
   const [selectionPreview, setSelectionPreview] = useState<string>("");
-  // Live diagnostic string shown in the toolbar so we can see (without
-  // DevTools) exactly what the browser reports for the active element's
-  // selection on each poll.
-  const [selectionDebug, setSelectionDebug] = useState<string>("");
   const updateSelectionPreview = (ta: HTMLTextAreaElement, start: number, end: number) => {
     if (start === end) return;
     const text = (ta.value || "").slice(Math.min(start, end), Math.max(start, end));
@@ -745,25 +768,16 @@ export function PanelGrid() {
     const ae = document.activeElement as HTMLElement | null;
     // Headers are <textarea> but labels are still <input> — BOTH expose
     // selectionStart/End the same way, so treat them uniformly.
-    if (ae && (ae.tagName === "TEXTAREA" || ae.tagName === "INPUT")) {
-      const ta = ae as HTMLTextAreaElement | HTMLInputElement;
-      const s = (ta as HTMLTextAreaElement).selectionStart ?? 0;
-      const en = (ta as HTMLTextAreaElement).selectionEnd ?? 0;
-      const a = ta.getAttribute("aria-label") || "";
-      setSelectionDebug(`${ae.tagName}:${s}-${en}${a ? ` [${a.split(" ")[0]}]` : ""}`);
-      const matches = /\b(header|label)\b/i.test(a);
-      if (!matches) return;
-      // Cast — HTMLTextAreaElement and HTMLInputElement both have
-      // selectionStart / selectionEnd / value, which is all we read.
-      toolbarTextareaRef.current = ta as HTMLTextAreaElement;
-      if (s !== en) {
-        toolbarSelectionRef.current = { start: s, end: en };
-        updateSelectionPreview(ta as HTMLTextAreaElement, s, en);
-      }
-    } else if (ae) {
-      setSelectionDebug(`${ae.tagName}`);
-    } else {
-      setSelectionDebug("none");
+    if (!ae || !(ae.tagName === "TEXTAREA" || ae.tagName === "INPUT")) return;
+    const ta = ae as HTMLTextAreaElement | HTMLInputElement;
+    const a = ta.getAttribute("aria-label") || "";
+    if (!/\b(header|label)\b/i.test(a)) return;
+    const s = (ta as HTMLTextAreaElement).selectionStart ?? 0;
+    const en = (ta as HTMLTextAreaElement).selectionEnd ?? 0;
+    toolbarTextareaRef.current = ta as HTMLTextAreaElement;
+    if (s !== en) {
+      toolbarSelectionRef.current = { start: s, end: en };
+      updateSelectionPreview(ta as HTMLTextAreaElement, s, en);
     }
   };
   const handleToolbarSelectionChange = (start: number, end: number) => {
@@ -1223,13 +1237,60 @@ export function PanelGrid() {
                 {/* Left drag handle */}
                 {renderDragHandle("col", li, gi, "start", groupCols)}
 
+                <div style={{ position: "relative", flex: 1, minWidth: 0 }}>
+                {group.styled_segments && group.styled_segments.length > 0 && (
+                  <div
+                    aria-hidden
+                    className="text-center text-[10px] rounded px-1 py-0.5"
+                    style={{
+                      position: "absolute",
+                      inset: 0,
+                      pointerEvents: "none",
+                      minHeight: "28px",
+                      fontWeight: group.font_style?.includes("Bold") ? 700 : 400,
+                      fontStyle: group.font_style?.includes("Italic") ? "italic" : "normal",
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                      lineHeight: 1.2,
+                      overflow: "hidden",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                  >
+                    <span>
+                      {group.styled_segments.map((seg, si) => (
+                        <span
+                          key={si}
+                          style={{
+                            color: seg.color || group.default_color || "var(--c-text-dim)",
+                            fontSize: seg.font_size ? seg.font_size + "px" : undefined,
+                            fontFamily: seg.font_name ? seg.font_name.replace(/\.(ttf|otf|ttc)$/i, "") : undefined,
+                            fontWeight: seg.font_style?.includes("Bold") ? 700 : undefined,
+                            fontStyle: seg.font_style?.includes("Italic") ? "italic" : undefined,
+                            textDecoration: seg.font_style?.includes("Strikethrough") ? "line-through" : seg.font_style?.includes("Underline") ? "underline" : undefined,
+                          }}
+                        >
+                          {seg.text}
+                        </span>
+                      ))}
+                    </span>
+                  </div>
+                )}
                 <textarea
-                  className="bg-transparent text-center text-[10px] flex-1 min-w-0 outline-none
+                  className="bg-transparent text-center text-[10px] w-full min-w-0 outline-none
                              rounded px-1 py-0.5 hover:ring-1 hover:ring-blue-400/40 transition-shadow
                              resize-none"
                   rows={group.text.includes("\n") ? Math.min(4, group.text.split("\n").length) : 1}
                   style={{
-                    color: group.default_color || "var(--c-text-dim)",
+                    // When per-character styled segments exist, make the
+                    // textarea's own text transparent so only the styled
+                    // overlay above is visible. caretColor keeps the cursor
+                    // visible for editing.
+                    color: (group.styled_segments && group.styled_segments.length > 0)
+                      ? "transparent"
+                      : (group.default_color || "var(--c-text-dim)"),
+                    caretColor: group.default_color || "var(--c-text-dim)",
                     backgroundColor: isBeingDragged ? "var(--c-accent)" : "rgba(255,255,255,0.15)",
                     minHeight: "28px",
                     borderBottom: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
@@ -1298,6 +1359,7 @@ export function PanelGrid() {
                   // still need to know which element was being edited so
                   // resolveSelection() can pull the range off that element.
                 />
+                </div>
 
                 {/* Always-visible edit button */}
                 <Tooltip title="Edit header properties" placement="right" arrow>
@@ -2425,7 +2487,6 @@ export function PanelGrid() {
           }
         }}
         selectionPreview={selectionPreview}
-        debugInfo={selectionDebug}
       />
     </div>
   );

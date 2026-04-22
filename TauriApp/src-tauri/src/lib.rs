@@ -131,7 +131,26 @@ async fn download_and_install_update(
 #[tauri::command]
 async fn save_base64_to_path(path: String, data_b64: String) -> Result<(), String> {
     let bytes = base64_decode(&data_b64).map_err(|e| format!("Base64 decode: {}", e))?;
+    let expected_len = bytes.len();
     std::fs::write(&path, &bytes).map_err(|e| format!("Write failed: {}", e))?;
+    // Post-write verification — if the filesystem swallowed the write but
+    // didn't raise an error (disk full on some platforms, quota exceeded,
+    // write-through cache lag), the file can end up 0 bytes or truncated.
+    // Detect that and surface a real error so the UI can show the user a
+    // meaningful message instead of a silent corrupt output file.
+    match std::fs::metadata(&path) {
+        Ok(meta) => {
+            let written = meta.len() as usize;
+            if written < expected_len.max(1) {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!(
+                    "Save incomplete: wrote {} bytes, expected {} (disk may be full).",
+                    written, expected_len
+                ));
+            }
+        }
+        Err(e) => return Err(format!("Verify failed: {}", e)),
+    }
     Ok(())
 }
 

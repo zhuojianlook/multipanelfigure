@@ -1020,14 +1020,37 @@ def save_volume_render(name: str, body: ZStackVolumeSaveRequest):
     img = _render_volume_to_pil(name, body)
     fmt = body.format.upper()
     save_kwargs: dict = {}
+    save_path = os.path.expanduser(body.path.strip() if body.path else "")
+    # Pre-flight disk-space check with a conservative size estimate
+    # (raw RGB is a hard upper bound for PNG/TIFF output).
+    try:
+        import shutil as _shutil
+        target_dir = os.path.dirname(save_path) or "."
+        estimated = img.size[0] * img.size[1] * 4 + 16 * 1024 * 1024
+        usage = _shutil.disk_usage(target_dir)
+        if usage.free < estimated:
+            raise HTTPException(507, f"Not enough disk space: need ~{estimated//(1024*1024)} MB, have {usage.free//(1024*1024)} MB free.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     if fmt == "JPEG":
         save_kwargs["quality"] = max(1, min(100, body.quality))
-        img.save(body.path, format="JPEG", **save_kwargs)
+        img.save(save_path, format="JPEG", **save_kwargs)
     elif fmt == "TIFF":
-        img.save(body.path, format="TIFF", compression="tiff_lzw")
+        img.save(save_path, format="TIFF", compression="tiff_lzw")
     else:
-        img.save(body.path, format="PNG")
-    return {"ok": True, "path": body.path}
+        img.save(save_path, format="PNG")
+    # Post-write verification — 0-byte means the write silently failed.
+    try:
+        sz = os.path.getsize(save_path)
+    except OSError:
+        sz = 0
+    if sz <= 0:
+        try: os.unlink(save_path)
+        except OSError: pass
+        raise HTTPException(500, f"Save failed: output file is empty ({save_path}).")
+    return {"ok": True, "path": save_path, "size_bytes": sz}
 
 
 class ZStackVolumeAsPanelRequest(ZStackVolumeRenderRequest):
@@ -1743,9 +1766,48 @@ def save_figure(body: SaveFigureRequest):
     fig_bytes = assemble_figure(cfg, processed, dpi=body.dpi, full_res_sizes=full_res_sizes2)
     save_path = os.path.expanduser(body.path.strip())
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+
+    # Pre-flight disk-space check — we know how many bytes we're about to
+    # write; refuse if the target volume can't hold them (plus a small
+    # margin). Prevents silent 0-byte output files on low-space machines.
+    try:
+        import shutil as _shutil
+        target_dir = os.path.dirname(save_path) or "."
+        usage = _shutil.disk_usage(target_dir)
+        required = len(fig_bytes) + 16 * 1024 * 1024  # +16 MB headroom
+        if usage.free < required:
+            raise HTTPException(
+                507,
+                f"Not enough disk space to save figure: need "
+                f"{required // (1024*1024)} MB, have "
+                f"{usage.free // (1024*1024)} MB free on the target volume.",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Don't block save if disk-usage call itself fails; just log.
+        import sys
+        print(f"[save_figure] disk_usage check failed: {e}", file=sys.stderr, flush=True)
+
     with open(save_path, "wb") as f:
         f.write(fig_bytes)
-    return {"ok": True, "path": save_path}
+
+    # Post-write verification — if the file somehow ended up 0 bytes or
+    # much smaller than expected (partial write, quota, etc.), delete it
+    # and surface an error rather than leaving a broken output behind.
+    try:
+        written = os.path.getsize(save_path)
+    except OSError:
+        written = 0
+    if written < max(1, len(fig_bytes) // 2):
+        try: os.unlink(save_path)
+        except OSError: pass
+        raise HTTPException(
+            500,
+            f"Save failed: wrote {written} bytes, expected {len(fig_bytes)} (possible disk-full or permission issue).",
+        )
+
+    return {"ok": True, "path": save_path, "size_bytes": written}
 
 
 class ProjectSaveRequest(BaseModel):
@@ -1771,10 +1833,34 @@ def save_proj(body: ProjectSaveRequest):
                 img_bytes[name] = vf.read()
         else:
             img_bytes[name] = pil_to_bytes(img)
+
+    # Pre-flight disk-space check. Project file size ≈ sum of all image
+    # bytes plus ~10% overhead for config JSON + ZIP metadata.
+    try:
+        import shutil as _shutil
+        target_dir = os.path.dirname(path) or "."
+        payload_size = sum(len(b) for b in img_bytes.values())
+        required = int(payload_size * 1.1) + 16 * 1024 * 1024  # +16 MB headroom
+        usage = _shutil.disk_usage(target_dir)
+        if usage.free < required:
+            raise HTTPException(
+                507,
+                f"Not enough disk space to save project: need ~"
+                f"{required // (1024*1024)} MB, have "
+                f"{usage.free // (1024*1024)} MB free on the target volume.",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        import sys
+        print(f"[save_proj] disk_usage check failed: {e}", file=sys.stderr, flush=True)
+
     save_project(cfg, img_bytes, path, custom_fonts or None)
     # Verify file was written
     if not os.path.isfile(path) or os.path.getsize(path) == 0:
-        raise HTTPException(500, f"Save failed: file at {path} is empty or missing")
+        try: os.unlink(path)
+        except OSError: pass
+        raise HTTPException(500, f"Save failed: file at {path} is empty or missing (possible disk-full or permission issue).")
     return {"ok": True, "path": path, "size_bytes": os.path.getsize(path)}
 
 
