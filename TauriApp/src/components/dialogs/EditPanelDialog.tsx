@@ -393,6 +393,18 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
     return () => cancelAnimationFrame(id);
   }, [loaded]);
 
+  // Final safety net — on initial mount and whenever props change such
+  // that the canvas would need repainting, schedule a cascade of draws
+  // over the first few seconds. Covers any remaining race where the
+  // browser hadn't laid out / decoded the image when earlier draws fired.
+  useEffect(() => {
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    for (const ms of [16, 50, 150, 400, 800, 1500, 3000]) {
+      timers.push(setTimeout(() => drawRef.current(), ms));
+    }
+    return () => timers.forEach(clearTimeout);
+  }, [imageSrc]);
+
   // Draw — extracted into a ref'd function so it can be called from multiple
   // places (layout effect, rAF tick, active-change effect). Canvas bitmaps
   // can be discarded by the browser in a display:none'd tab, so we rely on

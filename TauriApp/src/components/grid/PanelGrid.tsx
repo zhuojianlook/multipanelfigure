@@ -767,33 +767,48 @@ export function PanelGrid() {
     const text = (ta.value || "").slice(Math.min(start, end), Math.max(start, end));
     setSelectionPreview(text);
   };
+  // Centralized capture — whenever called, reads the active textarea's
+  // current selection and, if non-empty, caches it and updates the
+  // visible preview. Called from many triggers to maximize reliability.
+  const captureSelectionFromActive = () => {
+    const ae = document.activeElement as HTMLElement | null;
+    if (!ae || ae.tagName !== "TEXTAREA") return;
+    const ta = ae as HTMLTextAreaElement;
+    const a = ta.getAttribute("aria-label") || "";
+    if (!(a.startsWith("Column header") || a.startsWith("Row header"))) return;
+    toolbarTextareaRef.current = ta;
+    const s = ta.selectionStart ?? 0;
+    const en = ta.selectionEnd ?? 0;
+    if (s !== en) {
+      toolbarSelectionRef.current = { start: s, end: en };
+      updateSelectionPreview(ta, s, en);
+    }
+  };
   const handleToolbarSelectionChange = (start: number, end: number) => {
-    if (start !== end) toolbarSelectionRef.current = { start, end };
+    if (start !== end) {
+      toolbarSelectionRef.current = { start, end };
+      // Also update the preview so the indicator reactively shows the
+      // selected substring — important because in WebKit the document
+      // selectionchange event doesn't fire for textarea selections.
+      const ta = toolbarTextareaRef.current;
+      if (ta) updateSelectionPreview(ta, start, end);
+    }
   };
   useEffect(() => {
-    const handler = () => {
-      const ae = document.activeElement as HTMLElement | null;
-      if (ae && ae.tagName === "TEXTAREA") {
-        const ta = ae as HTMLTextAreaElement;
-        // Only track textareas we care about (headers/labels). The parent
-        // <div> of our header textareas has aria-label starting with
-        // "Column header" or "Row header"; easier to just test the
-        // textarea's own aria-label.
-        const a = ta.getAttribute("aria-label") || "";
-        if (a.startsWith("Column header") || a.startsWith("Row header")) {
-          toolbarTextareaRef.current = ta;
-          const s = ta.selectionStart ?? 0;
-          const en = ta.selectionEnd ?? 0;
-          if (s !== en) {
-            toolbarSelectionRef.current = { start: s, end: en };
-            updateSelectionPreview(ta, s, en);
-          }
-        }
-      }
+    // Document-level selectionchange (works in Chrome/Firefox for textarea)
+    document.addEventListener("selectionchange", captureSelectionFromActive);
+    // Global fallbacks — mouseup and keyup anywhere. Essential for WebKit
+    // where selectionchange on document doesn't catch textarea selections,
+    // and for the common case where drag-selecting ends with the cursor
+    // OUTSIDE the textarea (React's onMouseUp on the element never fires).
+    document.addEventListener("mouseup", captureSelectionFromActive);
+    document.addEventListener("keyup", captureSelectionFromActive);
+    return () => {
+      document.removeEventListener("selectionchange", captureSelectionFromActive);
+      document.removeEventListener("mouseup", captureSelectionFromActive);
+      document.removeEventListener("keyup", captureSelectionFromActive);
     };
-    document.addEventListener("selectionchange", handler);
-    return () => document.removeEventListener("selectionchange", handler);
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Resolve the selection at toolbar-action time: prefer the cached range
   // (captured by the selectionchange listener above right when the user
