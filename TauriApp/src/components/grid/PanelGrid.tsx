@@ -797,6 +797,31 @@ export function PanelGrid() {
     }
   };
   useEffect(() => {
+    // Document-level keydown / input logger — diagnostic. Logs EVERY key
+    // event + target so we can see when a key does / doesn't reach a
+    // textarea, and which element actually has focus.
+    const onAnyKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      console.log("[mpf-global] keydown", {
+        key: e.key,
+        shift: e.shiftKey,
+        ctrl: e.ctrlKey,
+        meta: e.metaKey,
+        targetTag: t?.tagName,
+        targetAria: t?.getAttribute?.("aria-label") || "",
+        activeTag: (document.activeElement as HTMLElement | null)?.tagName,
+        activeAria: (document.activeElement as HTMLElement | null)?.getAttribute?.("aria-label") || "",
+      });
+    };
+    const onAnyInput = (e: Event) => {
+      const t = e.target as HTMLTextAreaElement | HTMLInputElement | null;
+      const a = t?.getAttribute?.("aria-label") || "";
+      if (/\b(header|label)\b/i.test(a)) {
+        console.log("[mpf-global] input", { targetTag: t?.tagName, aria: a, value: JSON.stringify(t?.value || "") });
+      }
+    };
+    document.addEventListener("keydown", onAnyKey, true); // capture phase
+    document.addEventListener("input", onAnyInput, true);
     // Document-level selectionchange (works in Chrome/Firefox for textarea)
     document.addEventListener("selectionchange", captureSelectionFromActive);
     // Global fallbacks — mouseup and keyup anywhere. Essential for WebKit
@@ -813,6 +838,8 @@ export function PanelGrid() {
     // while the user is still holding it.
     const pollId = window.setInterval(captureSelectionFromActive, 100);
     return () => {
+      document.removeEventListener("keydown", onAnyKey, true);
+      document.removeEventListener("input", onAnyInput, true);
       document.removeEventListener("selectionchange", captureSelectionFromActive);
       document.removeEventListener("mouseup", captureSelectionFromActive);
       document.removeEventListener("keyup", captureSelectionFromActive);
@@ -1492,7 +1519,13 @@ export function PanelGrid() {
                   textDecoration: lbl.font_style?.includes("Strikethrough") ? "line-through" : lbl.font_style?.includes("Underline") ? "underline" : "none",
                 }}
                 value={lbl.text}
-                onChange={(e) => updateColumnLabel(ci, e.target.value)}
+                onChange={(e) => {
+                  console.log("[mpf] input onChange colLabel", { ci, value: JSON.stringify(e.target.value) });
+                  updateColumnLabel(ci, e.target.value);
+                }}
+                onKeyDown={(e) => {
+                  console.log("[mpf] input onKeyDown colLabel", { ci, key: e.key, shift: e.shiftKey });
+                }}
                 placeholder={`Col ${ci + 1}`}
                 aria-label={`Column ${ci + 1} label`}
                 onClick={(e) => e.stopPropagation()}
@@ -1704,12 +1737,14 @@ export function PanelGrid() {
                       toolbarSelectionRef.current = null;
                       setSelectionPreview("");
                       const newText = e.target.value;
+                      console.log("[mpf] textarea onChange row", { li, gi, value: JSON.stringify(newText), len: newText.length });
                       updateHeaderGroupText("row", li, gi, newText);
                       if (newText === "" && (group.styled_segments?.length ?? 0) > 0) {
                         updateHeaderGroupFormatting("row", li, gi, { styled_segments: [] });
                       }
                     }}
                     onKeyDown={(e) => {
+                      console.log("[mpf] textarea onKeyDown row", { li, gi, key: e.key, shift: e.shiftKey });
                       if (e.key === "Enter" && !e.shiftKey) {
                         e.preventDefault();
                         (e.currentTarget as HTMLTextAreaElement).blur();
@@ -1957,7 +1992,13 @@ export function PanelGrid() {
                       fontStyle: row_labels[ri]?.font_style?.includes("Italic") ? "italic" : "normal",
                     }}
                     value={row_labels[ri]?.text ?? ""}
-                    onChange={(e) => updateRowLabel(ri, e.target.value)}
+                    onChange={(e) => {
+                      console.log("[mpf] input onChange rowLabel", { ri, value: JSON.stringify(e.target.value) });
+                      updateRowLabel(ri, e.target.value);
+                    }}
+                    onKeyDown={(e) => {
+                      console.log("[mpf] input onKeyDown rowLabel", { ri, key: e.key, shift: e.shiftKey });
+                    }}
                     placeholder={`R${ri + 1}`}
                     aria-label={`Row ${ri + 1} label`}
                     onClick={(e) => e.stopPropagation()}
