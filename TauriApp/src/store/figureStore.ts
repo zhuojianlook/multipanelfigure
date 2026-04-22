@@ -529,6 +529,7 @@ export const useFigureStore = create<FigureState>()(
     },
 
     updateHeaderGroupText: (axis, level, groupIdx, text) => {
+      console.log("[mpf] updateHeaderGroupText", { axis, level, groupIdx, text: JSON.stringify(text), len: text.length });
       set((s) => {
         if (!s.config) return;
         const headers = axis === "col" ? s.config.column_headers : s.config.row_headers;
@@ -555,15 +556,22 @@ export const useFigureStore = create<FigureState>()(
       syncTimer = setTimeout(async () => {
         const cfg = get().config;
         if (!cfg) return;
-        // Await the header patch before kicking off the preview so the
-        // backend is guaranteed to have the new (possibly-cleared) text
-        // AND segments when the preview is rendered.
         try {
           const patchFn = axis === "col" ? api.patchColumnHeaders : api.patchRowHeaders;
           const headers = axis === "col" ? cfg.column_headers : cfg.row_headers;
+          // Summarise what we're about to send so the user can see on DevTools
+          // whether the cleared-text / empty-segments state actually reached
+          // the backend.
+          try {
+            const summary = headers.flatMap((lvl: { headers: { text: string; styled_segments?: unknown[] }[] }) =>
+              lvl.headers.map((h) => ({ text: h.text, segs: h.styled_segments?.length ?? 0 })),
+            );
+            console.log(`[mpf] sync patch ${axis}-headers`, summary);
+          } catch { /* ignore */ }
           await patchFn.call(api, headers);
+          console.log(`[mpf] sync patch ${axis}-headers DONE`);
         } catch (e) {
-          console.error(e);
+          console.error("[mpf] sync patch failed", e);
         }
         get().requestPreview();
       }, 200);
@@ -1137,6 +1145,7 @@ export const useFigureStore = create<FigureState>()(
       // updated at once).
       previewTimer = setTimeout(async () => {
         const mySeq = ++previewSeq;
+        console.log(`[mpf] preview fetch seq=${mySeq}`);
         set((s) => {
           s.previewLoading = true;
         });
@@ -1146,7 +1155,11 @@ export const useFigureStore = create<FigureState>()(
           // started since we fired this one — prevents a slow older
           // render from clobbering a fresher one (the reported "ghost
           // old header in preview" symptom).
-          if (mySeq !== previewSeq) return;
+          if (mySeq !== previewSeq) {
+            console.log(`[mpf] preview fetch seq=${mySeq} DISCARDED (newer=${previewSeq})`);
+            return;
+          }
+          console.log(`[mpf] preview fetch seq=${mySeq} APPLIED (imgBytes=${resp.image?.length ?? 0})`);
           set((s) => {
             s.previewImageB64 = resp.image;
             s.previewLoading = false;

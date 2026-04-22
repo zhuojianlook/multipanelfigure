@@ -1324,23 +1324,17 @@ export function PanelGrid() {
                   }}
                   value={group.text}
                   onChange={(e) => {
-                    // Typing invalidates any cached selection — the indices
-                    // would now point at different characters.
                     toolbarSelectionRef.current = null;
                     setSelectionPreview("");
                     const newText = e.target.value;
+                    console.log("[mpf] textarea onChange col", { li, gi, value: JSON.stringify(newText), len: newText.length });
                     updateHeaderGroupText("col", li, gi, newText);
-                    // Belt-and-suspenders: if the text was just cleared AND
-                    // segments still exist, explicitly wipe them via the
-                    // formatting channel too. Prevents the reported ghost
-                    // restore where an old per-character-styled header
-                    // reappeared after a delete-then-retype cycle.
                     if (newText === "" && (group.styled_segments?.length ?? 0) > 0) {
                       updateHeaderGroupFormatting("col", li, gi, { styled_segments: [] });
                     }
                   }}
                   onKeyDown={(e) => {
-                    // Plain Enter commits (blurs); Shift+Enter inserts a newline.
+                    console.log("[mpf] textarea onKeyDown col", { li, gi, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, meta: e.metaKey, alt: e.altKey });
                     if (e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
                       (e.currentTarget as HTMLTextAreaElement).blur();
