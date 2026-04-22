@@ -803,10 +803,18 @@ export function PanelGrid() {
     // OUTSIDE the textarea (React's onMouseUp on the element never fires).
     document.addEventListener("mouseup", captureSelectionFromActive);
     document.addEventListener("keyup", captureSelectionFromActive);
+    // Final brute-force safety net: poll the active textarea's selection
+    // 10× per second. If ALL the event-based capture paths above somehow
+    // miss the user's selection (selectionchange not firing for textareas
+    // in WebKit, React synthetic events being swallowed, etc.), this
+    // guarantees the preview eventually reflects the current selection
+    // while the user is still holding it.
+    const pollId = window.setInterval(captureSelectionFromActive, 100);
     return () => {
       document.removeEventListener("selectionchange", captureSelectionFromActive);
       document.removeEventListener("mouseup", captureSelectionFromActive);
       document.removeEventListener("keyup", captureSelectionFromActive);
+      window.clearInterval(pollId);
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 

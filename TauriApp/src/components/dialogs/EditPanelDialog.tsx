@@ -393,6 +393,17 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
     return () => cancelAnimationFrame(id);
   }, [loaded]);
 
+  // Absolute nuclear fallback: while the tab is active, poll the draw
+  // function every 250 ms. If the canvas bitmap has been cleared for
+  // ANY reason (browser optimisation, layout change, whatever), this
+  // guarantees it gets repainted within a quarter-second. Cheap — a
+  // fully-populated draw is microseconds.
+  useEffect(() => {
+    if (!active) return;
+    const id = window.setInterval(() => drawRef.current(), 250);
+    return () => window.clearInterval(id);
+  }, [active]);
+
   // Final safety net — on initial mount and whenever props change such
   // that the canvas would need repainting, schedule a cascade of draws
   // over the first few seconds. Covers any remaining race where the
