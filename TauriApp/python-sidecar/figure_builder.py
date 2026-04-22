@@ -107,7 +107,8 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
                 adj_y = y - offset / fig_h
 
         txt = fig.text(x, adj_y, full_text, ha=ha, va=va, fontproperties=adj_fp,
-                       color=color, rotation=rotation)
+                       color=color, rotation=rotation,
+                       multialignment=ha if ha in ("left", "center", "right") else "center")
 
         # Draw underline/strikethrough manually after rendering
         if has_underline or has_strikethrough:
@@ -173,6 +174,36 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
 
 # Cache of font name -> file path lookups
 _font_path_cache: Dict[str, Optional[str]] = {}
+
+
+def _wrap_text_to_width(text: str, width_inches: float, font_size: int) -> str:
+    """Insert \\n at word boundaries so `text` fits within `width_inches`.
+
+    Preserves any newlines the user already typed (Shift+Enter). Uses a
+    conservative average-character-width estimate — exact width depends on
+    the specific font, but 0.55 × font-size works reasonably for typical
+    sans-serif fonts used in scientific figures.
+    """
+    import textwrap as _tw
+    if not text or width_inches <= 0 or font_size <= 0:
+        return text
+    avg_char_w_in = font_size / 72.0 * 0.55
+    if avg_char_w_in <= 0:
+        return text
+    max_chars = max(4, int(width_inches / avg_char_w_in))
+    # Respect explicit newlines already in the text — each user-defined
+    # line is wrapped independently so shift+Enter behaviour is preserved.
+    out_lines = []
+    for raw_line in text.split("\n"):
+        if len(raw_line) <= max_chars:
+            out_lines.append(raw_line)
+        else:
+            wrapped = _tw.wrap(
+                raw_line, width=max_chars,
+                break_long_words=True, break_on_hyphens=True,
+            )
+            out_lines.extend(wrapped or [raw_line])
+    return "\n".join(out_lines)
 
 def _resolve_font_path(font_name: str) -> Optional[str]:
     """Resolve a font filename to its full path using the font discovery system."""
@@ -343,6 +374,29 @@ def _add_column_headers(fig, axes, header_levels: List[HeaderLevel],
             bbox_l = ax_left.get_position()
             bbox_r = ax_right.get_position()
             cx = (bbox_l.x0 + bbox_r.x1) / 2
+
+            # Auto-wrap long headers onto multiple lines so they stay within
+            # the span-width. Keep any user-inserted newlines (Shift+Enter)
+            # intact. We only auto-wrap when the header is rendered with a
+            # uniform style — per-character styled_segments would require
+            # splitting segments at line breaks which we defer.
+            uniform = (not segments) or (
+                len(set(s.get("color") for s in segments if s.get("color"))) <= 1
+                and not any(s.get("font_size") or s.get("font_name") for s in segments)
+            )
+            if uniform and hdr.text:
+                span_w_inches = max(0.0, (bbox_r.x1 - bbox_l.x0)) * fig_w
+                wrapped = _wrap_text_to_width(hdr.text, span_w_inches, hdr.font_size)
+                if wrapped != hdr.text:
+                    # Replace segments with a single default-coloured one
+                    # so multi-line rendering happens cleanly.
+                    segments = [{
+                        "color": hdr.default_color or "#000000",
+                        "text": wrapped,
+                        "font_name": None,
+                        "font_size": None,
+                        "font_style": None,
+                    }]
 
             # For the first tier (closest to panels), start from the primary label position
             if base_y_top is None:

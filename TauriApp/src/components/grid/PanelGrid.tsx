@@ -1307,7 +1307,16 @@ export function PanelGrid() {
                     // would now point at different characters.
                     toolbarSelectionRef.current = null;
                     setSelectionPreview("");
-                    updateHeaderGroupText("col", li, gi, e.target.value);
+                    const newText = e.target.value;
+                    updateHeaderGroupText("col", li, gi, newText);
+                    // Belt-and-suspenders: if the text was just cleared AND
+                    // segments still exist, explicitly wipe them via the
+                    // formatting channel too. Prevents the reported ghost
+                    // restore where an old per-character-styled header
+                    // reappeared after a delete-then-retype cycle.
+                    if (newText === "" && (group.styled_segments?.length ?? 0) > 0) {
+                      updateHeaderGroupFormatting("col", li, gi, { styled_segments: [] });
+                    }
                   }}
                   onKeyDown={(e) => {
                     // Plain Enter commits (blurs); Shift+Enter inserts a newline.
@@ -1671,7 +1680,12 @@ export function PanelGrid() {
                     value={group.text}
                     onChange={(e) => {
                       toolbarSelectionRef.current = null;
-                      updateHeaderGroupText("row", li, gi, e.target.value);
+                      setSelectionPreview("");
+                      const newText = e.target.value;
+                      updateHeaderGroupText("row", li, gi, newText);
+                      if (newText === "" && (group.styled_segments?.length ?? 0) > 0) {
+                        updateHeaderGroupFormatting("row", li, gi, { styled_segments: [] });
+                      }
                     }}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && !e.shiftKey) {

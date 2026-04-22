@@ -531,13 +531,16 @@ export const useFigureStore = create<FigureState>()(
         if (level < headers.length && groupIdx < headers[level].headers.length) {
           const group = headers[level].headers[groupIdx];
           group.text = text;
-          // If per-character styled segments existed but the plain text has
-          // been edited, the segments would now render stale. Clear them so
-          // the whole string falls back to the group default colour until
-          // the user re-applies colour/font to a selection.
+          // Clear per-character styled segments whenever the plain text no
+          // longer matches them. Covers three cases that previously let
+          // stale segments restore the OLD header visually after a
+          // delete-then-retype sequence:
+          //   (a) text went empty
+          //   (b) text is a strict prefix/substring of the old concat
+          //   (c) text is a different string entirely
           if (group.styled_segments && group.styled_segments.length > 0) {
             const concat = group.styled_segments.map((seg: any) => seg.text).join("");
-            if (concat !== text) {
+            if (text === "" || concat !== text) {
               group.styled_segments = [];
             }
           }
