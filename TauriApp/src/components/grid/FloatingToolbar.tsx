@@ -45,6 +45,10 @@ interface Props {
    *  selected substring (if any). Lets the user see what their next
    *  style change will apply to. */
   selectionPreview?: string;
+  /** Diagnostic info — raw selectionStart/End + active tag name — so we
+   *  can see in-app (without DevTools) whether the browser is reporting
+   *  the selection at all. */
+  debugInfo?: string;
 }
 
 export function FloatingToolbar({
@@ -62,6 +66,7 @@ export function FloatingToolbar({
   onColorChange,
   onBeforeAction,
   selectionPreview,
+  debugInfo,
 }: Props) {
   // Normalize fonts to an array of strings
   const fontList: string[] = Array.isArray(fonts)
@@ -334,6 +339,25 @@ export function FloatingToolbar({
           </Box>
         ) : (
           <Box sx={{ ml: 0.5, fontSize: "0.55rem", color: "text.disabled" }}>whole</Box>
+        )}
+
+        {debugInfo && (
+          <Box
+            sx={{
+              ml: 0.5,
+              px: 0.5,
+              py: 0.1,
+              fontSize: "0.5rem",
+              bgcolor: "rgba(255, 200, 0, 0.2)",
+              borderRadius: 0.5,
+              fontFamily: "monospace",
+              color: "text.secondary",
+              whiteSpace: "nowrap",
+            }}
+            title="Selection diagnostic"
+          >
+            {debugInfo}
+          </Box>
         )}
       </Box>
     </Popover>

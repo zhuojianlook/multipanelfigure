@@ -673,13 +673,103 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
     canvas.style.cursor = cursors[mode] || "default";
   };
 
+  // Compute crop overlay pixel positions (container-space). The dark
+  // strips sit outside the crop rect; the blue border wraps the rect.
+  const ox = cropRect.x * scale;
+  const oy = cropRect.y * scale;
+  const ow = cropRect.w * scale;
+  const oh = cropRect.h * scale;
+  // Image display size (pre-rotation) in container space.
+  const imgDispW = imgNatW * scale;
+  const imgDispH = imgNatH * scale;
+  const rotDeg = rotation || 0;
+
   return (
-    <div ref={containerRef} style={{ width: "100%" }}>
+    <div
+      ref={containerRef}
+      style={{
+        width: "100%",
+        height: (canvasH || 200) + "px",
+        position: "relative",
+        borderRadius: 4,
+        border: "1px solid #555",
+        overflow: "hidden",
+        backgroundColor: "#222",
+        userSelect: "none",
+      }}
+    >
+      {/* Always-visible HTML image, rotated/flipped via CSS. This is the
+          definitive source of pixels the user sees — never subject to any
+          canvas-bitmap timing issue. */}
+      {imageSrc && imgDispW > 0 && imgDispH > 0 && (
+        <img
+          src={imageSrc}
+          alt=""
+          draggable={false}
+          style={{
+            position: "absolute",
+            top: "50%",
+            left: "50%",
+            width: imgDispW + "px",
+            height: imgDispH + "px",
+            transform: `translate(-50%, -50%) rotate(${rotDeg}deg) scaleX(${flipH ? -1 : 1}) scaleY(${flipV ? -1 : 1})`,
+            transformOrigin: "center",
+            pointerEvents: "none",
+            display: "block",
+          }}
+        />
+      )}
+
+      {/* Dark overlay strips outside the crop rect. */}
+      {oh > 0 && ow > 0 && (
+        <>
+          {/* top */}
+          <div style={{ position: "absolute", top: 0, left: 0, width: "100%", height: Math.max(0, oy) + "px", backgroundColor: "rgba(0,0,0,0.5)", pointerEvents: "none" }} />
+          {/* bottom */}
+          <div style={{ position: "absolute", top: (oy + oh) + "px", left: 0, width: "100%", height: Math.max(0, canvasH - oy - oh) + "px", backgroundColor: "rgba(0,0,0,0.5)", pointerEvents: "none" }} />
+          {/* left */}
+          <div style={{ position: "absolute", top: oy + "px", left: 0, width: Math.max(0, ox) + "px", height: oh + "px", backgroundColor: "rgba(0,0,0,0.5)", pointerEvents: "none" }} />
+          {/* right */}
+          <div style={{ position: "absolute", top: oy + "px", left: (ox + ow) + "px", width: Math.max(0, canvasW - ox - ow) + "px", height: oh + "px", backgroundColor: "rgba(0,0,0,0.5)", pointerEvents: "none" }} />
+          {/* Crop border */}
+          <div style={{ position: "absolute", top: oy + "px", left: ox + "px", width: ow + "px", height: oh + "px", border: "2px solid #2196f3", boxSizing: "border-box", pointerEvents: "none" }} />
+          {/* 4 corner handles */}
+          {[
+            [ox - HANDLE_SIZE / 2, oy - HANDLE_SIZE / 2],
+            [ox + ow - HANDLE_SIZE / 2, oy - HANDLE_SIZE / 2],
+            [ox - HANDLE_SIZE / 2, oy + oh - HANDLE_SIZE / 2],
+            [ox + ow - HANDLE_SIZE / 2, oy + oh - HANDLE_SIZE / 2],
+          ].map(([hx, hy], i) => (
+            <div key={`c-${i}`} style={{ position: "absolute", top: hy + "px", left: hx + "px", width: HANDLE_SIZE + "px", height: HANDLE_SIZE + "px", backgroundColor: "#2196f3", pointerEvents: "none" }} />
+          ))}
+          {/* 4 edge midpoint handles */}
+          {[
+            [ox + ow / 2 - 4, oy - 4],
+            [ox + ow / 2 - 4, oy + oh - 4],
+            [ox - 4, oy + oh / 2 - 4],
+            [ox + ow - 4, oy + oh / 2 - 4],
+          ].map(([hx, hy], i) => (
+            <div key={`e-${i}`} style={{ position: "absolute", top: hy + "px", left: hx + "px", width: "8px", height: "8px", backgroundColor: "rgba(33,150,243,0.7)", pointerEvents: "none" }} />
+          ))}
+        </>
+      )}
+
+      {/* The canvas is retained as an invisible event capture layer; its
+          existing drag/resize hit-testing reads mouse positions relative
+          to this element so rewiring mouse handlers to work on the
+          container div alone would have been an unrelated refactor. */}
       <canvas
         ref={canvasRef}
         width={canvasW}
         height={canvasH || 200}
-        style={{ display: "block", borderRadius: 4, border: "1px solid #555", width: "100%" }}
+        style={{
+          position: "absolute",
+          top: 0, left: 0,
+          display: "block",
+          width: "100%",
+          height: "100%",
+          opacity: 0, // invisible — HTML elements above render the overlay
+        }}
         onMouseDown={onMouseDown}
         onMouseMove={onMouseMove}
       />

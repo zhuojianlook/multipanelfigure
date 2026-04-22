@@ -762,6 +762,10 @@ export function PanelGrid() {
   // Mirror the cached selection into reactive state so the toolbar can
   // display a preview of what substring will be styled next.
   const [selectionPreview, setSelectionPreview] = useState<string>("");
+  // Live diagnostic string shown in the toolbar so we can see (without
+  // DevTools) exactly what the browser reports for the active element's
+  // selection on each poll.
+  const [selectionDebug, setSelectionDebug] = useState<string>("");
   const updateSelectionPreview = (ta: HTMLTextAreaElement, start: number, end: number) => {
     if (start === end) return;
     const text = (ta.value || "").slice(Math.min(start, end), Math.max(start, end));
@@ -772,16 +776,28 @@ export function PanelGrid() {
   // visible preview. Called from many triggers to maximize reliability.
   const captureSelectionFromActive = () => {
     const ae = document.activeElement as HTMLElement | null;
-    if (!ae || ae.tagName !== "TEXTAREA") return;
-    const ta = ae as HTMLTextAreaElement;
-    const a = ta.getAttribute("aria-label") || "";
-    if (!(a.startsWith("Column header") || a.startsWith("Row header"))) return;
-    toolbarTextareaRef.current = ta;
-    const s = ta.selectionStart ?? 0;
-    const en = ta.selectionEnd ?? 0;
-    if (s !== en) {
-      toolbarSelectionRef.current = { start: s, end: en };
-      updateSelectionPreview(ta, s, en);
+    // Always populate the diagnostic readout so we can see what the
+    // browser is actually reporting.
+    if (ae && ae.tagName === "TEXTAREA") {
+      const ta = ae as HTMLTextAreaElement;
+      const s = ta.selectionStart ?? 0;
+      const en = ta.selectionEnd ?? 0;
+      const a = ta.getAttribute("aria-label") || "";
+      setSelectionDebug(`${ae.tagName}:${s}-${en}${a ? ` [${a.split(" ")[0]}]` : ""}`);
+      // Broadened to ANY header or label textarea — previously the filter
+      // was too strict ("Column header" / "Row header" only) so selections
+      // in column-/row-label textareas didn't register.
+      const matches = /\b(header|label)\b/i.test(a);
+      if (!matches) return;
+      toolbarTextareaRef.current = ta;
+      if (s !== en) {
+        toolbarSelectionRef.current = { start: s, end: en };
+        updateSelectionPreview(ta, s, en);
+      }
+    } else if (ae) {
+      setSelectionDebug(`${ae.tagName}`);
+    } else {
+      setSelectionDebug("none");
     }
   };
   const handleToolbarSelectionChange = (start: number, end: number) => {
@@ -2412,6 +2428,7 @@ export function PanelGrid() {
           }
         }}
         selectionPreview={selectionPreview}
+        debugInfo={selectionDebug}
       />
     </div>
   );
