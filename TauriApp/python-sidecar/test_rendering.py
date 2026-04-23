@@ -343,6 +343,39 @@ def test_consecutive_newlines_row_styled():
     run("21-consecutive-newlines-row", cfg)
 
 
+def test_triple_newline_clip_repro():
+    """Repro for 'triple linebreaks clip off top' bug.  User said 'Colu\\n\\n\\nmn 1' gets
+       its top lines clipped off the figure border. Use a larger font size (like the real
+       app default of 12) and per-char style to exercise the multi-styled path."""
+    print("test_triple_newline_clip_repro")
+    seg = [
+        StyledSegment(text="Colu", color="#000000", font_size=12),
+        StyledSegment(text="\n\n\nmn 1", color="#0000ff", font_size=12),
+    ]
+    cfg = make_config(col_header_texts=("Colu\n\n\nmn 1", "Plain"),
+                      col_header_segs=(seg, None))
+    # Bump font size on both headers to match app default
+    for c in range(cfg.cols):
+        cfg.column_headers[0].headers[c].font_size = 12
+    run("22-triple-newline-clip-repro", cfg)
+
+
+def test_color_change_position_shift_repro():
+    """Repro for 'color changes cause the position to shift' bug. A single-line header
+       where the first half is one color and the second half is another should lay out
+       as if it were one continuous line (no visible gap at the color boundary)."""
+    print("test_color_change_position_shift_repro")
+    # Deliberately split at a point where width estimate matters most.
+    seg = [
+        StyledSegment(text="Colu", color="#000000", font_size=12),
+        StyledSegment(text="mn 2", color="#ff00ff", font_size=12),
+    ]
+    cfg = make_config(col_header_segs=(None, seg))
+    for c in range(cfg.cols):
+        cfg.column_headers[0].headers[c].font_size = 12
+    run("23-color-change-shift-repro", cfg)
+
+
 if __name__ == "__main__":
     tests = [
         test_plain_headers,
@@ -366,6 +399,8 @@ if __name__ == "__main__":
         test_leading_newline_row_styled,
         test_trailing_newline_row_styled,
         test_consecutive_newlines_row_styled,
+        test_triple_newline_clip_repro,
+        test_color_change_position_shift_repro,
     ]
     for t in tests:
         try:

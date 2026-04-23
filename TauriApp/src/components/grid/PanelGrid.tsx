@@ -477,6 +477,65 @@ export function PanelGrid() {
     row_headers,
   } = config;
 
+  // Insert a "\n" into a header's text AND its styled_segments, preserving
+  // per-character styling across the break. Used for both the toolbar's
+  // Insert-Line-Break button AND intercepted Shift+Enter keypresses — going
+  // through updateHeaderGroupText alone would clear styled_segments because
+  // the segment concat no longer equals the new text.
+  const insertLineBreakInHeader = (
+    axis: "col" | "row",
+    level: number,
+    groupIdx: number,
+    ta: HTMLTextAreaElement,
+  ) => {
+    const headers = axis === "col" ? column_headers : row_headers;
+    const grp = headers[level]?.headers[groupIdx];
+    if (!grp) return;
+    const currentText = grp.text || "";
+    const currentSegs = (grp.styled_segments as HeaderStyledSegment[]) || [];
+    const defaultColor = grp.default_color || "#000000";
+
+    const rawStart = ta.selectionStart ?? currentText.length;
+    const rawEnd = ta.selectionEnd ?? currentText.length;
+    const start = Math.max(0, Math.min(rawStart, currentText.length));
+    const end = Math.max(start, Math.min(rawEnd, currentText.length));
+    const newText = currentText.slice(0, start) + "\n" + currentText.slice(end);
+
+    let newSegs: HeaderStyledSegment[] = [];
+    if (currentSegs.length) {
+      const out: HeaderStyledSegment[] = [];
+      let charCount = 0;
+      let inserted = false;
+      for (const seg of currentSegs) {
+        const segEnd = charCount + seg.text.length;
+        if (!inserted && start >= charCount && start <= segEnd) {
+          const beforeLocal = seg.text.slice(0, start - charCount);
+          const afterLocal = seg.text.slice(end - charCount);
+          if (beforeLocal.length > 0) out.push({ ...seg, text: beforeLocal });
+          out.push({ ...seg, text: "\n" });
+          if (afterLocal.length > 0) out.push({ ...seg, text: afterLocal });
+          inserted = true;
+        } else {
+          out.push(seg);
+        }
+        charCount = segEnd;
+      }
+      if (!inserted) out.push({ text: "\n", color: defaultColor });
+      newSegs = out;
+    }
+
+    updateHeaderGroupText(axis, level, groupIdx, newText);
+    if (newSegs.length > 0) {
+      updateHeaderGroupFormatting(axis, level, groupIdx, { styled_segments: newSegs });
+    }
+    requestAnimationFrame(() => {
+      try {
+        ta.focus();
+        ta.setSelectionRange(start + 1, start + 1);
+      } catch { /* ignore */ }
+    });
+  };
+
   /* ── Span dialog helpers ───────────────────────────── */
 
   const openSpanDialog = (axis: "col" | "row", level: number, groupIdx: number) => {
@@ -1399,6 +1458,14 @@ export function PanelGrid() {
                   }}
                   onKeyDown={(e) => {
                     console.log("[mpf] textarea onKeyDown col", { li, gi, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, meta: e.metaKey, alt: e.altKey });
+                    if (e.key === "Enter" && e.shiftKey) {
+                      // Route Shift+Enter through the segment-preserving path
+                      // so per-char styling doesn't get wiped when the textarea
+                      // value gains a \n that the stored segments don't have.
+                      e.preventDefault();
+                      insertLineBreakInHeader("col", li, gi, e.currentTarget as HTMLTextAreaElement);
+                      return;
+                    }
                     if (e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
                       (e.currentTarget as HTMLTextAreaElement).blur();
@@ -1834,6 +1901,11 @@ export function PanelGrid() {
                     }}
                     onKeyDown={(e) => {
                       console.log("[mpf] textarea onKeyDown row", { li, gi, key: e.key, shift: e.shiftKey });
+                      if (e.key === "Enter" && e.shiftKey) {
+                        e.preventDefault();
+                        insertLineBreakInHeader("row", li, gi, e.currentTarget as HTMLTextAreaElement);
+                        return;
+                      }
                       if (e.key === "Enter" && !e.shiftKey) {
                         e.preventDefault();
                         (e.currentTarget as HTMLTextAreaElement).blur();

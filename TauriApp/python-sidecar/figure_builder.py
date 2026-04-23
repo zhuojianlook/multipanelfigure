@@ -167,7 +167,38 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
     cos_r = _math.cos(rot_rad)
     sin_r = _math.sin(rot_rad)
 
-    # Helper: build FontProperties + inches-width estimate for a seg.
+    # Renderer used to measure actual rendered text widths — falls back to
+    # a conservative char-width estimate when the backend doesn't expose
+    # one (e.g. before the first canvas.draw() on some backends).
+    try:
+        _renderer = fig.canvas.get_renderer()  # Agg / AggBase supports this
+    except Exception:
+        _renderer = None
+    _dpi = float(fig.dpi) if fig.dpi else 100.0
+
+    def _measure_inches(txt: str, seg_fp) -> float:
+        """Measure the rendered width of `txt` in inches using the actual
+        font. Falls back to 0.55 × pt × len when no renderer is available.
+        Using real measurement is what makes adjacent segments line up
+        without a visible gap at the colour boundary."""
+        if not txt:
+            return 0.0
+        if _renderer is not None:
+            t = fig.text(0, 0, txt, fontproperties=seg_fp, color="none")
+            try:
+                bb = t.get_window_extent(_renderer)
+                return bb.width / _dpi
+            except Exception:
+                pass
+            finally:
+                try:
+                    t.remove()
+                except Exception:
+                    pass
+        size_pts = seg_fp.get_size() if hasattr(seg_fp, 'get_size') else 10
+        return (size_pts / 72.0) * 0.55 * max(1, len(txt))
+
+    # Helper: build FontProperties + inches-width for a seg.
     def _seg_fp_and_width(seg_text: str, seg: dict):
         seg_styles = seg.get('font_style') or []
         seg_size = seg.get('font_size') or fp.get_size()
@@ -179,7 +210,7 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
             seg_styles if seg_styles else (list(fp.get_style()) if hasattr(fp, 'get_style') else []),
         )
         size_pts = seg_fp.get_size() if hasattr(seg_fp, 'get_size') else 10
-        w_in = (size_pts / 72.0) * 0.55 * max(1, len(seg_text))
+        w_in = _measure_inches(seg_text, seg_fp)
         return seg_fp, w_in, size_pts
 
     # Split segments at "\n" into a list of LINES, where each line is a
