@@ -1109,7 +1109,9 @@ export function PanelGrid() {
   const needsColXBtnCol = colHdrTiers > 0 || config.show_column_labels !== false;
   const colTemplate = [
     "28px",                                     // +Row button column
-    ...Array(rowHdrTiers).fill("28px"),         // row header tier columns (matches input width)
+    // Row header tier columns: auto-grow to fit multi-line rotated headers
+    // so 5+ line breaks aren't clipped. 28px is the minimum (single line).
+    ...Array(rowHdrTiers).fill("minmax(28px, max-content)"),
     "28px",                                     // row label column
     ...Array(cols).fill(`${cellSize}px`),       // panel columns
     ...(needsColXBtnCol ? ["28px"] : []),       // X button column for col headers + primary col labels
@@ -1118,7 +1120,9 @@ export function PanelGrid() {
   const needsRowXBtnRow = rowHdrTiers > 0 || config.show_row_labels !== false;
   const rowTemplate = [
     "24px",                                     // +Col button row
-    ...Array(colHdrTiers).fill("28px"),         // col header tier rows (matches input height)
+    // Col header tier rows: auto-grow to fit multi-line headers so 5+
+    // line breaks aren't clipped. 28px minimum (single line).
+    ...Array(colHdrTiers).fill("minmax(28px, max-content)"),
     "28px",                                     // col label row
     ...Array(rows).fill(`${cellSize}px`),       // panel rows
     ...(needsRowXBtnRow ? ["28px"] : []),       // X button row for row headers + primary row labels
@@ -1416,12 +1420,14 @@ export function PanelGrid() {
                              rounded px-1 py-0.5 hover:ring-1 hover:ring-blue-400/40 transition-shadow
                              resize-none"
                   rows={Math.max(
-                    // Explicit newlines the user typed via Shift+Enter.
-                    group.text.includes("\n") ? Math.min(4, group.text.split("\n").length) : 1,
-                    // Plus a length-based auto-grow estimate — roughly
-                    // 18 characters per visible line at the 10-px font
-                    // size used for headers. Capped at 4 rows so a very
-                    // long header doesn't push the grid around.
+                    // Explicit newlines the user typed via Shift+Enter —
+                    // respect every one of them (capped at 12 so a pathological
+                    // paste doesn't blow out the grid).
+                    group.text.includes("\n") ? Math.min(12, group.text.split("\n").length) : 1,
+                    // Length-based auto-grow estimate for long single-line
+                    // headers — ~18 chars per visible line at 10-px font.
+                    // Still capped at 4 rows so long text wraps visibly without
+                    // pushing the grid around.
                     Math.min(4, Math.max(1, Math.ceil(group.text.length / 18))),
                   )}
                   style={{
@@ -1868,7 +1874,9 @@ export function PanelGrid() {
                                rounded px-0.5 py-1 hover:ring-1 hover:ring-blue-400/40 transition-shadow
                                resize-none"
                     rows={Math.max(
-                      group.text.includes("\n") ? Math.min(4, group.text.split("\n").length) : 1,
+                      // Respect every explicit newline (capped at 12 so a
+                      // pathological paste doesn't blow out the grid).
+                      group.text.includes("\n") ? Math.min(12, group.text.split("\n").length) : 1,
                       Math.min(4, Math.max(1, Math.ceil(group.text.length / 18))),
                     )}
                     style={{
@@ -1880,7 +1888,17 @@ export function PanelGrid() {
                       caretColor: group.default_color || "var(--c-text-dim)",
                       backgroundColor: isBeingDragged ? "var(--c-accent)" : "rgba(255,255,255,0.15)",
                       borderRight: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
-                      ...(isRotated ? { writingMode: "vertical-rl" as const, width: "28px", height: "100%" } : { minHeight: "28px" }),
+                      // Rotated textarea: in vertical-rl, each explicit line
+                      // stacks HORIZONTALLY (not vertically as it would for a
+                      // column header). So width must grow with line count or
+                      // multi-line row headers clip to the 28px band.
+                      ...(isRotated
+                        ? {
+                            writingMode: "vertical-rl" as const,
+                            width: `${Math.max(28, Math.min(12, group.text.split("\n").length) * 14)}px`,
+                            height: "100%",
+                          }
+                        : { minHeight: "28px" }),
                       fontWeight: group.font_style?.includes("Bold") ? 700 : 400,
                       fontStyle: group.font_style?.includes("Italic") ? "italic" : "normal",
                       overflow: "hidden",

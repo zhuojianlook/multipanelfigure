@@ -403,6 +403,64 @@ def test_styled_multiline_row_vs_plain_row_alignment():
     run("24-styled-multiline-row-vs-plain", cfg)
 
 
+def test_many_line_breaks_no_clip_col():
+    """Column header with 6 explicit line breaks (7 lines total). All 7 lines
+       must render WITHIN the figure — none clipped at the top edge."""
+    print("test_many_line_breaks_no_clip_col")
+    cfg = make_config(
+        col_header_texts=("L1\nL2\nL3\nL4\nL5\nL6\nL7", "Short"),
+    )
+    for c in range(cfg.cols):
+        cfg.column_headers[0].headers[c].font_size = 12
+    run("26-many-lines-col-clip", cfg)
+
+
+def test_many_line_breaks_no_clip_col_styled():
+    """Column header with 6 line breaks + per-char styling. All 7 lines must
+       render visibly, each with its assigned color."""
+    print("test_many_line_breaks_no_clip_col_styled")
+    seg = [
+        StyledSegment(text="Red", color="#ff0000", font_size=12),
+        StyledSegment(text="\nOrange", color="#ff8800", font_size=12),
+        StyledSegment(text="\nYellow", color="#cccc00", font_size=12),
+        StyledSegment(text="\nGreen", color="#00aa00", font_size=12),
+        StyledSegment(text="\nBlue", color="#0000ff", font_size=12),
+        StyledSegment(text="\nIndigo", color="#4b0082", font_size=12),
+        StyledSegment(text="\nViolet", color="#aa00aa", font_size=12),
+    ]
+    text = "Red\nOrange\nYellow\nGreen\nBlue\nIndigo\nViolet"
+    cfg = make_config(
+        col_header_texts=(text, "Short"),
+        col_header_segs=(seg, None),
+    )
+    for c in range(cfg.cols):
+        cfg.column_headers[0].headers[c].font_size = 12
+    run("27-many-lines-col-styled-clip", cfg)
+
+
+def test_many_line_breaks_no_clip_row_styled():
+    """Rotated row header with 6 line breaks + per-char styling. All 7 rotated
+       lines must render side-by-side, none clipped off the LEFT edge."""
+    print("test_many_line_breaks_no_clip_row_styled")
+    seg = [
+        StyledSegment(text="Red", color="#ff0000", font_size=12),
+        StyledSegment(text="\nOrange", color="#ff8800", font_size=12),
+        StyledSegment(text="\nYellow", color="#cccc00", font_size=12),
+        StyledSegment(text="\nGreen", color="#00aa00", font_size=12),
+        StyledSegment(text="\nBlue", color="#0000ff", font_size=12),
+        StyledSegment(text="\nIndigo", color="#4b0082", font_size=12),
+        StyledSegment(text="\nViolet", color="#aa00aa", font_size=12),
+    ]
+    text = "Red\nOrange\nYellow\nGreen\nBlue\nIndigo\nViolet"
+    cfg = make_config(
+        row_header_texts=(text, "Short"),
+        row_header_segs=(seg, None),
+    )
+    for r in range(cfg.rows):
+        cfg.row_headers[0].headers[r].font_size = 12
+    run("28-many-lines-row-styled-clip", cfg)
+
+
 def test_styled_multiline_header_with_label_alignment():
     """Follow-up to test 24: a multi-line STYLED row header at outer tier, with
        a plain row LABEL in the inner lane. Both should appear centered on the
@@ -452,6 +510,9 @@ if __name__ == "__main__":
         test_triple_newline_clip_repro,
         test_color_change_position_shift_repro,
         test_styled_multiline_row_vs_plain_row_alignment,
+        test_many_line_breaks_no_clip_col,
+        test_many_line_breaks_no_clip_col_styled,
+        test_many_line_breaks_no_clip_row_styled,
         test_styled_multiline_header_with_label_alignment,
     ]
     for t in tests:
