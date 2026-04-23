@@ -133,21 +133,18 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
                 pass  # Fallback: skip decoration if bbox fails
         return
 
-    # Multi-styled rendering — render one fig.text per segment and
-    # place each piece along the rotated baseline so per-character
-    # colour works for both horizontal headers AND rotated (vertical)
-    # row headers.
-    #
-    # How the geometry works:
-    #   * Each segment is rendered with ha="left", va=va, rotation=R.
-    #     The text's anchor is at the rotated "left edge" of the
-    #     segment, so each segment extends along the rotated x-axis
-    #     for its own width.
-    #   * To stack segments end-to-end we advance the anchor point by
-    #     (w_inches * cos(R), w_inches * sin(R)) in inches, converted
-    #     to figure-fractional coords using fig_w_in / fig_h_in.
-    #   * The caller's ha (left/center/right) offsets the starting
-    #     anchor so the *overall* string is positioned correctly.
+    # Multi-styled rendering — one fig.text per segment, placed along
+    # the rotated baseline. Handles:
+    #   * Per-character colour / font / size / style via segments.
+    #   * Rotation (row headers) — each segment rotated and the anchor
+    #     advances along the rotated baseline.
+    #   * Explicit newlines — segments containing "\n" are split into
+    #     sub-segments on separate lines. Each line is offset
+    #     perpendicular to the baseline so the text reads line-by-line
+    #     even when rotated.
+    #   * ha / va alignment — overall string alignment is respected by
+    #     offsetting the per-line starting anchor along / perpendicular
+    #     to the baseline.
     import math as _math
     fig_w_in = float(fig.get_size_inches()[0])
     fig_h_in = float(fig.get_size_inches()[1])
@@ -156,9 +153,8 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
     cos_r = _math.cos(rot_rad)
     sin_r = _math.sin(rot_rad)
 
-    seg_fps_list = []
-    seg_widths_in = []
-    for seg in norm_segs:
+    # Helper: build FontProperties + inches-width estimate for a seg.
+    def _seg_fp_and_width(seg_text: str, seg: dict):
         seg_styles = seg.get('font_style') or []
         seg_size = seg.get('font_size') or fp.get_size()
         seg_font = seg.get('font_name')
@@ -168,32 +164,77 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
             seg_size,
             seg_styles if seg_styles else (list(fp.get_style()) if hasattr(fp, 'get_style') else []),
         )
-        seg_fps_list.append(seg_fp)
         size_pts = seg_fp.get_size() if hasattr(seg_fp, 'get_size') else 10
-        # Width estimate in INCHES — font-size × 0.55 × char-count is a
-        # reasonable approximation for sans-serif fonts used in figures.
-        seg_widths_in.append((size_pts / 72.0) * 0.55 * max(1, len(seg['text'])))
+        w_in = (size_pts / 72.0) * 0.55 * max(1, len(seg_text))
+        return seg_fp, w_in, size_pts
 
-    total_w_in = sum(seg_widths_in)
+    # Split segments at "\n" into a list of LINES, where each line is a
+    # list of (text, seg_dict) pairs. Preserves each segment's original
+    # styling for every piece after the split.
+    lines: list[list[tuple[str, dict]]] = [[]]
+    max_size_per_line: list[float] = [10.0]
+    for seg in norm_segs:
+        txt = seg.get('text') or ''
+        parts = txt.split('\n')
+        for i, part in enumerate(parts):
+            if i > 0:
+                lines.append([])
+                max_size_per_line.append(10.0)
+            if part != '':
+                lines[-1].append((part, seg))
+                sz = float(seg.get('font_size') or fp.get_size() or 10)
+                if sz > max_size_per_line[-1]:
+                    max_size_per_line[-1] = sz
 
-    # Offset the starting anchor based on caller's ha so the overall
-    # string has the right alignment. Offsets are computed in inches
-    # along the rotated x-axis, then converted to figure-fractional
-    # (x, y) coords.
-    if ha == "right":
-        offset_in = total_w_in
-    elif ha == "center":
-        offset_in = total_w_in / 2
-    else:
-        offset_in = 0.0
-    cur_x = x - (offset_in * cos_r) / max(0.001, fig_w_in)
-    cur_y = y - (offset_in * sin_r) / max(0.001, fig_h_in)
+    # Line height in inches (slightly generous for breathing room).
+    # Use the MAX font size seen overall so all lines have a consistent
+    # height — matches matplotlib's default multi-line behaviour.
+    overall_max_size = max(max_size_per_line) if max_size_per_line else 10.0
+    line_height_in = overall_max_size * 1.2 / 72.0
+    num_lines = len(lines)
 
-    for seg, seg_fp, w_in in zip(norm_segs, seg_fps_list, seg_widths_in):
-        fig.text(cur_x, cur_y, seg['text'], ha="left", va=va,
-                 fontproperties=seg_fp, color=seg['color'], rotation=rot_deg)
-        cur_x += (w_in * cos_r) / max(0.001, fig_w_in)
-        cur_y += (w_in * sin_r) / max(0.001, fig_h_in)
+    for line_idx, line_segs in enumerate(lines):
+        # Perpendicular-to-baseline offset (positive = "up" relative to
+        # baseline direction — i.e. opposite to where the next line
+        # should be placed).
+        if va == 'top':
+            perp_offset_in = -line_idx * line_height_in
+        elif va == 'bottom':
+            perp_offset_in = (num_lines - 1 - line_idx) * line_height_in
+        else:  # center / baseline
+            perp_offset_in = ((num_lines - 1) / 2.0 - line_idx) * line_height_in
+
+        # Perpendicular direction in figure coords: (-sin_r, cos_r)
+        # — at rotation=0, that's (0, 1) so lines stack vertically.
+        line_base_x = x + (-sin_r * perp_offset_in) / max(0.001, fig_w_in)
+        line_base_y = y + (cos_r * perp_offset_in) / max(0.001, fig_h_in)
+
+        # Layout segments within this line along the baseline.
+        if not line_segs:
+            continue
+        seg_info = []  # list of (fp, width_in, text, color)
+        total_line_w = 0.0
+        for part_text, seg in line_segs:
+            seg_fp, w_in, _ = _seg_fp_and_width(part_text, seg)
+            seg_info.append((seg_fp, w_in, part_text, seg.get('color') or '#000000'))
+            total_line_w += w_in
+
+        if ha == 'right':
+            along_offset_in = total_line_w
+        elif ha == 'left':
+            along_offset_in = 0.0
+        else:  # center
+            along_offset_in = total_line_w / 2.0
+
+        cur_x = line_base_x - (along_offset_in * cos_r) / max(0.001, fig_w_in)
+        cur_y = line_base_y - (along_offset_in * sin_r) / max(0.001, fig_h_in)
+
+        for seg_fp, w_in, part_text, color in seg_info:
+            fig.text(cur_x, cur_y, part_text, ha='left', va=va,
+                     fontproperties=seg_fp, color=color,
+                     rotation=rot_deg, rotation_mode='anchor')
+            cur_x += (w_in * cos_r) / max(0.001, fig_w_in)
+            cur_y += (w_in * sin_r) / max(0.001, fig_h_in)
 
 
 # Cache of font name -> file path lookups
