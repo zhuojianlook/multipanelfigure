@@ -44,6 +44,20 @@ def _get_segments(obj):
             for c, t in parse_colored_text(obj.text, obj.default_color)]
 
 
+def _count_header_lines(hdr):
+    """Return the number of rendered lines for a header/label, based on explicit
+    newlines in its text or in its styled_segments. Used to reserve enough header
+    band space so multi-line headers don't clip off the figure."""
+    segs = None
+    if hasattr(hdr, 'styled_segments') and hdr.styled_segments:
+        segs = hdr.styled_segments
+    if segs:
+        joined = "".join((getattr(s, 'text', None) or '') for s in segs)
+        return max(1, joined.count("\n") + 1)
+    text = getattr(hdr, 'text', '') or ''
+    return max(1, text.count("\n") + 1)
+
+
 def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
                        rotation=0):
     """Draw multi-colored/styled text segments at a position.
@@ -528,9 +542,16 @@ def _add_column_headers(fig, axes, header_levels: List[HeaderLevel],
                             transform=fig.transFigure, color=hdr.line_color,
                             linewidth=hdr.line_width, linestyle='-', clip_on=False))
 
-        # After this tier, update base_y ONLY for the position that was used
+        # After this tier, update base_y ONLY for the position that was used.
+        # Account for multi-line headers (explicit \n or styled segments containing \n)
+        # so the NEXT tier starts above/below the full rendered text block.
         font_h_inches = max_font_size / 72.0
-        tier_h_frac = _inches_to_frac(font_h_inches, fig_h)
+        max_lines_in_tier = max(
+            (_count_header_lines(h) for h in level.headers if h.columns_or_rows),
+            default=1,
+        )
+        tier_h_inches = font_h_inches * 1.2 * max_lines_in_tier
+        tier_h_frac = _inches_to_frac(tier_h_inches, fig_h)
         has_top = any(h.position == "Top" and h.columns_or_rows for h in level.headers)
         has_bottom = any(h.position == "Bottom" and h.columns_or_rows for h in level.headers)
         if has_top:
@@ -661,9 +682,16 @@ def _add_row_headers(fig, axes, header_levels: List[HeaderLevel],
                             transform=fig.transFigure, color=hdr.line_color,
                             linewidth=hdr.line_width, linestyle='-', clip_on=False))
 
-        # After this tier, update base_x to account for the text width
+        # After this tier, update base_x to account for the text width.
+        # Account for multi-line headers so the NEXT tier sits clear of the
+        # full stacked-line block of the current tier.
         font_h_inches = max_font_size / 72.0
-        tier_w_frac = _inches_to_frac(font_h_inches, fig_w)
+        max_lines_in_tier = max(
+            (_count_header_lines(h) for h in level.headers if h.columns_or_rows),
+            default=1,
+        )
+        tier_w_inches = font_h_inches * 1.2 * max_lines_in_tier
+        tier_w_frac = _inches_to_frac(tier_w_inches, fig_w)
         has_left = any(h.position == "Left" and h.columns_or_rows for h in level.headers)
         has_right = any(h.position == "Right" and h.columns_or_rows for h in level.headers)
         if has_left:
@@ -1161,12 +1189,14 @@ def assemble_figure(cfg: FigureConfig,
                 continue
             max_fs = 10
             max_dist = 0.0
+            max_lines = 1
             for hdr in level.headers:
                 if hdr.columns_or_rows and hdr.position == position:
                     max_fs = max(max_fs, hdr.font_size)
                     max_dist = max(max_dist, hdr.distance)
+                    max_lines = max(max_lines, _count_header_lines(hdr))
             gap = max(max_dist * ref_inches, 0.04)
-            font_h = max_fs / 72.0 * 1.2
+            font_h = max_fs / 72.0 * 1.2 * max_lines
             total += gap + font_h + 0.04
         return total
 

@@ -185,6 +185,164 @@ def test_explicit_newline_with_per_char():
     run("07-newline-plus-styling", cfg)
 
 
+def test_long_row_wrapping():
+    """Long ROW header should auto-wrap. Rotated 90° so wrapping means stacked
+       lines side-by-side along the rotated baseline (perpendicular to text direction)."""
+    print("test_long_row_wrapping")
+    cfg = make_config(
+        row_header_texts=("A very long row header that should wrap nicely", "Short"),
+    )
+    run("08-long-row-wrap", cfg)
+
+
+def test_explicit_newline_in_row():
+    """Row header with explicit \\n — still rotated 90°. The two lines should both be
+       vertical and visibly separated (stacked perpendicular to text baseline)."""
+    print("test_explicit_newline_in_row")
+    cfg = make_config(row_header_texts=("Line 1\nLine 2", "Simple"))
+    run("09-row-explicit-newline", cfg)
+
+
+def test_explicit_newline_with_per_char_row():
+    """Row header: 'Red\\nBlue' with per-char color, rotated 90°. Should show 'Red' in
+       red on one rotated line, 'Blue' in blue on a second rotated line next to it.
+       This is the row analogue of test 07."""
+    print("test_explicit_newline_with_per_char_row")
+    seg = [
+        StyledSegment(text="Red", color="#ff0000"),
+        StyledSegment(text="\nBlue", color="#0000ff"),
+    ]
+    cfg = make_config(row_header_texts=("Red\nBlue", "Normal"), row_header_segs=(seg, None))
+    run("10-row-newline-plus-styling", cfg)
+
+
+def test_row_both_same_length_one_styled():
+    """Row analogue of test 03: two rows, same text length, one styled one plain.
+       Both should render as single rotated lines at matching positions."""
+    print("test_row_both_same_length_one_styled")
+    seg = [
+        StyledSegment(text="R", color="#ff0000"),
+        StyledSegment(text="ow 1", color="#000000"),
+    ]
+    # with_images=False narrows the panel area so auto-wrap could be tempted
+    cfg = make_config(row_header_segs=(seg, None))
+    run("11-narrow-rows", cfg, with_images=False)
+
+
+# ---------------------------------------------------------------------------
+# Multiple line breaks + edge positions (leading / trailing / consecutive)
+# ---------------------------------------------------------------------------
+
+def test_four_lines_col_plain():
+    """4 plain lines in a column header. Expected: L1, L2, L3, L4 stacked top→bottom,
+       equal spacing, all black."""
+    print("test_four_lines_col_plain")
+    cfg = make_config(col_header_texts=("L1\nL2\nL3\nL4", "Plain"))
+    run("12-four-lines-col", cfg)
+
+
+def test_four_lines_col_styled():
+    """4 styled lines in a column header. Expected: each line its own color,
+       stacked top→bottom."""
+    print("test_four_lines_col_styled")
+    seg = [
+        StyledSegment(text="Red", color="#ff0000"),
+        StyledSegment(text="\nGreen", color="#00aa00"),
+        StyledSegment(text="\nBlue", color="#0000ff"),
+        StyledSegment(text="\nPurple", color="#aa00aa"),
+    ]
+    cfg = make_config(col_header_texts=("Red\nGreen\nBlue\nPurple", "Plain"),
+                      col_header_segs=(seg, None))
+    run("13-four-lines-col-styled", cfg)
+
+
+def test_leading_newline_col_styled():
+    """Styled column header starting with a newline (blank line first).
+       Expected: blank line on top, then 'Hello' in red."""
+    print("test_leading_newline_col_styled")
+    seg = [
+        StyledSegment(text="\nHello", color="#ff0000"),
+    ]
+    cfg = make_config(col_header_texts=("\nHello", "Plain"), col_header_segs=(seg, None))
+    run("14-leading-newline-col", cfg)
+
+
+def test_trailing_newline_col_styled():
+    """Styled column header ending with a newline (blank line at bottom).
+       Expected: 'Hello' in red, then a blank line under it (reserved space)."""
+    print("test_trailing_newline_col_styled")
+    seg = [
+        StyledSegment(text="Hello\n", color="#ff0000"),
+    ]
+    cfg = make_config(col_header_texts=("Hello\n", "Plain"), col_header_segs=(seg, None))
+    run("15-trailing-newline-col", cfg)
+
+
+def test_consecutive_newlines_col_styled():
+    """Styled column with 'a\\n\\n\\nb' — two empty lines between a and b.
+       Expected: 'a' red, two blank lines, 'b' blue — total 4 line heights."""
+    print("test_consecutive_newlines_col_styled")
+    seg = [
+        StyledSegment(text="a", color="#ff0000"),
+        StyledSegment(text="\n\n\nb", color="#0000ff"),
+    ]
+    cfg = make_config(col_header_texts=("a\n\n\nb", "Plain"), col_header_segs=(seg, None))
+    run("16-consecutive-newlines-col", cfg)
+
+
+def test_four_lines_row_plain():
+    """4 plain lines in a rotated ROW header. Expected: L1, L2, L3, L4 stacked
+       perpendicular to the rotated baseline (i.e. side-by-side when looking at the figure)."""
+    print("test_four_lines_row_plain")
+    cfg = make_config(row_header_texts=("L1\nL2\nL3\nL4", "Plain"))
+    run("17-four-lines-row", cfg)
+
+
+def test_four_lines_row_styled():
+    """4 styled lines in a rotated row header. Each line its own color."""
+    print("test_four_lines_row_styled")
+    seg = [
+        StyledSegment(text="Red", color="#ff0000"),
+        StyledSegment(text="\nGreen", color="#00aa00"),
+        StyledSegment(text="\nBlue", color="#0000ff"),
+        StyledSegment(text="\nPurple", color="#aa00aa"),
+    ]
+    cfg = make_config(row_header_texts=("Red\nGreen\nBlue\nPurple", "Plain"),
+                      row_header_segs=(seg, None))
+    run("18-four-lines-row-styled", cfg)
+
+
+def test_leading_newline_row_styled():
+    """Rotated row header starting with newline. Expected: blank first line, then 'Hello' red."""
+    print("test_leading_newline_row_styled")
+    seg = [
+        StyledSegment(text="\nHello", color="#ff0000"),
+    ]
+    cfg = make_config(row_header_texts=("\nHello", "Plain"), row_header_segs=(seg, None))
+    run("19-leading-newline-row", cfg)
+
+
+def test_trailing_newline_row_styled():
+    """Rotated row header ending with newline. Expected: 'Hello' red, blank line after."""
+    print("test_trailing_newline_row_styled")
+    seg = [
+        StyledSegment(text="Hello\n", color="#ff0000"),
+    ]
+    cfg = make_config(row_header_texts=("Hello\n", "Plain"), row_header_segs=(seg, None))
+    run("20-trailing-newline-row", cfg)
+
+
+def test_consecutive_newlines_row_styled():
+    """Rotated row with 'a\\n\\n\\nb' per-char. 4 lines, 2 blank. Both end chars stay rotated."""
+    print("test_consecutive_newlines_row_styled")
+    seg = [
+        StyledSegment(text="a", color="#ff0000"),
+        StyledSegment(text="\n\n\nb", color="#0000ff"),
+    ]
+    cfg = make_config(row_header_texts=("a\n\n\nb", "Plain"), row_header_segs=(seg, None))
+    run("21-consecutive-newlines-row", cfg)
+
+
 if __name__ == "__main__":
     tests = [
         test_plain_headers,
@@ -194,6 +352,20 @@ if __name__ == "__main__":
         test_long_header_wrapping,
         test_explicit_newline_in_header,
         test_explicit_newline_with_per_char,
+        test_long_row_wrapping,
+        test_explicit_newline_in_row,
+        test_explicit_newline_with_per_char_row,
+        test_row_both_same_length_one_styled,
+        test_four_lines_col_plain,
+        test_four_lines_col_styled,
+        test_leading_newline_col_styled,
+        test_trailing_newline_col_styled,
+        test_consecutive_newlines_col_styled,
+        test_four_lines_row_plain,
+        test_four_lines_row_styled,
+        test_leading_newline_row_styled,
+        test_trailing_newline_row_styled,
+        test_consecutive_newlines_row_styled,
     ]
     for t in tests:
         try:

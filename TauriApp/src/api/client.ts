@@ -21,6 +21,18 @@ let _invokeReady = false;
 
 async function getInvoke() {
   if (_invokeReady) return _invoke;
+  // Detect actual Tauri runtime (window.__TAURI_INTERNALS__). In a plain
+  // browser dev preview the @tauri-apps/api/core module still resolves via
+  // Vite, but invoke() throws at runtime because there is no IPC bridge.
+  // Fall through to browser fetch in that case.
+  const inTauri =
+    typeof window !== "undefined" &&
+    (("__TAURI_INTERNALS__" in window) || ("__TAURI__" in window) || ("__TAURI_IPC__" in window));
+  if (!inTauri) {
+    _invoke = null;
+    _invokeReady = true;
+    return _invoke;
+  }
   try {
     const mod = await import("@tauri-apps/api/core");
     _invoke = mod.invoke;

@@ -1742,6 +1742,9 @@ export function PanelGrid() {
 
                 {(() => {
                   const isRotated = (group.rotation ?? 90) !== 0;
+                  const thisKey = `row-${li}-${gi}`;
+                  const isEditing = focusedKey === thisKey;
+                  const showOverlay = !isEditing && !!group.styled_segments && group.styled_segments.length > 0;
                   return (
                   <div style={{
                     ...(isRotated
@@ -1753,6 +1756,46 @@ export function PanelGrid() {
                     flex: 1,
                     minHeight: 0,
                   }}>
+                  <div style={{ position: "relative", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  {showOverlay && (
+                    <div
+                      aria-hidden
+                      style={{
+                        position: "absolute",
+                        inset: 0,
+                        pointerEvents: "none",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        textAlign: "center",
+                        fontWeight: group.font_style?.includes("Bold") ? 700 : 400,
+                        fontStyle: group.font_style?.includes("Italic") ? "italic" : "normal",
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-word",
+                        lineHeight: 1.2,
+                        fontSize: "10px",
+                        overflow: "hidden",
+                      }}
+                    >
+                      <span>
+                        {group.styled_segments!.map((seg, si) => (
+                          <span
+                            key={si}
+                            style={{
+                              color: seg.color || group.default_color || "var(--c-text-dim)",
+                              fontSize: seg.font_size ? seg.font_size + "px" : undefined,
+                              fontFamily: seg.font_name ? seg.font_name.replace(/\.(ttf|otf|ttc)$/i, "") : undefined,
+                              fontWeight: seg.font_style?.includes("Bold") ? 700 : undefined,
+                              fontStyle: seg.font_style?.includes("Italic") ? "italic" : undefined,
+                              textDecoration: seg.font_style?.includes("Strikethrough") ? "line-through" : seg.font_style?.includes("Underline") ? "underline" : undefined,
+                            }}
+                          >
+                            {seg.text}
+                          </span>
+                        ))}
+                      </span>
+                    </div>
+                  )}
                   <textarea
                     className="bg-transparent text-center text-[10px] outline-none
                                rounded px-0.5 py-1 hover:ring-1 hover:ring-blue-400/40 transition-shadow
@@ -1762,7 +1805,12 @@ export function PanelGrid() {
                       Math.min(4, Math.max(1, Math.ceil(group.text.length / 18))),
                     )}
                     style={{
-                      color: group.default_color || "var(--c-text-dim)",
+                      // Hide the textarea text when the styled overlay is
+                      // showing, so mixed-color rendering lands on top.
+                      // While editing we keep the plain text visible so
+                      // keyboard input behaves normally.
+                      color: showOverlay ? "transparent" : (group.default_color || "var(--c-text-dim)"),
+                      caretColor: group.default_color || "var(--c-text-dim)",
                       backgroundColor: isBeingDragged ? "var(--c-accent)" : "rgba(255,255,255,0.15)",
                       borderRight: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
                       ...(isRotated ? { writingMode: "vertical-rl" as const, width: "28px", height: "100%" } : { minHeight: "28px" }),
@@ -1821,13 +1869,19 @@ export function PanelGrid() {
                     onFocus={(e) => {
                       toolbarTextareaRef.current = e.currentTarget as HTMLTextAreaElement;
                       toolbarSelectionRef.current = null;
-                      const parent = e.currentTarget.parentElement?.parentElement;
+                      setSelectionPreview("");
+                      setFocusedKey(thisKey);
+                      const parent = e.currentTarget.parentElement?.parentElement?.parentElement;
                       if (parent) {
                         setToolbarAnchor(parent);
                         setToolbarTarget({ type: "header", axis: "row", level: li, groupIdx: gi });
                       }
                     }}
+                    onBlur={() => {
+                      setFocusedKey((cur) => (cur === thisKey ? "" : cur));
+                    }}
                   />
+                  </div>
                   </div>
                   );
                 })()}
