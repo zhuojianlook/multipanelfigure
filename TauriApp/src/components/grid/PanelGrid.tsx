@@ -2610,30 +2610,100 @@ export function PanelGrid() {
         }}
         selectionPreview={selectionPreview}
         onInsertLineBreak={() => {
-          // Insert a newline at the current cursor of whichever
-          // header/label field the toolbar is anchored to. Bypasses the
-          // Shift+Enter keystroke, which doesn't reach the textarea in
-          // some WKWebView builds.
-          const ta = toolbarTextareaRef.current as HTMLTextAreaElement | null;
+          // Insert a newline at the current cursor of the field the
+          // toolbar is anchored to. Works as a keyboard-independent
+          // alternative to Shift+Enter, which doesn't reach the
+          // textarea in WKWebView for some users.
+          const ta = toolbarTextareaRef.current as HTMLTextAreaElement | HTMLInputElement | null;
           if (!ta || !toolbarTarget) return;
-          const start = ta.selectionStart ?? ta.value.length;
-          const end = ta.selectionEnd ?? ta.value.length;
-          const before = ta.value.slice(0, start);
-          const after = ta.value.slice(end);
-          const newText = before + "\n" + after;
-          // Update the store via the appropriate path
+          // Read LATEST state from the store rather than ta.value so
+          // successive clicks don't over-write each other when React
+          // hasn't flushed the previous update's value to the DOM yet.
+          let currentText = "";
+          let currentSegs: HeaderStyledSegment[] = [];
+          let defaultColor = "#000000";
           if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
+            const headers = toolbarTarget.axis === "col" ? column_headers : row_headers;
+            const grp = headers[toolbarTarget.level]?.headers[toolbarTarget.groupIdx];
+            if (!grp) return;
+            currentText = grp.text || "";
+            currentSegs = (grp.styled_segments as HeaderStyledSegment[]) || [];
+            defaultColor = grp.default_color || "#000000";
+          } else if ((toolbarTarget.type === "colLabel" || toolbarTarget.type === "rowLabel") && toolbarTarget.index !== undefined) {
+            const labels = toolbarTarget.axis === "col" ? (config?.column_labels ?? []) : (config?.row_labels ?? []);
+            const lbl = labels[toolbarTarget.index];
+            if (!lbl) return;
+            currentText = lbl.text || "";
+            currentSegs = (lbl.styled_segments as HeaderStyledSegment[]) || [];
+            defaultColor = lbl.default_color || "#000000";
+          }
+
+          // Cursor position — prefer DOM's selection, but clamp to the
+          // store's text length so quick successive clicks (where the
+          // DOM value is a render or two behind) still land at/after
+          // the end of the current text.
+          const rawStart = ta.selectionStart ?? currentText.length;
+          const rawEnd = ta.selectionEnd ?? currentText.length;
+          const start = Math.max(0, Math.min(rawStart, currentText.length));
+          const end = Math.max(start, Math.min(rawEnd, currentText.length));
+          const newText = currentText.slice(0, start) + "\n" + currentText.slice(end);
+
+          // Compute new styled_segments preserving per-character styling.
+          // If the selection spans an existing segment, we split that
+          // segment around the inserted "\n" and keep the newline under
+          // the same per-character style as the preceding chars (or
+          // default style if we're at the very beginning).
+          const rebuildSegments = (): HeaderStyledSegment[] => {
+            if (!currentSegs.length) return [];
+            const out: HeaderStyledSegment[] = [];
+            let charCount = 0;
+            let inserted = false;
+            for (const seg of currentSegs) {
+              const segEnd = charCount + seg.text.length;
+              if (!inserted && start >= charCount && start <= segEnd) {
+                // Cursor lands inside (or at the end of) this segment.
+                const beforeLocal = seg.text.slice(0, start - charCount);
+                const afterLocal = seg.text.slice(end - charCount);
+                if (beforeLocal.length > 0) out.push({ ...seg, text: beforeLocal });
+                out.push({ ...seg, text: "\n" });
+                if (afterLocal.length > 0) out.push({ ...seg, text: afterLocal });
+                inserted = true;
+              } else {
+                // Either fully before the cursor, or fully after.
+                out.push(seg);
+              }
+              charCount = segEnd;
+            }
+            if (!inserted) {
+              out.push({ text: "\n", color: defaultColor });
+            }
+            return out;
+          };
+          const newSegs = rebuildSegments();
+
+          if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
+            // updateHeaderGroupText would clear styled_segments (concat
+            // check fails). Call formatting AFTER text so segments win.
             updateHeaderGroupText(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, newText);
+            if (newSegs.length > 0) {
+              updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { styled_segments: newSegs });
+            }
           } else if (toolbarTarget.type === "colLabel" && toolbarTarget.index !== undefined) {
             updateColumnLabel(toolbarTarget.index, newText);
+            if (newSegs.length > 0) {
+              updateLabelFormatting("col", toolbarTarget.index, { styled_segments: newSegs });
+            }
           } else if (toolbarTarget.type === "rowLabel" && toolbarTarget.index !== undefined) {
             updateRowLabel(toolbarTarget.index, newText);
+            if (newSegs.length > 0) {
+              updateLabelFormatting("row", toolbarTarget.index, { styled_segments: newSegs });
+            }
           }
           // Restore cursor position right after the inserted newline.
           requestAnimationFrame(() => {
             try {
-              ta.focus();
-              ta.setSelectionRange(start + 1, start + 1);
+              (ta as HTMLTextAreaElement).focus();
+              (ta as HTMLTextAreaElement).setSelectionRange(start + 1, start + 1);
             } catch { /* ignore */ }
           });
         }}
