@@ -133,38 +133,31 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
                 pass  # Fallback: skip decoration if bbox fails
         return
 
-    # Multi-styled rendering — draw one fig.text per segment. The
-    # previous AnchoredOffsetbox + HPacker approach had two bugs:
-    #   (a) loc="center" forced va=center regardless of the caller's
-    #       requested va, so column headers with va="bottom" shifted
-    #       downward when per-character styling was applied.
-    #   (b) HPacker ignores rotation, so rotated row headers came out
-    #       horizontal once they had per-character styling.
-    # Handling rotated multi-colour layouts is non-trivial (each
-    # segment would need to be placed along the rotated axis with
-    # per-segment width measurement). For rotated headers we fall
-    # back to single-colour rendering using the group's default_color
-    # — preserves rotation + position at the cost of per-character
-    # colour in rotated labels.
-    if rotation and abs(float(rotation)) > 0.01:
-        full_text = "".join(s['text'] for s in norm_segs)
-        # Use the group's default colour (first segment's colour is an
-        # OK fallback — usually one segment matches the default).
-        color = norm_segs[0].get('color') or '#000000'
-        fig.text(x, y, full_text, ha=ha, va=va, fontproperties=fp,
-                 color=color, rotation=rotation,
-                 multialignment=ha if ha in ("left", "center", "right") else "center")
-        return
-
-    # Horizontal multi-segment path: estimate each segment's width and
-    # place each piece as its own fig.text at the appropriate x offset.
-    # Respects the caller's ha / va so the overall position matches the
-    # single-coloured path. We use a font-size × 0.55 × char-count
-    # estimate rather than round-tripping through the renderer (which
-    # would require an extra figure draw on every header).
+    # Multi-styled rendering — render one fig.text per segment and
+    # place each piece along the rotated baseline so per-character
+    # colour works for both horizontal headers AND rotated (vertical)
+    # row headers.
+    #
+    # How the geometry works:
+    #   * Each segment is rendered with ha="left", va=va, rotation=R.
+    #     The text's anchor is at the rotated "left edge" of the
+    #     segment, so each segment extends along the rotated x-axis
+    #     for its own width.
+    #   * To stack segments end-to-end we advance the anchor point by
+    #     (w_inches * cos(R), w_inches * sin(R)) in inches, converted
+    #     to figure-fractional coords using fig_w_in / fig_h_in.
+    #   * The caller's ha (left/center/right) offsets the starting
+    #     anchor so the *overall* string is positioned correctly.
+    import math as _math
     fig_w_in = float(fig.get_size_inches()[0])
+    fig_h_in = float(fig.get_size_inches()[1])
+    rot_deg = float(rotation) if rotation else 0.0
+    rot_rad = _math.radians(rot_deg)
+    cos_r = _math.cos(rot_rad)
+    sin_r = _math.sin(rot_rad)
+
     seg_fps_list = []
-    seg_widths_frac = []
+    seg_widths_in = []
     for seg in norm_segs:
         seg_styles = seg.get('font_style') or []
         seg_size = seg.get('font_size') or fp.get_size()
@@ -177,21 +170,30 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
         )
         seg_fps_list.append(seg_fp)
         size_pts = seg_fp.get_size() if hasattr(seg_fp, 'get_size') else 10
-        est_inches = (size_pts / 72.0) * 0.55 * max(1, len(seg['text']))
-        seg_widths_frac.append(est_inches / max(0.001, fig_w_in))
+        # Width estimate in INCHES — font-size × 0.55 × char-count is a
+        # reasonable approximation for sans-serif fonts used in figures.
+        seg_widths_in.append((size_pts / 72.0) * 0.55 * max(1, len(seg['text'])))
 
-    total_w_frac = sum(seg_widths_frac)
+    total_w_in = sum(seg_widths_in)
+
+    # Offset the starting anchor based on caller's ha so the overall
+    # string has the right alignment. Offsets are computed in inches
+    # along the rotated x-axis, then converted to figure-fractional
+    # (x, y) coords.
     if ha == "right":
-        cur_x = x - total_w_frac
-    elif ha == "left":
-        cur_x = x
-    else:  # center (default)
-        cur_x = x - total_w_frac / 2
+        offset_in = total_w_in
+    elif ha == "center":
+        offset_in = total_w_in / 2
+    else:
+        offset_in = 0.0
+    cur_x = x - (offset_in * cos_r) / max(0.001, fig_w_in)
+    cur_y = y - (offset_in * sin_r) / max(0.001, fig_h_in)
 
-    for seg, seg_fp, w_frac in zip(norm_segs, seg_fps_list, seg_widths_frac):
-        fig.text(cur_x, y, seg['text'], ha="left", va=va,
-                 fontproperties=seg_fp, color=seg['color'], rotation=0)
-        cur_x += w_frac
+    for seg, seg_fp, w_in in zip(norm_segs, seg_fps_list, seg_widths_in):
+        fig.text(cur_x, cur_y, seg['text'], ha="left", va=va,
+                 fontproperties=seg_fp, color=seg['color'], rotation=rot_deg)
+        cur_x += (w_in * cos_r) / max(0.001, fig_w_in)
+        cur_y += (w_in * sin_r) / max(0.001, fig_h_in)
 
 
 # Cache of font name -> file path lookups
