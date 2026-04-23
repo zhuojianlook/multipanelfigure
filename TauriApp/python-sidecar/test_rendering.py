@@ -376,6 +376,56 @@ def test_color_change_position_shift_repro():
     run("23-color-change-shift-repro", cfg)
 
 
+def test_styled_multiline_row_vs_plain_row_alignment():
+    """Repro for user's reported 'secondary headers with color customization
+       appear to be not correct position' issue (the preview image screenshot
+       showed a 2-line styled row header NOT centered on the same y as its
+       plain-single-line sibling in the same tier).
+
+       Setup: two row headers at the same tier, same panel bbox:
+         Row 0 header: "Red\\nBlue" with red+blue per-char styling
+         Row 1 header: "Plain"    — single line, single color
+       Expected: BOTH rotated rows centered on their panel's mid-y, and the
+       *visual center* of the 2-line stack should land at exactly the same
+       y position as the plain single line would (their midpoints match)."""
+    print("test_styled_multiline_row_vs_plain_row_alignment")
+    seg = [
+        StyledSegment(text="Red", color="#ff0000", font_size=12),
+        StyledSegment(text="\nBlue", color="#0000ff", font_size=12),
+    ]
+    cfg = make_config(
+        row_header_texts=("Red\nBlue", "Plain"),
+        row_header_segs=(seg, None),
+    )
+    # Bump font size to match app default
+    for r in range(cfg.rows):
+        cfg.row_headers[0].headers[r].font_size = 12
+    run("24-styled-multiline-row-vs-plain", cfg)
+
+
+def test_styled_multiline_header_with_label_alignment():
+    """Follow-up to test 24: a multi-line STYLED row header at outer tier, with
+       a plain row LABEL in the inner lane. Both should appear centered on the
+       same panel row's mid-y. If they drift, _count_header_lines space
+       reservation vs. the perpendicular offset formula is out of sync."""
+    print("test_styled_multiline_header_with_label_alignment")
+    seg = [
+        StyledSegment(text="Red", color="#ff0000", font_size=12),
+        StyledSegment(text="\nBlue", color="#0000ff", font_size=12),
+    ]
+    cfg = make_config(
+        row_header_texts=("Red\nBlue", ""),  # only first row has a header
+        row_header_segs=(seg, None),
+        row_label_texts=("Row 1", "Row 2"),
+    )
+    for r in range(cfg.rows):
+        cfg.row_headers[0].headers[r].font_size = 12
+    for r in range(cfg.rows):
+        cfg.row_labels[r].font_size = 12
+        cfg.row_labels[r].rotation = 90.0
+    run("25-styled-header-plus-label-align", cfg)
+
+
 if __name__ == "__main__":
     tests = [
         test_plain_headers,
@@ -401,6 +451,8 @@ if __name__ == "__main__":
         test_consecutive_newlines_row_styled,
         test_triple_newline_clip_repro,
         test_color_change_position_shift_repro,
+        test_styled_multiline_row_vs_plain_row_alignment,
+        test_styled_multiline_header_with_label_alignment,
     ]
     for t in tests:
         try:

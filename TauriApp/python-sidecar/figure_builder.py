@@ -120,8 +120,15 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
             else:
                 adj_y = y - offset / fig_h
 
+        # Use rotation_mode='anchor' so the (x,y) anchor point is the
+        # fixed rotation origin. This matches the multi-styled path
+        # convention — without this, single-color rotated headers
+        # position differently than styled ones at the same cx/cy
+        # (user-visible: styled 2-line row headers drifted up relative
+        # to plain siblings in the same tier).
         txt = fig.text(x, adj_y, full_text, ha=ha, va=va, fontproperties=adj_fp,
                        color=color, rotation=rotation,
+                       rotation_mode='anchor',
                        multialignment=ha if ha in ("left", "center", "right") else "center")
 
         # Draw underline/strikethrough manually after rendering
