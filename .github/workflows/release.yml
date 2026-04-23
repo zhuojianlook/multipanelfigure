@@ -124,6 +124,13 @@ jobs:
     needs: build-tauri
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/exp-')
+    # Serialize updater-branch writes so parallel tag pushes (e.g. 108 + 109
+    # pushed together) don't race each other — older job would --force-push
+    # its (now-stale) manifest over the newer one. `cancel-in-progress: false`
+    # so every release still gets its chance to update the branch.
+    concurrency:
+      group: updater-branch-write
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -195,6 +202,16 @@ jobs:
       - name: Push manifest to updater branch
         run: |
           TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" == exp-* ]]; then
+            CHANNEL="experimental"
+            VERSION="${TAG#exp-}"
+            MANIFEST="latest-experimental.json"
+          else
+            CHANNEL="stable"
+            VERSION="${TAG#v}"
+            MANIFEST="latest.json"
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -208,14 +225,23 @@ jobs:
             git rm -rf . 2>/dev/null || true
           fi
 
-          # Copy the manifest (stable or experimental)
-          if [[ "$TAG" == exp-* ]]; then
-            cp artifacts/latest-experimental.json latest-experimental.json
-            git add latest-experimental.json
-          else
-            cp artifacts/latest.json latest.json
-            git add latest.json
+          # Downgrade guard: if the remote manifest for this channel is
+          # already a newer version, don't overwrite it (protects against
+          # out-of-order tag pushes — e.g. 0.1.108 completing after 0.1.109).
+          if [ -f "$MANIFEST" ]; then
+            REMOTE_VER=$(python3 -c "import json; print(json.load(open('$MANIFEST')).get('version',''))" 2>/dev/null || echo "")
+            if [ -n "$REMOTE_VER" ]; then
+              NEWER=$(python3 -c "r=tuple(int(x) for x in '$REMOTE_VER'.split('.') if x.isdigit()); v=tuple(int(x) for x in '$VERSION'.split('.') if x.isdigit()); print('1' if r>v else '0')")
+              if [ "$NEWER" = "1" ]; then
+                echo "Remote manifest is $REMOTE_VER (newer than $VERSION) — refusing to overwrite."
+                exit 0
+              fi
+            fi
           fi
+
+          # Copy the manifest (stable or experimental)
+          cp "artifacts/${MANIFEST}" "${MANIFEST}"
+          git add "${MANIFEST}"
 
           git commit -m "Update manifest for ${TAG}" --allow-empty
           git push origin updater-local:updater --force
