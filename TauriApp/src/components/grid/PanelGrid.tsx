@@ -1557,8 +1557,12 @@ export function PanelGrid() {
                 }}
                 value={lbl.text}
                 onChange={(e) => {
-                  console.log("[mpf] input onChange colLabel", { ci, value: JSON.stringify(e.target.value) });
-                  updateColumnLabel(ci, e.target.value);
+                  const newText = e.target.value;
+                  console.log("[mpf] input onChange colLabel", { ci, value: JSON.stringify(newText) });
+                  updateColumnLabel(ci, newText);
+                  if (newText === "" && (lbl.styled_segments?.length ?? 0) > 0) {
+                    updateLabelFormatting("col", ci, { styled_segments: [] });
+                  }
                 }}
                 onKeyDown={(e) => {
                   console.log("[mpf] input onKeyDown colLabel", { ci, key: e.key, shift: e.shiftKey });
@@ -2030,8 +2034,12 @@ export function PanelGrid() {
                     }}
                     value={row_labels[ri]?.text ?? ""}
                     onChange={(e) => {
-                      console.log("[mpf] input onChange rowLabel", { ri, value: JSON.stringify(e.target.value) });
-                      updateRowLabel(ri, e.target.value);
+                      const newText = e.target.value;
+                      console.log("[mpf] input onChange rowLabel", { ri, value: JSON.stringify(newText) });
+                      updateRowLabel(ri, newText);
+                      if (newText === "" && (row_labels[ri]?.styled_segments?.length ?? 0) > 0) {
+                        updateLabelFormatting("row", ri, { styled_segments: [] });
+                      }
                     }}
                     onKeyDown={(e) => {
                       console.log("[mpf] input onKeyDown rowLabel", { ri, key: e.key, shift: e.shiftKey });

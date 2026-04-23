@@ -467,37 +467,67 @@ export const useFigureStore = create<FigureState>()(
     },
 
     updateColumnLabel: (colIdx, text) => {
+      console.log("[mpf] updateColumnLabel", { colIdx, text: JSON.stringify(text) });
       set((s) => {
         if (s.config && colIdx < s.config.column_labels.length) {
-          s.config.column_labels[colIdx].text = text;
+          const lbl = s.config.column_labels[colIdx];
+          lbl.text = text;
+          // Mirror the header-text clearing behaviour: if the plain text
+          // no longer matches the concatenation of styled_segments, drop
+          // the segments so the backend renders `text` (possibly empty)
+          // instead of the stale styled fragments. This was the root
+          // cause of the "ghost header / label returns after clear"
+          // bug: backend's _get_segments prefers styled_segments over
+          // the plain text, so empty text + non-empty segments =
+          // backend rendered the old styled string.
+          if (lbl.styled_segments && lbl.styled_segments.length > 0) {
+            const concat = lbl.styled_segments.map((seg: { text: string }) => seg.text).join("");
+            if (text === "" || concat !== text) {
+              lbl.styled_segments = [];
+            }
+          }
           s.configDirty = true;
         }
       });
       if (syncTimer) clearTimeout(syncTimer);
-      syncTimer = setTimeout(() => {
+      syncTimer = setTimeout(async () => {
         const cfg = get().config;
-        if (cfg) {
-          api.patchColumnLabels(cfg.column_labels).catch(console.error);
-          get().requestPreview();
+        if (!cfg) return;
+        try {
+          await api.patchColumnLabels(cfg.column_labels);
+        } catch (e) {
+          console.error(e);
         }
-      }, 500);
+        get().requestPreview();
+      }, 200);
     },
 
     updateRowLabel: (rowIdx, text) => {
+      console.log("[mpf] updateRowLabel", { rowIdx, text: JSON.stringify(text) });
       set((s) => {
         if (s.config && rowIdx < s.config.row_labels.length) {
-          s.config.row_labels[rowIdx].text = text;
+          const lbl = s.config.row_labels[rowIdx];
+          lbl.text = text;
+          if (lbl.styled_segments && lbl.styled_segments.length > 0) {
+            const concat = lbl.styled_segments.map((seg: { text: string }) => seg.text).join("");
+            if (text === "" || concat !== text) {
+              lbl.styled_segments = [];
+            }
+          }
           s.configDirty = true;
         }
       });
       if (syncTimer) clearTimeout(syncTimer);
-      syncTimer = setTimeout(() => {
+      syncTimer = setTimeout(async () => {
         const cfg = get().config;
-        if (cfg) {
-          api.patchRowLabels(cfg.row_labels).catch(console.error);
-          get().requestPreview();
+        if (!cfg) return;
+        try {
+          await api.patchRowLabels(cfg.row_labels);
+        } catch (e) {
+          console.error(e);
         }
-      }, 500);
+        get().requestPreview();
+      }, 200);
     },
 
     addColumnHeaderLevel: () => {
