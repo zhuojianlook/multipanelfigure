@@ -5,6 +5,7 @@
    Uses MUI Popover anchored to the selected element.
    ────────────────────────────────────────────────────────── */
 
+import { useState, useEffect } from "react";
 import {
   Popover,
   Box,
@@ -79,6 +80,23 @@ export function FloatingToolbar({
     .slice().sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
 
   const hasStyle = (style: string) => fontStyle.includes(style);
+
+  // Local buffer for the font-size input. We commit only on blur or
+  // Enter — the previous per-keystroke onChange made typing "16" fire a
+  // patch at "1" first (which applied size=1 to the selected chars and
+  // shrank the planner text), and the value would snap around while the
+  // user was still typing. Keeping a local string buffer lets the user
+  // type any intermediate value without the model reacting until they
+  // explicitly commit.
+  const [sizeBuf, setSizeBuf] = useState<string>(String(fontSize));
+  useEffect(() => {
+    setSizeBuf(String(fontSize));
+  }, [fontSize]);
+  const commitSize = () => {
+    const v = Math.max(1, Math.min(200, Number(sizeBuf) || fontSize));
+    if (v !== fontSize) onFontSizeChange(v);
+    setSizeBuf(String(v));
+  };
 
   return (
     <Popover
@@ -280,13 +298,17 @@ export function FloatingToolbar({
           ))}
         </Select>
 
-        {/* Size input */}
+        {/* Size input — commits on blur/Enter, not per-keystroke */}
         <TextField
           type="number"
-          value={fontSize}
-          onChange={(e) => {
-            const v = Math.max(1, Math.min(200, Number(e.target.value) || 1));
-            onFontSizeChange(v);
+          value={sizeBuf}
+          onChange={(e) => setSizeBuf(e.target.value)}
+          onBlur={commitSize}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              commitSize();
+              (e.currentTarget as HTMLInputElement).blur();
+            }
           }}
           size="small"
           variant="standard"

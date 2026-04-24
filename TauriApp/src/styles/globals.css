@@ -97,3 +97,25 @@ input[type="number"]::-webkit-outer-spin-button {
 .no-drag {
   -webkit-app-region: no-drag;
 }
+
+/*
+ * Hide scrollbar + gutter on the header/label editing textareas.
+ *
+ * Why: those textareas are paired with an absolutely-positioned colour
+ * overlay (a <div>). Even with overflow:hidden, WebKit reserves gutter
+ * space on the right for a potential scrollbar, which shifts the
+ * textarea's text-align:center content a few px LEFT of the overlay's
+ * truly-centered content. When per-char styling activates and the
+ * overlay paints, the user sees the two drift apart (selection highlight
+ * lands on the textarea's leftward text while the coloured glyphs sit
+ * further right). Removing the gutter makes both elements centre in the
+ * same box.
+ */
+.no-overlay-scrollbar {
+  scrollbar-width: none; /* Firefox */
+}
+.no-overlay-scrollbar::-webkit-scrollbar {
+  display: none; /* WebKit / Chromium */
+  width: 0;
+  height: 0;
+}

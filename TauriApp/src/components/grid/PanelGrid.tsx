@@ -1586,7 +1586,7 @@ export function PanelGrid() {
                 <textarea
                   className="bg-transparent text-center text-[10px] w-full min-w-0 outline-none
                              rounded px-1 py-0.5 hover:ring-1 hover:ring-blue-400/40 transition-shadow
-                             resize-none"
+                             resize-none no-overlay-scrollbar"
                   rows={Math.max(
                     // Explicit newlines the user typed via Shift+Enter —
                     // respect every one of them (capped at 12 so a pathological
@@ -1825,7 +1825,7 @@ export function PanelGrid() {
               )}
               <textarea
                 className="bg-transparent text-center text-[10px] flex-1 min-w-0 outline-none
-                           rounded px-1 py-0.5 resize-none"
+                           rounded px-1 py-0.5 resize-none no-overlay-scrollbar"
                 rows={Math.max(
                   // Respect every Shift+Enter newline (capped at 12).
                   lbl.text.includes("\n") ? Math.min(12, lbl.text.split("\n").length) : 1,
@@ -2104,7 +2104,7 @@ export function PanelGrid() {
                   <textarea
                     className="bg-transparent text-center text-[10px] outline-none
                                rounded px-2 py-1 hover:ring-1 hover:ring-blue-400/40 transition-shadow
-                               resize-none"
+                               resize-none no-overlay-scrollbar"
                     rows={Math.max(
                       // Respect every explicit newline (capped at 12 so a
                       // pathological paste doesn't blow out the grid).
@@ -2436,7 +2436,7 @@ export function PanelGrid() {
                   )}
                   <textarea
                     className="bg-transparent text-center text-[10px] outline-none
-                               rounded px-1 py-1 resize-none"
+                               rounded px-1 py-1 resize-none no-overlay-scrollbar"
                     rows={Math.max(
                       (row_labels[ri]?.text ?? "").includes("\n")
                         ? Math.min(12, (row_labels[ri]?.text ?? "").split("\n").length)
