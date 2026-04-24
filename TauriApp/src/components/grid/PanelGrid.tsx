@@ -1564,18 +1564,13 @@ export function PanelGrid() {
                       wordBreak: "break-word",
                       lineHeight: 1.2,
                       overflow: "hidden",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
                     }}
                   >
-                    <span>
-                      {group.styled_segments.map((seg, si) => (
-                        <span key={si} style={segOverlayStyle(seg, group.default_color)}>
-                          {seg.text}
-                        </span>
-                      ))}
-                    </span>
+                    {group.styled_segments.map((seg, si) => (
+                      <span key={si} style={segOverlayStyle(seg, group.default_color)}>
+                        {seg.text}
+                      </span>
+                    ))}
                   </div>
                 )}
                 <textarea
@@ -1799,24 +1794,20 @@ export function PanelGrid() {
                     position: "absolute",
                     inset: 0,
                     pointerEvents: "none",
+                    minHeight: "28px",
                     fontWeight: lbl.font_style?.includes("Bold") ? 700 : 400,
                     fontStyle: lbl.font_style?.includes("Italic") ? "italic" : "normal",
                     whiteSpace: "pre-wrap",
                     wordBreak: "break-word",
                     lineHeight: 1.2,
                     overflow: "hidden",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
                   }}
                 >
-                  <span>
-                    {lbl.styled_segments!.map((seg, si) => (
-                      <span key={si} style={segOverlayStyle(seg, lbl.default_color)}>
-                        {seg.text}
-                      </span>
-                    ))}
-                  </span>
+                  {lbl.styled_segments!.map((seg, si) => (
+                    <span key={si} style={segOverlayStyle(seg, lbl.default_color)}>
+                      {seg.text}
+                    </span>
+                  ))}
                 </div>
               )}
               <textarea
@@ -2060,30 +2051,27 @@ export function PanelGrid() {
                   {showOverlay && (
                     <div
                       aria-hidden
+                      className="text-center text-[10px] rounded px-0.5 py-1"
                       style={{
                         position: "absolute",
                         inset: 0,
                         pointerEvents: "none",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        textAlign: "center",
                         fontWeight: group.font_style?.includes("Bold") ? 700 : 400,
                         fontStyle: group.font_style?.includes("Italic") ? "italic" : "normal",
                         whiteSpace: "pre-wrap",
                         wordBreak: "break-word",
                         lineHeight: 1.2,
-                        fontSize: "10px",
                         overflow: "hidden",
+                        // Inherits writingMode: vertical-rl from the outer
+                        // rotated wrapper, so the overlay glyphs flow in the
+                        // same direction as the rotated textarea's glyphs.
                       }}
                     >
-                      <span>
-                        {group.styled_segments!.map((seg, si) => (
-                          <span key={si} style={segOverlayStyle(seg, group.default_color)}>
-                            {seg.text}
-                          </span>
-                        ))}
-                      </span>
+                      {group.styled_segments!.map((seg, si) => (
+                        <span key={si} style={segOverlayStyle(seg, group.default_color)}>
+                          {seg.text}
+                        </span>
+                      ))}
                     </div>
                   )}
                   <textarea
@@ -2393,30 +2381,27 @@ export function PanelGrid() {
                   {rowLabelShowOverlay && rlbl && (
                     <div
                       aria-hidden
+                      className="text-center text-[10px] rounded px-0.5 py-1"
                       style={{
                         position: "absolute",
                         inset: 0,
                         pointerEvents: "none",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        textAlign: "center",
                         fontWeight: rlbl.font_style?.includes("Bold") ? 700 : 400,
                         fontStyle: rlbl.font_style?.includes("Italic") ? "italic" : "normal",
                         whiteSpace: "pre-wrap",
                         wordBreak: "break-word",
                         lineHeight: 1.2,
-                        fontSize: "10px",
                         overflow: "hidden",
+                        // Inherits writingMode: vertical-rl from the outer
+                        // rotated wrapper (when rotated) so glyphs flow in
+                        // the same direction as the textarea's glyphs.
                       }}
                     >
-                      <span>
-                        {rlbl.styled_segments!.map((seg, si) => (
-                          <span key={si} style={segOverlayStyle(seg, rlbl.default_color)}>
-                            {seg.text}
-                          </span>
-                        ))}
-                      </span>
+                      {rlbl.styled_segments!.map((seg, si) => (
+                        <span key={si} style={segOverlayStyle(seg, rlbl.default_color)}>
+                          {seg.text}
+                        </span>
+                      ))}
                     </div>
                   )}
                   <textarea
