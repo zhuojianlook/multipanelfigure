@@ -1373,7 +1373,13 @@ export function PanelGrid() {
                 {(() => {
                   const thisKey = `col-${li}-${gi}`;
                   const isEditing = focusedKey === thisKey;
-                  const showOverlay = !isEditing && group.styled_segments && group.styled_segments.length > 0;
+                  // Show the per-char colour overlay WHENEVER segments exist,
+                  // including while the user is editing — they've reported
+                  // that not seeing the colours during typing is confusing.
+                  // When they type a char that no longer matches the segment
+                  // concat, updateHeaderGroupText clears styled_segments so
+                  // the overlay naturally disappears at that moment.
+                  const showOverlay = !!(group.styled_segments && group.styled_segments.length > 0);
                   return (
                 <div style={{ position: "relative", flex: 1, minWidth: 0 }}>
                 {showOverlay && (
@@ -1431,17 +1437,19 @@ export function PanelGrid() {
                     Math.min(4, Math.max(1, Math.ceil(group.text.length / 18))),
                   )}
                   style={{
-                    // Text color: transparent only when the overlay is
-                    // actively showing (i.e. segments exist AND this
-                    // textarea isn't the one the user is currently
-                    // editing). While editing, keep the text visible so
-                    // keyboard input (Backspace, Shift+Enter, etc.) shows
-                    // up normally.
+                    // When showOverlay is true, make the textarea's own text
+                    // transparent so the colored overlay paints through
+                    // unobstructed. caretColor still shows the blinking cursor
+                    // so typing remains usable.
                     color: showOverlay
                       ? "transparent"
                       : (group.default_color || "var(--c-text-dim)"),
                     caretColor: group.default_color || "var(--c-text-dim)",
-                    backgroundColor: isBeingDragged ? "var(--c-accent)" : "rgba(255,255,255,0.15)",
+                    // Drop the semi-opaque white bg when the overlay is on —
+                    // at 15% opacity it washes out per-char colours.
+                    backgroundColor: isBeingDragged
+                      ? "var(--c-accent)"
+                      : (showOverlay ? "transparent" : "rgba(255,255,255,0.15)"),
                     minHeight: "28px",
                     borderBottom: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
                     fontWeight: group.font_style?.includes("Bold") ? 700 : 400,
@@ -1817,7 +1825,10 @@ export function PanelGrid() {
                   const isRotated = (group.rotation ?? 90) !== 0;
                   const thisKey = `row-${li}-${gi}`;
                   const isEditing = focusedKey === thisKey;
-                  const showOverlay = !isEditing && !!group.styled_segments && group.styled_segments.length > 0;
+                  // Show per-char colour overlay whenever segments exist —
+                  // even during editing — so the user sees their assigned
+                  // colours as they type. Matches the col-header behavior.
+                  const showOverlay = !!(group.styled_segments && group.styled_segments.length > 0);
                   return (
                   <div style={{
                     ...(isRotated
@@ -1880,13 +1891,17 @@ export function PanelGrid() {
                       Math.min(4, Math.max(1, Math.ceil(group.text.length / 18))),
                     )}
                     style={{
-                      // Hide the textarea text when the styled overlay is
-                      // showing, so mixed-color rendering lands on top.
-                      // While editing we keep the plain text visible so
-                      // keyboard input behaves normally.
+                      // When showOverlay is true, make the textarea's own
+                      // text transparent so the colored overlay paints
+                      // through unobstructed. The blinking caret stays
+                      // visible via caretColor so typing remains usable.
                       color: showOverlay ? "transparent" : (group.default_color || "var(--c-text-dim)"),
                       caretColor: group.default_color || "var(--c-text-dim)",
-                      backgroundColor: isBeingDragged ? "var(--c-accent)" : "rgba(255,255,255,0.15)",
+                      // Drop the semi-opaque white bg when overlay is on —
+                      // at 15% opacity it washes out per-char colours.
+                      backgroundColor: isBeingDragged
+                        ? "var(--c-accent)"
+                        : (showOverlay ? "transparent" : "rgba(255,255,255,0.15)"),
                       borderRight: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
                       // Rotated textarea: in vertical-rl, each explicit line
                       // stacks HORIZONTALLY (not vertically as it would for a

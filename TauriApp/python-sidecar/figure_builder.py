@@ -184,13 +184,29 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
     _dpi = float(fig.dpi) if fig.dpi else 100.0
 
     def _measure_inches(txt: str, seg_fp) -> float:
-        """Measure the rendered width of `txt` in inches using the actual
-        font. Falls back to 0.55 × pt × len when no renderer is available.
-        Using real measurement is what makes adjacent segments line up
-        without a visible gap at the colour boundary."""
+        """Measure the LAYOUT (advance) width of `txt` in inches using the
+        actual font.
+
+        Prefers ``renderer.get_text_width_height_descent`` — this returns the
+        typographic advance width (how far the pen moves after rendering),
+        which is what matplotlib uses when laying out the next character.
+        Using advance width is what makes adjacent segments line up without
+        a visible gap at the colour boundary; a get_window_extent()-based
+        measurement reports the tight INK bbox which omits each segment's
+        leading/trailing side bearing and causes stair-stepped baselines
+        when multiple coloured segments are joined (user-reported
+        'changing color shifts characters slightly')."""
         if not txt:
             return 0.0
         if _renderer is not None:
+            try:
+                w_px, _h, _d = _renderer.get_text_width_height_descent(
+                    txt, seg_fp, ismath=False)
+                return float(w_px) / _dpi
+            except Exception:
+                pass
+            # Fallback: figure.text() + bbox — less accurate but better
+            # than the constant-char-width estimate below.
             t = fig.text(0, 0, txt, fontproperties=seg_fp, color="none")
             try:
                 bb = t.get_window_extent(_renderer)
@@ -264,12 +280,49 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
         # Layout segments within this line along the baseline.
         if not line_segs:
             continue
-        seg_info = []  # list of (fp, width_in, text, color)
-        total_line_w = 0.0
+        # Resolve each seg's FontProperties + color up front.
+        seg_fps = []
+        seg_colors = []
+        seg_texts = []
         for part_text, seg in line_segs:
-            seg_fp, w_in, _ = _seg_fp_and_width(part_text, seg)
-            seg_info.append((seg_fp, w_in, part_text, seg.get('color') or '#000000'))
-            total_line_w += w_in
+            seg_fp, _, _ = _seg_fp_and_width(part_text, seg)
+            seg_fps.append(seg_fp)
+            seg_colors.append(seg.get('color') or '#000000')
+            seg_texts.append(part_text)
+
+        # Position each segment using PREFIX widths — measuring a
+        # single rendered string "AB" and subtracting width("A") gives
+        # the true cursor-advance for "B" (including leading/trailing
+        # bearing and kerning at the A|B boundary). Measuring each
+        # segment in isolation misses the kerning adjustment and shows
+        # up as a per-segment drift / gap — visible in rotated row
+        # headers as a stair-stepped baseline (user-reported
+        # "changing color shifts characters slightly").
+        #
+        # We measure prefixes using the FIRST segment's font. When all
+        # segments share a font (the common per-colour-only case) this
+        # is exactly right. When fonts differ we fall back to summing
+        # per-segment measurements — kerning across a font change is
+        # rare enough that a bearing-sized gap is acceptable.
+        mixed_fonts = any(fp_i is not seg_fps[0] for fp_i in seg_fps[1:])
+        seg_starts_in = [0.0]  # along-baseline start for each seg
+        if not mixed_fonts and seg_fps:
+            full_line_text = "".join(seg_texts)
+            # Prefix lengths: 0, len(seg[0]), len(seg[0])+len(seg[1]), ...
+            cum = 0
+            prefix_widths = [0.0]
+            for st in seg_texts:
+                cum += len(st)
+                prefix_widths.append(_measure_inches(full_line_text[:cum], seg_fps[0]))
+            seg_starts_in = prefix_widths[:-1]
+            total_line_w = prefix_widths[-1]
+        else:
+            # Mixed-font fallback: sum per-segment widths.
+            total_line_w = 0.0
+            for st, fp_i in zip(seg_texts, seg_fps):
+                seg_starts_in.append(total_line_w + _measure_inches(st, fp_i))
+                total_line_w = seg_starts_in[-1]
+            seg_starts_in = seg_starts_in[:-1]
 
         if ha == 'right':
             along_offset_in = total_line_w
@@ -278,15 +331,24 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
         else:  # center
             along_offset_in = total_line_w / 2.0
 
-        cur_x = line_base_x - (along_offset_in * cos_r) / max(0.001, fig_w_in)
-        cur_y = line_base_y - (along_offset_in * sin_r) / max(0.001, fig_h_in)
+        base_cx = line_base_x - (along_offset_in * cos_r) / max(0.001, fig_w_in)
+        base_cy = line_base_y - (along_offset_in * sin_r) / max(0.001, fig_h_in)
 
-        for seg_fp, w_in, part_text, color in seg_info:
-            fig.text(cur_x, cur_y, part_text, ha='left', va=va,
+        # Always anchor each segment at its TYPOGRAPHIC BASELINE
+        # (va='baseline'), not at the ink bounding-box edge. matplotlib
+        # computes va='top'/'center'/'bottom' from the per-string ink
+        # bbox — and ink bbox varies per glyph (e.g. "A" vs "B" vs "y"
+        # differ by 1-2 px). For rotated text that per-glyph difference
+        # becomes a HORIZONTAL stair-step in the final image, which is
+        # the "color change shifts characters slightly" user report.
+        # Baseline alignment is stable across glyphs and collapses the
+        # stair-step.
+        for seg_fp, seg_start, part_text, color in zip(seg_fps, seg_starts_in, seg_texts, seg_colors):
+            cur_x = base_cx + (seg_start * cos_r) / max(0.001, fig_w_in)
+            cur_y = base_cy + (seg_start * sin_r) / max(0.001, fig_h_in)
+            fig.text(cur_x, cur_y, part_text, ha='left', va='baseline',
                      fontproperties=seg_fp, color=color,
                      rotation=rot_deg, rotation_mode='anchor')
-            cur_x += (w_in * cos_r) / max(0.001, fig_w_in)
-            cur_y += (w_in * sin_r) / max(0.001, fig_h_in)
 
 
 # Cache of font name -> file path lookups
