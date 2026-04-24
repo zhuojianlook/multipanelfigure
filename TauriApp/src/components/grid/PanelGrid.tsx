@@ -536,6 +536,66 @@ export function PanelGrid() {
     });
   };
 
+  // Insert "\n" at the cursor of a primary col/row LABEL textarea, preserving
+  // per-char styled_segments — same pattern as insertLineBreakInHeader, but
+  // for the primary (next-to-panel) labels.
+  const insertLineBreakInLabel = (
+    axis: "col" | "row",
+    index: number,
+    ta: HTMLTextAreaElement,
+  ) => {
+    const labels = axis === "col" ? column_labels : row_labels;
+    const lbl = labels[index];
+    if (!lbl) return;
+    const currentText = lbl.text || "";
+    const currentSegs = (lbl.styled_segments as HeaderStyledSegment[]) || [];
+    const defaultColor = lbl.default_color || "#000000";
+
+    const rawStart = ta.selectionStart ?? currentText.length;
+    const rawEnd = ta.selectionEnd ?? currentText.length;
+    const start = Math.max(0, Math.min(rawStart, currentText.length));
+    const end = Math.max(start, Math.min(rawEnd, currentText.length));
+    const newText = currentText.slice(0, start) + "\n" + currentText.slice(end);
+
+    let newSegs: HeaderStyledSegment[] = [];
+    if (currentSegs.length) {
+      const out: HeaderStyledSegment[] = [];
+      let charCount = 0;
+      let inserted = false;
+      for (const seg of currentSegs) {
+        const segEnd = charCount + seg.text.length;
+        if (!inserted && start >= charCount && start <= segEnd) {
+          const beforeLocal = seg.text.slice(0, start - charCount);
+          const afterLocal = seg.text.slice(end - charCount);
+          if (beforeLocal.length > 0) out.push({ ...seg, text: beforeLocal });
+          out.push({ ...seg, text: "\n" });
+          if (afterLocal.length > 0) out.push({ ...seg, text: afterLocal });
+          inserted = true;
+        } else {
+          out.push(seg);
+        }
+        charCount = segEnd;
+      }
+      if (!inserted) out.push({ text: "\n", color: defaultColor });
+      newSegs = out;
+    }
+
+    if (axis === "col") {
+      updateColumnLabel(index, newText);
+    } else {
+      updateRowLabel(index, newText);
+    }
+    if (newSegs.length > 0) {
+      updateLabelFormatting(axis, index, { styled_segments: newSegs });
+    }
+    requestAnimationFrame(() => {
+      try {
+        ta.focus();
+        ta.setSelectionRange(start + 1, start + 1);
+      } catch { /* ignore */ }
+    });
+  };
+
   /* ── Span dialog helpers ───────────────────────────── */
 
   const openSpanDialog = (axis: "col" | "row", level: number, groupIdx: number) => {
@@ -1112,7 +1172,9 @@ export function PanelGrid() {
     // Row header tier columns: auto-grow to fit multi-line rotated headers
     // so 5+ line breaks aren't clipped. 28px is the minimum (single line).
     ...Array(rowHdrTiers).fill("minmax(28px, max-content)"),
-    "28px",                                     // row label column
+    // Row label column: same — auto-grow so primary labels with Shift+Enter
+    // line breaks don't clip (matches the secondary-header behavior).
+    "minmax(28px, max-content)",                // row label column
     ...Array(cols).fill(`${cellSize}px`),       // panel columns
     ...(needsColXBtnCol ? ["28px"] : []),       // X button column for col headers + primary col labels
   ].join(" ");
@@ -1123,7 +1185,8 @@ export function PanelGrid() {
     // Col header tier rows: auto-grow to fit multi-line headers so 5+
     // line breaks aren't clipped. 28px minimum (single line).
     ...Array(colHdrTiers).fill("minmax(28px, max-content)"),
-    "28px",                                     // col label row
+    // Col label row: same auto-grow behavior.
+    "minmax(28px, max-content)",                // col label row
     ...Array(rows).fill(`${cellSize}px`),       // panel rows
     ...(needsRowXBtnRow ? ["28px"] : []),       // X button row for row headers + primary row labels
   ].join(" ");
@@ -1625,16 +1688,25 @@ export function PanelGrid() {
               }}
               onClick={(e) => handleLabelClick(e, "col", ci)}
             >
-              <input
+              <textarea
                 className="bg-transparent text-center text-[10px] flex-1 min-w-0 outline-none
-                           rounded px-1 py-0.5"
+                           rounded px-1 py-0.5 resize-none"
+                rows={Math.max(
+                  // Respect every Shift+Enter newline (capped at 12).
+                  lbl.text.includes("\n") ? Math.min(12, lbl.text.split("\n").length) : 1,
+                  1,
+                )}
                 style={{
                   color: lbl.default_color || "var(--c-text-dim)",
                   backgroundColor: "rgba(255,255,255,0.15)",
-                  height: "28px",
+                  minHeight: "28px",
                   fontWeight: lbl.font_style?.includes("Bold") ? 700 : 400,
                   fontStyle: lbl.font_style?.includes("Italic") ? "italic" : "normal",
                   textDecoration: lbl.font_style?.includes("Strikethrough") ? "line-through" : lbl.font_style?.includes("Underline") ? "underline" : "none",
+                  overflow: "hidden",
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-word",
+                  lineHeight: 1.2,
                 }}
                 value={lbl.text}
                 onChange={(e) => {
@@ -1647,6 +1719,17 @@ export function PanelGrid() {
                 }}
                 onKeyDown={(e) => {
                   console.log("[mpf] input onKeyDown colLabel", { ci, key: e.key, shift: e.shiftKey });
+                  if (e.key === "Enter" && e.shiftKey) {
+                    // Shift+Enter inserts a newline preserving segments.
+                    e.preventDefault();
+                    insertLineBreakInLabel("col", ci, e.currentTarget as HTMLTextAreaElement);
+                    return;
+                  }
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    // Plain Enter blurs (commits edit) — matches header behavior.
+                    e.preventDefault();
+                    (e.currentTarget as HTMLTextAreaElement).blur();
+                  }
                 }}
                 placeholder={`Col ${ci + 1}`}
                 aria-label={`Column ${ci + 1} label`}
@@ -2181,15 +2264,35 @@ export function PanelGrid() {
                     minHeight: 0,
                   }}
                 >
-                  <input
+                  <textarea
                     className="bg-transparent text-center text-[10px] outline-none
-                               rounded px-0.5 py-1"
+                               rounded px-0.5 py-1 resize-none"
+                    rows={Math.max(
+                      (row_labels[ri]?.text ?? "").includes("\n")
+                        ? Math.min(12, (row_labels[ri]?.text ?? "").split("\n").length)
+                        : 1,
+                      1,
+                    )}
                     style={{
                       color: row_labels[ri]?.default_color || "var(--c-text-dim)",
                       backgroundColor: "rgba(255,255,255,0.15)",
-                      ...(isRotated ? { writingMode: "vertical-rl" as const, width: "28px", height: "100%" } : { height: "28px", width: "100%" }),
+                      // Rotated row label in writing-mode:vertical-rl — each
+                      // explicit line stacks HORIZONTALLY after rotation, so
+                      // width must grow with line count to avoid clipping.
+                      // Matches the secondary row header width formula.
+                      ...(isRotated
+                        ? {
+                            writingMode: "vertical-rl" as const,
+                            width: `${Math.max(28, Math.min(12, (row_labels[ri]?.text ?? "").split("\n").length) * 14)}px`,
+                            height: "100%",
+                          }
+                        : { minHeight: "28px", width: "100%" }),
                       fontWeight: row_labels[ri]?.font_style?.includes("Bold") ? 700 : 400,
                       fontStyle: row_labels[ri]?.font_style?.includes("Italic") ? "italic" : "normal",
+                      overflow: "hidden",
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                      lineHeight: 1.2,
                     }}
                     value={row_labels[ri]?.text ?? ""}
                     onChange={(e) => {
@@ -2202,6 +2305,15 @@ export function PanelGrid() {
                     }}
                     onKeyDown={(e) => {
                       console.log("[mpf] input onKeyDown rowLabel", { ri, key: e.key, shift: e.shiftKey });
+                      if (e.key === "Enter" && e.shiftKey) {
+                        e.preventDefault();
+                        insertLineBreakInLabel("row", ri, e.currentTarget as HTMLTextAreaElement);
+                        return;
+                      }
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        (e.currentTarget as HTMLTextAreaElement).blur();
+                      }
                     }}
                     placeholder={`R${ri + 1}`}
                     aria-label={`Row ${ri + 1} label`}

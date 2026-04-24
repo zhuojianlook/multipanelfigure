@@ -360,7 +360,24 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
         # is exactly right. When fonts differ we fall back to summing
         # per-segment measurements — kerning across a font change is
         # rare enough that a bearing-sized gap is acceptable.
-        mixed_fonts = any(fp_i is not seg_fps[0] for fp_i in seg_fps[1:])
+        #
+        # Compare by actual font parameters (name + size + file), NOT by
+        # object identity — every seg gets a fresh FontProperties object
+        # from _font_props(), so `is not` would always say "mixed" and
+        # we'd lose kerning even when the fonts are effectively identical.
+        def _fp_key(fp_x):
+            try:
+                return (
+                    fp_x.get_name() if hasattr(fp_x, 'get_name') else None,
+                    fp_x.get_size() if hasattr(fp_x, 'get_size') else None,
+                    getattr(fp_x, '_fname', None),
+                    fp_x.get_style() if hasattr(fp_x, 'get_style') else None,
+                    fp_x.get_weight() if hasattr(fp_x, 'get_weight') else None,
+                )
+            except Exception:
+                return id(fp_x)
+        first_key = _fp_key(seg_fps[0]) if seg_fps else None
+        mixed_fonts = any(_fp_key(fp_i) != first_key for fp_i in seg_fps[1:])
         seg_starts_in = [0.0]  # along-baseline start for each seg
         if not mixed_fonts and seg_fps:
             full_line_text = "".join(seg_texts)
@@ -1359,7 +1376,13 @@ def assemble_figure(cfg: FigureConfig,
     # Column/row labels can individually be at different positions.
     # Check ALL labels for each position, not just the first one.
     def _label_space_by_pos(labels, has_labels, position):
-        """Calculate space needed for labels at a specific position."""
+        """Calculate space needed for labels at a specific position.
+
+        Accounts for multi-line labels (Shift+Enter newlines) by counting
+        the max line-count across all labels at this position — otherwise a
+        label like "Row 1\\nDetail" clips off the figure edge because we
+        only reserved one line's worth of space.
+        """
         if not has_labels or not labels:
             return 0.0
         pos_labels = [l for l in labels if l.text.strip() and getattr(l, 'position', 'Top') == position]
@@ -1367,7 +1390,8 @@ def assemble_figure(cfg: FigureConfig,
             return 0.0
         fs = max((l.font_size for l in pos_labels), default=12)
         dist = max((l.distance for l in pos_labels), default=0.01)
-        return max(0.18, dist * ref_dim + fs / 72.0 * 1.2 + 0.06)
+        max_lines = max((_count_header_lines(l) for l in pos_labels), default=1)
+        return max(0.18, dist * ref_dim + fs / 72.0 * 1.2 * max_lines + 0.06)
 
     top_label_space = _label_space_by_pos(cfg.column_labels, has_col_labels, "Top")
     bottom_label_space = _label_space_by_pos(cfg.column_labels, has_col_labels, "Bottom")

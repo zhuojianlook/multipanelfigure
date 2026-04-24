@@ -17,6 +17,11 @@ import {
   Snackbar,
   Alert,
   Tooltip,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Button,
 } from "@mui/material";
 import SettingsIcon from "@mui/icons-material/Settings";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
@@ -47,6 +52,7 @@ export function PanelCell({ row, col, imageName }: Props) {
   const [dragOver, setDragOver] = useState(false);
   const [ctxMenu, setCtxMenu] = useState<{ mouseX: number; mouseY: number } | null>(null);
   const [snackMsg, setSnackMsg] = useState("");
+  const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
   const selectedImage = useSelectedImage();
 
   const img: LoadedImage | undefined = imageName
@@ -101,9 +107,7 @@ export function PanelCell({ row, col, imageName }: Props) {
 
   const handleClearPanel = () => {
     if (!imageName) { setCtxMenu(null); return; }
-    if (window.confirm(`Clear image from R${row + 1}C${col + 1}? All settings will be lost.`)) {
-      setPanelImage(row, col, "");
-    }
+    setClearConfirmOpen(true);
     setCtxMenu(null);
   };
 
@@ -369,6 +373,30 @@ export function PanelCell({ row, col, imageName }: Props) {
         row={row}
         col={col}
       />
+
+      {/* Clear panel confirmation dialog — same MUI style as the New button */}
+      <Dialog open={clearConfirmOpen} onClose={() => setClearConfirmOpen(false)}>
+        <DialogTitle>Clear Panel</DialogTitle>
+        <DialogContent>
+          <Typography>
+            Clear image from R{row + 1}C{col + 1}? All settings for this panel
+            will be lost.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setClearConfirmOpen(false)}>Cancel</Button>
+          <Button
+            variant="contained"
+            color="error"
+            onClick={() => {
+              setPanelImage(row, col, "");
+              setClearConfirmOpen(false);
+            }}
+          >
+            Clear
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }
