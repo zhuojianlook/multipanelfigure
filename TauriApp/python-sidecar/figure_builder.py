@@ -650,15 +650,28 @@ def _add_column_headers(fig, axes, header_levels: List[HeaderLevel],
                         "font_style": None,
                     }]
 
-            # For the first tier (closest to panels), start from the primary label position
+            # For the first tier (closest to panels), start from the primary label position.
+            # IMPORTANT: scale label_h by the MAX rendered line-count across all
+            # primary column labels at this position — otherwise a multi-line
+            # primary label (Shift+Enter newlines, shipped in 0.1.113) overlaps
+            # the secondary header above/below it.
             if base_y_top is None:
                 base_y_top = bbox_l.y1
                 if has_labels and column_labels:
-                    # Use the actual label distance + font height to find where labels end
-                    lbl_dist = column_labels[0].distance if column_labels else 0.025
-                    lbl_fs = column_labels[0].font_size if column_labels else 12
+                    top_lbls = [l for l in column_labels
+                                if l.text.strip() and getattr(l, 'position', 'Top') == 'Top']
+                    if top_lbls:
+                        lbl_dist = max(l.distance for l in top_lbls)
+                        lbl_fs = max(l.font_size for l in top_lbls)
+                        max_lines = max((_count_header_lines(l) for l in top_lbls), default=1)
+                    else:
+                        lbl_dist = column_labels[0].distance
+                        lbl_fs = column_labels[0].font_size
+                        max_lines = 1
                     label_offset = lbl_dist * ref
-                    label_h = lbl_fs / 72.0
+                    # Full text-block height: one line + (N-1) × line_height
+                    # at matplotlib's 1.2 line-height factor.
+                    label_h = (lbl_fs / 72.0) * (1.0 + 1.2 * (max_lines - 1))
                     # Compensate for rotated row label font centering
                     font_h_frac_correction = _inches_to_frac(lbl_fs / 72.0 * 0.5, fig_h)
                     base_y_top += _inches_to_frac(label_offset + label_h, fig_h) + font_h_frac_correction
@@ -666,10 +679,18 @@ def _add_column_headers(fig, axes, header_levels: List[HeaderLevel],
                 ax_bottom = axes[-1, group_cols[0]]
                 base_y_bottom = ax_bottom.get_position().y0
                 if has_labels and column_labels:
-                    lbl_dist = column_labels[0].distance if column_labels else 0.025
-                    lbl_fs = column_labels[0].font_size if column_labels else 12
+                    bot_lbls = [l for l in column_labels
+                                if l.text.strip() and getattr(l, 'position', 'Top') == 'Bottom']
+                    if bot_lbls:
+                        lbl_dist = max(l.distance for l in bot_lbls)
+                        lbl_fs = max(l.font_size for l in bot_lbls)
+                        max_lines = max((_count_header_lines(l) for l in bot_lbls), default=1)
+                    else:
+                        lbl_dist = column_labels[0].distance
+                        lbl_fs = column_labels[0].font_size
+                        max_lines = 1
                     label_offset = lbl_dist * ref
-                    label_h = lbl_fs / 72.0
+                    label_h = (lbl_fs / 72.0) * (1.0 + 1.2 * (max_lines - 1))
                     font_h_frac_correction = _inches_to_frac(lbl_fs / 72.0 * 0.5, fig_h)
                     base_y_bottom -= _inches_to_frac(label_offset + label_h, fig_h) - font_h_frac_correction
 
@@ -795,23 +816,42 @@ def _add_row_headers(fig, axes, header_levels: List[HeaderLevel],
                         "font_style": None,
                     }]
 
+            # Same multi-line accounting as column headers: account for the
+            # MAX line count across primary row labels at this position so
+            # secondary/tertiary row headers don't overlap a multi-line primary.
             if base_x_left is None:
                 base_x_left = bbox_t.x0
                 if has_labels and row_labels:
-                    lbl_dist = row_labels[0].distance if row_labels else 0.025
-                    lbl_fs = row_labels[0].font_size if row_labels else 12
+                    left_lbls = [l for l in row_labels
+                                 if l.text.strip() and getattr(l, 'position', 'Left') == 'Left']
+                    if left_lbls:
+                        lbl_dist = max(l.distance for l in left_lbls)
+                        lbl_fs = max(l.font_size for l in left_lbls)
+                        max_lines = max((_count_header_lines(l) for l in left_lbls), default=1)
+                    else:
+                        lbl_dist = row_labels[0].distance
+                        lbl_fs = row_labels[0].font_size
+                        max_lines = 1
                     label_offset = lbl_dist * ref
-                    label_w = lbl_fs / 72.0
+                    label_w = (lbl_fs / 72.0) * (1.0 + 1.2 * (max_lines - 1))
                     font_w_frac_correction = _inches_to_frac(lbl_fs / 72.0 * 0.5, fig_w)
                     base_x_left -= _inches_to_frac(label_offset + label_w, fig_w) + font_w_frac_correction
             if base_x_right is None:
                 ax_r = axes[group_rows[0], -1]
                 base_x_right = ax_r.get_position().x1
                 if has_labels and row_labels:
-                    lbl_dist = row_labels[0].distance if row_labels else 0.025
-                    lbl_fs = row_labels[0].font_size if row_labels else 12
+                    right_lbls = [l for l in row_labels
+                                  if l.text.strip() and getattr(l, 'position', 'Left') == 'Right']
+                    if right_lbls:
+                        lbl_dist = max(l.distance for l in right_lbls)
+                        lbl_fs = max(l.font_size for l in right_lbls)
+                        max_lines = max((_count_header_lines(l) for l in right_lbls), default=1)
+                    else:
+                        lbl_dist = row_labels[0].distance
+                        lbl_fs = row_labels[0].font_size
+                        max_lines = 1
                     label_offset = lbl_dist * ref
-                    label_w = lbl_fs / 72.0
+                    label_w = (lbl_fs / 72.0) * (1.0 + 1.2 * (max_lines - 1))
                     font_w_frac_correction = _inches_to_frac(lbl_fs / 72.0 * 0.5, fig_w)
                     base_x_right += _inches_to_frac(label_offset + label_w, fig_w) + font_w_frac_correction
 
