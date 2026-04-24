@@ -1564,13 +1564,23 @@ export function PanelGrid() {
                       wordBreak: "break-word",
                       lineHeight: 1.2,
                       overflow: "hidden",
+                      // Keep the same soft grey backdrop the textarea normally
+                      // shows, so the "textarea has a bg" affordance survives
+                      // when the colour overlay activates.
+                      backgroundColor: "rgba(255,255,255,0.15)",
                     }}
                   >
-                    {group.styled_segments.map((seg, si) => (
-                      <span key={si} style={segOverlayStyle(seg, group.default_color)}>
-                        {seg.text}
-                      </span>
-                    ))}
+                    {/* Single <span> wrapper unifies all seg children into one
+                        inline text-run. Without it, adjacent <span>s can pick
+                        up tiny sub-pixel gaps in rotated/vertical-rl layouts
+                        (user saw "Ro w 1" with a gap at the seg boundary). */}
+                    <span>
+                      {group.styled_segments.map((seg, si) => (
+                        <span key={si} style={segOverlayStyle(seg, group.default_color)}>
+                          {seg.text}
+                        </span>
+                      ))}
+                    </span>
                   </div>
                 )}
                 <textarea
@@ -1801,13 +1811,16 @@ export function PanelGrid() {
                     wordBreak: "break-word",
                     lineHeight: 1.2,
                     overflow: "hidden",
+                    backgroundColor: "rgba(255,255,255,0.15)",
                   }}
                 >
-                  {lbl.styled_segments!.map((seg, si) => (
-                    <span key={si} style={segOverlayStyle(seg, lbl.default_color)}>
-                      {seg.text}
-                    </span>
-                  ))}
+                  <span>
+                    {lbl.styled_segments!.map((seg, si) => (
+                      <span key={si} style={segOverlayStyle(seg, lbl.default_color)}>
+                        {seg.text}
+                      </span>
+                    ))}
+                  </span>
                 </div>
               )}
               <textarea
@@ -2051,7 +2064,7 @@ export function PanelGrid() {
                   {showOverlay && (
                     <div
                       aria-hidden
-                      className="text-center text-[10px] rounded px-0.5 py-1"
+                      className="text-center text-[10px] rounded px-1 py-1"
                       style={{
                         position: "absolute",
                         inset: 0,
@@ -2062,21 +2075,24 @@ export function PanelGrid() {
                         wordBreak: "break-word",
                         lineHeight: 1.2,
                         overflow: "hidden",
+                        backgroundColor: "rgba(255,255,255,0.15)",
                         // Inherits writingMode: vertical-rl from the outer
                         // rotated wrapper, so the overlay glyphs flow in the
                         // same direction as the rotated textarea's glyphs.
                       }}
                     >
-                      {group.styled_segments!.map((seg, si) => (
-                        <span key={si} style={segOverlayStyle(seg, group.default_color)}>
-                          {seg.text}
-                        </span>
-                      ))}
+                      <span>
+                        {group.styled_segments!.map((seg, si) => (
+                          <span key={si} style={segOverlayStyle(seg, group.default_color)}>
+                            {seg.text}
+                          </span>
+                        ))}
+                      </span>
                     </div>
                   )}
                   <textarea
                     className="bg-transparent text-center text-[10px] outline-none
-                               rounded px-0.5 py-1 hover:ring-1 hover:ring-blue-400/40 transition-shadow
+                               rounded px-1 py-1 hover:ring-1 hover:ring-blue-400/40 transition-shadow
                                resize-none"
                     rows={Math.max(
                       // Respect every explicit newline (capped at 12 so a
@@ -2381,7 +2397,7 @@ export function PanelGrid() {
                   {rowLabelShowOverlay && rlbl && (
                     <div
                       aria-hidden
-                      className="text-center text-[10px] rounded px-0.5 py-1"
+                      className="text-center text-[10px] rounded px-1 py-1"
                       style={{
                         position: "absolute",
                         inset: 0,
@@ -2392,21 +2408,21 @@ export function PanelGrid() {
                         wordBreak: "break-word",
                         lineHeight: 1.2,
                         overflow: "hidden",
-                        // Inherits writingMode: vertical-rl from the outer
-                        // rotated wrapper (when rotated) so glyphs flow in
-                        // the same direction as the textarea's glyphs.
+                        backgroundColor: "rgba(255,255,255,0.15)",
                       }}
                     >
-                      {rlbl.styled_segments!.map((seg, si) => (
-                        <span key={si} style={segOverlayStyle(seg, rlbl.default_color)}>
-                          {seg.text}
-                        </span>
-                      ))}
+                      <span>
+                        {rlbl.styled_segments!.map((seg, si) => (
+                          <span key={si} style={segOverlayStyle(seg, rlbl.default_color)}>
+                            {seg.text}
+                          </span>
+                        ))}
+                      </span>
                     </div>
                   )}
                   <textarea
                     className="bg-transparent text-center text-[10px] outline-none
-                               rounded px-0.5 py-1 resize-none"
+                               rounded px-1 py-1 resize-none"
                     rows={Math.max(
                       (row_labels[ri]?.text ?? "").includes("\n")
                         ? Math.min(12, (row_labels[ri]?.text ?? "").split("\n").length)
