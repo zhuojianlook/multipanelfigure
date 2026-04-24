@@ -1678,16 +1678,63 @@ export function PanelGrid() {
         {/* ── Column labels row ────────────────────────── */}
         {config.show_column_labels !== false ? (
           <>
-          {column_labels.map((lbl, ci) => (
+          {column_labels.map((lbl, ci) => {
+            // Show the per-char colour overlay whenever styled_segments
+            // exist for this PRIMARY column label — matches the secondary
+            // header behavior (user: "primary headers don't show the
+            // color selection"). Overlay sits underneath the textarea
+            // (which is rendered with transparent text + transparent bg
+            // when the overlay is active) so coloured chars show through.
+            const labelShowOverlay = !!(lbl.styled_segments && lbl.styled_segments.length > 0);
+            return (
             <div
               key={`cl-${ci}`}
               className="flex items-center justify-center gap-0.5 group/cl"
               style={{
                 gridRow: labelRow,
                 gridColumn: panelColStart + ci,
+                position: "relative",
               }}
               onClick={(e) => handleLabelClick(e, "col", ci)}
             >
+              {labelShowOverlay && (
+                <div
+                  aria-hidden
+                  className="text-center text-[10px] rounded px-1 py-0.5"
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    pointerEvents: "none",
+                    fontWeight: lbl.font_style?.includes("Bold") ? 700 : 400,
+                    fontStyle: lbl.font_style?.includes("Italic") ? "italic" : "normal",
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                    lineHeight: 1.2,
+                    overflow: "hidden",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                >
+                  <span>
+                    {lbl.styled_segments!.map((seg, si) => (
+                      <span
+                        key={si}
+                        style={{
+                          color: seg.color || lbl.default_color || "var(--c-text-dim)",
+                          fontSize: seg.font_size ? seg.font_size + "px" : undefined,
+                          fontFamily: seg.font_name ? seg.font_name.replace(/\.(ttf|otf|ttc)$/i, "") : undefined,
+                          fontWeight: seg.font_style?.includes("Bold") ? 700 : undefined,
+                          fontStyle: seg.font_style?.includes("Italic") ? "italic" : undefined,
+                          textDecoration: seg.font_style?.includes("Strikethrough") ? "line-through" : seg.font_style?.includes("Underline") ? "underline" : undefined,
+                        }}
+                      >
+                        {seg.text}
+                      </span>
+                    ))}
+                  </span>
+                </div>
+              )}
               <textarea
                 className="bg-transparent text-center text-[10px] flex-1 min-w-0 outline-none
                            rounded px-1 py-0.5 resize-none"
@@ -1697,8 +1744,9 @@ export function PanelGrid() {
                   1,
                 )}
                 style={{
-                  color: lbl.default_color || "var(--c-text-dim)",
-                  backgroundColor: "rgba(255,255,255,0.15)",
+                  color: labelShowOverlay ? "transparent" : (lbl.default_color || "var(--c-text-dim)"),
+                  caretColor: lbl.default_color || "var(--c-text-dim)",
+                  backgroundColor: labelShowOverlay ? "transparent" : "rgba(255,255,255,0.15)",
                   minHeight: "28px",
                   fontWeight: lbl.font_style?.includes("Bold") ? 700 : 400,
                   fontStyle: lbl.font_style?.includes("Italic") ? "italic" : "normal",
@@ -1787,7 +1835,8 @@ export function PanelGrid() {
                 </button>
               </Tooltip>
             </div>
-          ))}
+            );
+          })}
           {/* X button to remove column labels — same style as secondary header X */}
           <Tooltip title="Remove column labels" placement="right" arrow>
             <button
@@ -2251,6 +2300,8 @@ export function PanelGrid() {
             >
               {(() => {
                 const isRotated = (row_labels[ri]?.rotation ?? 90) !== 0;
+                const rlbl = row_labels[ri];
+                const rowLabelShowOverlay = !!(rlbl?.styled_segments && rlbl.styled_segments.length > 0);
                 return (
                 <div
                   style={{
@@ -2262,8 +2313,48 @@ export function PanelGrid() {
                     justifyContent: "center",
                     flex: 1,
                     minHeight: 0,
+                    position: "relative",
                   }}
                 >
+                  {rowLabelShowOverlay && rlbl && (
+                    <div
+                      aria-hidden
+                      style={{
+                        position: "absolute",
+                        inset: 0,
+                        pointerEvents: "none",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        textAlign: "center",
+                        fontWeight: rlbl.font_style?.includes("Bold") ? 700 : 400,
+                        fontStyle: rlbl.font_style?.includes("Italic") ? "italic" : "normal",
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-word",
+                        lineHeight: 1.2,
+                        fontSize: "10px",
+                        overflow: "hidden",
+                      }}
+                    >
+                      <span>
+                        {rlbl.styled_segments!.map((seg, si) => (
+                          <span
+                            key={si}
+                            style={{
+                              color: seg.color || rlbl.default_color || "var(--c-text-dim)",
+                              fontSize: seg.font_size ? seg.font_size + "px" : undefined,
+                              fontFamily: seg.font_name ? seg.font_name.replace(/\.(ttf|otf|ttc)$/i, "") : undefined,
+                              fontWeight: seg.font_style?.includes("Bold") ? 700 : undefined,
+                              fontStyle: seg.font_style?.includes("Italic") ? "italic" : undefined,
+                              textDecoration: seg.font_style?.includes("Strikethrough") ? "line-through" : seg.font_style?.includes("Underline") ? "underline" : undefined,
+                            }}
+                          >
+                            {seg.text}
+                          </span>
+                        ))}
+                      </span>
+                    </div>
+                  )}
                   <textarea
                     className="bg-transparent text-center text-[10px] outline-none
                                rounded px-0.5 py-1 resize-none"
@@ -2274,8 +2365,11 @@ export function PanelGrid() {
                       1,
                     )}
                     style={{
-                      color: row_labels[ri]?.default_color || "var(--c-text-dim)",
-                      backgroundColor: "rgba(255,255,255,0.15)",
+                      color: rowLabelShowOverlay
+                        ? "transparent"
+                        : (row_labels[ri]?.default_color || "var(--c-text-dim)"),
+                      caretColor: row_labels[ri]?.default_color || "var(--c-text-dim)",
+                      backgroundColor: rowLabelShowOverlay ? "transparent" : "rgba(255,255,255,0.15)",
                       // Rotated row label in writing-mode:vertical-rl — each
                       // explicit line stacks HORIZONTALLY after rotation, so
                       // width must grow with line count to avoid clipping.
