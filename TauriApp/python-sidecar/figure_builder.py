@@ -416,12 +416,90 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
         # the "color change shifts characters slightly" user report.
         # Baseline alignment is stable across glyphs and collapses the
         # stair-step.
+        #
+        # Per-segment extra styles (Underline, Strikethrough, Superscript,
+        # Subscript) are carried on seg_fp._extra_styles (set by
+        # _font_props). The multi-styled path previously dropped them —
+        # they were only rendered in the single-colour plain path — so
+        # user-reported "underline/strikethrough/super/sub don't work"
+        # whenever any colour variation was present. Handle them here.
         for seg_fp, seg_start, part_text, color in zip(seg_fps, seg_starts_in, seg_texts, seg_colors):
             cur_x = base_cx + (seg_start * cos_r) / max(0.001, fig_w_in)
             cur_y = base_cy + (seg_start * sin_r) / max(0.001, fig_h_in)
-            fig.text(cur_x, cur_y, part_text, ha='left', va='baseline',
-                     fontproperties=seg_fp, color=color,
+
+            extra = list(getattr(seg_fp, '_extra_styles', []) or [])
+            has_underline = 'Underline' in extra
+            has_strike = 'Strikethrough' in extra
+            is_super = 'Superscript' in extra
+            is_sub = 'Subscript' in extra
+
+            # Super/subscript: shrink font and lift/drop baseline by 30% of
+            # the segment's ORIGINAL size along the perpendicular-to-baseline
+            # direction (so it works for rotated text too).
+            draw_fp = seg_fp
+            draw_x, draw_y = cur_x, cur_y
+            if is_super or is_sub:
+                orig_size = seg_fp.get_size() if hasattr(seg_fp, 'get_size') else 10
+                try:
+                    draw_fp = seg_fp.copy()
+                    draw_fp.set_size(orig_size * 0.7)
+                    # Preserve extra_styles marker on the copy for safety
+                    draw_fp._extra_styles = [s for s in extra if s not in ('Superscript', 'Subscript')]
+                except Exception:
+                    draw_fp = seg_fp
+                offset_in = (orig_size / 72.0) * 0.3  # 30% of em in inches
+                # Perpendicular direction in figure coords: (-sin_r, cos_r)
+                sign = +1 if is_super else -1
+                draw_x = cur_x + (-sin_r * sign * offset_in) / max(0.001, fig_w_in)
+                draw_y = cur_y + (cos_r * sign * offset_in) / max(0.001, fig_h_in)
+
+            txt_artist = fig.text(draw_x, draw_y, part_text, ha='left', va='baseline',
+                     fontproperties=draw_fp, color=color,
                      rotation=rot_deg, rotation_mode='anchor')
+
+            # Underline / Strikethrough: measure the rendered segment's
+            # bbox in figure fractions and draw a Line2D along the same
+            # baseline direction, offset perpendicular to it. This makes
+            # the decoration rotate with the text automatically.
+            if (has_underline or has_strike) and _renderer is not None:
+                try:
+                    fig.canvas.draw()
+                    bb = txt_artist.get_window_extent(_renderer)
+                    bb_fig = bb.transformed(fig.transFigure.inverted())
+                    lw = max(0.5, draw_fp.get_size() / 20) if hasattr(draw_fp, 'get_size') else 0.8
+                    # We know the baseline is at (draw_x, draw_y) in figure
+                    # fractions; the text extends `seg_advance` along the
+                    # baseline direction and ~ascent perpendicular (upward).
+                    seg_adv_in = _measure_inches(part_text, draw_fp)
+                    # Endpoints of baseline in figure coords
+                    bx0, by0 = draw_x, draw_y
+                    bx1 = draw_x + (seg_adv_in * cos_r) / max(0.001, fig_w_in)
+                    by1 = draw_y + (seg_adv_in * sin_r) / max(0.001, fig_h_in)
+                    # Perpendicular unit vector in figure coords
+                    perp_dx = -sin_r / max(0.001, fig_w_in)
+                    perp_dy = cos_r / max(0.001, fig_h_in)
+                    if has_underline:
+                        # 0.05em below baseline (toward descent)
+                        off_in = -(draw_fp.get_size() / 72.0) * 0.08 if hasattr(draw_fp, 'get_size') else -0.01
+                        ux0 = bx0 + perp_dx * off_in
+                        uy0 = by0 + perp_dy * off_in
+                        ux1 = bx1 + perp_dx * off_in
+                        uy1 = by1 + perp_dy * off_in
+                        fig.add_artist(plt.Line2D(
+                            [ux0, ux1], [uy0, uy1], transform=fig.transFigure,
+                            color=color, linewidth=lw, linestyle='-', clip_on=False))
+                    if has_strike:
+                        # ~0.3em above baseline (roughly middle of x-height)
+                        off_in = (draw_fp.get_size() / 72.0) * 0.30 if hasattr(draw_fp, 'get_size') else 0.03
+                        sx0 = bx0 + perp_dx * off_in
+                        sy0 = by0 + perp_dy * off_in
+                        sx1 = bx1 + perp_dx * off_in
+                        sy1 = by1 + perp_dy * off_in
+                        fig.add_artist(plt.Line2D(
+                            [sx0, sx1], [sy0, sy1], transform=fig.transFigure,
+                            color=color, linewidth=lw, linestyle='-', clip_on=False))
+                except Exception:
+                    pass  # Decoration best-effort; skip on measurement failure
 
 
 # Cache of font name -> file path lookups

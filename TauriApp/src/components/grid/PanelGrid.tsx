@@ -9,7 +9,7 @@
    - Right-click context menus for header manipulation
    ────────────────────────────────────────────────────────── */
 
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, type CSSProperties } from "react";
 import {
   Menu,
   MenuItem,
@@ -76,6 +76,45 @@ interface HeaderStyledSegment {
   font_name?: string;
   font_size?: number;
   font_style?: string[];
+}
+
+// Builds the inline CSS for one styled segment inside the per-char overlay
+// used by header/label editors. Handles color, font, bold+italic stacking,
+// combined underline+strikethrough, and super/subscript.
+//
+// Why explicit fontWeight/fontStyle (400/normal) rather than undefined:
+// the overlay's outer container inherits the ELEMENT-level Bold/Italic; if
+// an individual seg has those removed, leaving undefined would incorrectly
+// inherit the container's value and show the seg as still-bold/italic.
+function segOverlayStyle(
+  seg: HeaderStyledSegment,
+  fallbackColor?: string,
+): CSSProperties {
+  const st = seg.font_style ?? [];
+  const bold = st.includes("Bold");
+  const italic = st.includes("Italic");
+  const underline = st.includes("Underline");
+  const strike = st.includes("Strikethrough");
+  const sup = st.includes("Superscript");
+  const sub = st.includes("Subscript");
+
+  const deco: string[] = [];
+  if (underline) deco.push("underline");
+  if (strike) deco.push("line-through");
+
+  const baseSize = seg.font_size;
+  const shrink = sup || sub;
+  return {
+    color: seg.color || fallbackColor || "var(--c-text-dim)",
+    fontSize: shrink
+      ? (baseSize ? `${baseSize * 0.7}px` : "0.7em")
+      : baseSize ? `${baseSize}px` : undefined,
+    fontFamily: seg.font_name ? seg.font_name.replace(/\.(ttf|otf|ttc)$/i, "") : undefined,
+    fontWeight: bold ? 700 : 400,
+    fontStyle: italic ? "italic" : "normal",
+    textDecoration: deco.length > 0 ? deco.join(" ") : undefined,
+    verticalAlign: sup ? "super" : sub ? "sub" : undefined,
+  };
 }
 
 interface HeaderPropsDialogState {
@@ -839,17 +878,82 @@ export function PanelGrid() {
     });
   };
 
+  // Resolve the effective font_style for the currently-selected characters
+  // (intersection of per-char styles). If there's no selection, falls back
+  // to the element's default font_style. This lets the toggle handler ADD
+  // a style to chars that don't have it and REMOVE it from chars that all
+  // already do — i.e. proper stacking (bold+italic+underline+...).
+  const effectiveFontStylesForSelection = (): string[] => {
+    const sel = resolveSelection();
+    if (!sel || !toolbarTarget) return [...toolbarData.fontStyle];
+    let fullText = "";
+    let segs: HeaderStyledSegment[] | undefined;
+    let defaultStyles: string[] = [];
+    if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
+      const headers = toolbarTarget.axis === "col" ? column_headers : row_headers;
+      const g = headers[toolbarTarget.level]?.headers[toolbarTarget.groupIdx];
+      if (!g) return [...toolbarData.fontStyle];
+      fullText = g.text || "";
+      segs = (g.styled_segments as HeaderStyledSegment[]) || undefined;
+      defaultStyles = g.font_style || [];
+    } else if ((toolbarTarget.type === "colLabel" || toolbarTarget.type === "rowLabel") && toolbarTarget.index !== undefined) {
+      const labels = toolbarTarget.axis === "col" ? (config?.column_labels ?? []) : (config?.row_labels ?? []);
+      const lbl = labels[toolbarTarget.index];
+      if (!lbl) return [...toolbarData.fontStyle];
+      fullText = lbl.text || "";
+      segs = (lbl.styled_segments as HeaderStyledSegment[]) || undefined;
+      defaultStyles = lbl.font_style || [];
+    }
+    // Build per-char style list (mirrors applySegmentPatch's flatten step).
+    type CharStyle = string[];
+    const flat: CharStyle[] = [];
+    if (!segs || segs.length === 0) {
+      for (let i = 0; i < fullText.length; i++) flat.push([...defaultStyles]);
+    } else {
+      for (const seg of segs) {
+        const sty = seg.font_style && seg.font_style.length > 0 ? seg.font_style : defaultStyles;
+        for (let i = 0; i < seg.text.length; i++) flat.push([...sty]);
+      }
+      if (flat.length !== fullText.length) {
+        // Desync — fall back to defaults.
+        flat.length = 0;
+        for (let i = 0; i < fullText.length; i++) flat.push([...defaultStyles]);
+      }
+    }
+    const lo = Math.max(0, Math.min(sel.start, sel.end));
+    const hi = Math.min(flat.length, Math.max(sel.start, sel.end));
+    if (hi <= lo) return [...toolbarData.fontStyle];
+    // Intersection: a style is "present in selection" iff EVERY char in
+    // the selection has it. That matches most word-processor toggle
+    // semantics — partial presence means the next toggle ADDs.
+    const first = flat[lo];
+    const inter = first.filter((s) =>
+      flat.slice(lo, hi).every((cs) => cs.includes(s)),
+    );
+    return inter;
+  };
+
   const handleToolbarFontStyleToggle = (style: string) => {
-    const current = [...toolbarData.fontStyle];
+    // Start from the SELECTION's effective styles (intersection) so
+    // stacking works — previously we pulled from toolbarData.fontStyle
+    // which is the HEADER-LEVEL default, so toggling Italic on an
+    // already-Bold char would blow away the Bold.
+    const current = effectiveFontStylesForSelection();
     const idx = current.indexOf(style);
     if (idx >= 0) current.splice(idx, 1);
     else current.push(style);
     applyStylingPatch({ font_style: current }, () => {
       if (!toolbarTarget) return;
+      // "No selection" path — toggle against the element's full current
+      // default font_style list instead of the bare selection-effective one.
+      const elementCurrent = [...toolbarData.fontStyle];
+      const ei = elementCurrent.indexOf(style);
+      if (ei >= 0) elementCurrent.splice(ei, 1);
+      else elementCurrent.push(style);
       if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
-        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { font_style: current });
+        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { font_style: elementCurrent });
       } else if ((toolbarTarget.type === "colLabel" || toolbarTarget.type === "rowLabel") && toolbarTarget.index !== undefined) {
-        updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { font_style: current });
+        updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { font_style: elementCurrent });
       }
     });
   };
@@ -1467,17 +1571,7 @@ export function PanelGrid() {
                   >
                     <span>
                       {group.styled_segments.map((seg, si) => (
-                        <span
-                          key={si}
-                          style={{
-                            color: seg.color || group.default_color || "var(--c-text-dim)",
-                            fontSize: seg.font_size ? seg.font_size + "px" : undefined,
-                            fontFamily: seg.font_name ? seg.font_name.replace(/\.(ttf|otf|ttc)$/i, "") : undefined,
-                            fontWeight: seg.font_style?.includes("Bold") ? 700 : undefined,
-                            fontStyle: seg.font_style?.includes("Italic") ? "italic" : undefined,
-                            textDecoration: seg.font_style?.includes("Strikethrough") ? "line-through" : seg.font_style?.includes("Underline") ? "underline" : undefined,
-                          }}
-                        >
+                        <span key={si} style={segOverlayStyle(seg, group.default_color)}>
                           {seg.text}
                         </span>
                       ))}
@@ -1718,17 +1812,7 @@ export function PanelGrid() {
                 >
                   <span>
                     {lbl.styled_segments!.map((seg, si) => (
-                      <span
-                        key={si}
-                        style={{
-                          color: seg.color || lbl.default_color || "var(--c-text-dim)",
-                          fontSize: seg.font_size ? seg.font_size + "px" : undefined,
-                          fontFamily: seg.font_name ? seg.font_name.replace(/\.(ttf|otf|ttc)$/i, "") : undefined,
-                          fontWeight: seg.font_style?.includes("Bold") ? 700 : undefined,
-                          fontStyle: seg.font_style?.includes("Italic") ? "italic" : undefined,
-                          textDecoration: seg.font_style?.includes("Strikethrough") ? "line-through" : seg.font_style?.includes("Underline") ? "underline" : undefined,
-                        }}
-                      >
+                      <span key={si} style={segOverlayStyle(seg, lbl.default_color)}>
                         {seg.text}
                       </span>
                     ))}
@@ -1995,17 +2079,7 @@ export function PanelGrid() {
                     >
                       <span>
                         {group.styled_segments!.map((seg, si) => (
-                          <span
-                            key={si}
-                            style={{
-                              color: seg.color || group.default_color || "var(--c-text-dim)",
-                              fontSize: seg.font_size ? seg.font_size + "px" : undefined,
-                              fontFamily: seg.font_name ? seg.font_name.replace(/\.(ttf|otf|ttc)$/i, "") : undefined,
-                              fontWeight: seg.font_style?.includes("Bold") ? 700 : undefined,
-                              fontStyle: seg.font_style?.includes("Italic") ? "italic" : undefined,
-                              textDecoration: seg.font_style?.includes("Strikethrough") ? "line-through" : seg.font_style?.includes("Underline") ? "underline" : undefined,
-                            }}
-                          >
+                          <span key={si} style={segOverlayStyle(seg, group.default_color)}>
                             {seg.text}
                           </span>
                         ))}
@@ -2338,17 +2412,7 @@ export function PanelGrid() {
                     >
                       <span>
                         {rlbl.styled_segments!.map((seg, si) => (
-                          <span
-                            key={si}
-                            style={{
-                              color: seg.color || rlbl.default_color || "var(--c-text-dim)",
-                              fontSize: seg.font_size ? seg.font_size + "px" : undefined,
-                              fontFamily: seg.font_name ? seg.font_name.replace(/\.(ttf|otf|ttc)$/i, "") : undefined,
-                              fontWeight: seg.font_style?.includes("Bold") ? 700 : undefined,
-                              fontStyle: seg.font_style?.includes("Italic") ? "italic" : undefined,
-                              textDecoration: seg.font_style?.includes("Strikethrough") ? "line-through" : seg.font_style?.includes("Underline") ? "underline" : undefined,
-                            }}
-                          >
+                          <span key={si} style={segOverlayStyle(seg, rlbl.default_color)}>
                             {seg.text}
                           </span>
                         ))}
