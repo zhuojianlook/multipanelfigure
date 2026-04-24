@@ -261,6 +261,58 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
     line_height_in = overall_max_size * 1.2 / 72.0
     num_lines = len(lines)
 
+    # Map the CALLER's va ('top'/'center'/'bottom') to the baseline offset
+    # needed when per-segment draws use va='baseline'. Without this, the
+    # whole styled text block shifts relative to where the plain-path
+    # (non-styled) render would land — user-reported as "changing colour
+    # shifts column header downwards" (va='bottom' caller, styled path
+    # was drawing at baseline instead of ink-bottom-at-y, so baseline
+    # was at y instead of y+descent — text effectively moved down by
+    # `descent` relative to the plain equivalent).
+    #
+    # Probe matplotlib's own bbox for a test text anchored at (0,0) with
+    # va='baseline' — bb.y0 is the descent below baseline and bb.y1 is
+    # the ascent above. Using fig.text+get_window_extent matches what
+    # matplotlib uses for va='top/center/bottom' alignment in the
+    # single-color (plain) path, so the styled path lands at the same
+    # visual position.
+    ref_fp_for_metrics = fp
+    ascent_in = 0.0
+    descent_in = 0.0
+    if _renderer is not None:
+        try:
+            probe = fig.text(0, 0, "Mg", fontproperties=ref_fp_for_metrics,
+                             ha='left', va='baseline', color='none')
+            try:
+                bb = probe.get_window_extent(_renderer)
+                ascent_in = bb.y1 / _dpi
+                descent_in = -bb.y0 / _dpi
+            finally:
+                probe.remove()
+        except Exception:
+            pass
+    if ascent_in <= 0:
+        # Fallback estimates from font size (Arial-like 80/20 split).
+        size_pts = ref_fp_for_metrics.get_size() if hasattr(ref_fp_for_metrics, 'get_size') else 10
+        ascent_in = size_pts * 0.8 / 72.0
+        descent_in = size_pts * 0.2 / 72.0
+
+    if va == 'bottom':
+        # Caller wants INK-BBOX BOTTOM at y. Plain-path puts baseline at
+        # y + descent. Per-seg baseline draws put baseline at y. Shift
+        # the block up by +descent (in PERP-UP direction) to match.
+        baseline_offset_perp_in = descent_in
+    elif va == 'top':
+        # Caller wants INK-BBOX TOP at y. Baseline at y - ascent. Shift
+        # block down (in PERP-DOWN direction) by ascent.
+        baseline_offset_perp_in = -ascent_in
+    elif va in ('center', 'center_baseline'):
+        # Caller wants INK-BBOX CENTER at y. Center = baseline + (ascent-descent)/2.
+        # To put center at y: baseline = y - (ascent-descent)/2.
+        baseline_offset_perp_in = -(ascent_in - descent_in) / 2.0
+    else:  # 'baseline'
+        baseline_offset_perp_in = 0.0
+
     for line_idx, line_segs in enumerate(lines):
         # Perpendicular-to-baseline offset (positive = "up" relative to
         # baseline direction — i.e. opposite to where the next line
@@ -274,8 +326,12 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
 
         # Perpendicular direction in figure coords: (-sin_r, cos_r)
         # — at rotation=0, that's (0, 1) so lines stack vertically.
-        line_base_x = x + (-sin_r * perp_offset_in) / max(0.001, fig_w_in)
-        line_base_y = y + (cos_r * perp_offset_in) / max(0.001, fig_h_in)
+        # Apply the baseline_offset in the SAME perpendicular direction so
+        # the per-seg va='baseline' draws land at the same ink-bbox
+        # position the caller's va asked for.
+        total_perp_in = perp_offset_in + baseline_offset_perp_in
+        line_base_x = x + (-sin_r * total_perp_in) / max(0.001, fig_w_in)
+        line_base_y = y + (cos_r * total_perp_in) / max(0.001, fig_h_in)
 
         # Layout segments within this line along the baseline.
         if not line_segs:
