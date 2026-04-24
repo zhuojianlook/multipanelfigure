@@ -2034,6 +2034,14 @@ export function PanelGrid() {
                   position: "relative",
                   opacity: isBeingDragged ? 0.8 : 1,
                   cursor: "pointer",
+                  // Grey affordance bg put on the grid-cell itself so it
+                  // spans the full configured row-span — the inner textarea
+                  // is sized to its text width (e.g. 28px) and would only
+                  // paint the bg over that stripe.
+                  backgroundColor: isBeingDragged
+                    ? "var(--c-accent)"
+                    : "rgba(255,255,255,0.15)",
+                  borderRadius: 4,
                 }}
                 onClick={(e) => handleHeaderClick(e, "row", li, gi)}
                 onContextMenu={(e) => handleHeaderContextMenu(e, "row", li, gi)}
@@ -2064,7 +2072,7 @@ export function PanelGrid() {
                   {showOverlay && (
                     <div
                       aria-hidden
-                      className="text-center text-[10px] rounded px-1 py-1"
+                      className="text-center text-[10px] rounded px-2 py-1"
                       style={{
                         position: "absolute",
                         inset: 0,
@@ -2075,7 +2083,10 @@ export function PanelGrid() {
                         wordBreak: "break-word",
                         lineHeight: 1.2,
                         overflow: "hidden",
-                        backgroundColor: "rgba(255,255,255,0.15)",
+                        // Bg lives on the outer grid-cell div now; overlay
+                        // stays transparent so the cell-level bg (which
+                        // spans the full row-span) shows through behind
+                        // the coloured glyphs.
                         // Inherits writingMode: vertical-rl from the outer
                         // rotated wrapper, so the overlay glyphs flow in the
                         // same direction as the rotated textarea's glyphs.
@@ -2092,7 +2103,7 @@ export function PanelGrid() {
                   )}
                   <textarea
                     className="bg-transparent text-center text-[10px] outline-none
-                               rounded px-1 py-1 hover:ring-1 hover:ring-blue-400/40 transition-shadow
+                               rounded px-2 py-1 hover:ring-1 hover:ring-blue-400/40 transition-shadow
                                resize-none"
                     rows={Math.max(
                       // Respect every explicit newline (capped at 12 so a
@@ -2107,11 +2118,10 @@ export function PanelGrid() {
                       // visible via caretColor so typing remains usable.
                       color: showOverlay ? "transparent" : (group.default_color || "var(--c-text-dim)"),
                       caretColor: group.default_color || "var(--c-text-dim)",
-                      // Drop the semi-opaque white bg when overlay is on —
-                      // at 15% opacity it washes out per-char colours.
-                      backgroundColor: isBeingDragged
-                        ? "var(--c-accent)"
-                        : (showOverlay ? "transparent" : "rgba(255,255,255,0.15)"),
+                      // Bg now lives on the outer grid-cell div (drag-aware)
+                      // so it spans the full configured row-span. Leave the
+                      // textarea transparent so the outer bg shows through.
+                      backgroundColor: "transparent",
                       borderRight: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
                       // Rotated textarea: in vertical-rl, each explicit line
                       // stacks HORIZONTALLY (not vertically as it would for a
@@ -2373,6 +2383,10 @@ export function PanelGrid() {
                 display: "flex",
                 flexDirection: "column",
                 alignItems: "center",
+                // Grey affordance bg on the cell so it spans the full row
+                // regardless of the inner textarea's sized-to-text width.
+                backgroundColor: "rgba(255,255,255,0.15)",
+                borderRadius: 4,
               }}
               onClick={(e) => handleLabelClick(e, "row", ri)}
             >
@@ -2408,7 +2422,7 @@ export function PanelGrid() {
                         wordBreak: "break-word",
                         lineHeight: 1.2,
                         overflow: "hidden",
-                        backgroundColor: "rgba(255,255,255,0.15)",
+                        // Bg lives on the outer grid-cell div now.
                       }}
                     >
                       <span>
@@ -2434,7 +2448,9 @@ export function PanelGrid() {
                         ? "transparent"
                         : (row_labels[ri]?.default_color || "var(--c-text-dim)"),
                       caretColor: row_labels[ri]?.default_color || "var(--c-text-dim)",
-                      backgroundColor: rowLabelShowOverlay ? "transparent" : "rgba(255,255,255,0.15)",
+                      // Bg moved to the outer grid-cell div so it spans the
+                      // full row; textarea stays transparent.
+                      backgroundColor: "transparent",
                       // Rotated row label in writing-mode:vertical-rl — each
                       // explicit line stacks HORIZONTALLY after rotation, so
                       // width must grow with line count to avoid clipping.
