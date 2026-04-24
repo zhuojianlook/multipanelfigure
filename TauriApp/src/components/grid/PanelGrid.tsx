@@ -9,7 +9,7 @@
    - Right-click context menus for header manipulation
    ────────────────────────────────────────────────────────── */
 
-import { useState, useCallback, useRef, useEffect, type CSSProperties } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import {
   Menu,
   MenuItem,
@@ -48,6 +48,8 @@ import CloseIcon from "@mui/icons-material/Close";
 import { useFigureStore, type LoadedImage } from "../../store/figureStore";
 import { PanelCell } from "./PanelCell";
 import { FloatingToolbar } from "./FloatingToolbar";
+import { HeaderEditor, type HeaderEditorTarget } from "./HeaderEditor";
+import { type StyledTextEditorHandle } from "./StyledTextEditor";
 import type { HeaderGroup, PanelInfo } from "../../api/types";
 import { api } from "../../api/client";
 
@@ -76,45 +78,6 @@ interface HeaderStyledSegment {
   font_name?: string;
   font_size?: number;
   font_style?: string[];
-}
-
-// Builds the inline CSS for one styled segment inside the per-char overlay
-// used by header/label editors. Handles color, font, bold+italic stacking,
-// combined underline+strikethrough, and super/subscript.
-//
-// Why explicit fontWeight/fontStyle (400/normal) rather than undefined:
-// the overlay's outer container inherits the ELEMENT-level Bold/Italic; if
-// an individual seg has those removed, leaving undefined would incorrectly
-// inherit the container's value and show the seg as still-bold/italic.
-function segOverlayStyle(
-  seg: HeaderStyledSegment,
-  fallbackColor?: string,
-): CSSProperties {
-  const st = seg.font_style ?? [];
-  const bold = st.includes("Bold");
-  const italic = st.includes("Italic");
-  const underline = st.includes("Underline");
-  const strike = st.includes("Strikethrough");
-  const sup = st.includes("Superscript");
-  const sub = st.includes("Subscript");
-
-  const deco: string[] = [];
-  if (underline) deco.push("underline");
-  if (strike) deco.push("line-through");
-
-  const baseSize = seg.font_size;
-  const shrink = sup || sub;
-  return {
-    color: seg.color || fallbackColor || "var(--c-text-dim)",
-    fontSize: shrink
-      ? (baseSize ? `${baseSize * 0.7}px` : "0.7em")
-      : baseSize ? `${baseSize}px` : undefined,
-    fontFamily: seg.font_name ? seg.font_name.replace(/\.(ttf|otf|ttc)$/i, "") : undefined,
-    fontWeight: bold ? 700 : 400,
-    fontStyle: italic ? "italic" : "normal",
-    textDecoration: deco.length > 0 ? deco.join(" ") : undefined,
-    verticalAlign: sup ? "super" : sub ? "sub" : undefined,
-  };
 }
 
 interface HeaderPropsDialogState {
@@ -967,28 +930,49 @@ export function PanelGrid() {
   // cache only *non-empty* ranges, so the ref still holds the user's last
   // real selection when the toolbar handler finally fires.
   const toolbarTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // Parallel channel for the new StyledTextEditor-based surfaces. When
+  // a HeaderEditor activates, it sets activeEditorRef; captureSelection-
+  // FromActive and the toolbar's Shift+Enter handler prefer it over the
+  // textarea ref. Textarea-based surfaces still populate
+  // toolbarTextareaRef via their existing onFocus/onSelect handlers.
+  const activeEditorRef = useRef<StyledTextEditorHandle | null>(null);
+  const activeEditorTargetRef = useRef<HeaderEditorTarget | null>(null);
   const toolbarSelectionRef = useRef<{ start: number; end: number } | null>(null);
   // Mirror the cached selection into reactive state so the toolbar can
   // display a preview of what substring will be styled next.
   const [selectionPreview, setSelectionPreview] = useState<string>("");
-  // Key of the currently-focused header / label textarea (so we can hide
-  // the styled-segment overlay for the one the user is editing — the
-  // overlay was causing reports of "deletion doesn't register" and
-  // "Shift+Enter does nothing" because the transparent-text textarea
-  // beneath it was hard to interact with).
-  const [focusedKey, setFocusedKey] = useState<string>("");
   const updateSelectionPreview = (ta: HTMLTextAreaElement, start: number, end: number) => {
     if (start === end) return;
     const text = (ta.value || "").slice(Math.min(start, end), Math.max(start, end));
     setSelectionPreview(text);
   };
-  // Centralized capture — whenever called, reads the active textarea's
-  // current selection and, if non-empty, caches it and updates the
-  // visible preview. Called from many triggers to maximize reliability.
+  const updateSelectionPreviewFromText = (text: string, start: number, end: number) => {
+    if (start === end) return;
+    setSelectionPreview(text.slice(Math.min(start, end), Math.max(start, end)));
+  };
+  const getActiveEditorText = (): string => {
+    const t = activeEditorTargetRef.current;
+    if (!t) return "";
+    if (t.type === "header") {
+      const headers = t.axis === "col" ? column_headers : row_headers;
+      return headers[t.level]?.headers[t.groupIdx]?.text || "";
+    }
+    const labels = t.axis === "col" ? column_labels : row_labels;
+    return labels[t.index]?.text || "";
+  };
+  // Capture a non-empty selection from whichever surface is active
+  // (HeaderEditor OR the legacy textarea).
   const captureSelectionFromActive = () => {
+    const ed = activeEditorRef.current;
+    if (ed) {
+      const sel = ed.getSelection();
+      if (sel && sel.start !== sel.end) {
+        toolbarSelectionRef.current = sel;
+        updateSelectionPreviewFromText(getActiveEditorText(), sel.start, sel.end);
+        return;
+      }
+    }
     const ae = document.activeElement as HTMLElement | null;
-    // Headers are <textarea> but labels are still <input> — BOTH expose
-    // selectionStart/End the same way, so treat them uniformly.
     if (!ae || !(ae.tagName === "TEXTAREA" || ae.tagName === "INPUT")) return;
     const ta = ae as HTMLTextAreaElement | HTMLInputElement;
     const a = ta.getAttribute("aria-label") || "";
@@ -1001,12 +985,24 @@ export function PanelGrid() {
       updateSelectionPreview(ta as HTMLTextAreaElement, s, en);
     }
   };
+  // Called by HeaderEditor on every non-empty selection change.
+  const handleEditorSelectionChange = (sel: { start: number; end: number }) => {
+    toolbarSelectionRef.current = sel;
+    updateSelectionPreviewFromText(getActiveEditorText(), sel.start, sel.end);
+  };
+  // Activated on editor focus — records it as "the current one" and
+  // positions the floating toolbar to match.
+  const activateEditor = (target: HeaderEditorTarget, handle: StyledTextEditorHandle) => {
+    activeEditorRef.current = handle;
+    activeEditorTargetRef.current = target;
+    toolbarTextareaRef.current = null;
+    toolbarSelectionRef.current = null;
+    setSelectionPreview("");
+    setToolbarTarget(target as ToolbarTarget);
+  };
   const handleToolbarSelectionChange = (start: number, end: number) => {
     if (start !== end) {
       toolbarSelectionRef.current = { start, end };
-      // Also update the preview so the indicator reactively shows the
-      // selected substring — important because in WebKit the document
-      // selectionchange event doesn't fire for textarea selections.
       const ta = toolbarTextareaRef.current;
       if (ta) updateSelectionPreview(ta, start, end);
     }
@@ -1529,174 +1525,46 @@ export function PanelGrid() {
                 {/* Left drag handle */}
                 {renderDragHandle("col", li, gi, "start", groupCols)}
 
-                {(() => {
-                  const thisKey = `col-${li}-${gi}`;
-                  const isEditing = focusedKey === thisKey;
-                  // Show the per-char colour overlay WHENEVER segments exist,
-                  // including while the user is editing — they've reported
-                  // that not seeing the colours during typing is confusing.
-                  // When they type a char that no longer matches the segment
-                  // concat, updateHeaderGroupText clears styled_segments so
-                  // the overlay naturally disappears at that moment.
-                  const showOverlay = !!(group.styled_segments && group.styled_segments.length > 0);
-                  return (
-                <div style={{ position: "relative", flex: 1, minWidth: 0 }}>
-                {showOverlay && (
-                  <div
-                    aria-hidden
-                    className="text-center text-[10px] rounded px-1 py-0.5"
+                <div
+                  style={{ position: "relative", flex: 1, minWidth: 0 }}
+                  onFocus={(e) => { setToolbarAnchor(e.currentTarget); }}
+                >
+                  <HeaderEditor
+                    target={{ type: "header", axis: "col", level: li, groupIdx: gi }}
+                    text={group.text}
+                    styledSegments={group.styled_segments as HeaderStyledSegment[] | undefined}
+                    defaultColor={group.default_color}
+                    fontStyle={group.font_style}
+                    className="text-center text-[10px] rounded px-1 py-0.5 no-overlay-scrollbar hover:ring-1 hover:ring-blue-400/40 transition-shadow"
                     style={{
-                      position: "absolute",
-                      inset: 0,
-                      pointerEvents: "none",
                       minHeight: "28px",
-                      fontWeight: group.font_style?.includes("Bold") ? 700 : 400,
-                      fontStyle: group.font_style?.includes("Italic") ? "italic" : "normal",
+                      backgroundColor: isBeingDragged ? "var(--c-accent)" : "rgba(255,255,255,0.15)",
+                      borderBottom: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
+                      textDecoration: group.font_style?.includes("Strikethrough") ? "line-through" : group.font_style?.includes("Underline") ? "underline" : undefined,
                       whiteSpace: "pre-wrap",
                       wordBreak: "break-word",
                       lineHeight: 1.2,
-                      overflow: "hidden",
-                      // Keep the same soft grey backdrop the textarea normally
-                      // shows, so the "textarea has a bg" affordance survives
-                      // when the colour overlay activates.
-                      backgroundColor: "rgba(255,255,255,0.15)",
                     }}
-                  >
-                    {/* Single <span> wrapper unifies all seg children into one
-                        inline text-run. Without it, adjacent <span>s can pick
-                        up tiny sub-pixel gaps in rotated/vertical-rl layouts
-                        (user saw "Ro w 1" with a gap at the seg boundary). */}
-                    <span>
-                      {group.styled_segments.map((seg, si) => (
-                        <span key={si} style={segOverlayStyle(seg, group.default_color)}>
-                          {seg.text}
-                        </span>
-                      ))}
-                    </span>
-                  </div>
-                )}
-                <textarea
-                  className="bg-transparent text-center text-[10px] w-full min-w-0 outline-none
-                             rounded px-1 py-0.5 hover:ring-1 hover:ring-blue-400/40 transition-shadow
-                             resize-none no-overlay-scrollbar"
-                  rows={Math.max(
-                    // Explicit newlines the user typed via Shift+Enter —
-                    // respect every one of them (capped at 12 so a pathological
-                    // paste doesn't blow out the grid).
-                    group.text.includes("\n") ? Math.min(12, group.text.split("\n").length) : 1,
-                    // Length-based auto-grow estimate for long single-line
-                    // headers — ~18 chars per visible line at 10-px font.
-                    // Still capped at 4 rows so long text wraps visibly without
-                    // pushing the grid around.
-                    Math.min(4, Math.max(1, Math.ceil(group.text.length / 18))),
-                  )}
-                  style={{
-                    // When showOverlay is true, make the textarea's own text
-                    // transparent so the colored overlay paints through
-                    // unobstructed. caretColor still shows the blinking cursor
-                    // so typing remains usable.
-                    color: showOverlay
-                      ? "transparent"
-                      : (group.default_color || "var(--c-text-dim)"),
-                    caretColor: group.default_color || "var(--c-text-dim)",
-                    // Drop the semi-opaque white bg when the overlay is on —
-                    // at 15% opacity it washes out per-char colours.
-                    backgroundColor: isBeingDragged
-                      ? "var(--c-accent)"
-                      : (showOverlay ? "transparent" : "rgba(255,255,255,0.15)"),
-                    minHeight: "28px",
-                    borderBottom: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
-                    fontWeight: group.font_style?.includes("Bold") ? 700 : 400,
-                    fontStyle: group.font_style?.includes("Italic") ? "italic" : "normal",
-                    overflow: "hidden",
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                    lineHeight: 1.2,
-                  }}
-                  value={group.text}
-                  onChange={(e) => {
-                    toolbarSelectionRef.current = null;
-                    setSelectionPreview("");
-                    const newText = e.target.value;
-                    console.log("[mpf] textarea onChange col", { li, gi, value: JSON.stringify(newText), len: newText.length });
-                    updateHeaderGroupText("col", li, gi, newText);
-                    if (newText === "" && (group.styled_segments?.length ?? 0) > 0) {
-                      updateHeaderGroupFormatting("col", li, gi, { styled_segments: [] });
-                    }
-                  }}
-                  onKeyDown={(e) => {
-                    console.log("[mpf] textarea onKeyDown col", { li, gi, key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey, meta: e.metaKey, alt: e.altKey });
-                    if (e.key === "Enter" && e.shiftKey) {
-                      // Route Shift+Enter through the segment-preserving path
-                      // so per-char styling doesn't get wiped when the textarea
-                      // value gains a \n that the stored segments don't have.
-                      e.preventDefault();
-                      {
-                        const ta = e.currentTarget as HTMLTextAreaElement;
-                        const s = ta.selectionStart ?? 0;
-                        const en = ta.selectionEnd ?? s;
-                        const newCaret = insertLineBreakInHeader("col", li, gi, s, en);
-                        if (newCaret !== undefined) {
-                          requestAnimationFrame(() => {
-                            try { ta.focus(); ta.setSelectionRange(newCaret, newCaret); } catch { /* */ }
-                          });
-                        }
+                    onTextChange={(newText) => {
+                      updateHeaderGroupText("col", li, gi, newText);
+                      if (newText === "" && (group.styled_segments?.length ?? 0) > 0) {
+                        updateHeaderGroupFormatting("col", li, gi, { styled_segments: [] });
                       }
-                      return;
-                    }
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      (e.currentTarget as HTMLTextAreaElement).blur();
-                    }
-                  }}
-                  onSelect={(e) => {
-                    const ta = e.currentTarget as HTMLTextAreaElement;
-                    handleToolbarSelectionChange(ta.selectionStart ?? 0, ta.selectionEnd ?? 0);
-                  }}
-                  onMouseUp={(e) => {
-                    // Drag-to-select completes on mouseup; snapshot the
-                    // final range immediately (some browsers fire the
-                    // onSelect/selectionchange event asynchronously, so the
-                    // ref may otherwise hold a mid-drag range when a
-                    // toolbar action fires next).
-                    const ta = e.currentTarget as HTMLTextAreaElement;
-                    const s = ta.selectionStart ?? 0;
-                    const en = ta.selectionEnd ?? 0;
-                    toolbarTextareaRef.current = ta;
-                    if (s !== en) toolbarSelectionRef.current = { start: s, end: en };
-                  }}
-                  onKeyUp={(e) => {
-                    // Keyboard selections (Shift+Arrow etc.) — same story.
-                    const ta = e.currentTarget as HTMLTextAreaElement;
-                    const s = ta.selectionStart ?? 0;
-                    const en = ta.selectionEnd ?? 0;
-                    toolbarTextareaRef.current = ta;
-                    if (s !== en) toolbarSelectionRef.current = { start: s, end: en };
-                  }}
-                  placeholder="Header"
-                  aria-label={`Column header level ${li + 1} group ${gi + 1}`}
-                  onClick={(e) => e.stopPropagation()}
-                  onFocus={(e) => {
-                    toolbarTextareaRef.current = e.currentTarget as HTMLTextAreaElement;
-                    toolbarSelectionRef.current = null;
-                    setSelectionPreview("");
-                    setFocusedKey(thisKey);
-                    const parent = e.currentTarget.parentElement;
-                    if (parent) {
-                      setToolbarAnchor(parent);
-                      setToolbarTarget({ type: "header", axis: "col", level: li, groupIdx: gi });
-                    }
-                  }}
-                  onBlur={() => {
-                    // Only clear the focused flag — leave toolbar refs
-                    // intact so toolbar button clicks can still resolve
-                    // the selection.
-                    setFocusedKey((cur) => (cur === thisKey ? "" : cur));
-                  }}
-                />
+                    }}
+                    onActivate={activateEditor}
+                    onSelectionNonEmpty={handleEditorSelectionChange}
+                    onShiftEnter={(sel) => {
+                      const newCaret = insertLineBreakInHeader("col", li, gi, sel.start, sel.end);
+                      if (newCaret !== undefined) {
+                        const h = activeEditorRef.current;
+                        requestAnimationFrame(() => { h?.focus(); h?.setSelection(newCaret, newCaret); });
+                      }
+                    }}
+                    enterBlurs
+                    onClick={(e) => e.stopPropagation()}
+                    onBeforeAction={captureSelectionFromActive}
+                  />
                 </div>
-                );
-                })()}
 
                 {/* Always-visible edit button */}
                 <Tooltip title="Edit header properties" placement="right" arrow>
@@ -1780,13 +1648,6 @@ export function PanelGrid() {
         {config.show_column_labels !== false ? (
           <>
           {column_labels.map((lbl, ci) => {
-            // Show the per-char colour overlay whenever styled_segments
-            // exist for this PRIMARY column label — matches the secondary
-            // header behavior (user: "primary headers don't show the
-            // color selection"). Overlay sits underneath the textarea
-            // (which is rendered with transparent text + transparent bg
-            // when the overlay is active) so coloured chars show through.
-            const labelShowOverlay = !!(lbl.styled_segments && lbl.styled_segments.length > 0);
             return (
             <div
               key={`cl-${ci}`}
@@ -1797,98 +1658,41 @@ export function PanelGrid() {
                 position: "relative",
               }}
               onClick={(e) => handleLabelClick(e, "col", ci)}
+              onFocus={(e) => { setToolbarAnchor(e.currentTarget); }}
             >
-              {labelShowOverlay && (
-                <div
-                  aria-hidden
-                  className="text-center text-[10px] rounded px-1 py-0.5"
-                  style={{
-                    position: "absolute",
-                    inset: 0,
-                    pointerEvents: "none",
-                    minHeight: "28px",
-                    fontWeight: lbl.font_style?.includes("Bold") ? 700 : 400,
-                    fontStyle: lbl.font_style?.includes("Italic") ? "italic" : "normal",
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                    lineHeight: 1.2,
-                    overflow: "hidden",
-                    backgroundColor: "rgba(255,255,255,0.15)",
-                  }}
-                >
-                  <span>
-                    {lbl.styled_segments!.map((seg, si) => (
-                      <span key={si} style={segOverlayStyle(seg, lbl.default_color)}>
-                        {seg.text}
-                      </span>
-                    ))}
-                  </span>
-                </div>
-              )}
-              <textarea
-                className="bg-transparent text-center text-[10px] flex-1 min-w-0 outline-none
-                           rounded px-1 py-0.5 resize-none no-overlay-scrollbar"
-                rows={Math.max(
-                  // Respect every Shift+Enter newline (capped at 12).
-                  lbl.text.includes("\n") ? Math.min(12, lbl.text.split("\n").length) : 1,
-                  1,
-                )}
+              <HeaderEditor
+                target={{ type: "colLabel", axis: "col", index: ci }}
+                text={lbl.text}
+                styledSegments={lbl.styled_segments as HeaderStyledSegment[] | undefined}
+                defaultColor={lbl.default_color}
+                fontStyle={lbl.font_style}
+                className="text-center text-[10px] rounded px-1 py-0.5 flex-1 min-w-0 no-overlay-scrollbar"
                 style={{
-                  color: labelShowOverlay ? "transparent" : (lbl.default_color || "var(--c-text-dim)"),
-                  caretColor: lbl.default_color || "var(--c-text-dim)",
-                  backgroundColor: labelShowOverlay ? "transparent" : "rgba(255,255,255,0.15)",
                   minHeight: "28px",
-                  fontWeight: lbl.font_style?.includes("Bold") ? 700 : 400,
-                  fontStyle: lbl.font_style?.includes("Italic") ? "italic" : "normal",
-                  textDecoration: lbl.font_style?.includes("Strikethrough") ? "line-through" : lbl.font_style?.includes("Underline") ? "underline" : "none",
-                  overflow: "hidden",
+                  backgroundColor: "rgba(255,255,255,0.15)",
+                  textDecoration: lbl.font_style?.includes("Strikethrough") ? "line-through" : lbl.font_style?.includes("Underline") ? "underline" : undefined,
                   whiteSpace: "pre-wrap",
                   wordBreak: "break-word",
                   lineHeight: 1.2,
                 }}
-                value={lbl.text}
-                onChange={(e) => {
-                  const newText = e.target.value;
-                  console.log("[mpf] input onChange colLabel", { ci, value: JSON.stringify(newText) });
+                onTextChange={(newText) => {
                   updateColumnLabel(ci, newText);
                   if (newText === "" && (lbl.styled_segments?.length ?? 0) > 0) {
                     updateLabelFormatting("col", ci, { styled_segments: [] });
                   }
                 }}
-                onKeyDown={(e) => {
-                  console.log("[mpf] input onKeyDown colLabel", { ci, key: e.key, shift: e.shiftKey });
-                  if (e.key === "Enter" && e.shiftKey) {
-                    // Shift+Enter inserts a newline preserving segments.
-                    e.preventDefault();
-                    {
-                      const ta = e.currentTarget as HTMLTextAreaElement;
-                      const s = ta.selectionStart ?? 0;
-                      const en = ta.selectionEnd ?? s;
-                      const newCaret = insertLineBreakInLabel("col", ci, s, en);
-                      if (newCaret !== undefined) {
-                        requestAnimationFrame(() => {
-                          try { ta.focus(); ta.setSelectionRange(newCaret, newCaret); } catch { /* */ }
-                        });
-                      }
-                    }
-                    return;
-                  }
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    // Plain Enter blurs (commits edit) — matches header behavior.
-                    e.preventDefault();
-                    (e.currentTarget as HTMLTextAreaElement).blur();
+                onActivate={activateEditor}
+                onSelectionNonEmpty={handleEditorSelectionChange}
+                onShiftEnter={(sel) => {
+                  const newCaret = insertLineBreakInLabel("col", ci, sel.start, sel.end);
+                  if (newCaret !== undefined) {
+                    const h = activeEditorRef.current;
+                    requestAnimationFrame(() => { h?.focus(); h?.setSelection(newCaret, newCaret); });
                   }
                 }}
-                placeholder={`Col ${ci + 1}`}
-                aria-label={`Column ${ci + 1} label`}
+                enterBlurs
                 onClick={(e) => e.stopPropagation()}
-                onFocus={(e) => {
-                  const parent = e.currentTarget.parentElement;
-                  if (parent) {
-                    setToolbarAnchor(parent);
-                    setToolbarTarget({ type: "colLabel", axis: "col", index: ci });
-                  }
-                }}
+                onBeforeAction={captureSelectionFromActive}
               />
               <Tooltip title="Edit header properties" placement="right" arrow>
                 <button
@@ -2063,172 +1867,61 @@ export function PanelGrid() {
 
                 {(() => {
                   const isRotated = (group.rotation ?? 90) !== 0;
-                  const thisKey = `row-${li}-${gi}`;
-                  const isEditing = focusedKey === thisKey;
-                  // Show per-char colour overlay whenever segments exist —
-                  // even during editing — so the user sees their assigned
-                  // colours as they type. Matches the col-header behavior.
-                  const showOverlay = !!(group.styled_segments && group.styled_segments.length > 0);
                   return (
-                  <div style={{
-                    ...(isRotated
-                      ? { writingMode: "vertical-rl" as const, transform: "rotate(180deg)", textOrientation: "mixed" as const }
-                      : {}),
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    flex: 1,
-                    minHeight: 0,
-                  }}>
-                  <div style={{ position: "relative", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                  {showOverlay && (
-                    <div
-                      aria-hidden
-                      className="text-center text-[10px] rounded px-2 py-1"
+                  <div
+                    style={{
+                      ...(isRotated
+                        ? { writingMode: "vertical-rl" as const, transform: "rotate(180deg)", textOrientation: "mixed" as const }
+                        : {}),
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      flex: 1,
+                      minHeight: 0,
+                      borderRight: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
+                    }}
+                    onFocus={(e) => { setToolbarAnchor(e.currentTarget.parentElement || e.currentTarget); }}
+                  >
+                    <HeaderEditor
+                      target={{ type: "header", axis: "row", level: li, groupIdx: gi }}
+                      text={group.text}
+                      styledSegments={group.styled_segments as HeaderStyledSegment[] | undefined}
+                      defaultColor={group.default_color}
+                      fontStyle={group.font_style}
+                      className="text-center text-[10px] rounded px-2 py-1 no-overlay-scrollbar hover:ring-1 hover:ring-blue-400/40 transition-shadow"
                       style={{
-                        position: "absolute",
-                        inset: 0,
-                        pointerEvents: "none",
-                        fontWeight: group.font_style?.includes("Bold") ? 700 : 400,
-                        fontStyle: group.font_style?.includes("Italic") ? "italic" : "normal",
+                        textDecoration: group.font_style?.includes("Strikethrough") ? "line-through" : group.font_style?.includes("Underline") ? "underline" : undefined,
                         whiteSpace: "pre-wrap",
                         wordBreak: "break-word",
                         lineHeight: 1.2,
-                        overflow: "hidden",
-                        // Bg lives on the outer grid-cell div now; overlay
-                        // stays transparent so the cell-level bg (which
-                        // spans the full row-span) shows through behind
-                        // the coloured glyphs.
-                        // Inherits writingMode: vertical-rl from the outer
-                        // rotated wrapper, so the overlay glyphs flow in the
-                        // same direction as the rotated textarea's glyphs.
+                        // The editor inherits writingMode/transform from the
+                        // rotated wrapper above when rotated.
+                        ...(isRotated
+                          ? {
+                              width: `${Math.max(28, Math.min(12, group.text.split("\n").length) * 14)}px`,
+                              height: "100%",
+                            }
+                          : { minHeight: "28px" }),
                       }}
-                    >
-                      <span>
-                        {group.styled_segments!.map((seg, si) => (
-                          <span key={si} style={segOverlayStyle(seg, group.default_color)}>
-                            {seg.text}
-                          </span>
-                        ))}
-                      </span>
-                    </div>
-                  )}
-                  <textarea
-                    className="bg-transparent text-center text-[10px] outline-none
-                               rounded px-2 py-1 hover:ring-1 hover:ring-blue-400/40 transition-shadow
-                               resize-none no-overlay-scrollbar"
-                    rows={Math.max(
-                      // Respect every explicit newline (capped at 12 so a
-                      // pathological paste doesn't blow out the grid).
-                      group.text.includes("\n") ? Math.min(12, group.text.split("\n").length) : 1,
-                      Math.min(4, Math.max(1, Math.ceil(group.text.length / 18))),
-                    )}
-                    style={{
-                      // When showOverlay is true, make the textarea's own
-                      // text transparent so the colored overlay paints
-                      // through unobstructed. The blinking caret stays
-                      // visible via caretColor so typing remains usable.
-                      color: showOverlay ? "transparent" : (group.default_color || "var(--c-text-dim)"),
-                      caretColor: group.default_color || "var(--c-text-dim)",
-                      // Bg now lives on the outer grid-cell div (drag-aware)
-                      // so it spans the full configured row-span. Leave the
-                      // textarea transparent so the outer bg shows through.
-                      backgroundColor: "transparent",
-                      borderRight: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
-                      // Rotated textarea: in vertical-rl, each explicit line
-                      // stacks HORIZONTALLY (not vertically as it would for a
-                      // column header). So width must grow with line count or
-                      // multi-line row headers clip to the 28px band.
-                      ...(isRotated
-                        ? {
-                            writingMode: "vertical-rl" as const,
-                            width: `${Math.max(28, Math.min(12, group.text.split("\n").length) * 14)}px`,
-                            height: "100%",
-                          }
-                        : { minHeight: "28px" }),
-                      fontWeight: group.font_style?.includes("Bold") ? 700 : 400,
-                      fontStyle: group.font_style?.includes("Italic") ? "italic" : "normal",
-                      overflow: "hidden",
-                      whiteSpace: "pre-wrap",
-                      wordBreak: "break-word",
-                      lineHeight: 1.2,
-                    }}
-                    value={group.text}
-                    onChange={(e) => {
-                      toolbarSelectionRef.current = null;
-                      setSelectionPreview("");
-                      const newText = e.target.value;
-                      console.log("[mpf] textarea onChange row", { li, gi, value: JSON.stringify(newText), len: newText.length });
-                      updateHeaderGroupText("row", li, gi, newText);
-                      if (newText === "" && (group.styled_segments?.length ?? 0) > 0) {
-                        updateHeaderGroupFormatting("row", li, gi, { styled_segments: [] });
-                      }
-                    }}
-                    onKeyDown={(e) => {
-                      console.log("[mpf] textarea onKeyDown row", { li, gi, key: e.key, shift: e.shiftKey });
-                      if (e.key === "Enter" && e.shiftKey) {
-                        e.preventDefault();
-                        {
-                          const ta = e.currentTarget as HTMLTextAreaElement;
-                          const s = ta.selectionStart ?? 0;
-                          const en = ta.selectionEnd ?? s;
-                          const newCaret = insertLineBreakInHeader("row", li, gi, s, en);
-                          if (newCaret !== undefined) {
-                            requestAnimationFrame(() => {
-                              try { ta.focus(); ta.setSelectionRange(newCaret, newCaret); } catch { /* */ }
-                            });
-                          }
+                      onTextChange={(newText) => {
+                        updateHeaderGroupText("row", li, gi, newText);
+                        if (newText === "" && (group.styled_segments?.length ?? 0) > 0) {
+                          updateHeaderGroupFormatting("row", li, gi, { styled_segments: [] });
                         }
-                        return;
-                      }
-                      if (e.key === "Enter" && !e.shiftKey) {
-                        e.preventDefault();
-                        (e.currentTarget as HTMLTextAreaElement).blur();
-                      }
-                    }}
-                    onSelect={(e) => {
-                      const ta = e.currentTarget as HTMLTextAreaElement;
-                      handleToolbarSelectionChange(ta.selectionStart ?? 0, ta.selectionEnd ?? 0);
-                    }}
-                    onMouseUp={(e) => {
-                      const ta = e.currentTarget as HTMLTextAreaElement;
-                      const s = ta.selectionStart ?? 0;
-                      const en = ta.selectionEnd ?? 0;
-                      toolbarTextareaRef.current = ta;
-                      if (s !== en) {
-                        toolbarSelectionRef.current = { start: s, end: en };
-                        updateSelectionPreview(ta, s, en);
-                      }
-                    }}
-                    onKeyUp={(e) => {
-                      const ta = e.currentTarget as HTMLTextAreaElement;
-                      const s = ta.selectionStart ?? 0;
-                      const en = ta.selectionEnd ?? 0;
-                      toolbarTextareaRef.current = ta;
-                      if (s !== en) {
-                        toolbarSelectionRef.current = { start: s, end: en };
-                        updateSelectionPreview(ta, s, en);
-                      }
-                    }}
-                    placeholder="Header"
-                    aria-label={`Row header level ${li + 1} group ${gi + 1}`}
-                    onClick={(e) => e.stopPropagation()}
-                    onFocus={(e) => {
-                      toolbarTextareaRef.current = e.currentTarget as HTMLTextAreaElement;
-                      toolbarSelectionRef.current = null;
-                      setSelectionPreview("");
-                      setFocusedKey(thisKey);
-                      const parent = e.currentTarget.parentElement?.parentElement?.parentElement;
-                      if (parent) {
-                        setToolbarAnchor(parent);
-                        setToolbarTarget({ type: "header", axis: "row", level: li, groupIdx: gi });
-                      }
-                    }}
-                    onBlur={() => {
-                      setFocusedKey((cur) => (cur === thisKey ? "" : cur));
-                    }}
-                  />
-                  </div>
+                      }}
+                      onActivate={activateEditor}
+                      onSelectionNonEmpty={handleEditorSelectionChange}
+                      onShiftEnter={(sel) => {
+                        const newCaret = insertLineBreakInHeader("row", li, gi, sel.start, sel.end);
+                        if (newCaret !== undefined) {
+                          const h = activeEditorRef.current;
+                          requestAnimationFrame(() => { h?.focus(); h?.setSelection(newCaret, newCaret); });
+                        }
+                      }}
+                      enterBlurs
+                      onClick={(e) => e.stopPropagation()}
+                      onBeforeAction={captureSelectionFromActive}
+                    />
                   </div>
                   );
                 })()}
@@ -2415,7 +2108,6 @@ export function PanelGrid() {
               {(() => {
                 const isRotated = (row_labels[ri]?.rotation ?? 90) !== 0;
                 const rlbl = row_labels[ri];
-                const rowLabelShowOverlay = !!(rlbl?.styled_segments && rlbl.styled_segments.length > 0);
                 return (
                 <div
                   style={{
@@ -2429,110 +2121,46 @@ export function PanelGrid() {
                     minHeight: 0,
                     position: "relative",
                   }}
+                  onFocus={(e) => { setToolbarAnchor(e.currentTarget.parentElement || e.currentTarget); }}
                 >
-                  {rowLabelShowOverlay && rlbl && (
-                    <div
-                      aria-hidden
-                      className="text-center text-[10px] rounded px-1 py-1"
-                      style={{
-                        position: "absolute",
-                        inset: 0,
-                        pointerEvents: "none",
-                        fontWeight: rlbl.font_style?.includes("Bold") ? 700 : 400,
-                        fontStyle: rlbl.font_style?.includes("Italic") ? "italic" : "normal",
-                        whiteSpace: "pre-wrap",
-                        wordBreak: "break-word",
-                        lineHeight: 1.2,
-                        overflow: "hidden",
-                        // Bg lives on the outer grid-cell div now.
-                      }}
-                    >
-                      <span>
-                        {rlbl.styled_segments!.map((seg, si) => (
-                          <span key={si} style={segOverlayStyle(seg, rlbl.default_color)}>
-                            {seg.text}
-                          </span>
-                        ))}
-                      </span>
-                    </div>
-                  )}
-                  <textarea
-                    className="bg-transparent text-center text-[10px] outline-none
-                               rounded px-1 py-1 resize-none no-overlay-scrollbar"
-                    rows={Math.max(
-                      (row_labels[ri]?.text ?? "").includes("\n")
-                        ? Math.min(12, (row_labels[ri]?.text ?? "").split("\n").length)
-                        : 1,
-                      1,
-                    )}
+                  <HeaderEditor
+                    target={{ type: "rowLabel", axis: "row", index: ri }}
+                    text={rlbl?.text ?? ""}
+                    styledSegments={rlbl?.styled_segments as HeaderStyledSegment[] | undefined}
+                    defaultColor={rlbl?.default_color}
+                    fontStyle={rlbl?.font_style}
+                    className="text-center text-[10px] rounded px-1 py-1 no-overlay-scrollbar"
                     style={{
-                      color: rowLabelShowOverlay
-                        ? "transparent"
-                        : (row_labels[ri]?.default_color || "var(--c-text-dim)"),
-                      caretColor: row_labels[ri]?.default_color || "var(--c-text-dim)",
-                      // Bg moved to the outer grid-cell div so it spans the
-                      // full row; textarea stays transparent.
-                      backgroundColor: "transparent",
-                      // Rotated row label in writing-mode:vertical-rl — each
-                      // explicit line stacks HORIZONTALLY after rotation, so
-                      // width must grow with line count to avoid clipping.
-                      // Matches the secondary row header width formula.
-                      ...(isRotated
-                        ? {
-                            writingMode: "vertical-rl" as const,
-                            width: `${Math.max(28, Math.min(12, (row_labels[ri]?.text ?? "").split("\n").length) * 14)}px`,
-                            height: "100%",
-                          }
-                        : { minHeight: "28px", width: "100%" }),
-                      fontWeight: row_labels[ri]?.font_style?.includes("Bold") ? 700 : 400,
-                      fontStyle: row_labels[ri]?.font_style?.includes("Italic") ? "italic" : "normal",
-                      overflow: "hidden",
+                      textDecoration: rlbl?.font_style?.includes("Strikethrough") ? "line-through" : rlbl?.font_style?.includes("Underline") ? "underline" : undefined,
                       whiteSpace: "pre-wrap",
                       wordBreak: "break-word",
                       lineHeight: 1.2,
+                      ...(isRotated
+                        ? {
+                            width: `${Math.max(28, Math.min(12, (rlbl?.text ?? "").split("\n").length) * 14)}px`,
+                            height: "100%",
+                          }
+                        : { minHeight: "28px", width: "100%" }),
                     }}
-                    value={row_labels[ri]?.text ?? ""}
-                    onChange={(e) => {
-                      const newText = e.target.value;
-                      console.log("[mpf] input onChange rowLabel", { ri, value: JSON.stringify(newText) });
+                    onTextChange={(newText) => {
                       updateRowLabel(ri, newText);
-                      if (newText === "" && (row_labels[ri]?.styled_segments?.length ?? 0) > 0) {
+                      if (newText === "" && (rlbl?.styled_segments?.length ?? 0) > 0) {
                         updateLabelFormatting("row", ri, { styled_segments: [] });
                       }
                     }}
-                    onKeyDown={(e) => {
-                      console.log("[mpf] input onKeyDown rowLabel", { ri, key: e.key, shift: e.shiftKey });
-                      if (e.key === "Enter" && e.shiftKey) {
-                        e.preventDefault();
-                        {
-                          const ta = e.currentTarget as HTMLTextAreaElement;
-                          const s = ta.selectionStart ?? 0;
-                          const en = ta.selectionEnd ?? s;
-                          const newCaret = insertLineBreakInLabel("row", ri, s, en);
-                          if (newCaret !== undefined) {
-                            requestAnimationFrame(() => {
-                              try { ta.focus(); ta.setSelectionRange(newCaret, newCaret); } catch { /* */ }
-                            });
-                          }
-                        }
-                        return;
-                      }
-                      if (e.key === "Enter" && !e.shiftKey) {
-                        e.preventDefault();
-                        (e.currentTarget as HTMLTextAreaElement).blur();
+                    onActivate={activateEditor}
+                    onSelectionNonEmpty={handleEditorSelectionChange}
+                    onShiftEnter={(sel) => {
+                      const newCaret = insertLineBreakInLabel("row", ri, sel.start, sel.end);
+                      if (newCaret !== undefined) {
+                        const h = activeEditorRef.current;
+                        requestAnimationFrame(() => { h?.focus(); h?.setSelection(newCaret, newCaret); });
                       }
                     }}
-                    placeholder={`R${ri + 1}`}
-                    aria-label={`Row ${ri + 1} label`}
+                    enterBlurs
                     onClick={(e) => e.stopPropagation()}
-                    onFocus={(e) => {
-                      const parent = e.currentTarget.parentElement?.parentElement?.parentElement;
-                      if (parent) {
-                      setToolbarAnchor(parent);
-                      setToolbarTarget({ type: "rowLabel", axis: "row", index: ri });
-                    }
-                  }}
-                />
+                    onBeforeAction={captureSelectionFromActive}
+                  />
                 </div>
                 );
               })()}
@@ -3091,98 +2719,58 @@ export function PanelGrid() {
           // Insert a newline at the current cursor of the field the
           // toolbar is anchored to. Works as a keyboard-independent
           // alternative to Shift+Enter, which doesn't reach the
-          // textarea in WKWebView for some users.
-          const ta = toolbarTextareaRef.current as HTMLTextAreaElement | HTMLInputElement | null;
-          if (!ta || !toolbarTarget) return;
-          // Read LATEST state from the store rather than ta.value so
-          // successive clicks don't over-write each other when React
-          // hasn't flushed the previous update's value to the DOM yet.
-          let currentText = "";
-          let currentSegs: HeaderStyledSegment[] = [];
-          let defaultColor = "#000000";
+          // editor in WKWebView for some users.
+          if (!toolbarTarget) return;
+          // Prefer the active contentEditable editor's selection. Fall
+          // back to a textarea's selectionStart/End for any legacy
+          // surface that hasn't been migrated yet.
+          let start: number | null = null;
+          let end: number | null = null;
+          const ed = activeEditorRef.current;
+          if (ed) {
+            const sel = ed.getSelection();
+            if (sel) { start = sel.start; end = sel.end; }
+          }
+          if (start === null) {
+            const ta = toolbarTextareaRef.current as HTMLTextAreaElement | HTMLInputElement | null;
+            if (ta) {
+              start = ta.selectionStart ?? 0;
+              end = ta.selectionEnd ?? start;
+            }
+          }
+          if (start === null) return;
+          let newCaret: number | undefined;
           if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
-            const headers = toolbarTarget.axis === "col" ? column_headers : row_headers;
-            const grp = headers[toolbarTarget.level]?.headers[toolbarTarget.groupIdx];
-            if (!grp) return;
-            currentText = grp.text || "";
-            currentSegs = (grp.styled_segments as HeaderStyledSegment[]) || [];
-            defaultColor = grp.default_color || "#000000";
+            newCaret = insertLineBreakInHeader(
+              toolbarTarget.axis,
+              toolbarTarget.level,
+              toolbarTarget.groupIdx,
+              start,
+              end ?? start,
+            );
           } else if ((toolbarTarget.type === "colLabel" || toolbarTarget.type === "rowLabel") && toolbarTarget.index !== undefined) {
-            const labels = toolbarTarget.axis === "col" ? (config?.column_labels ?? []) : (config?.row_labels ?? []);
-            const lbl = labels[toolbarTarget.index];
-            if (!lbl) return;
-            currentText = lbl.text || "";
-            currentSegs = (lbl.styled_segments as HeaderStyledSegment[]) || [];
-            defaultColor = lbl.default_color || "#000000";
+            newCaret = insertLineBreakInLabel(
+              toolbarTarget.axis,
+              toolbarTarget.index,
+              start,
+              end ?? start,
+            );
           }
-
-          // Cursor position — prefer DOM's selection, but clamp to the
-          // store's text length so quick successive clicks (where the
-          // DOM value is a render or two behind) still land at/after
-          // the end of the current text.
-          const rawStart = ta.selectionStart ?? currentText.length;
-          const rawEnd = ta.selectionEnd ?? currentText.length;
-          const start = Math.max(0, Math.min(rawStart, currentText.length));
-          const end = Math.max(start, Math.min(rawEnd, currentText.length));
-          const newText = currentText.slice(0, start) + "\n" + currentText.slice(end);
-
-          // Compute new styled_segments preserving per-character styling.
-          // If the selection spans an existing segment, we split that
-          // segment around the inserted "\n" and keep the newline under
-          // the same per-character style as the preceding chars (or
-          // default style if we're at the very beginning).
-          const rebuildSegments = (): HeaderStyledSegment[] => {
-            if (!currentSegs.length) return [];
-            const out: HeaderStyledSegment[] = [];
-            let charCount = 0;
-            let inserted = false;
-            for (const seg of currentSegs) {
-              const segEnd = charCount + seg.text.length;
-              if (!inserted && start >= charCount && start <= segEnd) {
-                // Cursor lands inside (or at the end of) this segment.
-                const beforeLocal = seg.text.slice(0, start - charCount);
-                const afterLocal = seg.text.slice(end - charCount);
-                if (beforeLocal.length > 0) out.push({ ...seg, text: beforeLocal });
-                out.push({ ...seg, text: "\n" });
-                if (afterLocal.length > 0) out.push({ ...seg, text: afterLocal });
-                inserted = true;
-              } else {
-                // Either fully before the cursor, or fully after.
-                out.push(seg);
-              }
-              charCount = segEnd;
-            }
-            if (!inserted) {
-              out.push({ text: "\n", color: defaultColor });
-            }
-            return out;
-          };
-          const newSegs = rebuildSegments();
-
-          if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
-            // updateHeaderGroupText would clear styled_segments (concat
-            // check fails). Call formatting AFTER text so segments win.
-            updateHeaderGroupText(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, newText);
-            if (newSegs.length > 0) {
-              updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { styled_segments: newSegs });
-            }
-          } else if (toolbarTarget.type === "colLabel" && toolbarTarget.index !== undefined) {
-            updateColumnLabel(toolbarTarget.index, newText);
-            if (newSegs.length > 0) {
-              updateLabelFormatting("col", toolbarTarget.index, { styled_segments: newSegs });
-            }
-          } else if (toolbarTarget.type === "rowLabel" && toolbarTarget.index !== undefined) {
-            updateRowLabel(toolbarTarget.index, newText);
-            if (newSegs.length > 0) {
-              updateLabelFormatting("row", toolbarTarget.index, { styled_segments: newSegs });
-            }
-          }
-          // Restore cursor position right after the inserted newline.
+          if (newCaret === undefined) return;
+          // Restore caret after the inserted newline.
           requestAnimationFrame(() => {
-            try {
-              (ta as HTMLTextAreaElement).focus();
-              (ta as HTMLTextAreaElement).setSelectionRange(start + 1, start + 1);
-            } catch { /* ignore */ }
+            if (ed) {
+              ed.focus();
+              ed.setSelection(newCaret!, newCaret!);
+              return;
+            }
+            const ta = toolbarTextareaRef.current as HTMLTextAreaElement | HTMLInputElement | null;
+            if (ta) {
+              try {
+                (ta as HTMLTextAreaElement).focus();
+                (ta as HTMLTextAreaElement).setSelectionRange(newCaret!, newCaret!);
+              } catch { /* ignore */ }
+            }
           });
         }}
       />
