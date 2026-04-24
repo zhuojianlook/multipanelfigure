@@ -525,7 +525,8 @@ export function PanelGrid() {
     axis: "col" | "row",
     level: number,
     groupIdx: number,
-    ta: HTMLTextAreaElement,
+    caretStart: number,
+    caretEnd?: number,
   ) => {
     const headers = axis === "col" ? column_headers : row_headers;
     const grp = headers[level]?.headers[groupIdx];
@@ -534,8 +535,8 @@ export function PanelGrid() {
     const currentSegs = (grp.styled_segments as HeaderStyledSegment[]) || [];
     const defaultColor = grp.default_color || "#000000";
 
-    const rawStart = ta.selectionStart ?? currentText.length;
-    const rawEnd = ta.selectionEnd ?? currentText.length;
+    const rawStart = caretStart;
+    const rawEnd = caretEnd ?? caretStart;
     const start = Math.max(0, Math.min(rawStart, currentText.length));
     const end = Math.max(start, Math.min(rawEnd, currentText.length));
     const newText = currentText.slice(0, start) + "\n" + currentText.slice(end);
@@ -567,12 +568,7 @@ export function PanelGrid() {
     if (newSegs.length > 0) {
       updateHeaderGroupFormatting(axis, level, groupIdx, { styled_segments: newSegs });
     }
-    requestAnimationFrame(() => {
-      try {
-        ta.focus();
-        ta.setSelectionRange(start + 1, start + 1);
-      } catch { /* ignore */ }
-    });
+    return start + 1;
   };
 
   // Insert "\n" at the cursor of a primary col/row LABEL textarea, preserving
@@ -581,7 +577,8 @@ export function PanelGrid() {
   const insertLineBreakInLabel = (
     axis: "col" | "row",
     index: number,
-    ta: HTMLTextAreaElement,
+    caretStart: number,
+    caretEnd?: number,
   ) => {
     const labels = axis === "col" ? column_labels : row_labels;
     const lbl = labels[index];
@@ -590,8 +587,8 @@ export function PanelGrid() {
     const currentSegs = (lbl.styled_segments as HeaderStyledSegment[]) || [];
     const defaultColor = lbl.default_color || "#000000";
 
-    const rawStart = ta.selectionStart ?? currentText.length;
-    const rawEnd = ta.selectionEnd ?? currentText.length;
+    const rawStart = caretStart;
+    const rawEnd = caretEnd ?? caretStart;
     const start = Math.max(0, Math.min(rawStart, currentText.length));
     const end = Math.max(start, Math.min(rawEnd, currentText.length));
     const newText = currentText.slice(0, start) + "\n" + currentText.slice(end);
@@ -627,12 +624,7 @@ export function PanelGrid() {
     if (newSegs.length > 0) {
       updateLabelFormatting(axis, index, { styled_segments: newSegs });
     }
-    requestAnimationFrame(() => {
-      try {
-        ta.focus();
-        ta.setSelectionRange(start + 1, start + 1);
-      } catch { /* ignore */ }
-    });
+    return start + 1;
   };
 
   /* ── Span dialog helpers ───────────────────────────── */
@@ -1639,7 +1631,17 @@ export function PanelGrid() {
                       // so per-char styling doesn't get wiped when the textarea
                       // value gains a \n that the stored segments don't have.
                       e.preventDefault();
-                      insertLineBreakInHeader("col", li, gi, e.currentTarget as HTMLTextAreaElement);
+                      {
+                        const ta = e.currentTarget as HTMLTextAreaElement;
+                        const s = ta.selectionStart ?? 0;
+                        const en = ta.selectionEnd ?? s;
+                        const newCaret = insertLineBreakInHeader("col", li, gi, s, en);
+                        if (newCaret !== undefined) {
+                          requestAnimationFrame(() => {
+                            try { ta.focus(); ta.setSelectionRange(newCaret, newCaret); } catch { /* */ }
+                          });
+                        }
+                      }
                       return;
                     }
                     if (e.key === "Enter" && !e.shiftKey) {
@@ -1858,7 +1860,17 @@ export function PanelGrid() {
                   if (e.key === "Enter" && e.shiftKey) {
                     // Shift+Enter inserts a newline preserving segments.
                     e.preventDefault();
-                    insertLineBreakInLabel("col", ci, e.currentTarget as HTMLTextAreaElement);
+                    {
+                      const ta = e.currentTarget as HTMLTextAreaElement;
+                      const s = ta.selectionStart ?? 0;
+                      const en = ta.selectionEnd ?? s;
+                      const newCaret = insertLineBreakInLabel("col", ci, s, en);
+                      if (newCaret !== undefined) {
+                        requestAnimationFrame(() => {
+                          try { ta.focus(); ta.setSelectionRange(newCaret, newCaret); } catch { /* */ }
+                        });
+                      }
+                    }
                     return;
                   }
                   if (e.key === "Enter" && !e.shiftKey) {
@@ -2156,7 +2168,17 @@ export function PanelGrid() {
                       console.log("[mpf] textarea onKeyDown row", { li, gi, key: e.key, shift: e.shiftKey });
                       if (e.key === "Enter" && e.shiftKey) {
                         e.preventDefault();
-                        insertLineBreakInHeader("row", li, gi, e.currentTarget as HTMLTextAreaElement);
+                        {
+                          const ta = e.currentTarget as HTMLTextAreaElement;
+                          const s = ta.selectionStart ?? 0;
+                          const en = ta.selectionEnd ?? s;
+                          const newCaret = insertLineBreakInHeader("row", li, gi, s, en);
+                          if (newCaret !== undefined) {
+                            requestAnimationFrame(() => {
+                              try { ta.focus(); ta.setSelectionRange(newCaret, newCaret); } catch { /* */ }
+                            });
+                          }
+                        }
                         return;
                       }
                       if (e.key === "Enter" && !e.shiftKey) {
@@ -2482,7 +2504,17 @@ export function PanelGrid() {
                       console.log("[mpf] input onKeyDown rowLabel", { ri, key: e.key, shift: e.shiftKey });
                       if (e.key === "Enter" && e.shiftKey) {
                         e.preventDefault();
-                        insertLineBreakInLabel("row", ri, e.currentTarget as HTMLTextAreaElement);
+                        {
+                          const ta = e.currentTarget as HTMLTextAreaElement;
+                          const s = ta.selectionStart ?? 0;
+                          const en = ta.selectionEnd ?? s;
+                          const newCaret = insertLineBreakInLabel("row", ri, s, en);
+                          if (newCaret !== undefined) {
+                            requestAnimationFrame(() => {
+                              try { ta.focus(); ta.setSelectionRange(newCaret, newCaret); } catch { /* */ }
+                            });
+                          }
+                        }
                         return;
                       }
                       if (e.key === "Enter" && !e.shiftKey) {
