@@ -121,6 +121,10 @@ export function Sidebar() {
   const [resizeWarningOpen, setResizeWarningOpen] = useState(false);
   const [resizeWarningConflicts, setResizeWarningConflicts] = useState<string[]>([]);
   const [pendingResize, setPendingResize] = useState<{ rows: number; cols: number } | null>(null);
+  // Global-font-apply override warning state
+  const [fontWarningOpen, setFontWarningOpen] = useState(false);
+  const [fontWarningConflicts, setFontWarningConflicts] = useState<string[]>([]);
+  const [pendingGlobalFont, setPendingGlobalFont] = useState<string | null>(null);
 
   // Save/Load project dialogs
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
@@ -174,6 +178,52 @@ export function Sidebar() {
     setResizeWarningOpen(false);
     setPendingResize(null);
     setResizeWarningConflicts([]);
+  };
+
+  // Apply the global font to every header / label, including clearing
+  // any per-segment font_name overrides so the new global font wins
+  // uniformly. Used by both the no-conflict path and the override
+  // confirmation dialog.
+  const applyGlobalFont = (fontName: string) => {
+    if (!config) return;
+    const stripSegFont = (segs: any[] | null | undefined) =>
+      Array.isArray(segs) ? segs.map((s) => ({ ...s, font_name: undefined })) : segs;
+    const colLabels = config.column_labels.map((l: any) => ({
+      ...l,
+      font_name: fontName,
+      styled_segments: stripSegFont(l.styled_segments),
+    }));
+    const rowLabels = config.row_labels.map((l: any) => ({
+      ...l,
+      font_name: fontName,
+      styled_segments: stripSegFont(l.styled_segments),
+    }));
+    const colHeaders = config.column_headers.map((level: any) => ({
+      ...level,
+      headers: level.headers.map((h: any) => ({
+        ...h,
+        font_name: fontName,
+        styled_segments: stripSegFont(h.styled_segments),
+      })),
+    }));
+    const rowHeaders = config.row_headers.map((level: any) => ({
+      ...level,
+      headers: level.headers.map((h: any) => ({
+        ...h,
+        font_name: fontName,
+        styled_segments: stripSegFont(h.styled_segments),
+      })),
+    }));
+    setConfig({ ...config, column_labels: colLabels, row_labels: rowLabels, column_headers: colHeaders, row_headers: rowHeaders });
+  };
+
+  const confirmGlobalFont = () => {
+    if (pendingGlobalFont) {
+      applyGlobalFont(pendingGlobalFont);
+    }
+    setFontWarningOpen(false);
+    setPendingGlobalFont(null);
+    setFontWarningConflicts([]);
   };
 
   return (
@@ -378,17 +428,46 @@ export function Sidebar() {
               const el = document.getElementById("global-font-select") as HTMLSelectElement;
               if (!el) return;
               const fontName = el.value;
-              const colLabels = config.column_labels.map((l: any) => ({ ...l, font_name: fontName }));
-              const rowLabels = config.row_labels.map((l: any) => ({ ...l, font_name: fontName }));
-              const colHeaders = config.column_headers.map((level: any) => ({
-                ...level,
-                headers: level.headers.map((h: any) => ({ ...h, font_name: fontName })),
-              }));
-              const rowHeaders = config.row_headers.map((level: any) => ({
-                ...level,
-                headers: level.headers.map((h: any) => ({ ...h, font_name: fontName })),
-              }));
-              setConfig({ ...config, column_labels: colLabels, row_labels: rowLabels, column_headers: colHeaders, row_headers: rowHeaders });
+              // Collect human-readable labels for any element whose
+              // current font_name (or any seg's font_name) differs from
+              // the new global font. If any are found, show the
+              // override-warning dialog before committing.
+              const conflicts: string[] = [];
+              const isMismatch = (f: string | null | undefined) =>
+                f && f !== fontName;
+              const segMismatch = (segs: any[] | null | undefined) =>
+                Array.isArray(segs) && segs.some((s) => isMismatch(s?.font_name));
+              config.column_labels.forEach((l: any, i: number) => {
+                if (isMismatch(l.font_name) || segMismatch(l.styled_segments)) {
+                  conflicts.push(`Column ${i + 1} label`);
+                }
+              });
+              config.row_labels.forEach((l: any, i: number) => {
+                if (isMismatch(l.font_name) || segMismatch(l.styled_segments)) {
+                  conflicts.push(`Row ${i + 1} label`);
+                }
+              });
+              config.column_headers.forEach((level: any, li: number) => {
+                level.headers.forEach((h: any, gi: number) => {
+                  if (isMismatch(h.font_name) || segMismatch(h.styled_segments)) {
+                    conflicts.push(`Column header tier ${li + 1} group ${gi + 1}`);
+                  }
+                });
+              });
+              config.row_headers.forEach((level: any, li: number) => {
+                level.headers.forEach((h: any, gi: number) => {
+                  if (isMismatch(h.font_name) || segMismatch(h.styled_segments)) {
+                    conflicts.push(`Row header tier ${li + 1} group ${gi + 1}`);
+                  }
+                });
+              });
+              if (conflicts.length > 0) {
+                setFontWarningConflicts(conflicts);
+                setPendingGlobalFont(fontName);
+                setFontWarningOpen(true);
+              } else {
+                applyGlobalFont(fontName);
+              }
             }}
           >
             Apply
@@ -635,6 +714,29 @@ export function Sidebar() {
           <Button onClick={() => setResizeWarningOpen(false)}>Cancel</Button>
           <Button onClick={confirmResize} color="error" variant="contained">
             Resize Anyway
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* ── Global Font Override Warning Dialog ─────── */}
+      <Dialog open={fontWarningOpen} onClose={() => setFontWarningOpen(false)}>
+        <DialogTitle>Override custom fonts?</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            The following elements have a custom font set that will be overridden by the global font:
+          </DialogContentText>
+          <Box component="ul" sx={{ mt: 1, pl: 2, maxHeight: 200, overflowY: "auto" }}>
+            {fontWarningConflicts.map((c, i) => (
+              <li key={i}>
+                <Typography variant="body2">{c}</Typography>
+              </li>
+            ))}
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setFontWarningOpen(false)}>Cancel</Button>
+          <Button onClick={confirmGlobalFont} color="error" variant="contained">
+            Apply Anyway
           </Button>
         </DialogActions>
       </Dialog>
