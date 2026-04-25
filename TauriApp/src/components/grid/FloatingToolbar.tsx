@@ -99,21 +99,20 @@ export function FloatingToolbar({
 
   const hasStyle = (style: string) => fontStyle.includes(style);
 
-  // Local buffer for the font-size input. We commit only on blur or
-  // Enter — the previous per-keystroke onChange made typing "16" fire a
-  // patch at "1" first (which applied size=1 to the selected chars and
-  // shrank the planner text), and the value would snap around while the
-  // user was still typing. Keeping a local string buffer lets the user
-  // type any intermediate value without the model reacting until they
-  // explicitly commit.
+  // Local buffer for the font-size input. Each keystroke updates the
+  // buffer; if the buffer parses to a valid size in [1,200], we commit
+  // immediately so the user sees the change as they type. Bare partial
+  // states like "" or "0" stay in the buffer without committing.
   const [sizeBuf, setSizeBuf] = useState<string>(String(fontSize));
   useEffect(() => {
     setSizeBuf(String(fontSize));
   }, [fontSize]);
-  const commitSize = () => {
-    const v = Math.max(1, Math.min(200, Number(sizeBuf) || fontSize));
-    if (v !== fontSize) onFontSizeChange(v);
-    setSizeBuf(String(v));
+  const handleSizeInput = (raw: string) => {
+    setSizeBuf(raw);
+    const n = Number(raw);
+    if (raw !== "" && Number.isFinite(n) && n >= 1 && n <= 200 && n !== fontSize) {
+      onFontSizeChange(n);
+    }
   };
 
   return (
@@ -316,18 +315,12 @@ export function FloatingToolbar({
           ))}
         </Select>
 
-        {/* Size input — commits on blur/Enter, not per-keystroke */}
+        {/* Size input — commits immediately as the user types so the
+            change is visible without having to leave the field. */}
         <TextField
           type="number"
           value={sizeBuf}
-          onChange={(e) => setSizeBuf(e.target.value)}
-          onBlur={commitSize}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              commitSize();
-              (e.currentTarget as HTMLInputElement).blur();
-            }
-          }}
+          onChange={(e) => handleSizeInput(e.target.value)}
           size="small"
           variant="standard"
           slotProps={{
@@ -344,7 +337,7 @@ export function FloatingToolbar({
           }}
         />
 
-        {/* Color picker */}
+        {/* Color picker — native OS picker, restored at user request. */}
         <Tooltip title="Text color" arrow>
           <Box
             component="input"

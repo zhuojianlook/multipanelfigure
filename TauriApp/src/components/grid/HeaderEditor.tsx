@@ -42,6 +42,10 @@ export interface HeaderEditorProps {
   onTextChange: (text: string) => void;
   onActivate: (target: HeaderEditorTarget, handle: StyledTextEditorHandle) => void;
   onSelectionNonEmpty?: (sel: { start: number; end: number }) => void;
+  /** Fired when the editor's selection collapses or the user edits the
+   *  text (any change that invalidates a cached range). Parents use
+   *  this to clear toolbarSelectionRef / the selection-preview chip. */
+  onSelectionCleared?: () => void;
   onShiftEnter?: (sel: { start: number; end: number }) => void;
   /** Regular Enter collapses focus (blur) to match the existing
    *  behaviour of the row-label textarea. Disabled by default because
@@ -64,6 +68,7 @@ export function HeaderEditor(props: HeaderEditorProps) {
     onTextChange,
     onActivate,
     onSelectionNonEmpty,
+    onSelectionCleared,
     onShiftEnter,
     enterBlurs,
     onClick,
@@ -95,11 +100,24 @@ export function HeaderEditor(props: HeaderEditorProps) {
       fontStyle={fontStyle}
       className={className}
       style={style}
-      onTextChange={onTextChange}
+      onTextChange={(t) => {
+        // Any edit invalidates any cached selection range the parent's
+        // toolbar is holding (offsets may now refer to different chars).
+        onSelectionCleared?.();
+        onTextChange(t);
+      }}
       onFocus={() => {
         if (ref.current) onActivate(target, ref.current);
       }}
       onSelectionChange={(sel) => {
+        // Only forward NON-EMPTY selections. A collapsed selection isn't
+        // a meaningful "user wants this range" signal — and collapse
+        // events fire during focus-transition cycles (e.g. clicking a
+        // toolbar button briefly steals/restores focus, which triggers
+        // a selectionchange with a momentarily-empty range). Clearing
+        // the cached toolbar selection on those would defeat the
+        // purpose of the cache. Real text edits already trigger
+        // onSelectionCleared via the onTextChange wrapper above.
         if (sel && sel.start !== sel.end) onSelectionNonEmpty?.(sel);
       }}
       onKeyDown={handleKeyDown}

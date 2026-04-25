@@ -950,14 +950,22 @@ export function PanelGrid() {
     if (start === end) return;
     setSelectionPreview(text.slice(Math.min(start, end), Math.max(start, end)));
   };
+  // Read the LIVE text from the store rather than from closure-captured
+  // const refs. The selectionchange listener can fire before React's
+  // re-render commits the latest store update — when the user deletes
+  // and retypes text, the handler's closure still saw "Column 1" while
+  // the store already had "Test", which made the chip slice the wrong
+  // string and show old characters.
   const getActiveEditorText = (): string => {
     const t = activeEditorTargetRef.current;
     if (!t) return "";
+    const cfg = useFigureStore.getState().config;
+    if (!cfg) return "";
     if (t.type === "header") {
-      const headers = t.axis === "col" ? column_headers : row_headers;
+      const headers = t.axis === "col" ? cfg.column_headers : cfg.row_headers;
       return headers[t.level]?.headers[t.groupIdx]?.text || "";
     }
-    const labels = t.axis === "col" ? column_labels : row_labels;
+    const labels = t.axis === "col" ? cfg.column_labels : cfg.row_labels;
     return labels[t.index]?.text || "";
   };
   // Capture a non-empty selection from whichever surface is active
@@ -989,6 +997,14 @@ export function PanelGrid() {
   const handleEditorSelectionChange = (sel: { start: number; end: number }) => {
     toolbarSelectionRef.current = sel;
     updateSelectionPreviewFromText(getActiveEditorText(), sel.start, sel.end);
+  };
+  // Called by HeaderEditor when the selection collapses or the user
+  // edits the text. Drops the cached range so a subsequent toolbar
+  // action doesn't apply to stale offsets, and clears the preview chip
+  // so the user isn't looking at e.g. "Column" after deleting that text.
+  const handleEditorSelectionCleared = () => {
+    toolbarSelectionRef.current = null;
+    setSelectionPreview("");
   };
   // Activated on editor focus — records it as "the current one" and
   // positions the floating toolbar to match.
@@ -1227,18 +1243,25 @@ export function PanelGrid() {
       }
     }
 
-    // Restore focus + visual selection to the editor so the user sees
-    // the highlight persist after clicking a toolbar button or committing
-    // a font-size change. Without this, focus sits on the toolbar
-    // control and the contentEditable's selection goes invisible — even
-    // though toolbarSelectionRef still holds the range for the next
-    // patch.
+    // Restore the editor's visual selection so it doesn't fade after a
+    // toolbar action — but skip the re-focus if the user is currently
+    // typing into a form input (e.g. the font-size field). Re-focusing
+    // would steal focus from the input mid-type. If activeElement is
+    // a focusable form control, leave focus alone and only re-apply
+    // the selection range so the highlight stays visible in the editor.
     if (sel) {
       const ed = activeEditorRef.current;
       if (ed) {
+        const ae = document.activeElement as HTMLElement | null;
+        const focusElsewhere =
+          ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.tagName === "SELECT");
         requestAnimationFrame(() => {
-          ed.focus();
-          ed.setSelection(sel.start, sel.end);
+          if (focusElsewhere) {
+            ed.setSelection(sel.start, sel.end);
+          } else {
+            ed.focus();
+            ed.setSelection(sel.start, sel.end);
+          }
         });
       }
     }
@@ -1274,15 +1297,35 @@ export function PanelGrid() {
 
   const cellSize = 160;
 
+  // Precompute the widest line-count for each row-header tier and the
+  // primary row label. The grid track for those columns is sized to fit
+  // the unwrapped content because CSS grid's `max-content` track sizing
+  // doesn't propagate cleanly through a vertical-rl + transform-rotated
+  // flex container.
+  //
+  // Width formula matches the col-header row template's growth pattern:
+  // 28px minimum, plus 12px per line beyond the first.  For a 10px
+  // font with line-height 1.2, that's exactly the line-stride. So row
+  // header thickness ≡ col header height for the same line count.
+  const rowHdrLineCounts = row_headers.map((level) =>
+    level.headers.reduce(
+      (max, h) => Math.max(max, (h.text || "").split("\n").length || 1),
+      1,
+    ),
+  );
+  const rowLabelMaxLines = (config.row_labels || []).reduce(
+    (max, l) => Math.max(max, (l.text || "").split("\n").length || 1),
+    1,
+  );
+  const trackWidthForLines = (n: number) => `${Math.max(28, 4 + n * 12)}px`;
+  const rowHdrTrackWidths = rowHdrLineCounts.map(trackWidthForLines);
+  const rowLabelTrackWidth = trackWidthForLines(rowLabelMaxLines);
+
   const needsColXBtnCol = colHdrTiers > 0 || config.show_column_labels !== false;
   const colTemplate = [
     "28px",                                     // +Row button column
-    // Row header tier columns: auto-grow to fit multi-line rotated headers
-    // so 5+ line breaks aren't clipped. 28px is the minimum (single line).
-    ...Array(rowHdrTiers).fill("minmax(28px, max-content)"),
-    // Row label column: same — auto-grow so primary labels with Shift+Enter
-    // line breaks don't clip (matches the secondary-header behavior).
-    "minmax(28px, max-content)",                // row label column
+    ...rowHdrTrackWidths,                       // secondary row header tiers — grow with line breaks
+    rowLabelTrackWidth,                         // primary row label column — grows with line breaks
     ...Array(cols).fill(`${cellSize}px`),       // panel columns
     ...(needsColXBtnCol ? ["28px"] : []),       // X button column for col headers + primary col labels
   ].join(" ");
@@ -1554,6 +1597,14 @@ export function PanelGrid() {
                     className="text-center text-[10px] rounded px-1 py-0.5 no-overlay-scrollbar hover:ring-1 hover:ring-blue-400/40 transition-shadow"
                     style={{
                       minHeight: "28px",
+                      // Flex-center so the text sits visually centered
+                      // in the box whether it's single- or multi-line.
+                      // text-align:center (via the class) handles the
+                      // inline (horizontal) axis; align-items:center
+                      // handles the block (vertical) axis.
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
                       backgroundColor: isBeingDragged ? "var(--c-accent)" : "rgba(255,255,255,0.15)",
                       borderBottom: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
                       textDecoration: group.font_style?.includes("Strikethrough") ? "line-through" : group.font_style?.includes("Underline") ? "underline" : undefined,
@@ -1569,6 +1620,7 @@ export function PanelGrid() {
                     }}
                     onActivate={activateEditor}
                     onSelectionNonEmpty={handleEditorSelectionChange}
+                    onSelectionCleared={handleEditorSelectionCleared}
                     onShiftEnter={(sel) => {
                       const newCaret = insertLineBreakInHeader("col", li, gi, sel.start, sel.end);
                       if (newCaret !== undefined) {
@@ -1685,6 +1737,9 @@ export function PanelGrid() {
                 className="text-center text-[10px] rounded px-1 py-0.5 flex-1 min-w-0 no-overlay-scrollbar"
                 style={{
                   minHeight: "28px",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
                   backgroundColor: "rgba(255,255,255,0.15)",
                   textDecoration: lbl.font_style?.includes("Strikethrough") ? "line-through" : lbl.font_style?.includes("Underline") ? "underline" : undefined,
                   whiteSpace: "pre-wrap",
@@ -1699,6 +1754,7 @@ export function PanelGrid() {
                 }}
                 onActivate={activateEditor}
                 onSelectionNonEmpty={handleEditorSelectionChange}
+                onSelectionCleared={handleEditorSelectionCleared}
                 onShiftEnter={(sel) => {
                   const newCaret = insertLineBreakInLabel("col", ci, sel.start, sel.end);
                   if (newCaret !== undefined) {
@@ -1866,14 +1922,12 @@ export function PanelGrid() {
                   position: "relative",
                   opacity: isBeingDragged ? 0.8 : 1,
                   cursor: "pointer",
-                  // Grey affordance bg put on the grid-cell itself so it
-                  // spans the full configured row-span — the inner textarea
-                  // is sized to its text width (e.g. 28px) and would only
-                  // paint the bg over that stripe.
-                  backgroundColor: isBeingDragged
-                    ? "var(--c-accent)"
-                    : "rgba(255,255,255,0.15)",
-                  borderRadius: 4,
+                  // Separator LINE lives on the outer grid-cell so the
+                  // inner wrapper can have symmetric padding around the
+                  // text (centered both axes). Previously the wrapper
+                  // carried borderRight + paddingRight which pushed the
+                  // text visually toward the line side.
+                  borderRight: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
                 }}
                 onClick={(e) => handleHeaderClick(e, "row", li, gi)}
                 onContextMenu={(e) => handleHeaderContextMenu(e, "row", li, gi)}
@@ -1892,17 +1946,18 @@ export function PanelGrid() {
                       display: "flex",
                       alignItems: "center",
                       justifyContent: "center",
-                      flex: 1,
+                      // Stretch to fill the cell so the editor inside
+                      // centers within the full cell width (= same width
+                      // for every row in the column). With shrink-to-
+                      // content the wrapper varied per row and the text
+                      // looked off-centre between rows.
+                      width: "100%",
+                      height: "100%",
                       minHeight: 0,
-                      borderRight: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
-                      // Extra padding between the wrapper's border-right
-                      // line and the inner editor content, so the header
-                      // text doesn't visually touch the separator line in
-                      // rotated mode. px-3 on the editor alone wasn't
-                      // enough because the wrapper's content-box is what
-                      // frames the editor, and with flex-center the editor
-                      // was sitting right against the border.
-                      paddingRight: 6,
+                      backgroundColor: isBeingDragged
+                        ? "var(--c-accent)"
+                        : "rgba(255,255,255,0.15)",
+                      borderRadius: 4,
                     }}
                     onFocus={(e) => { setToolbarAnchor(e.currentTarget.parentElement || e.currentTarget); }}
                   >
@@ -1912,19 +1967,24 @@ export function PanelGrid() {
                       styledSegments={group.styled_segments as HeaderStyledSegment[] | undefined}
                       defaultColor={group.default_color}
                       fontStyle={group.font_style}
-                      className="text-center text-[10px] rounded px-2 py-1 no-overlay-scrollbar hover:ring-1 hover:ring-blue-400/40 transition-shadow"
+                      className="text-center text-[10px] rounded px-0.5 py-1 no-overlay-scrollbar hover:ring-1 hover:ring-blue-400/40 transition-shadow"
                       style={{
+                        // Flex-center the text along both axes, regardless
+                        // of writing mode. In vertical-rl, align-items
+                        // centers along the BLOCK axis (= horizontal
+                        // physical) so text doesn't pile against the
+                        // block-start (right) edge. justify-content centers
+                        // along the inline axis (= vertical), redundant
+                        // with text-align: center but harmless.
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
                         textDecoration: group.font_style?.includes("Strikethrough") ? "line-through" : group.font_style?.includes("Underline") ? "underline" : undefined,
                         whiteSpace: "pre-wrap",
                         wordBreak: "break-word",
                         lineHeight: 1.2,
-                        // The editor inherits writingMode/transform from the
-                        // rotated wrapper above when rotated.
                         ...(isRotated
-                          ? {
-                              width: `${Math.max(28, Math.min(12, group.text.split("\n").length) * 14)}px`,
-                              height: "100%",
-                            }
+                          ? { width: "100%", height: "100%" }
                           : { minHeight: "28px" }),
                       }}
                       onTextChange={(newText) => {
@@ -1935,6 +1995,7 @@ export function PanelGrid() {
                       }}
                       onActivate={activateEditor}
                       onSelectionNonEmpty={handleEditorSelectionChange}
+                      onSelectionCleared={handleEditorSelectionCleared}
                       onShiftEnter={(sel) => {
                         const newCaret = insertLineBreakInHeader("row", li, gi, sel.start, sel.end);
                         if (newCaret !== undefined) {
@@ -1950,8 +2011,10 @@ export function PanelGrid() {
                   );
                 })()}
 
-                {/* Buttons below the bounding box */}
-                <div style={{ display: "flex", flexDirection: "row", alignItems: "center", gap: 2, flexShrink: 0 }}>
+                {/* Buttons below the bounding box — absolute-positioned so
+                    they don't consume cell vertical space, which would push
+                    the rotated wrapper up and make text appear off-centre. */}
+                <div style={{ position: "absolute", bottom: 2, left: 0, right: 0, display: "flex", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 2 }}>
                   <Tooltip title="Edit header properties" placement="bottom" arrow>
                     <button
                       style={{
@@ -2122,10 +2185,6 @@ export function PanelGrid() {
                 display: "flex",
                 flexDirection: "column",
                 alignItems: "center",
-                // Grey affordance bg on the cell so it spans the full row
-                // regardless of the inner textarea's sized-to-text width.
-                backgroundColor: "rgba(255,255,255,0.15)",
-                borderRadius: 4,
               }}
               onClick={(e) => handleLabelClick(e, "row", ri)}
             >
@@ -2141,9 +2200,16 @@ export function PanelGrid() {
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
-                    flex: 1,
+                    // Stretch to fill the cell so the editor inside is
+                    // centered within the full cell width — same wrapper
+                    // width for every row in the column means the text
+                    // looks consistently centred between rows.
+                    width: "100%",
+                    height: "100%",
                     minHeight: 0,
                     position: "relative",
+                    backgroundColor: "rgba(255,255,255,0.15)",
+                    borderRadius: 4,
                   }}
                   onFocus={(e) => { setToolbarAnchor(e.currentTarget.parentElement || e.currentTarget); }}
                 >
@@ -2153,17 +2219,17 @@ export function PanelGrid() {
                     styledSegments={rlbl?.styled_segments as HeaderStyledSegment[] | undefined}
                     defaultColor={rlbl?.default_color}
                     fontStyle={rlbl?.font_style}
-                    className="text-center text-[10px] rounded px-1 py-1 no-overlay-scrollbar"
+                    className="text-center text-[10px] rounded px-0.5 py-1 no-overlay-scrollbar"
                     style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
                       textDecoration: rlbl?.font_style?.includes("Strikethrough") ? "line-through" : rlbl?.font_style?.includes("Underline") ? "underline" : undefined,
                       whiteSpace: "pre-wrap",
                       wordBreak: "break-word",
                       lineHeight: 1.2,
                       ...(isRotated
-                        ? {
-                            width: `${Math.max(28, Math.min(12, (rlbl?.text ?? "").split("\n").length) * 14)}px`,
-                            height: "100%",
-                          }
+                        ? { width: "100%", height: "100%" }
                         : { minHeight: "28px", width: "100%" }),
                     }}
                     onTextChange={(newText) => {
@@ -2174,6 +2240,7 @@ export function PanelGrid() {
                     }}
                     onActivate={activateEditor}
                     onSelectionNonEmpty={handleEditorSelectionChange}
+                    onSelectionCleared={handleEditorSelectionCleared}
                     onShiftEnter={(sel) => {
                       const newCaret = insertLineBreakInLabel("row", ri, sel.start, sel.end);
                       if (newCaret !== undefined) {
@@ -2188,8 +2255,10 @@ export function PanelGrid() {
                 </div>
                 );
               })()}
-              {/* Buttons below the bounding box */}
-              <div style={{ display: "flex", flexDirection: "row", alignItems: "center", gap: 2, flexShrink: 0 }}>
+              {/* Buttons below the bounding box — absolute-positioned so
+                  they don't consume cell vertical space, which would push
+                  the rotated wrapper up and make text appear off-centre. */}
+              <div style={{ position: "absolute", bottom: 2, left: 0, right: 0, display: "flex", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 2 }}>
                 <Tooltip title="Edit header properties" placement="bottom" arrow>
                   <button
                     style={{

@@ -946,9 +946,15 @@ def _add_row_headers(fig, axes, header_levels: List[HeaderLevel],
                                ha="right" if hdr.position == "Left" else "left",
                                va="center", rotation=hdr.rotation)
 
-            # Draw line for ALL headers (not just spanning)
+            # Draw line for ALL headers (not just spanning). The row gap
+            # is half the col gap (0.025 vs 0.05 inches) because under
+            # rotation_mode='anchor' with ha="right", cx already sits on
+            # the rotated text's bbox right edge — there's no descender
+            # padding eating into the visual gap the way there is for
+            # col headers' va="bottom" + 0.05. Halving keeps the visual
+            # text-to-line spacing the same on both axes.
             if hdr.line_width > 0:
-                line_gap_x = _inches_to_frac(0.05, fig_w)
+                line_gap_x = _inches_to_frac(0.025, fig_w)
                 x_line = cx + line_gap_x if hdr.position == "Left" else cx - line_gap_x
                 line_length = getattr(hdr, 'line_length', 1.0) or 1.0
                 span_h = bbox_t.y1 - bbox_b.y0
@@ -964,7 +970,6 @@ def _add_row_headers(fig, axes, header_levels: List[HeaderLevel],
                 # End caps: small perpendicular lines at each end toward previous header
                 if getattr(hdr, 'end_caps', False):
                     cap_len = _inches_to_frac(0.06, fig_w)
-                    # Caps point toward the panels (rightward for Left, leftward for Right)
                     cap_dir = 1 if hdr.position == "Left" else -1
                     for cap_y in [mid_y - half_span, mid_y + half_span]:
                         fig.add_artist(plt.Line2D(
