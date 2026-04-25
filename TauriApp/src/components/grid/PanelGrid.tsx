@@ -1297,16 +1297,28 @@ export function PanelGrid() {
 
   const cellSize = 160;
 
-  // Precompute the widest line-count for each row-header tier and the
-  // primary row label. The grid track for those columns is sized to fit
-  // the unwrapped content because CSS grid's `max-content` track sizing
-  // doesn't propagate cleanly through a vertical-rl + transform-rotated
-  // flex container.
+  // Precompute the widest line-count for each header / label tier so
+  // both axes grow visibly with each line break (not just at 3+).
   //
-  // Width formula matches the col-header row template's growth pattern:
-  // 28px minimum, plus 12px per line beyond the first.  For a 10px
-  // font with line-height 1.2, that's exactly the line-stride. So row
-  // header thickness ≡ col header height for the same line count.
+  // Track size formula: 28px baseline (matches the editor's min-height),
+  // plus 12px per ADDITIONAL line. 12px = 10px font × 1.2 line-height,
+  // i.e. one full line stride. So adding one Shift+Enter widens row
+  // tracks (or heightens col tracks) by exactly one line's worth.
+  const sizeForLines = (n: number) => `${28 + Math.max(0, n - 1) * 12}px`;
+
+  const colHdrLineCounts = column_headers.map((level) =>
+    level.headers.reduce(
+      (max, h) => Math.max(max, (h.text || "").split("\n").length || 1),
+      1,
+    ),
+  );
+  const colLabelMaxLines = (config.column_labels || []).reduce(
+    (max, l) => Math.max(max, (l.text || "").split("\n").length || 1),
+    1,
+  );
+  const colHdrTrackHeights = colHdrLineCounts.map(sizeForLines);
+  const colLabelTrackHeight = sizeForLines(colLabelMaxLines);
+
   const rowHdrLineCounts = row_headers.map((level) =>
     level.headers.reduce(
       (max, h) => Math.max(max, (h.text || "").split("\n").length || 1),
@@ -1317,9 +1329,8 @@ export function PanelGrid() {
     (max, l) => Math.max(max, (l.text || "").split("\n").length || 1),
     1,
   );
-  const trackWidthForLines = (n: number) => `${Math.max(28, 4 + n * 12)}px`;
-  const rowHdrTrackWidths = rowHdrLineCounts.map(trackWidthForLines);
-  const rowLabelTrackWidth = trackWidthForLines(rowLabelMaxLines);
+  const rowHdrTrackWidths = rowHdrLineCounts.map(sizeForLines);
+  const rowLabelTrackWidth = sizeForLines(rowLabelMaxLines);
 
   const needsColXBtnCol = colHdrTiers > 0 || config.show_column_labels !== false;
   const colTemplate = [
@@ -1333,11 +1344,8 @@ export function PanelGrid() {
   const needsRowXBtnRow = rowHdrTiers > 0 || config.show_row_labels !== false;
   const rowTemplate = [
     "24px",                                     // +Col button row
-    // Col header tier rows: auto-grow to fit multi-line headers so 5+
-    // line breaks aren't clipped. 28px minimum (single line).
-    ...Array(colHdrTiers).fill("minmax(28px, max-content)"),
-    // Col label row: same auto-grow behavior.
-    "minmax(28px, max-content)",                // col label row
+    ...colHdrTrackHeights,                      // col header tiers — grow with line breaks
+    colLabelTrackHeight,                        // col label row — grows with line breaks
     ...Array(rows).fill(`${cellSize}px`),       // panel rows
     ...(needsRowXBtnRow ? ["28px"] : []),       // X button row for row headers + primary row labels
   ].join(" ");
