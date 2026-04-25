@@ -1,15 +1,15 @@
 {
-  "version": "0.1.124",
-  "notes": "Update to exp-0.1.124",
-  "pub_date": "2026-04-25T11:33:34Z",
+  "version": "0.1.125",
+  "notes": "Update to exp-0.1.125",
+  "pub_date": "2026-04-25T11:40:59Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSSFh1MUthaVIzbGY0dS9sSlUrSGJ2V1pFQXFZVDVXRGxUbWwxZ1BDSzhtMUI2emlIOFduQjNOMnhUSk1nUTlxYzlLTCsydldmZjFLaytGQnhwdHc5Mk5uQXlqNDMxc0E4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc3MTE2NzkyCWZpbGU6TXVsdGktUGFuZWwgRmlndXJlIEJ1aWxkZXJfMC4xLjEyNF94NjQtc2V0dXAuZXhlCkFpaVVZV2lwekF1Q1d2TnlLUzhFdDcxOThYUW0xSHEvQzBaaDdCejU0N1BPTlVmc2lWbmsvdFJxMElQcEpNM2JGbzUrdGpFM0tzYlZuYkRKYnJzcUR3PT0K",
-      "url": "https://github.com/zhuojianlook/multipanelfigure/releases/download/exp-0.1.124/Multi-Panel.Figure.Builder_0.1.124_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSSFh1MUthaVIzbFY3VEJoYUg5dHZXMXVZZHVtV1I3TlZRSlVTZXBEOWVCNSt0Q3RiSk1oSFN4VUNqUHhnNTNtb21EWWNrc2h3cVNqZEdBYnpyYjFuRy82Y1pLVFIyZXdJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc3MTE3MjM0CWZpbGU6TXVsdGktUGFuZWwgRmlndXJlIEJ1aWxkZXJfMC4xLjEyNV94NjQtc2V0dXAuZXhlCnBjamFLckRWMWkxNzBYbklJOGJEczlUanRmaURmNW1xWGE3L2JTanZmbEZncWZKYUt0OThrWVlSVDVHU3pVSlE1MWY3aVlJVVVwVU05dFpRN3B5dEJBPT0K",
+      "url": "https://github.com/zhuojianlook/multipanelfigure/releases/download/exp-0.1.125/Multi-Panel.Figure.Builder_0.1.125_x64-setup.exe"
     },
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSSFh1MUthaVIzbGMweExvM3pPNlM2TVdwZGtSWUdvczB2OGJaYXlHa012bTNrNGkvOXFGOWhpSDBFL2FNQzFEbjR3T1poUjd0cGpNN2M1alltSFNhNGhoMWozN1E4K0E4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc3MTE2NDEzCWZpbGU6TXVsdGktUGFuZWwgRmlndXJlIEJ1aWxkZXIuYXBwLnRhci5negpRTEQ2VEZzSzRHU0tSeit0V2xrSUV0dUFhOFBqRmVwWlF5b1FaeFR2QnQ5QXE2eVQrTVNNZWhkSUQ2ZDdLVkZidzZPTUpYajNpYWpkK0hlM1NGVDBBZz09Cg==",
-      "url": "https://github.com/zhuojianlook/multipanelfigure/releases/download/exp-0.1.124/Multi-Panel.Figure.Builder.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSSFh1MUthaVIzbGVHTUZNdWd5ZlB5T1lwUitETUVWOWFaQzdrakNvU1dKQmlCNExONnowdkpyc0hwT0Fka0ZMWUxDSHJmZXEzOTduci9nRWg3UjJZa3h0SVF3ZGRKb1FNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc3MTE2OTQ1CWZpbGU6TXVsdGktUGFuZWwgRmlndXJlIEJ1aWxkZXIuYXBwLnRhci5negp4dTFrK2IrVmtQTitpYVdPeUlpM1NPM1N5V0lZVzlCYjdqdERNbVRZbmNVZmZrSk1CaEJ6TEV6SU9PNXQ0cklnNTlMdVVYdzlQWmxUQVFyZk9EWUxBdz09Cg==",
+      "url": "https://github.com/zhuojianlook/multipanelfigure/releases/download/exp-0.1.125/Multi-Panel.Figure.Builder.app.tar.gz"
     }
   }
 }
