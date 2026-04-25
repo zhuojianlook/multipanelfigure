@@ -339,8 +339,20 @@ export function Sidebar() {
           <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
           <select
             id="global-font-select"
-            defaultValue={fonts.length > 0 ? (config?.column_labels?.[0]?.font_name || "arial.ttf") : ""}
-            key={fonts.length > 0 ? "loaded" : "empty"}
+            defaultValue={(() => {
+              if (fonts.length === 0) return "";
+              const existing = config?.column_labels?.[0]?.font_name;
+              if (existing && fonts.includes(existing)) return existing;
+              // Case-insensitive Arial match (Windows "arial.ttf",
+              // macOS "Arial.ttf", Linux variants — the installed
+              // filename varies by OS).
+              const arial = fonts.find((f) =>
+                /^arial\b/i.test(f.replace(/\.(ttf|otf|ttc)$/i, "")),
+              );
+              if (arial) return arial;
+              return fonts[0] || "";
+            })()}
+            key={fonts.length > 0 ? `loaded-${fonts.length}` : "empty"}
             style={{
               fontSize: "0.65rem",
               flex: 1,
@@ -409,6 +421,10 @@ export function Sidebar() {
               if (!el) return;
               const n = Number(el.value);
               if (!isFinite(n) || n < 4) return;
+              // Apply to BOTH secondary headers (column_headers/row_headers)
+              // AND primary labels (column_labels/row_labels). Previously
+              // only the former were updated, so when a project had no
+              // secondary header levels the button appeared to do nothing.
               const colHeaders = config.column_headers.map((level: any) => ({
                 ...level,
                 headers: level.headers.map((h: any) => ({
@@ -427,7 +443,17 @@ export function Sidebar() {
                   styled_segments: (h.styled_segments || []).map((seg: any) => ({ ...seg, font_size: undefined })),
                 })),
               }));
-              setConfig({ ...config, column_headers: colHeaders, row_headers: rowHeaders });
+              const colLabels = config.column_labels.map((l: any) => ({
+                ...l,
+                font_size: n,
+                styled_segments: (l.styled_segments || []).map((seg: any) => ({ ...seg, font_size: undefined })),
+              }));
+              const rowLabels = config.row_labels.map((l: any) => ({
+                ...l,
+                font_size: n,
+                styled_segments: (l.styled_segments || []).map((seg: any) => ({ ...seg, font_size: undefined })),
+              }));
+              setConfig({ ...config, column_headers: colHeaders, row_headers: rowHeaders, column_labels: colLabels, row_labels: rowLabels });
             }}
           >
             Apply

@@ -79,6 +79,24 @@ export function FloatingToolbar({
   const displayFonts = (fontList.length > 0 ? fontList : fallbackFonts)
     .slice().sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
 
+  // Resolve the Select's value to a font that actually exists in the
+  // current option list — falls back to the first case-insensitive
+  // Arial match, then to the first font in the list. Prevents the
+  // dropdown from rendering blank when the model's font_name is unset
+  // or points at a font not installed on the current machine (common
+  // when a project is opened on a different OS).
+  const effectiveFontName = (() => {
+    if (fontName && displayFonts.includes(fontName)) return fontName;
+    if (fontName) {
+      const lower = fontName.toLowerCase();
+      const match = displayFonts.find((f) => f.toLowerCase() === lower);
+      if (match) return match;
+    }
+    const arial = displayFonts.find((f) => /^arial\b/i.test(f.replace(/\.(ttf|otf|ttc)$/i, "")));
+    if (arial) return arial;
+    return displayFonts[0] || "";
+  })();
+
   const hasStyle = (style: string) => fontStyle.includes(style);
 
   // Local buffer for the font-size input. We commit only on blur or
@@ -279,7 +297,7 @@ export function FloatingToolbar({
 
         {/* Font dropdown */}
         <Select
-          value={fontName}
+          value={effectiveFontName}
           onChange={(e) => onFontNameChange(e.target.value)}
           size="small"
           variant="standard"

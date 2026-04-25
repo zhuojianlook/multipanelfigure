@@ -148,6 +148,15 @@ function buildHtml(
   }
   let html = "";
   for (const seg of segs) {
+    // A seg whose text is ONLY newlines becomes raw <br> elements
+    // without a wrapping span. Wrapping the br in its own zero-height
+    // styled span introduced a ~1-2px gap in vertical-rl layouts
+    // (adjacent char spans ended up with a gap at the line-break
+    // boundary), misaligning coloured chars in rotated row headers.
+    if (/^\n+$/.test(seg.text)) {
+      html += "<br>".repeat(seg.text.length);
+      continue;
+    }
     const style = cssObjectToString(segSpanStyle(seg, defaultColor));
     const parts = seg.text.split("\n").map(escapeHtml).join("<br>");
     html += `<span style="${style}">${parts}</span>`;

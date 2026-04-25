@@ -1226,6 +1226,22 @@ export function PanelGrid() {
         fullPatchFn();
       }
     }
+
+    // Restore focus + visual selection to the editor so the user sees
+    // the highlight persist after clicking a toolbar button or committing
+    // a font-size change. Without this, focus sits on the toolbar
+    // control and the contentEditable's selection goes invisible — even
+    // though toolbarSelectionRef still holds the range for the next
+    // patch.
+    if (sel) {
+      const ed = activeEditorRef.current;
+      if (ed) {
+        requestAnimationFrame(() => {
+          ed.focus();
+          ed.setSelection(sel.start, sel.end);
+        });
+      }
+    }
   };
 
   const handleToolbarColorChange = (color: string) => {
@@ -1879,6 +1895,14 @@ export function PanelGrid() {
                       flex: 1,
                       minHeight: 0,
                       borderRight: `${group.line_width}px ${group.line_style === "dashed" ? "dashed" : group.line_style === "dotted" ? "dotted" : "solid"} ${group.line_color}`,
+                      // Extra padding between the wrapper's border-right
+                      // line and the inner editor content, so the header
+                      // text doesn't visually touch the separator line in
+                      // rotated mode. px-3 on the editor alone wasn't
+                      // enough because the wrapper's content-box is what
+                      // frames the editor, and with flex-center the editor
+                      // was sitting right against the border.
+                      paddingRight: 6,
                     }}
                     onFocus={(e) => { setToolbarAnchor(e.currentTarget.parentElement || e.currentTarget); }}
                   >
