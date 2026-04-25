@@ -782,15 +782,41 @@ def _add_column_headers(fig, axes, header_levels: List[HeaderLevel],
             else:
                 cy = base_y_bottom - dist_y
 
+            text_idx_before = len(fig.texts)
             _draw_colored_text(fig, cx, cy, segments, fp,
                                ha="center",
                                va="bottom" if hdr.position == "Top" else "top",
                                rotation=hdr.rotation)
 
-            # Draw line for ALL headers (not just spanning)
+            # Draw line for ALL headers (not just spanning).
+            # Position from the text's actual rendered bbox so the gap
+            # is visually consistent with the row-header line gap (which
+            # also reads bbox). Falls back to the cy anchor if the
+            # renderer hasn't been primed.
             if hdr.line_width > 0:
-                line_gap_y = _inches_to_frac(0.05, fig_h)
-                y_line = cy - line_gap_y if hdr.position == "Top" else cy + line_gap_y
+                gap_inches = 0.025
+                line_gap_y = _inches_to_frac(gap_inches, fig_h)
+                y_line_from_bbox = None
+                try:
+                    fig.canvas.draw()
+                    renderer = fig.canvas.get_renderer()
+                    new_artists = fig.texts[text_idx_before:]
+                    if new_artists:
+                        edge_y = None
+                        for ta in new_artists:
+                            bb = ta.get_window_extent(renderer).transformed(fig.transFigure.inverted())
+                            if hdr.position == "Top":
+                                edge_y = bb.y0 if edge_y is None else min(edge_y, bb.y0)
+                            else:
+                                edge_y = bb.y1 if edge_y is None else max(edge_y, bb.y1)
+                        if edge_y is not None:
+                            y_line_from_bbox = (edge_y - line_gap_y) if hdr.position == "Top" else (edge_y + line_gap_y)
+                except Exception:
+                    pass
+                if y_line_from_bbox is not None:
+                    y_line = y_line_from_bbox
+                else:
+                    y_line = cy - line_gap_y if hdr.position == "Top" else cy + line_gap_y
                 line_length = getattr(hdr, 'line_length', 1.0) or 1.0
                 span_w = bbox_r.x1 - bbox_l.x0
                 half_span = span_w * line_length / 2
@@ -942,20 +968,39 @@ def _add_row_headers(fig, axes, header_levels: List[HeaderLevel],
             else:
                 cx = base_x_right + dist_x
 
+            text_idx_before = len(fig.texts)
             _draw_colored_text(fig, cx, cy, segments, fp,
                                ha="right" if hdr.position == "Left" else "left",
                                va="center", rotation=hdr.rotation)
 
-            # Draw line for ALL headers (not just spanning). The row gap
-            # is half the col gap (0.025 vs 0.05 inches) because under
-            # rotation_mode='anchor' with ha="right", cx already sits on
-            # the rotated text's bbox right edge — there's no descender
-            # padding eating into the visual gap the way there is for
-            # col headers' va="bottom" + 0.05. Halving keeps the visual
-            # text-to-line spacing the same on both axes.
+            # Draw line for ALL headers — position from the rendered
+            # text's bbox so the visual gap between text and line is
+            # identical to the col-header gap (both use the same
+            # gap_inches measured from the bbox edge).
             if hdr.line_width > 0:
-                line_gap_x = _inches_to_frac(0.025, fig_w)
-                x_line = cx + line_gap_x if hdr.position == "Left" else cx - line_gap_x
+                gap_inches = 0.025
+                line_gap_x = _inches_to_frac(gap_inches, fig_w)
+                x_line_from_bbox = None
+                try:
+                    fig.canvas.draw()
+                    renderer = fig.canvas.get_renderer()
+                    new_artists = fig.texts[text_idx_before:]
+                    if new_artists:
+                        edge_x = None
+                        for ta in new_artists:
+                            bb = ta.get_window_extent(renderer).transformed(fig.transFigure.inverted())
+                            if hdr.position == "Left":
+                                edge_x = bb.x1 if edge_x is None else max(edge_x, bb.x1)
+                            else:
+                                edge_x = bb.x0 if edge_x is None else min(edge_x, bb.x0)
+                        if edge_x is not None:
+                            x_line_from_bbox = (edge_x + line_gap_x) if hdr.position == "Left" else (edge_x - line_gap_x)
+                except Exception:
+                    pass
+                if x_line_from_bbox is not None:
+                    x_line = x_line_from_bbox
+                else:
+                    x_line = cx + line_gap_x if hdr.position == "Left" else cx - line_gap_x
                 line_length = getattr(hdr, 'line_length', 1.0) or 1.0
                 span_h = bbox_t.y1 - bbox_b.y0
                 half_span = span_h * line_length / 2
