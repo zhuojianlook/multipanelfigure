@@ -92,7 +92,12 @@ jobs:
         run: |
           set -e
           mkdir -p TauriApp/src-tauri/binaries
-          curl -fL -o TauriApp/src-tauri/binaries/ffmpeg-aarch64-apple-darwin \
+          # --retry handles 5xx + connection failures with exponential
+          # backoff so a single-shot GitHub 502 doesn't kill the release
+          # (--retry-all-errors so HTTP 4xx/5xx also retry, not just
+          # transport errors). 5 attempts × 4-second base delay.
+          curl -fL --retry 5 --retry-delay 4 --retry-all-errors \
+            -o TauriApp/src-tauri/binaries/ffmpeg-aarch64-apple-darwin \
             https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-darwin-arm64
           chmod +x TauriApp/src-tauri/binaries/ffmpeg-aarch64-apple-darwin
           TauriApp/src-tauri/binaries/ffmpeg-aarch64-apple-darwin -version | head -1
@@ -101,9 +106,23 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           New-Item -ItemType Directory -Force -Path TauriApp/src-tauri/binaries | Out-Null
-          Invoke-WebRequest -Uri "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-win32-x64" `
-            -OutFile "TauriApp/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe"
-          & "TauriApp/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe" -version | Select-Object -First 1
+          $url = "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-win32-x64"
+          $dest = "TauriApp/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe"
+          # Invoke-WebRequest has no native retry, so wrap it in a loop
+          # that backs off on transient failures (GitHub 502, network
+          # blips). 5 attempts with linear backoff.
+          $max = 5
+          for ($i = 1; $i -le $max; $i++) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $dest -ErrorAction Stop
+              break
+            } catch {
+              if ($i -eq $max) { throw }
+              Write-Host "Download attempt $i/$max failed: $_ — retrying..."
+              Start-Sleep -Seconds (4 * $i)
+            }
+          }
+          & $dest -version | Select-Object -First 1
         shell: pwsh
 
       - name: Install frontend deps
