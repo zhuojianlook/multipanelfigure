@@ -176,6 +176,91 @@ async function fetchChangelog(): Promise<ChangelogEntry[]> {
 import { useFigureStore } from "../../store/figureStore";
 import { SaveFigureDialog } from "../dialogs/SaveFigureDialog";
 
+/* ── SaveCollageButton ───────────────────────────────────────
+   Renders the collage canvas to PNG client-side (compositing
+   each item at its x/y/w/h on a single offscreen <canvas>),
+   then writes the bytes to a user-chosen path via the
+   existing save_base64_to_path Tauri command. In a non-Tauri
+   browser preview, falls back to a download anchor. */
+function SaveCollageButton() {
+  const items = useCollageStore((s) => s.items);
+  const canvasW = useCollageStore((s) => s.canvasW);
+  const canvasH = useCollageStore((s) => s.canvasH);
+  const background = useCollageStore((s) => s.background);
+
+  const handleSave = async () => {
+    if (items.length === 0) {
+      window.alert("No items in the collage to save. Add a figure or image first.");
+      return;
+    }
+    // Compose items onto an offscreen canvas at full virtual resolution.
+    // We load each <img> first (they may already be cached from the data
+    // URL paint, but Image() resolves the decode lifecycle cleanly) so
+    // ctx.drawImage doesn't draw blank tiles for any straggler.
+    const canvas = document.createElement("canvas");
+    canvas.width = canvasW;
+    canvas.height = canvasH;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      window.alert("Could not initialise a 2D canvas context.");
+      return;
+    }
+    ctx.fillStyle = background;
+    ctx.fillRect(0, 0, canvasW, canvasH);
+
+    const sorted = [...items].sort((a, b) => a.z - b.z);
+    for (const it of sorted) {
+      await new Promise<void>((resolve) => {
+        const img = new window.Image();
+        img.onload = () => {
+          try {
+            ctx.drawImage(img, it.x, it.y, it.w, it.h);
+          } catch (err) {
+            console.warn("[collage] drawImage failed for", it.name, err);
+          }
+          resolve();
+        };
+        img.onerror = () => resolve();
+        img.src = it.src;
+      });
+    }
+
+    const dataUrl = canvas.toDataURL("image/png");
+    const b64 = dataUrl.split(",")[1] ?? "";
+
+    // Try Tauri save flow first.
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const { invoke } = await import("@tauri-apps/api/core");
+      const path = await save({
+        defaultPath: "collage.png",
+        filters: [{ name: "PNG image", extensions: ["png"] }],
+      });
+      if (!path) return;
+      await invoke("save_base64_to_path", { path, dataB64: b64 });
+      window.alert(`Collage saved to ${path}`);
+      return;
+    } catch {
+      /* Not running inside Tauri — fall back to browser download. */
+    }
+    const a = document.createElement("a");
+    a.href = dataUrl;
+    a.download = "collage.png";
+    a.click();
+  };
+
+  return (
+    <Button
+      variant="contained"
+      color="secondary"
+      startIcon={<SaveIcon />}
+      onClick={handleSave}
+    >
+      Save Collage
+    </Button>
+  );
+}
+
 /* ── CollageWorkspaceControls ────────────────────────────────
    Workspace toggle (Builder ↔ Collage) and the "Add to Collage"
    action that captures the currently-rendered figure preview
@@ -217,6 +302,7 @@ function CollageWorkspaceControls() {
       const h = aspect >= 1 ? targetMax / aspect : targetMax;
       const offset = itemCount * 24;
       addItem({
+        kind: "figure",
         src: `data:image/png;base64,${resp.image}`,
         name: `Figure ${itemCount + 1}`,
         x: 40 + offset,
@@ -269,6 +355,7 @@ export function Toolbar() {
   const loadedImages = useFigureStore((s) => s.loadedImages);
   const uploadImages = useFigureStore((s) => s.uploadImages);
   const uploadImagesFromPaths = useFigureStore((s) => s.uploadImagesFromPaths);
+  const mode = useCollageStore((s) => s.mode);
   const fileRef = useRef<HTMLInputElement>(null);
   const [saveDlgOpen, setSaveDlgOpen] = useState(false);
   const [newConfirmOpen, setNewConfirmOpen] = useState(false);
@@ -361,46 +448,51 @@ export function Toolbar() {
         flexWrap: "wrap",
       }}
     >
-      {/* Load images */}
-      <Button
-        variant="contained"
-        startIcon={<AddPhotoAlternateIcon />}
-        onClick={handleLoadMedia}
-      >
-        Load Media
-      </Button>
+      {/* The Load Media / file-count chip / New trio belongs to the
+          multi-panel builder workflow only. In collage mode they're
+          hidden — the collage has its own Import image / Import
+          project buttons inside CollageView's toolbar. */}
+      {mode === "builder" && (
+        <>
+          <Button
+            variant="contained"
+            startIcon={<AddPhotoAlternateIcon />}
+            onClick={handleLoadMedia}
+          >
+            Load Media
+          </Button>
 
-      <input
-        ref={fileRef}
-        type="file"
-        accept=".tif,.tiff,.png,.jpg,.jpeg,.cr2,.cr3,.nef,.arw,.dng,.orf,.rw2,.pef,.raf,.nd2,.mp4,.avi,.mov,.mkv,.webm,.wmv,.flv,.m4v,.mpg,.mpeg,.3gp,.ts,.mts"
-        multiple
-        style={{ display: "none" }}
-        aria-label="Load image files"
-        onChange={(e) => handleFiles(e.target.files)}
-      />
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".tif,.tiff,.png,.jpg,.jpeg,.cr2,.cr3,.nef,.arw,.dng,.orf,.rw2,.pef,.raf,.nd2,.mp4,.avi,.mov,.mkv,.webm,.wmv,.flv,.m4v,.mpg,.mpeg,.3gp,.ts,.mts"
+            multiple
+            style={{ display: "none" }}
+            aria-label="Load image files"
+            onChange={(e) => handleFiles(e.target.files)}
+          />
 
-      {/* Badge */}
-      <Chip
-        label={`${imageCount} file${imageCount !== 1 ? "s" : ""}`}
-        size="small"
-        variant="outlined"
-      />
+          <Chip
+            label={`${imageCount} file${imageCount !== 1 ? "s" : ""}`}
+            size="small"
+            variant="outlined"
+          />
 
-      {/* New / Clear Session */}
-      <Tooltip title="New figure — clears all panels, images, and settings">
-        <Button
-          size="small"
-          variant="outlined"
-          color="error"
-          startIcon={<RestartAltIcon />}
-          onClick={() => {
-            setNewConfirmOpen(true);
-          }}
-        >
-          New
-        </Button>
-      </Tooltip>
+          <Tooltip title="New figure — clears all panels, images, and settings">
+            <Button
+              size="small"
+              variant="outlined"
+              color="error"
+              startIcon={<RestartAltIcon />}
+              onClick={() => {
+                setNewConfirmOpen(true);
+              }}
+            >
+              New
+            </Button>
+          </Tooltip>
+        </>
+      )}
 
       {/* New figure confirmation dialog */}
       <Dialog open={newConfirmOpen} onClose={() => setNewConfirmOpen(false)}>
@@ -449,15 +541,22 @@ export function Toolbar() {
       {/* Collage workspace toggle + Add to Collage */}
       <CollageWorkspaceControls />
 
-      {/* Save figure */}
-      <Button
-        variant="contained"
-        color="secondary"
-        startIcon={<SaveIcon />}
-        onClick={() => setSaveDlgOpen(true)}
-      >
-        Save Figure
-      </Button>
+      {/* Save figure / Save collage — same button, two modes. The
+          collage path renders the canvas client-side via <canvas>
+          and ships the bytes through the existing save_base64_to_path
+          Tauri command (or download fallback in browser). */}
+      {mode === "builder" ? (
+        <Button
+          variant="contained"
+          color="secondary"
+          startIcon={<SaveIcon />}
+          onClick={() => setSaveDlgOpen(true)}
+        >
+          Save Figure
+        </Button>
+      ) : (
+        <SaveCollageButton />
+      )}
 
       {/* Help menu */}
       <Tooltip title="Help">

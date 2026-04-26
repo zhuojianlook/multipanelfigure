@@ -13,8 +13,15 @@
 import { create } from "zustand";
 import { immer } from "zustand/middleware/immer";
 
+export type CollageItemKind = "figure" | "image";
+
 export type CollageItem = {
   id: string;
+  /** "figure" = produced via Add to Collage from the multi-panel builder.
+   *  "image" = imported from disk via Import Image. The distinction lets
+   *  the strip badge them and lets future return-to-builder code route
+   *  only figure-kinded items. */
+  kind: CollageItemKind;
   /** base64-encoded PNG/JPEG payload. data: prefix included for direct <img src> use. */
   src: string;
   /** Display name shown in tooltips / future label rendering. */
@@ -38,6 +45,15 @@ export type CollageItem = {
 
 export type WorkspaceMode = "builder" | "collage";
 
+/** Default canvas: Nature full-page proportions (183 mm × 247 mm) at 300 DPI
+ *  → 2161 × 2917 px. Common scientific-publication target so users don't
+ *  have to look up dimensions before assembling. */
+export const DEFAULT_CANVAS_W = 2161;
+export const DEFAULT_CANVAS_H = 2917;
+/** Grid step in canvas pixels. 50 px ≈ 4.2 mm at 300 DPI — fine enough for
+ *  alignment without being claustrophobic on the screen. */
+export const DEFAULT_GRID_STEP = 50;
+
 export type CollageState = {
   /** Top-level workspace toggle. The builder shows the panel grid +
    *  preview; the collage shows the assembly canvas. */
@@ -51,10 +67,17 @@ export type CollageState = {
   background: string;
   /** Currently-selected item id, or null. */
   selectedId: string | null;
+  /** Gridline visibility + snap-to-grid step. Both default ON. */
+  gridVisible: boolean;
+  snapEnabled: boolean;
+  gridStep: number;
 
   setMode: (m: WorkspaceMode) => void;
+  setGridVisible: (v: boolean) => void;
+  setSnapEnabled: (v: boolean) => void;
+  setGridStep: (n: number) => void;
 
-  addItem: (item: Omit<CollageItem, "id" | "z" | "rotation"> & Partial<Pick<CollageItem, "rotation">>) => string;
+  addItem: (item: Omit<CollageItem, "id" | "z" | "rotation" | "kind"> & Partial<Pick<CollageItem, "rotation" | "kind">>) => string;
   updateItem: (id: string, patch: Partial<CollageItem>) => void;
   removeItem: (id: string) => void;
   moveItem: (id: string, dx: number, dy: number) => void;
@@ -67,30 +90,54 @@ export type CollageState = {
 
 const STORAGE_KEY = "mpfig_collage_v1";
 
-function loadInitial(): Pick<CollageState, "items" | "canvasW" | "canvasH" | "background"> {
+type Persisted = Pick<CollageState, "items" | "canvasW" | "canvasH" | "background" | "gridVisible" | "snapEnabled" | "gridStep">;
+
+function loadInitial(): Persisted {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const data = JSON.parse(raw);
       if (data && Array.isArray(data.items)) {
+        // Migrate older collage items that pre-date the `kind` field.
+        const items = data.items.map((it: any) => ({
+          kind: it.kind || "image",
+          ...it,
+        })) as CollageItem[];
         return {
-          items: data.items,
-          canvasW: data.canvasW || 1600,
-          canvasH: data.canvasH || 1200,
+          items,
+          canvasW: data.canvasW || DEFAULT_CANVAS_W,
+          canvasH: data.canvasH || DEFAULT_CANVAS_H,
           background: data.background || "#FFFFFF",
+          gridVisible: data.gridVisible ?? true,
+          snapEnabled: data.snapEnabled ?? true,
+          gridStep: data.gridStep || DEFAULT_GRID_STEP,
         };
       }
     }
   } catch {
     /* ignore corrupt storage */
   }
-  return { items: [], canvasW: 1600, canvasH: 1200, background: "#FFFFFF" };
+  return {
+    items: [],
+    canvasW: DEFAULT_CANVAS_W,
+    canvasH: DEFAULT_CANVAS_H,
+    background: "#FFFFFF",
+    gridVisible: true,
+    snapEnabled: true,
+    gridStep: DEFAULT_GRID_STEP,
+  };
 }
 
-function persist(s: Pick<CollageState, "items" | "canvasW" | "canvasH" | "background">) {
+function persist(s: Persisted) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      items: s.items, canvasW: s.canvasW, canvasH: s.canvasH, background: s.background,
+      items: s.items,
+      canvasW: s.canvasW,
+      canvasH: s.canvasH,
+      background: s.background,
+      gridVisible: s.gridVisible,
+      snapEnabled: s.snapEnabled,
+      gridStep: s.gridStep,
     }));
   } catch {
     /* quota — ignore */
@@ -104,6 +151,9 @@ export const useCollageStore = create<CollageState>()(
     mode: "builder" as WorkspaceMode,
 
     setMode: (m) => set((s) => { s.mode = m; }),
+    setGridVisible: (v) => { set((s) => { s.gridVisible = v; }); persist(get()); },
+    setSnapEnabled: (v) => { set((s) => { s.snapEnabled = v; }); persist(get()); },
+    setGridStep: (n) => { set((s) => { s.gridStep = Math.max(2, Math.min(500, Math.round(n))); }); persist(get()); },
 
     addItem: (item) => {
       const id = `item_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -114,6 +164,7 @@ export const useCollageStore = create<CollageState>()(
           id,
           z: maxZ + 1,
           rotation: item.rotation ?? 0,
+          kind: item.kind ?? "image",
         } as CollageItem);
         s.selectedId = id;
       });

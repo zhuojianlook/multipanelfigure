@@ -1,7 +1,8 @@
 /* ──────────────────────────────────────────────────────────
    CollageView — main canvas for the Collage Assembly
    workspace. Free-form positioning of items (rendered figures
-   or imported images) via click-and-drag.
+   or imported images) via click-and-drag, with optional
+   snap-to-grid alignment.
    ────────────────────────────────────────────────────────── */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -14,12 +15,16 @@ import {
   Tooltip,
   Typography,
   Divider,
+  ToggleButton,
 } from "@mui/material";
 import AddPhotoAlternateIcon from "@mui/icons-material/AddPhotoAlternate";
-import DeleteForeverIcon from "@mui/icons-material/DeleteForever";
-import VerticalAlignTopIcon from "@mui/icons-material/VerticalAlignTop";
-import DeleteIcon from "@mui/icons-material/Delete";
+import GridOnIcon from "@mui/icons-material/GridOn";
+import GridOffIcon from "@mui/icons-material/GridOff";
+import StraightenIcon from "@mui/icons-material/Straighten";
+import FolderOpenIcon from "@mui/icons-material/FolderOpen";
 import { useCollageStore } from "../../store/collageStore";
+import { useFigureStore } from "../../store/figureStore";
+import { CollageStrip } from "./CollageStrip";
 
 export function CollageView() {
   const items = useCollageStore((s) => s.items);
@@ -27,23 +32,28 @@ export function CollageView() {
   const canvasH = useCollageStore((s) => s.canvasH);
   const background = useCollageStore((s) => s.background);
   const selectedId = useCollageStore((s) => s.selectedId);
+  const gridVisible = useCollageStore((s) => s.gridVisible);
+  const snapEnabled = useCollageStore((s) => s.snapEnabled);
+  const gridStep = useCollageStore((s) => s.gridStep);
   const setSelectedId = useCollageStore((s) => s.setSelectedId);
   const updateItem = useCollageStore((s) => s.updateItem);
   const moveItem = useCollageStore((s) => s.moveItem);
-  const removeItem = useCollageStore((s) => s.removeItem);
   const bringToFront = useCollageStore((s) => s.bringToFront);
   const setCanvasSize = useCollageStore((s) => s.setCanvasSize);
   const setBackground = useCollageStore((s) => s.setBackground);
-  const clear = useCollageStore((s) => s.clear);
+  const setGridVisible = useCollageStore((s) => s.setGridVisible);
+  const setSnapEnabled = useCollageStore((s) => s.setSnapEnabled);
+  const setGridStep = useCollageStore((s) => s.setGridStep);
   const addItem = useCollageStore((s) => s.addItem);
+  const loadProject = useFigureStore((s) => s.loadProject);
+  const setMode = useCollageStore((s) => s.setMode);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const projectInputRef = useRef<HTMLInputElement>(null);
   const [fitScale, setFitScale] = useState(1);
 
-  // Recompute fit-scale whenever the container or canvas dimensions change.
-  // The canvas is rendered at its logical size, then transform-scaled so it
-  // fits inside the available pane with a small margin.
+  // Recompute fit-scale on container/canvas resize so the page always fits.
   useEffect(() => {
     const compute = () => {
       const el = containerRef.current;
@@ -67,8 +77,10 @@ export function CollageView() {
     [items],
   );
 
+  /** Round v to the nearest grid step when snap is enabled. */
+  const snap = (v: number) => (snapEnabled ? Math.round(v / gridStep) * gridStep : v);
+
   const onPickImageFile = async (file: File) => {
-    // Read file → data URL → measure natural dims via Image() → push to store.
     const reader = new FileReader();
     reader.onload = () => {
       const src = String(reader.result);
@@ -80,14 +92,14 @@ export function CollageView() {
         const aspect = img.naturalWidth / img.naturalHeight;
         const w = aspect >= 1 ? targetMax : targetMax * aspect;
         const h = aspect >= 1 ? targetMax / aspect : targetMax;
-        // Stagger newly-added items so they don't all land on top of each
-        // other — count of existing items × 24 px offset.
+        // Stagger newly-added items so they don't all land on top.
         const offset = items.length * 24;
         addItem({
+          kind: "image",
           src,
           name: file.name,
-          x: 40 + offset,
-          y: 40 + offset,
+          x: snap(40 + offset),
+          y: snap(40 + offset),
           w,
           h,
           naturalW: img.naturalWidth,
@@ -103,8 +115,55 @@ export function CollageView() {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
     files.forEach(onPickImageFile);
-    // Reset so the same file can be re-selected after removal.
     if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  /** Import .mpf project: load it into the multi-panel builder, then
+   *  switch to builder mode so the user can review and click "Add to
+   *  Collage". This route reuses the existing project loader rather
+   *  than introducing a stateless render endpoint. */
+  const handleImportProjectPick = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (projectInputRef.current) projectInputRef.current.value = "";
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".mpf")) {
+      window.alert("Please choose a .mpf project file.");
+      return;
+    }
+    const ok = window.confirm(
+      `Load "${file.name}" into the Multi-Panel Builder?\n\n` +
+      "Your current builder state will be replaced. Then you can review " +
+      "the figure and click \"Add to Collage\" to insert it.",
+    );
+    if (!ok) return;
+    try {
+      // The backend's loadProject takes a server-side path, but in dev/
+      // browser we have a File object. Write it through the file-upload
+      // shim if available; otherwise fall back to picking via the OS
+      // dialog inside Tauri.
+      try {
+        const { open } = await import("@tauri-apps/plugin-dialog");
+        const picked = await open({
+          multiple: false,
+          filters: [{ name: "Project", extensions: ["mpf"] }],
+        });
+        if (picked && typeof picked === "string") {
+          await loadProject(picked);
+          setMode("builder");
+          return;
+        }
+      } catch {
+        /* not in Tauri — fall through to alert */
+      }
+      window.alert(
+        "Project import currently requires the desktop app's native file " +
+        "dialog. Use Sidebar → Load Project from the Multi-Panel Builder, " +
+        "then return here and click Add to Collage.",
+      );
+    } catch (err) {
+      console.error(err);
+      window.alert("Could not load project. Check the console for details.");
+    }
   };
 
   return (
@@ -116,7 +175,7 @@ export function CollageView() {
         alignItems="center"
         sx={{ px: 1.5, py: 1, borderBottom: "1px solid var(--c-border)", flexShrink: 0 }}
       >
-        <Tooltip title="Import image (PNG, JPEG, TIFF, etc.) into the collage">
+        <Tooltip title="Import an arbitrary image into the collage">
           <Button
             size="small"
             variant="outlined"
@@ -135,6 +194,24 @@ export function CollageView() {
           onChange={handleFileChange}
         />
 
+        <Tooltip title="Open a saved .mpf project in the Multi-Panel Builder so you can render and add it to the collage">
+          <Button
+            size="small"
+            variant="outlined"
+            startIcon={<FolderOpenIcon />}
+            onClick={() => projectInputRef.current?.click()}
+          >
+            Import project
+          </Button>
+        </Tooltip>
+        <input
+          ref={projectInputRef}
+          type="file"
+          accept=".mpf"
+          style={{ display: "none" }}
+          onChange={handleImportProjectPick}
+        />
+
         <Divider orientation="vertical" flexItem />
 
         <Typography variant="caption" sx={{ color: "text.secondary" }}>Canvas</Typography>
@@ -143,7 +220,7 @@ export function CollageView() {
           size="small"
           value={canvasW}
           onChange={(e) => setCanvasSize(Math.max(100, Number(e.target.value) || 100), canvasH)}
-          inputProps={{ min: 100, max: 8000, step: 100 }}
+          inputProps={{ min: 100, max: 8000, step: 50 }}
           sx={{
             width: 84,
             "& input": { fontSize: "0.75rem", py: 0.5, textAlign: "center", colorScheme: "dark" },
@@ -158,7 +235,7 @@ export function CollageView() {
           size="small"
           value={canvasH}
           onChange={(e) => setCanvasSize(canvasW, Math.max(100, Number(e.target.value) || 100))}
-          inputProps={{ min: 100, max: 8000, step: 100 }}
+          inputProps={{ min: 100, max: 8000, step: 50 }}
           sx={{
             width: 84,
             "& input": { fontSize: "0.75rem", py: 0.5, textAlign: "center", colorScheme: "dark" },
@@ -177,32 +254,57 @@ export function CollageView() {
           />
         </Tooltip>
 
+        <Divider orientation="vertical" flexItem />
+
+        <Tooltip title={gridVisible ? "Hide gridlines" : "Show gridlines"}>
+          <ToggleButton
+            value="grid"
+            selected={gridVisible}
+            size="small"
+            onChange={() => setGridVisible(!gridVisible)}
+            sx={{ p: 0.5, border: "1px solid var(--c-border)" }}
+          >
+            {gridVisible ? <GridOnIcon fontSize="small" /> : <GridOffIcon fontSize="small" />}
+          </ToggleButton>
+        </Tooltip>
+        <Tooltip title={snapEnabled ? "Snap-to-grid is on" : "Snap-to-grid is off"}>
+          <ToggleButton
+            value="snap"
+            selected={snapEnabled}
+            size="small"
+            onChange={() => setSnapEnabled(!snapEnabled)}
+            sx={{ p: 0.5, border: "1px solid var(--c-border)" }}
+          >
+            <StraightenIcon fontSize="small" />
+          </ToggleButton>
+        </Tooltip>
+        <TextField
+          type="number"
+          size="small"
+          value={gridStep}
+          onChange={(e) => setGridStep(Number(e.target.value) || 50)}
+          inputProps={{ min: 2, max: 500, step: 5 }}
+          title="Grid step (px)"
+          sx={{
+            width: 64,
+            "& input": { fontSize: "0.75rem", py: 0.5, textAlign: "center", colorScheme: "dark" },
+            "& input[type=number]::-webkit-inner-spin-button, & input[type=number]::-webkit-outer-spin-button": {
+              filter: "invert(1)", opacity: 1,
+            },
+          }}
+        />
+
         <Box sx={{ flex: 1 }} />
 
         <Typography variant="caption" sx={{ color: "text.secondary" }}>
           {items.length} item{items.length === 1 ? "" : "s"} · zoom {(fitScale * 100).toFixed(0)}%
         </Typography>
-
-        <Tooltip title="Remove all items">
-          <span>
-            <IconButton
-              size="small"
-              disabled={items.length === 0}
-              onClick={() => {
-                if (window.confirm(`Remove all ${items.length} item(s) from the collage?`)) clear();
-              }}
-            >
-              <DeleteForeverIcon fontSize="small" />
-            </IconButton>
-          </span>
-        </Tooltip>
       </Stack>
 
       {/* ── Canvas viewport ─────────────────────────────────── */}
       <Box
         ref={containerRef}
         onMouseDown={(e) => {
-          // Clicking the empty viewport deselects.
           if (e.target === e.currentTarget) setSelectedId(null);
         }}
         sx={{
@@ -222,10 +324,8 @@ export function CollageView() {
           p: 2,
         }}
       >
-        {/* The "page" (canvas). Rendered at logical pixel dimensions but
-            transform-scaled to fit. Using transform keeps item child math
-            simple — drag deltas are computed against the unscaled size and
-            then divided by fitScale at the source. */}
+        {/* The "page" — virtual logical-pixel canvas, transform-scaled to
+            fit the available area. */}
         <Box
           sx={{
             position: "relative",
@@ -236,6 +336,17 @@ export function CollageView() {
             transformOrigin: "top left",
             boxShadow: "0 0 0 1px rgba(255,255,255,0.15), 0 8px 24px rgba(0,0,0,0.4)",
             flexShrink: 0,
+            // Gridline overlay rendered as repeating linear-gradients.
+            // Two overlays — vertical lines + horizontal lines — at gridStep
+            // pixels with subtle opacity so they don't fight with the items.
+            ...(gridVisible
+              ? {
+                  backgroundImage:
+                    `linear-gradient(to right, rgba(0,0,0,0.10) 1px, transparent 1px),` +
+                    `linear-gradient(to bottom, rgba(0,0,0,0.10) 1px, transparent 1px)`,
+                  backgroundSize: `${gridStep}px ${gridStep}px, ${gridStep}px ${gridStep}px`,
+                }
+              : {}),
           }}
           onMouseDown={(e) => {
             if (e.target === e.currentTarget) setSelectedId(null);
@@ -251,17 +362,23 @@ export function CollageView() {
                   e.stopPropagation();
                   setSelectedId(it.id);
                   bringToFront(it.id);
-                  // Use a running last-x/y so each mousemove only contributes
-                  // its incremental delta (cumulative deltas would double-apply
-                  // because moveItem mutates the item's x/y on every tick).
-                  let lastX = e.clientX;
-                  let lastY = e.clientY;
+                  // Track absolute x/y instead of incremental deltas so the
+                  // snap-to-grid math stays correct (snapping deltas would
+                  // accumulate jitter as the cursor moves).
+                  const startMouseX = e.clientX;
+                  const startMouseY = e.clientY;
+                  const startX = it.x;
+                  const startY = it.y;
                   const onMove = (ev: MouseEvent) => {
-                    const dx = (ev.clientX - lastX) / fitScale;
-                    const dy = (ev.clientY - lastY) / fitScale;
-                    lastX = ev.clientX;
-                    lastY = ev.clientY;
-                    moveItem(it.id, dx, dy);
+                    const dx = (ev.clientX - startMouseX) / fitScale;
+                    const dy = (ev.clientY - startMouseY) / fitScale;
+                    const targetX = snap(startX + dx);
+                    const targetY = snap(startY + dy);
+                    // moveItem expects deltas — compute the delta from the
+                    // current position to the new snapped target.
+                    const cur = useCollageStore.getState().items.find((i) => i.id === it.id);
+                    if (!cur) return;
+                    moveItem(it.id, targetX - cur.x, targetY - cur.y);
                   };
                   const onUp = () => {
                     window.removeEventListener("mousemove", onMove);
@@ -296,8 +413,6 @@ export function CollageView() {
                   }}
                 />
                 {isSelected && (
-                  /* Bottom-right resize handle — preserves aspect ratio while
-                     dragging (user can hold Shift to ignore aspect — phase 2). */
                   <Box
                     onMouseDown={(e) => {
                       e.preventDefault();
@@ -310,13 +425,15 @@ export function CollageView() {
                       const onMove = (ev: MouseEvent) => {
                         const dx = (ev.clientX - startX) / fitScale;
                         const dy = (ev.clientY - startY) / fitScale;
-                        // Pick the larger of the two deltas to keep aspect.
                         const tentativeW = startW + dx;
                         const tentativeH = startH + dy;
-                        // Drive width by whichever delta is larger in proportion.
                         const widthDriven = Math.abs(dx) > Math.abs(dy);
-                        const newW = widthDriven ? tentativeW : tentativeH * aspect;
-                        const newH = widthDriven ? tentativeW / aspect : tentativeH;
+                        let newW = widthDriven ? tentativeW : tentativeH * aspect;
+                        let newH = widthDriven ? tentativeW / aspect : tentativeH;
+                        // Snap the dimensions too so resized items keep
+                        // gridline alignment.
+                        newW = Math.max(20, snap(newW));
+                        newH = Math.max(20, snap(newH));
                         if (newW > 20 && newH > 20) {
                           updateItem(it.id, { w: newW, h: newH });
                         }
@@ -347,32 +464,8 @@ export function CollageView() {
         </Box>
       </Box>
 
-      {/* ── Selected-item action bar ────────────────────────── */}
-      {selectedId && (() => {
-        const it = items.find((i) => i.id === selectedId);
-        if (!it) return null;
-        return (
-          <Box sx={{ display: "flex", alignItems: "center", gap: 1, px: 1.5, py: 0.75, borderTop: "1px solid var(--c-border)", flexShrink: 0 }}>
-            <Typography variant="caption" sx={{ color: "text.secondary", maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {it.name}
-            </Typography>
-            <Box sx={{ flex: 1 }} />
-            <Typography variant="caption" sx={{ color: "text.secondary" }}>
-              {Math.round(it.w)} × {Math.round(it.h)} px @ ({Math.round(it.x)}, {Math.round(it.y)})
-            </Typography>
-            <Tooltip title="Bring to front">
-              <IconButton size="small" onClick={() => bringToFront(it.id)}>
-                <VerticalAlignTopIcon fontSize="small" />
-              </IconButton>
-            </Tooltip>
-            <Tooltip title="Remove from collage">
-              <IconButton size="small" color="error" onClick={() => removeItem(it.id)}>
-                <DeleteIcon fontSize="small" />
-              </IconButton>
-            </Tooltip>
-          </Box>
-        );
-      })()}
+      {/* ── Item strip (timeline-style) at the bottom ────────── */}
+      <CollageStrip />
     </Box>
   );
 }

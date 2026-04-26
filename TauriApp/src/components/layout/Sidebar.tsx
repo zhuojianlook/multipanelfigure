@@ -28,6 +28,7 @@ import DeleteIcon from "@mui/icons-material/Delete";
 import UploadFileIcon from "@mui/icons-material/UploadFile";
 import StraightenIcon from "@mui/icons-material/Straighten";
 import { useFigureStore } from "../../store/figureStore";
+import { useCollageStore } from "../../store/collageStore";
 import { api } from "../../api/client";
 import { AnalysisDialog } from "../dialogs/AnalysisDialog";
 
@@ -105,7 +106,32 @@ function Spinner({
 
 /* ── main component ───────────────────────────────────── */
 
+/* The sidebar is multipanel-builder-only for now. CollageSidebar is
+   a deliberately empty placeholder — its eventual collage-specific
+   tools are TBD per spec. Keeping the route at the top means the
+   builder hooks below are only mounted when the builder is active,
+   so we don't accidentally fire builder-side data fetches while the
+   user is in collage mode. */
+function CollageSidebar() {
+  return (
+    <Box sx={{ p: 2, color: "text.secondary", fontSize: "0.7rem" }}>
+      <Typography variant="caption" sx={{ display: "block", letterSpacing: 1.2, fontSize: "0.6rem", textTransform: "uppercase", mb: 1 }}>
+        Collage Tools
+      </Typography>
+      <Typography variant="caption" sx={{ fontStyle: "italic" }}>
+        Sidebar tools for the Collage Assembly will be added in a follow-up.
+      </Typography>
+    </Box>
+  );
+}
+
 export function Sidebar() {
+  const mode = useCollageStore((s) => s.mode);
+  if (mode === "collage") return <CollageSidebar />;
+  return <BuilderSidebar />;
+}
+
+function BuilderSidebar() {
   const config = useFigureStore((s) => s.config);
   const updateGridSize = useFigureStore((s) => s.updateGridSize);
   const setSpacing = useFigureStore((s) => s.setSpacing);
