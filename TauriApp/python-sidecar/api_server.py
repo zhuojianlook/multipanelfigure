@@ -1818,6 +1818,27 @@ def save_figure(body: SaveFigureRequest):
 import threading as _threading
 import uuid as _uuid
 import subprocess as _subprocess
+import sys as _sys
+
+
+def _ffmpeg_path() -> str:
+    """Resolve the ffmpeg binary path.
+
+    In the production Tauri bundle the sidecar (api-server) is invoked
+    as a child process, and ffmpeg is bundled as a sibling externalBin
+    via tauri.conf.json. So look next to sys.executable first. In dev
+    mode (running api_server.py with the system Python) sys.executable
+    points at the Python interpreter, in which case we fall back to
+    `ffmpeg` from PATH.
+    """
+    if getattr(_sys, "frozen", False):
+        exec_dir = os.path.dirname(_sys.executable)
+        candidate = os.path.join(
+            exec_dir, "ffmpeg.exe" if os.name == "nt" else "ffmpeg",
+        )
+        if os.path.exists(candidate):
+            return candidate
+    return "ffmpeg"
 
 # Job state — all access through _render_jobs_lock.
 _render_jobs: Dict[str, Dict] = {}
@@ -1835,10 +1856,12 @@ class RenderVideoRequest(BaseModel):
 
 @app.get("/api/figure/render-video/ffmpeg-available")
 def render_video_ffmpeg_available():
-    """Probe whether ffmpeg is on PATH so the frontend can hide the
-    audio-retention option when it isn't available."""
+    """Probe whether ffmpeg is invocable. The 0.1.130 build bundles a
+    static LGPL ffmpeg next to the sidecar via Tauri externalBin, so
+    this should always be true in production. In dev mode it falls back
+    to PATH ffmpeg, where availability depends on the user's machine."""
     try:
-        result = _subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=2)
+        result = _subprocess.run([_ffmpeg_path(), "-version"], capture_output=True, timeout=2)
         return {"available": result.returncode == 0}
     except (FileNotFoundError, _subprocess.TimeoutExpired, Exception):
         return {"available": False}
@@ -2049,7 +2072,7 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
                     tmp_out = save_path + ".silent" + os.path.splitext(save_path)[1]
                     os.replace(save_path, tmp_out)
                     cmd = [
-                        "ffmpeg", "-y",
+                        _ffmpeg_path(), "-y",
                         "-i", tmp_out,
                         "-ss", f"{start_t:.4f}",
                         "-t", f"{use_dur:.4f}",
