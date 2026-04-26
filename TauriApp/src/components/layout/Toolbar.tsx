@@ -34,6 +34,11 @@ import RestartAltIcon from "@mui/icons-material/RestartAlt";
 import SystemUpdateAltIcon from "@mui/icons-material/SystemUpdateAlt";
 import DownloadIcon from "@mui/icons-material/Download";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
+import LibraryAddIcon from "@mui/icons-material/LibraryAdd";
+import DashboardIcon from "@mui/icons-material/Dashboard";
+import ViewModuleIcon from "@mui/icons-material/ViewModule";
+import { useCollageStore } from "../../store/collageStore";
+import { api } from "../../api/client";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
@@ -170,7 +175,95 @@ async function fetchChangelog(): Promise<ChangelogEntry[]> {
 }
 import { useFigureStore } from "../../store/figureStore";
 import { SaveFigureDialog } from "../dialogs/SaveFigureDialog";
-import { api } from "../../api/client";
+
+/* ── CollageWorkspaceControls ────────────────────────────────
+   Workspace toggle (Builder ↔ Collage) and the "Add to Collage"
+   action that captures the currently-rendered figure preview
+   and pushes it into the collage store. */
+function CollageWorkspaceControls() {
+  const mode = useCollageStore((s) => s.mode);
+  const setMode = useCollageStore((s) => s.setMode);
+  const addItem = useCollageStore((s) => s.addItem);
+  const itemCount = useCollageStore((s) => s.items.length);
+  const configDirty = useFigureStore((s) => s.configDirty);
+
+  const handleAddToCollage = async () => {
+    if (configDirty) {
+      const ok = window.confirm(
+        "You have unsaved changes in the multi-panel builder.\n\n" +
+        "Adding to the collage uses the current rendered preview, but the " +
+        "underlying project file is not saved. Use Sidebar → Save Project " +
+        "first if you want to keep this exact state recoverable.\n\n" +
+        "Continue and add to collage?",
+      );
+      if (!ok) return;
+    }
+    try {
+      // Render at full preview quality (matplotlib pipeline) so the
+      // collage shows the same labels/headers/scale bars the user sees.
+      const resp = await api.getPreview();
+      if (!resp?.image) {
+        window.alert("Preview is empty — add some images to your panels first.");
+        return;
+      }
+      const naturalW = resp.width || 0;
+      const naturalH = resp.height || 0;
+      const aspect = naturalH > 0 ? naturalW / naturalH : 1;
+      // Default insert size: keep a sensible visual scale on a 1600×1200
+      // canvas. Use 600 px on the longer axis; subsequent items can be
+      // resized via the corner handle.
+      const targetMax = 600;
+      const w = aspect >= 1 ? targetMax : targetMax * aspect;
+      const h = aspect >= 1 ? targetMax / aspect : targetMax;
+      const offset = itemCount * 24;
+      addItem({
+        src: `data:image/png;base64,${resp.image}`,
+        name: `Figure ${itemCount + 1}`,
+        x: 40 + offset,
+        y: 40 + offset,
+        w,
+        h,
+        naturalW,
+        naturalH,
+      });
+      setMode("collage");
+    } catch (e) {
+      console.error("Add to collage failed:", e);
+      window.alert("Failed to capture the figure preview. Check the console.");
+    }
+  };
+
+  return (
+    <>
+      <Tooltip title={mode === "collage" ? "Back to Multi-Panel Builder" : "Open Collage Assembly"}>
+        <Button
+          variant={mode === "collage" ? "contained" : "outlined"}
+          color="primary"
+          size="small"
+          startIcon={mode === "collage" ? <ViewModuleIcon /> : <DashboardIcon />}
+          onClick={() => setMode(mode === "collage" ? "builder" : "collage")}
+          sx={{ textTransform: "none" }}
+        >
+          {mode === "collage" ? "Multi-Panel Builder" : "Collage Assembly"}
+        </Button>
+      </Tooltip>
+      {mode === "builder" && (
+        <Tooltip title="Render the current figure and add it to the Collage Assembly">
+          <Button
+            variant="outlined"
+            color="primary"
+            size="small"
+            startIcon={<LibraryAddIcon />}
+            onClick={handleAddToCollage}
+            sx={{ textTransform: "none" }}
+          >
+            Add to Collage
+          </Button>
+        </Tooltip>
+      )}
+    </>
+  );
+}
 
 export function Toolbar() {
   const loadedImages = useFigureStore((s) => s.loadedImages);
@@ -352,6 +445,9 @@ export function Toolbar() {
       </Dialog>
 
       <Box sx={{ flex: 1 }} />
+
+      {/* Collage workspace toggle + Add to Collage */}
+      <CollageWorkspaceControls />
 
       {/* Save figure */}
       <Button

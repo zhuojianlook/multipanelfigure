@@ -6,12 +6,63 @@
 
 import { useState, useCallback, useEffect } from "react";
 import { useFigureStore } from "../../store/figureStore";
+import { useCollageStore } from "../../store/collageStore";
 import { Sidebar } from "./Sidebar";
 import { Toolbar } from "./Toolbar";
 import { ImageStrip } from "../image-strip/ImageStrip";
 import { PanelGrid } from "../grid/PanelGrid";
 import { PreviewPane } from "../preview/PreviewPane";
+import { CollageView } from "../collage/CollageView";
 import { Alert } from "@mui/material";
+
+function CenterPane({
+  splitPct, dragging, onSplitterDown,
+}: { splitPct: number; dragging: boolean; onSplitterDown: () => void }) {
+  const mode = useCollageStore((s) => s.mode);
+  if (mode === "collage") {
+    return (
+      <div className="flex flex-1 flex-col min-h-0 min-w-0">
+        <CollageView />
+      </div>
+    );
+  }
+  return (
+    <>
+      {/* Image strip */}
+      <ImageStrip />
+
+      {/* Horizontal splitter: grid (left) | divider | preview (right) */}
+      <div className="flex flex-1 min-h-0 min-w-0 relative">
+        <div
+          className="overflow-auto min-w-0"
+          style={{ width: `${splitPct}%`, minWidth: 200 }}
+        >
+          <PanelGrid />
+        </div>
+        <div
+          className="flex-none cursor-col-resize flex items-center justify-center"
+          style={{ width: 8, backgroundColor: "var(--c-border)" }}
+          onMouseDown={onSplitterDown}
+        >
+          <div
+            className="rounded-full"
+            style={{
+              width: 4, height: 40,
+              backgroundColor: dragging ? "var(--c-accent)" : "var(--c-text-dim)",
+              opacity: 0.6,
+            }}
+          />
+        </div>
+        <div
+          className="overflow-auto min-w-0"
+          style={{ width: `${100 - splitPct}%` }}
+        >
+          <PreviewPane />
+        </div>
+      </div>
+    </>
+  );
+}
 
 export function AppShell() {
   const fetchConfig = useFigureStore((s) => s.fetchConfig);
@@ -158,49 +209,14 @@ export function AppShell() {
         {/* Toolbar */}
         <Toolbar />
 
-        {/* Image strip */}
-        <ImageStrip />
-
-        {/* Horizontal splitter: grid (left) | divider | preview (right) */}
-        <div className="flex flex-1 min-h-0 min-w-0 relative">
-          {/* Grid section (left) */}
-          <div
-            className="overflow-auto min-w-0"
-            style={{ width: `${splitPct}%`, minWidth: 200 }}
-          >
-            <PanelGrid />
-          </div>
-
-          {/* Vertical drag handle */}
-          <div
-            className="flex-none cursor-col-resize flex items-center justify-center"
-            style={{
-              width: 8,
-              backgroundColor: "var(--c-border)",
-            }}
-            onMouseDown={onMouseDown}
-          >
-            <div
-              className="rounded-full"
-              style={{
-                width: 4,
-                height: 40,
-                backgroundColor: dragging
-                  ? "var(--c-accent)"
-                  : "var(--c-text-dim)",
-                opacity: 0.6,
-              }}
-            />
-          </div>
-
-          {/* Preview section (right) */}
-          <div
-            className="overflow-auto min-w-0"
-            style={{ width: `${100 - splitPct}%` }}
-          >
-            <PreviewPane />
-          </div>
-        </div>
+        {/* Mode-specific body. Builder = image strip + grid|preview split.
+            Collage = single-pane CollageView. The Toolbar is shared so
+            users can flip between modes from one place. */}
+        <CenterPane
+          splitPct={splitPct}
+          dragging={dragging}
+          onSplitterDown={onMouseDown}
+        />
       </main>
     </div>
   );
