@@ -81,36 +81,28 @@ jobs:
         if: runner.os != 'Windows'
         run: chmod +x TauriApp/src-tauri/binaries/api-server-*
 
-      # ── Bundle ffmpeg (LGPL, static) so audio retention works without
-      # requiring the user to install ffmpeg system-wide. yt-dlp's
-      # FFmpeg-Builds release publishes ARM64 macOS + x86_64 Windows
-      # static builds; we extract just the ffmpeg binary and place it
-      # at the path Tauri's externalBin convention expects.
+      # ── Bundle ffmpeg (static) so audio retention works without
+      # requiring the user to install ffmpeg system-wide. We pin to
+      # eugeneware/ffmpeg-static b6.1.1 — a stable release that ships
+      # single statically-linked binaries (no archive extraction, no
+      # dylib bundling), unlike yt-dlp/FFmpeg-Builds which dropped
+      # macOS + LGPL builds and BtbN which ships no macOS arm64.
       - name: Download ffmpeg (macOS arm64)
         if: runner.os == 'macOS'
         run: |
           set -e
           mkdir -p TauriApp/src-tauri/binaries
-          curl -L -o ffmpeg.tar.xz \
-            https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-macosarm64-lgpl.tar.xz
-          tar -xf ffmpeg.tar.xz
-          BIN=$(find . -maxdepth 3 -name ffmpeg -type f | head -1)
-          if [ -z "$BIN" ]; then echo "ffmpeg binary not found in archive"; exit 1; fi
-          cp "$BIN" TauriApp/src-tauri/binaries/ffmpeg-aarch64-apple-darwin
+          curl -fL -o TauriApp/src-tauri/binaries/ffmpeg-aarch64-apple-darwin \
+            https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-darwin-arm64
           chmod +x TauriApp/src-tauri/binaries/ffmpeg-aarch64-apple-darwin
-          rm -rf ffmpeg.tar.xz ffmpeg-*-macosarm64-lgpl/ ffmpeg-*-lgpl/ || true
           TauriApp/src-tauri/binaries/ffmpeg-aarch64-apple-darwin -version | head -1
         shell: bash
       - name: Download ffmpeg (Windows x86_64)
         if: runner.os == 'Windows'
         run: |
           New-Item -ItemType Directory -Force -Path TauriApp/src-tauri/binaries | Out-Null
-          Invoke-WebRequest -Uri "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip" -OutFile ffmpeg.zip
-          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-extract
-          $bin = Get-ChildItem -Path ffmpeg-extract -Recurse -Filter ffmpeg.exe | Select-Object -First 1
-          if (-not $bin) { Write-Error "ffmpeg.exe not found in archive"; exit 1 }
-          Copy-Item -Path $bin.FullName -Destination "TauriApp/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe"
-          Remove-Item -Recurse -Force ffmpeg.zip, ffmpeg-extract -ErrorAction SilentlyContinue
+          Invoke-WebRequest -Uri "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-win32-x64" `
+            -OutFile "TauriApp/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe"
           & "TauriApp/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe" -version | Select-Object -First 1
         shell: pwsh
 
