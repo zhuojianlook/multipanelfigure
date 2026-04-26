@@ -2010,6 +2010,63 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
                     if processed[r][c] is None:
                         processed[r][c] = _PIL.new("RGB", (col_max_w[c], row_max_h[r]), "white")
 
+            # Adjacent Panel zoom insets — mirror the save_figure pipeline so
+            # the target cell isn't left blank for each exported frame.
+            for r in range(rows):
+                for c in range(cols):
+                    panel = cfg.panels[r][c]
+                    if panel.add_zoom_inset and panel.zoom_inset and panel.zoom_inset.inset_type == "Adjacent Panel":
+                        zi = panel.zoom_inset
+                        ar, ac = r, c
+                        if zi.side == "Top": ar -= 1
+                        elif zi.side == "Bottom": ar += 1
+                        elif zi.side == "Left": ac -= 1
+                        elif zi.side == "Right": ac += 1
+                        if 0 <= ar < rows and 0 <= ac < cols:
+                            ext_name = getattr(zi, 'separate_image_name', '') or ''
+                            if ext_name and ext_name not in ('', 'select') and ext_name in loaded_images:
+                                ext_img = loaded_images[ext_name].convert("RGB")
+                                xi = getattr(zi, 'x_inset', 0) or 0
+                                yi = getattr(zi, 'y_inset', 0) or 0
+                                wi = getattr(zi, 'width_inset', ext_img.size[0]) or ext_img.size[0]
+                                hi = getattr(zi, 'height_inset', ext_img.size[1]) or ext_img.size[1]
+                                xi = max(0, min(xi, ext_img.size[0]-1))
+                                yi = max(0, min(yi, ext_img.size[1]-1))
+                                wi = max(1, min(wi, ext_img.size[0]-xi))
+                                hi = max(1, min(hi, ext_img.size[1]-yi))
+                                region = ext_img.crop((xi, yi, xi+wi, yi+hi))
+                                zw = max(1, int(wi * zi.zoom_factor))
+                                zh = max(1, int(hi * zi.zoom_factor))
+                                region = region.resize((zw, zh), Image.LANCZOS)
+                                processed[ar][ac] = region
+                            else:
+                                main_img = processed[r][c]
+                                miw, mih = main_img.size
+                                p_src = cfg.panels[r][c]
+                                if p_src.crop_image and p_src.crop and len(p_src.crop) == 4:
+                                    fw = p_src.crop[2] - p_src.crop[0]
+                                    fh = p_src.crop[3] - p_src.crop[1]
+                                elif p_src.image_name and p_src.image_name in loaded_images:
+                                    fw, fh = loaded_images[p_src.image_name].size
+                                else:
+                                    fw, fh = miw, mih
+                                scx = miw / max(fw, 1)
+                                scy = mih / max(fh, 1)
+                                bw = max(1, getattr(zi, 'rectangle_width', 2) or 2)
+                                bw_x = bw * scx
+                                bw_y = bw * scy
+                                cx1 = max(0, int(zi.x * scx + bw_x))
+                                cy1 = max(0, int(zi.y * scy + bw_y))
+                                cx2 = min(miw, int((zi.x + zi.width) * scx - bw_x))
+                                cy2 = min(mih, int((zi.y + zi.height) * scy - bw_y))
+                                cx2 = max(cx1 + 1, cx2)
+                                cy2 = max(cy1 + 1, cy2)
+                                region = main_img.crop((cx1, cy1, cx2, cy2))
+                                zw = max(1, int(zi.width * zi.zoom_factor * scx))
+                                zh = max(1, int(zi.height * zi.zoom_factor * scy))
+                                region = region.resize((zw, zh), Image.LANCZOS)
+                                processed[ar][ac] = region
+
             full_res_sizes2: Dict[Tuple[int, int], Tuple[int, int]] = {}
             for r in range(rows):
                 for c in range(cols):
