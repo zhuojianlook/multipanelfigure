@@ -506,35 +506,6 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
 _font_path_cache: Dict[str, Optional[str]] = {}
 
 
-def _wrap_text_to_width(text: str, width_inches: float, font_size: int) -> str:
-    """Insert \\n at word boundaries so `text` fits within `width_inches`.
-
-    Preserves any newlines the user already typed (Shift+Enter). Uses a
-    conservative average-character-width estimate — exact width depends on
-    the specific font, but 0.55 × font-size works reasonably for typical
-    sans-serif fonts used in scientific figures.
-    """
-    import textwrap as _tw
-    if not text or width_inches <= 0 or font_size <= 0:
-        return text
-    avg_char_w_in = font_size / 72.0 * 0.55
-    if avg_char_w_in <= 0:
-        return text
-    max_chars = max(4, int(width_inches / avg_char_w_in))
-    # Respect explicit newlines already in the text — each user-defined
-    # line is wrapped independently so shift+Enter behaviour is preserved.
-    out_lines = []
-    for raw_line in text.split("\n"):
-        if len(raw_line) <= max_chars:
-            out_lines.append(raw_line)
-        else:
-            wrapped = _tw.wrap(
-                raw_line, width=max_chars,
-                break_long_words=True, break_on_hyphens=True,
-            )
-            out_lines.extend(wrapped or [raw_line])
-    return "\n".join(out_lines)
-
 def _resolve_font_path(font_name: str) -> Optional[str]:
     """Resolve a font filename to its full path using the font discovery system."""
     if font_name in _font_path_cache:
@@ -705,28 +676,14 @@ def _add_column_headers(fig, axes, header_levels: List[HeaderLevel],
             bbox_r = ax_right.get_position()
             cx = (bbox_l.x0 + bbox_r.x1) / 2
 
-            # Auto-wrap long headers onto multiple lines so they stay within
-            # the span-width. Keep any user-inserted newlines (Shift+Enter)
-            # intact. We only auto-wrap when the header is rendered with a
-            # uniform style — per-character styled_segments would require
-            # splitting segments at line breaks which we defer.
-            uniform = (not segments) or (
-                len(set(s.get("color") for s in segments if s.get("color"))) <= 1
-                and not any(s.get("font_size") or s.get("font_name") for s in segments)
-            )
-            if uniform and hdr.text:
-                span_w_inches = max(0.0, (bbox_r.x1 - bbox_l.x0)) * fig_w
-                wrapped = _wrap_text_to_width(hdr.text, span_w_inches, hdr.font_size)
-                if wrapped != hdr.text:
-                    # Replace segments with a single default-coloured one
-                    # so multi-line rendering happens cleanly.
-                    segments = [{
-                        "color": hdr.default_color or "#000000",
-                        "text": wrapped,
-                        "font_name": None,
-                        "font_size": None,
-                        "font_style": None,
-                    }]
+            # NOTE: no automatic word-wrap here. The renderer used to
+            # heuristically insert "\n" when the text overflowed the
+            # span, but its char-width heuristic produced break points
+            # that didn't match the panel-planner's CSS wrap, and it
+            # discarded styled_segments. Wrapping is the user's call —
+            # they break lines explicitly via Insert Line Break /
+            # Shift+Enter, and the result is consistent across the
+            # planner and the rendered preview.
 
             # For the first tier (closest to panels), start from the primary label position.
             # IMPORTANT: scale label_h by the MAX rendered line-count across all
@@ -890,35 +847,7 @@ def _add_row_headers(fig, axes, header_levels: List[HeaderLevel],
             bbox_b = ax_bot.get_position()
             cy = (bbox_t.y1 + bbox_b.y0) / 2
 
-            # Auto-wrap long row headers. "Width" for a row header is the
-            # span height if rotated (common case — vertical row headers)
-            # or the fixed horizontal label-band width when rendered
-            # horizontally. Wrap on the axis that the text actually
-            # extends along.
-            rot = float(getattr(hdr, "rotation", 90.0) or 0.0)
-            is_vertical = abs((rot % 180.0)) > 45.0
-            uniform = (not segments) or (
-                len(set(s.get("color") for s in segments if s.get("color"))) <= 1
-                and not any(s.get("font_size") or s.get("font_name") for s in segments)
-            )
-            if uniform and hdr.text:
-                if is_vertical:
-                    # Text runs vertically along the row span — use the
-                    # span-height as the available text length.
-                    wrap_extent_inches = max(0.0, (bbox_t.y1 - bbox_b.y0)) * fig_h
-                else:
-                    # Horizontal row header — only the label-band width
-                    # (roughly the distance × ref) is available.
-                    wrap_extent_inches = max(0.4, max_offset * ref * 0.9)
-                wrapped = _wrap_text_to_width(hdr.text, wrap_extent_inches, hdr.font_size)
-                if wrapped != hdr.text:
-                    segments = [{
-                        "color": hdr.default_color or "#000000",
-                        "text": wrapped,
-                        "font_name": None,
-                        "font_size": None,
-                        "font_style": None,
-                    }]
+            # NOTE: see the column-header block above — no auto-wrap.
 
             # Same multi-line accounting as column headers: account for the
             # MAX line count across primary row labels at this position so
@@ -1059,22 +988,7 @@ def _add_column_labels(fig, axes, labels: List[AxisLabel], rows: int, cols: int)
         cx = (bbox.x0 + bbox.x1) / 2
         dist_frac = lbl.distance * ref / fig_h
 
-        # Auto-wrap long column labels onto multiple lines based on the
-        # column-width. Shift+Enter newlines in the label text are
-        # preserved.
-        uniform = (not segments) or (
-            len(set(s.get("color") for s in segments if s.get("color"))) <= 1
-            and not any(s.get("font_size") or s.get("font_name") for s in segments)
-        )
-        if uniform and lbl.text:
-            col_w_in = max(0.0, (bbox.x1 - bbox.x0)) * fig_w
-            wrapped = _wrap_text_to_width(lbl.text, col_w_in, lbl.font_size)
-            if wrapped != lbl.text:
-                segments = [{
-                    "color": lbl.default_color or "#000000",
-                    "text": wrapped,
-                    "font_name": None, "font_size": None, "font_style": None,
-                }]
+        # NOTE: no auto-wrap — see the column-header block above.
 
         if lbl.position == "Top":
             cy = bbox.y1 + dist_frac
@@ -1101,26 +1015,7 @@ def _add_row_labels(fig, axes, labels: List[AxisLabel], rows: int, cols: int):
         cy = (bbox.y0 + bbox.y1) / 2
         rot = lbl.rotation
 
-        # Auto-wrap long row labels along their text direction — row
-        # height if rotated vertical, else the allotted side-band width.
-        is_vertical = abs((rot % 180.0)) > 45.0
-        uniform = (not segments) or (
-            len(set(s.get("color") for s in segments if s.get("color"))) <= 1
-            and not any(s.get("font_size") or s.get("font_name") for s in segments)
-        )
-        if uniform and lbl.text:
-            if is_vertical:
-                row_h_in = max(0.0, (bbox.y1 - bbox.y0)) * fig_h
-                wrap_extent_inches = row_h_in
-            else:
-                wrap_extent_inches = max(0.4, lbl.distance * ref * 0.9)
-            wrapped = _wrap_text_to_width(lbl.text, wrap_extent_inches, lbl.font_size)
-            if wrapped != lbl.text:
-                segments = [{
-                    "color": lbl.default_color or "#000000",
-                    "text": wrapped,
-                    "font_name": None, "font_size": None, "font_style": None,
-                }]
+        # NOTE: no auto-wrap — see the column-header block above.
         dist_frac = lbl.distance * ref / fig_w
         # For rotated text with ha="center", the text center (not edge)
         # sits at the coordinate.  Add half the font height so the nearest
