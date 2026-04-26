@@ -269,16 +269,21 @@ function CollageWorkspaceControls() {
   const mode = useCollageStore((s) => s.mode);
   const setMode = useCollageStore((s) => s.setMode);
   const addItem = useCollageStore((s) => s.addItem);
+  const updateItem = useCollageStore((s) => s.updateItem);
   const itemCount = useCollageStore((s) => s.items.length);
+  const selectedId = useCollageStore((s) => s.selectedId);
   const configDirty = useFigureStore((s) => s.configDirty);
+  const loadProject = useFigureStore((s) => s.loadProject);
 
   const handleAddToCollage = async () => {
     if (configDirty) {
       const ok = window.confirm(
         "You have unsaved changes in the multi-panel builder.\n\n" +
-        "Adding to the collage uses the current rendered preview, but the " +
-        "underlying project file is not saved. Use Sidebar → Save Project " +
-        "first if you want to keep this exact state recoverable.\n\n" +
+        "Adding to the collage uses the current rendered preview. The " +
+        "builder state is auto-stashed under ~/.multipanelfigure/" +
+        "collage_stash/ so clicking Multi-Panel Builder later restores " +
+        "this exact figure. Save your own .mpf separately if you want " +
+        "a permanent copy in your Documents.\n\n" +
         "Continue and add to collage?",
       );
       if (!ok) return;
@@ -294,14 +299,11 @@ function CollageWorkspaceControls() {
       const naturalW = resp.width || 0;
       const naturalH = resp.height || 0;
       const aspect = naturalH > 0 ? naturalW / naturalH : 1;
-      // Default insert size: keep a sensible visual scale on a 1600×1200
-      // canvas. Use 600 px on the longer axis; subsequent items can be
-      // resized via the corner handle.
       const targetMax = 600;
       const w = aspect >= 1 ? targetMax : targetMax * aspect;
       const h = aspect >= 1 ? targetMax / aspect : targetMax;
       const offset = itemCount * 24;
-      addItem({
+      const id = addItem({
         kind: "figure",
         src: `data:image/png;base64,${resp.image}`,
         name: `Figure ${itemCount + 1}`,
@@ -312,6 +314,20 @@ function CollageWorkspaceControls() {
         naturalW,
         naturalH,
       });
+      // Stash the current project so the collage can later restore
+      // this exact builder state. Stash filename keyed by the new
+      // item's id (alphanumeric/underscore only — matches the backend
+      // sanitisation regex).
+      const stashPath = `~/.multipanelfigure/collage_stash/${id}.mpf`;
+      try {
+        await api.saveProject(stashPath);
+        updateItem(id, { stashPath });
+      } catch (e) {
+        // Stashing is a nice-to-have; don't block the collage add if it
+        // fails (e.g. read-only home directory). The button just won't
+        // round-trip back to this figure's editor.
+        console.warn("[collage] stash save failed:", e);
+      }
       setMode("collage");
     } catch (e) {
       console.error("Add to collage failed:", e);
@@ -319,15 +335,52 @@ function CollageWorkspaceControls() {
     }
   };
 
+  /** Multi-Panel Builder click in collage mode. If a figure-kind item
+   *  is selected and has a stashPath, ask whether to load that
+   *  figure's editor. Otherwise just toggle the workspace. */
+  const handleBuilderClick = async () => {
+    if (mode !== "collage") {
+      setMode("collage");
+      return;
+    }
+    const selected = useCollageStore.getState().items.find((i) => i.id === selectedId);
+    if (selected && selected.kind === "figure" && selected.stashPath) {
+      const ok = window.confirm(
+        `Open "${selected.name}" in the Multi-Panel Builder?\n\n` +
+        "Your current builder state will be replaced by the snapshot taken " +
+        "when this figure was added to the collage.",
+      );
+      if (!ok) return;
+      try {
+        await loadProject(selected.stashPath);
+      } catch (e) {
+        console.error("[collage] load stash failed:", e);
+        window.alert(
+          "Could not restore the original builder state for this figure " +
+          "(stash may have been deleted). Switching to the builder anyway.",
+        );
+      }
+    }
+    setMode("builder");
+  };
+
   return (
     <>
-      <Tooltip title={mode === "collage" ? "Back to Multi-Panel Builder" : "Open Collage Assembly"}>
+      <Tooltip
+        title={
+          mode === "collage"
+            ? selectedId && useCollageStore.getState().items.find((i) => i.id === selectedId)?.kind === "figure"
+              ? "Open this figure in the Multi-Panel Builder"
+              : "Back to Multi-Panel Builder"
+            : "Open Collage Assembly"
+        }
+      >
         <Button
           variant={mode === "collage" ? "contained" : "outlined"}
           color="primary"
           size="small"
           startIcon={mode === "collage" ? <ViewModuleIcon /> : <DashboardIcon />}
-          onClick={() => setMode(mode === "collage" ? "builder" : "collage")}
+          onClick={() => (mode === "collage" ? handleBuilderClick() : setMode("collage"))}
           sx={{ textTransform: "none" }}
         >
           {mode === "collage" ? "Multi-Panel Builder" : "Collage Assembly"}

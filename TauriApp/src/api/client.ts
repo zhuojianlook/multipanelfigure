@@ -338,6 +338,11 @@ class ApiClient {
     return apiJson<Record<string, number>>("/api/resolutions/restore-defaults", "POST");
   }
 
+  // ── Collage stash ──────────────────────────────────────
+  async deleteCollageStash(itemId: string): Promise<void> {
+    await apiJson(`/api/collage/stash/${encodeURIComponent(itemId)}`, "DELETE");
+  }
+
   // ── Measurements ────────────────────────────────────────
 
   async getMeasurements(): Promise<{ measurements: Array<{ panel: string; name: string; type: string; value: string }> }> {

@@ -41,6 +41,12 @@ export type CollageItem = {
   rotation: number;
   /** Stacking order. Higher z is drawn later (on top). */
   z: number;
+  /** Absolute path to the stashed .mpf project for figure-kind items.
+   *  Set when the user clicks "Add to Collage" — lets the Multi-Panel
+   *  Builder button restore that figure's full editor state on click.
+   *  Null for image-kind items and for any figure that pre-dates this
+   *  field. */
+  stashPath: string | null;
 };
 
 export type WorkspaceMode = "builder" | "collage";
@@ -77,7 +83,7 @@ export type CollageState = {
   setSnapEnabled: (v: boolean) => void;
   setGridStep: (n: number) => void;
 
-  addItem: (item: Omit<CollageItem, "id" | "z" | "rotation" | "kind"> & Partial<Pick<CollageItem, "rotation" | "kind">>) => string;
+  addItem: (item: Omit<CollageItem, "id" | "z" | "rotation" | "kind" | "stashPath"> & Partial<Pick<CollageItem, "rotation" | "kind" | "stashPath">>) => string;
   updateItem: (id: string, patch: Partial<CollageItem>) => void;
   removeItem: (id: string) => void;
   moveItem: (id: string, dx: number, dy: number) => void;
@@ -98,9 +104,10 @@ function loadInitial(): Persisted {
     if (raw) {
       const data = JSON.parse(raw);
       if (data && Array.isArray(data.items)) {
-        // Migrate older collage items that pre-date the `kind` field.
+        // Migrate older collage items that pre-date later fields.
         const items = data.items.map((it: any) => ({
           kind: it.kind || "image",
+          stashPath: it.stashPath ?? null,
           ...it,
         })) as CollageItem[];
         return {
@@ -165,6 +172,7 @@ export const useCollageStore = create<CollageState>()(
           z: maxZ + 1,
           rotation: item.rotation ?? 0,
           kind: item.kind ?? "image",
+          stashPath: item.stashPath ?? null,
         } as CollageItem);
         s.selectedId = id;
       });

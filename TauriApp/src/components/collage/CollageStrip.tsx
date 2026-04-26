@@ -13,7 +13,8 @@
 import { Box, IconButton, Tooltip, Typography, Chip } from "@mui/material";
 import DeleteIcon from "@mui/icons-material/Delete";
 import VerticalAlignTopIcon from "@mui/icons-material/VerticalAlignTop";
-import { useCollageStore } from "../../store/collageStore";
+import { useCollageStore, type CollageItem } from "../../store/collageStore";
+import { api } from "../../api/client";
 
 export function CollageStrip() {
   const items = useCollageStore((s) => s.items);
@@ -21,6 +22,18 @@ export function CollageStrip() {
   const setSelectedId = useCollageStore((s) => s.setSelectedId);
   const removeItem = useCollageStore((s) => s.removeItem);
   const bringToFront = useCollageStore((s) => s.bringToFront);
+
+  /** Remove an item AND clean up its stash file. Stash deletion is
+   *  best-effort — if the backend can't reach it we still drop the
+   *  item from the collage. */
+  const removeItemAndStash = async (it: CollageItem) => {
+    try {
+      await api.deleteCollageStash(it.id);
+    } catch {
+      /* ignore — orphaned stash will be cleaned up on next reset */
+    }
+    removeItem(it.id);
+  };
 
   return (
     <Box
@@ -122,7 +135,7 @@ export function CollageStrip() {
                     onClick={(e) => {
                       e.stopPropagation();
                       if (window.confirm(`Remove "${it.name}" from the collage?`)) {
-                        removeItem(it.id);
+                        removeItemAndStash(it);
                       }
                     }}
                     sx={{ width: 18, height: 18, color: "#ff8a80" }}

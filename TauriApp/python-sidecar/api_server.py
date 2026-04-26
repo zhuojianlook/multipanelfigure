@@ -2455,6 +2455,35 @@ def put_resolutions(body: ResolutionUpdate):
     return {"ok": True}
 
 
+# ── Collage stash management ───────────────────────────────────────────────
+# When a user clicks "Add to Collage" we save a snapshot of the current
+# project to a stash so the collage's "Multi-Panel Builder" button can
+# round-trip back to that exact figure's editor state. The frontend
+# generates the stash id; we only need a safe deletion endpoint so the
+# stash isn't orphaned when the collage item is removed.
+
+import re as _re_stash
+
+_COLLAGE_STASH_DIR = Path.home() / ".multipanelfigure" / "collage_stash"
+
+
+@app.delete("/api/collage/stash/{item_id}")
+def delete_collage_stash(item_id: str):
+    """Delete a stashed .mpf for the given collage item id. The id
+    must be alphanumeric/underscore only — anything else is rejected
+    so the endpoint can never be tricked into traversing outside the
+    stash directory."""
+    if not _re_stash.match(r"^[A-Za-z0-9_]+$", item_id):
+        raise HTTPException(400, "Invalid stash id")
+    path = _COLLAGE_STASH_DIR / f"{item_id}.mpf"
+    try:
+        if path.is_file():
+            path.unlink()
+    except OSError:
+        pass
+    return {"ok": True}
+
+
 @app.post("/api/resolutions/restore-defaults")
 def restore_default_resolutions():
     """Reset the resolution presets to the bundled microscope defaults
