@@ -180,6 +180,12 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Need full history + all tags so we can git-log between this
+          # tag and the previous tag of the same channel for the
+          # auto-generated release notes.
+          fetch-depth: 0
+          fetch-tags: true
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -292,6 +298,45 @@ jobs:
           git push origin updater-local:updater --force
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate release notes from git log
+        id: notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # Walk same-channel history so the notes for v0.1.X cover
+          # commits since v0.1.(X-1), not since exp-0.1.X.
+          if [[ "$TAG" == exp-* ]]; then
+            PATTERN='exp-*'
+          else
+            PATTERN='v*'
+          fi
+          PREV_TAG=$(git tag -l "$PATTERN" --sort=-v:refname | grep -vx "$TAG" | head -1)
+          echo "Previous tag: ${PREV_TAG:-<none>}"
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..${TAG}"
+            COMPARE_LINE="**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${TAG}"
+          else
+            RANGE="$TAG"
+            COMPARE_LINE=""
+          fi
+          # Bullets: skip merges, the Co-Authored-By trailer, and empties.
+          # Keep the conventional-commit prefix so readers can scan by type
+          # (feat/fix/ci/chore/...). The frontend changelog parser will
+          # strip those prefixes again for display.
+          BULLETS=$(git log --no-merges --pretty=format:'* %s' "$RANGE" \
+            | grep -vE '^\* (Merge|Co-Authored-By)' \
+            | grep -vE '^\*\s*$' || true)
+          if [ -z "$BULLETS" ]; then
+            BULLETS="* Release ${TAG}"
+          fi
+          {
+            echo "body<<MPF_NOTES_EOF"
+            echo "$BULLETS"
+            if [ -n "$COMPARE_LINE" ]; then
+              echo ""
+              echo "$COMPARE_LINE"
+            fi
+            echo "MPF_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -301,5 +346,5 @@ jobs:
             artifacts/release-*/**/*.app.tar.gz
             artifacts/release-*/**/*.sig
             artifacts/latest*.json
-          generate_release_notes: true
+          body: ${{ steps.notes.outputs.body }}
           prerelease: ${{ startsWith(github.ref, 'refs/tags/exp-') }}

@@ -121,6 +121,11 @@ async function fetchChangelog(): Promise<ChangelogEntry[]> {
           if (/^[*\-]\s+/.test(trimmed)) {
             let text = trimmed.replace(/^[*\-]\s+/, "").trim();
             text = text.replace(/\s+by\s+@\S+.*$/i, "").replace(/\s+in\s+https:\/\/\S+/g, "").trim();
+            // Strip conventional-commit prefix (feat/fix/chore/...) so the
+            // changelog reads cleanly. CI now writes release bodies from
+            // git log including those prefixes; this is the corresponding
+            // display-side cleanup.
+            text = text.replace(/^(feat|fix|chore|docs|refactor|style|test|ci|build|perf)(\(.+?\))?:\s*/i, "").trim();
             // Skip "Full Changelog" links
             if (text.includes("Full Changelog") || text.includes("github.com/compare")) continue;
             if (text.length > 5) changes.push(text);
