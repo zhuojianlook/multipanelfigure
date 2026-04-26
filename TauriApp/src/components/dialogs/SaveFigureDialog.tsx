@@ -372,11 +372,6 @@ export function SaveFigureDialog({ open, onClose }: Props) {
                     </Select>
                   </FormControl>
                 )}
-                {ffmpegAvailable === false && retainAudio && (
-                  <Alert severity="warning" sx={{ mt: 1, py: 0.25 }}>
-                    ffmpeg not found on PATH — audio retention requires ffmpeg. The video will be rendered without audio.
-                  </Alert>
-                )}
               </Box>
             )}
             {ffmpegAvailable === false && (
