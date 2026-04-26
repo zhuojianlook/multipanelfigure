@@ -332,6 +332,14 @@ export function FloatingToolbar({
               fontSize: "0.65rem",
               textAlign: "center",
               py: 0,
+              // Match the sidebar's Header size: dark colorScheme +
+              // inverted spin buttons so the arrows render white on the
+              // dark popup background.
+              colorScheme: "dark",
+            },
+            "& input[type=number]::-webkit-inner-spin-button, & input[type=number]::-webkit-outer-spin-button": {
+              filter: "invert(1)",
+              opacity: 1,
             },
             "& .MuiInput-underline:before": { borderBottom: "none" },
           }}

@@ -511,7 +511,24 @@ export function Sidebar() {
             defaultValue={config?.column_headers?.[0]?.headers?.[0]?.font_size ?? 14}
             key={`hdr-size-${config?.column_headers?.length ?? 0}-${config?.row_headers?.length ?? 0}`}
             inputProps={{ min: 4, max: 200, step: 1 }}
-            sx={{ width: 56, "& input": { fontSize: "0.65rem", py: 0.25, px: 0.5 } }}
+            sx={{
+              width: 56,
+              // colorScheme:dark switches the WebView's native form controls
+              // (including the number-input spinner arrows) to a dark
+              // palette → arrows render white instead of dark grey on the
+              // dark sidebar.
+              "& input": {
+                fontSize: "0.65rem",
+                py: 0.25,
+                px: 0.5,
+                textAlign: "center",
+                colorScheme: "dark",
+              },
+              "& input[type=number]::-webkit-inner-spin-button, & input[type=number]::-webkit-outer-spin-button": {
+                filter: "invert(1)",
+                opacity: 1,
+              },
+            }}
           />
           <Button
             variant="contained"
