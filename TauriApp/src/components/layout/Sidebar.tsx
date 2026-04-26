@@ -289,31 +289,10 @@ export function Sidebar() {
         </Button>
       </Box>
       <Box sx={{ px: 1.5, display: "flex", flexDirection: "column", gap: 0.5 }}>
-        {config.resolution_entries && Object.entries(config.resolution_entries).map(([name, val]) => {
-          // Parse unit from name suffix if present, e.g. "Microscope 10x|um" or default to μm
-          const parts = name.split("|");
-          const displayName = parts[0];
-          const unit = parts[1] || "um";
-          const unitLabelMap: Record<string, string> = { km: "km", m: "m", cm: "cm", mm: "mm", um: "\u00B5m", nm: "nm", pm: "pm" };
-          const unitLabel = unitLabelMap[unit] || "\u00B5m";
-          // val is stored in µm/px internally — convert back to display unit
-          const convFromUm: Record<string, number> = { km: 1e9, m: 1e6, cm: 10000, mm: 1000, um: 1, nm: 0.001, pm: 1e-6 };
-          const displayVal = (val as number) / (convFromUm[unit] || 1);
-          return (
-            <Box key={name} sx={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <Typography variant="caption" sx={{ fontSize: "0.65rem" }}>{displayName}: {Number(displayVal.toPrecision(6))} {unitLabel}/px</Typography>
-              <IconButton size="small" onClick={() => {
-                const entries = { ...config.resolution_entries };
-                delete entries[name];
-                setConfig({ ...config, resolution_entries: entries });
-                api.updateResolutions(entries).catch(console.error);
-              }} sx={{ width: 20, height: 20 }}>
-                <DeleteIcon sx={{ fontSize: 12 }} />
-              </IconButton>
-            </Box>
-          );
-        })}
-        {/* Add new scale bar: Name, Value, Unit, direction toggle */}
+        {/* Add new scale bar: Name, Value, Unit, direction toggle.
+            Kept at the top so a long preset list (and it gets long
+            once the bundled microscope defaults are loaded) doesn't
+            push the input form below the fold. */}
         <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, alignItems: "center" }}>
           <TextField
             placeholder="Name"
@@ -389,6 +368,34 @@ export function Sidebar() {
           }} sx={{ width: 22, height: 22 }}>
             <AddIcon sx={{ fontSize: 14 }} />
           </IconButton>
+        </Box>
+        {/* Capped + scrollable list — long preset libraries shouldn't
+            push every other sidebar section below the fold. */}
+        <Box sx={{ maxHeight: 260, overflowY: "auto", display: "flex", flexDirection: "column", gap: 0.5, mt: 0.5 }}>
+          {config.resolution_entries && Object.entries(config.resolution_entries).map(([name, val]) => {
+            // Parse unit from name suffix if present, e.g. "Microscope 10x|um" or default to μm
+            const parts = name.split("|");
+            const displayName = parts[0];
+            const unit = parts[1] || "um";
+            const unitLabelMap: Record<string, string> = { km: "km", m: "m", cm: "cm", mm: "mm", um: "\u00B5m", nm: "nm", pm: "pm" };
+            const unitLabel = unitLabelMap[unit] || "\u00B5m";
+            // val is stored in µm/px internally — convert back to display unit
+            const convFromUm: Record<string, number> = { km: 1e9, m: 1e6, cm: 10000, mm: 1000, um: 1, nm: 0.001, pm: 1e-6 };
+            const displayVal = (val as number) / (convFromUm[unit] || 1);
+            return (
+              <Box key={name} sx={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <Typography variant="caption" sx={{ fontSize: "0.65rem" }}>{displayName}: {Number(displayVal.toPrecision(6))} {unitLabel}/px</Typography>
+                <IconButton size="small" onClick={() => {
+                  const entries = { ...config.resolution_entries };
+                  delete entries[name];
+                  setConfig({ ...config, resolution_entries: entries });
+                  api.updateResolutions(entries).catch(console.error);
+                }} sx={{ width: 20, height: 20 }}>
+                  <DeleteIcon sx={{ fontSize: 12 }} />
+                </IconButton>
+              </Box>
+            );
+          })}
         </Box>
       </Box>
 
