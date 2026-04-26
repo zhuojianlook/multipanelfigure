@@ -2372,6 +2372,44 @@ async def upload_fonts(files: List[UploadFile] = File(...)):
 # Persistent scale bar storage
 _SCALE_BAR_FILE = Path.home() / ".multipanelfigure" / "scale_bars.json"
 
+# Default microscope presets (μm/pixel). Values converted from the
+# user-supplied calibration list; entries originally given in pixels/μm
+# are stored here as 1/(px per μm).
+DEFAULT_RESOLUTION_ENTRIES: Dict[str, float] = {
+    # NIKON TC1 (640x480)
+    "NIKON TC1 4x":  1 / 0.2925,
+    "NIKON TC1 10x": 1 / 0.7412,
+    "NIKON TC1 20x": 1 / 1.465,
+    "NIKON TC1 40x": 1 / 2.925,
+    # NIKON Ti — Microscope Room (772x618)
+    "NIKON Ti 4x":   1 / 0.38,
+    "NIKON Ti 10x":  1 / 0.9313,
+    "NIKON Ti 20x":  1 / 1.8833,
+    "NIKON Ti 40x":  1 / 3.8,
+    # INCUCYTE (1408x1040)
+    "INCUCYTE 4x":   2.82,
+    "INCUCYTE 10x":  1.24,
+    "INCUCYTE 20x":  0.62,
+    "INCUCYTE Whole Well": 1000.0 / 141.5462,
+    # ZEISS L12 OLD (1388x1040)
+    "ZEISS L12 OLD 5x":  1.3,
+    "ZEISS L12 OLD 10x": 0.6425,
+    "ZEISS L12 OLD 20x": 0.3222,
+    "ZEISS L12 OLD 40x": 0.1603,
+    "ZEISS L12 OLD 63x": 0.1018,
+    # ZEISS L12 NEW (2752x2208)
+    "ZEISS L12 NEW 5x":  0.9101,
+    "ZEISS L12 NEW 10x": 0.4551,
+    "ZEISS L12 NEW 20x": 0.2278,
+    "ZEISS L12 NEW 40x": 0.1132,
+    # ZOE TC1 TIFF (2592x1944)
+    "ZOE TC1 20x": 1 / 2.6233,
+    # NIKON TC1 Dissecting Microscope (0.63x @ 1x → 106 px/mm)
+    "NIKON TC1 Dissecting 0.63x@1x": 1000.0 / 106.0,
+    # HEIDELBERG IVCM (400μm field)
+    "HEIDELBERG IVCM": 1 / 0.96,
+}
+
 def _load_persistent_scale_bars() -> Dict[str, float]:
     """Load scale bars from persistent storage."""
     try:
@@ -2391,10 +2429,14 @@ def _save_persistent_scale_bars(entries: Dict[str, float]):
     except Exception as e:
         print(f"Warning: Could not save scale bars: {e}")
 
-# Load persistent scale bars on startup
+# Seed defaults on startup. If the user has a persistent scale_bars.json
+# (custom list from prior usage), respect it as-is; otherwise populate
+# with the bundled microscope presets.
 _persistent_scales = _load_persistent_scale_bars()
 if _persistent_scales:
     cfg.resolution_entries.update(_persistent_scales)
+else:
+    cfg.resolution_entries.update(DEFAULT_RESOLUTION_ENTRIES)
 
 
 @app.get("/api/resolutions")
