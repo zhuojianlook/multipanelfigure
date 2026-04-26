@@ -480,7 +480,7 @@ export function Toolbar() {
 
             {updateStatus === "up-to-date" && (
               <Alert severity="success" sx={{ py: 0, fontSize: "0.75rem", width: "100%" }}>
-                You are running the latest version ({appVersion}).
+                You are running the latest {updateChannel} version ({appVersion}).
               </Alert>
             )}
             {updateStatus === "available" && (
