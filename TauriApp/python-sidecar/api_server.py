@@ -2455,6 +2455,15 @@ def put_resolutions(body: ResolutionUpdate):
     return {"ok": True}
 
 
+@app.post("/api/resolutions/restore-defaults")
+def restore_default_resolutions():
+    """Reset the resolution presets to the bundled microscope defaults
+    and persist them to ~/.multipanelfigure/scale_bars.json."""
+    cfg.resolution_entries = dict(DEFAULT_RESOLUTION_ENTRIES)
+    _save_persistent_scale_bars(cfg.resolution_entries)
+    return cfg.resolution_entries
+
+
 # ── R Analysis Endpoints ───────────────────────────────────────────────────
 
 import subprocess

@@ -334,6 +334,10 @@ class ApiClient {
     await apiJson("/api/resolutions", "PUT", JSON.stringify({ entries }));
   }
 
+  async restoreDefaultResolutions(): Promise<Record<string, number>> {
+    return apiJson<Record<string, number>>("/api/resolutions/restore-defaults", "POST");
+  }
+
   // ── Measurements ────────────────────────────────────────
 
   async getMeasurements(): Promise<{ measurements: Array<{ panel: string; name: string; type: string; value: string }> }> {

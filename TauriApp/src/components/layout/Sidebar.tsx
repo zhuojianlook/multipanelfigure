@@ -271,7 +271,23 @@ export function Sidebar() {
       <Divider sx={{ my: 1 }} />
 
       {/* ── SCALE BARS (Resolution Presets) ────────────── */}
-      <SectionTitle>Scale Bars</SectionTitle>
+      <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", pr: 1.5 }}>
+        <SectionTitle>Scale Bars</SectionTitle>
+        <Button
+          size="small"
+          variant="text"
+          onClick={async () => {
+            if (!window.confirm("Replace all scale-bar presets with the bundled microscope defaults? Custom entries will be lost.")) return;
+            try {
+              const entries = await api.restoreDefaultResolutions();
+              if (config) setConfig({ ...config, resolution_entries: entries });
+            } catch (e) { console.error(e); }
+          }}
+          sx={{ fontSize: "0.55rem", textTransform: "none", py: 0, minWidth: 0, px: 0.75 }}
+        >
+          Restore defaults
+        </Button>
+      </Box>
       <Box sx={{ px: 1.5, display: "flex", flexDirection: "column", gap: 0.5 }}>
         {config.resolution_entries && Object.entries(config.resolution_entries).map(([name, val]) => {
           // Parse unit from name suffix if present, e.g. "Microscope 10x|um" or default to μm
