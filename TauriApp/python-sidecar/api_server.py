@@ -1810,6 +1810,330 @@ def save_figure(body: SaveFigureRequest):
     return {"ok": True, "path": save_path, "size_bytes": written}
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Video render — animate panels with `play_range` enabled across their
+# [frame_start, frame_end] ranges and mux into an mp4/avi.
+# ─────────────────────────────────────────────────────────────────────
+
+import threading as _threading
+import uuid as _uuid
+import subprocess as _subprocess
+
+# Job state — all access through _render_jobs_lock.
+_render_jobs: Dict[str, Dict] = {}
+_render_jobs_lock = _threading.Lock()
+
+
+class RenderVideoRequest(BaseModel):
+    path: str
+    format: str = "mp4"           # "mp4" | "avi"
+    fps: int = 30                 # 1-60
+    background: str = "White"
+    dpi: int = 150
+    audio_panel_image_name: Optional[str] = None  # if set, must match a play_range panel's image_name
+
+
+@app.get("/api/figure/render-video/ffmpeg-available")
+def render_video_ffmpeg_available():
+    """Probe whether ffmpeg is on PATH so the frontend can hide the
+    audio-retention option when it isn't available."""
+    try:
+        result = _subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=2)
+        return {"available": result.returncode == 0}
+    except (FileNotFoundError, _subprocess.TimeoutExpired, Exception):
+        return {"available": False}
+
+
+@app.post("/api/figure/render-video")
+def render_video_start(body: RenderVideoRequest):
+    if body.fps < 1 or body.fps > 60:
+        raise HTTPException(400, "fps must be 1-60")
+    if body.format.lower() not in ("mp4", "avi"):
+        raise HTTPException(400, "format must be mp4 or avi")
+
+    rows, cols = cfg.rows, cfg.cols
+    range_panels: List[Tuple[int, int, PanelInfo]] = []
+    for r in range(rows):
+        for c in range(cols):
+            p = cfg.panels[r][c]
+            if getattr(p, "play_range", False) and p.image_name and p.image_name in loaded_videos:
+                range_panels.append((r, c, p))
+    if not range_panels:
+        raise HTTPException(400, "No panels have 'Play range in video export' enabled.")
+
+    total_frames = max((p.frame_end - p.frame_start + 1) for _, _, p in range_panels)
+    if total_frames < 1:
+        raise HTTPException(400, "Computed total frame count is 0; check the play-range bounds.")
+
+    save_path = os.path.expanduser(body.path.strip())
+    if not save_path.lower().endswith("." + body.format.lower()):
+        save_path = save_path + "." + body.format.lower()
+    out_dir = os.path.dirname(save_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Disk-space pre-flight: rough estimate of 800 KB per output frame
+    # (ballpark for a 1080p mp4 at modest quality).
+    try:
+        import shutil as _shutil
+        usage = _shutil.disk_usage(out_dir)
+        required = total_frames * 800 * 1024 + 64 * 1024 * 1024  # +64 MB headroom
+        if usage.free < required:
+            raise HTTPException(
+                507,
+                f"Not enough disk space: need ~{required // (1024*1024)} MB, have "
+                f"{usage.free // (1024*1024)} MB free on the target volume.",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # disk check is best-effort
+
+    job_id = _uuid.uuid4().hex
+    with _render_jobs_lock:
+        _render_jobs[job_id] = {
+            "status": "running",
+            "current": 0,
+            "total": total_frames,
+            "output_path": save_path,
+            "error": None,
+            "cancel_requested": False,
+        }
+
+    t = _threading.Thread(
+        target=_render_video_worker,
+        args=(job_id, body, total_frames, range_panels, save_path),
+        daemon=True,
+    )
+    t.start()
+    return {"job_id": job_id, "total_frames": total_frames}
+
+
+def _render_video_worker(job_id: str, body: RenderVideoRequest,
+                         total_frames: int,
+                         range_panels: List[Tuple[int, int, "PanelInfo"]],
+                         save_path: str) -> None:
+    import cv2 as _cv2
+    import numpy as _np
+    from io import BytesIO as _BytesIO
+    from PIL import Image as _PIL
+
+    rows, cols = cfg.rows, cfg.cols
+    snapshot: Dict[str, Image.Image] = {}
+    captures: Dict[str, "_cv2.VideoCapture"] = {}
+    writer = None
+    try:
+        # Snapshot loaded_images for video panels so we can restore them
+        # after the render — assemble_figure reads from loaded_images and
+        # we'll be swapping each panel's image to the current animated
+        # frame in turn.
+        for _, _, p in range_panels:
+            if p.image_name in loaded_images:
+                snapshot[p.image_name] = loaded_images[p.image_name]
+
+        # Open one VideoCapture per video panel (faster than re-opening
+        # for every output frame).
+        for _, _, p in range_panels:
+            path = loaded_videos.get(p.image_name)
+            if path:
+                captures[p.image_name] = _cv2.VideoCapture(path)
+
+        for frame_idx in range(total_frames):
+            with _render_jobs_lock:
+                if _render_jobs[job_id]["cancel_requested"]:
+                    raise RuntimeError("Cancelled by user")
+
+            # Update each play_range panel's loaded_images entry to the
+            # frame that should display at this output index. Panels
+            # whose range is shorter than the longest hold on their last
+            # frame (per spec).
+            for _, _, p in range_panels:
+                src_frame = min(p.frame_start + frame_idx, p.frame_end)
+                cap = captures.get(p.image_name)
+                if cap is None:
+                    continue
+                cap.set(_cv2.CAP_PROP_POS_FRAMES, src_frame)
+                ok, bgr = cap.read()
+                if not ok:
+                    continue
+                rgb = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2RGB)
+                loaded_images[p.image_name] = _PIL.fromarray(rgb)
+
+            # Mirror the save_figure pipeline for this frame.
+            processed: List[List[Optional[Image.Image]]] = []
+            for r in range(rows):
+                row_imgs = []
+                for c in range(cols):
+                    panel = cfg.panels[r][c]
+                    if panel.image_name and panel.image_name in loaded_images:
+                        row_imgs.append(process_panel(
+                            loaded_images[panel.image_name], panel,
+                            min_dims, loaded_images,
+                            skip_labels=True, skip_symbols=True,
+                        ))
+                    else:
+                        row_imgs.append(None)
+                processed.append(row_imgs)
+
+            col_max_w = [
+                max((processed[r][c].size[0] for r in range(rows) if processed[r][c] is not None),
+                    default=min_dims[0]) for c in range(cols)
+            ]
+            row_max_h = [
+                max((processed[r][c].size[1] for c in range(cols) if processed[r][c] is not None),
+                    default=min_dims[1]) for r in range(rows)
+            ]
+            for r in range(rows):
+                for c in range(cols):
+                    if processed[r][c] is None:
+                        processed[r][c] = _PIL.new("RGB", (col_max_w[c], row_max_h[r]), "white")
+
+            full_res_sizes2: Dict[Tuple[int, int], Tuple[int, int]] = {}
+            for r in range(rows):
+                for c in range(cols):
+                    panel = cfg.panels[r][c]
+                    if panel.image_name and panel.image_name in loaded_images:
+                        orig_img = loaded_images[panel.image_name]
+                        if panel.crop_image and panel.crop and len(panel.crop) == 4:
+                            full_res_sizes2[(r, c)] = (panel.crop[2] - panel.crop[0], panel.crop[3] - panel.crop[1])
+                        else:
+                            full_res_sizes2[(r, c)] = orig_img.size
+
+            orig_format = cfg.output_format
+            orig_bg = cfg.background
+            cfg.output_format = "PNG"
+            cfg.background = body.background
+            try:
+                fig_bytes = assemble_figure(cfg, processed, dpi=body.dpi, full_res_sizes=full_res_sizes2)
+            finally:
+                cfg.output_format = orig_format
+                cfg.background = orig_bg
+
+            pil_out = _PIL.open(_BytesIO(fig_bytes)).convert("RGB")
+            np_rgb = _np.asarray(pil_out)
+            np_bgr = _cv2.cvtColor(np_rgb, _cv2.COLOR_RGB2BGR)
+
+            if writer is None:
+                h, w = np_bgr.shape[:2]
+                fourcc = _cv2.VideoWriter_fourcc(*"mp4v") if body.format.lower() == "mp4" \
+                    else _cv2.VideoWriter_fourcc(*"MJPG")
+                writer = _cv2.VideoWriter(save_path, fourcc, float(body.fps), (w, h))
+                if not writer.isOpened():
+                    raise RuntimeError(f"Failed to open VideoWriter for {save_path}")
+            writer.write(np_bgr)
+
+            with _render_jobs_lock:
+                _render_jobs[job_id]["current"] = frame_idx + 1
+
+        if writer is not None:
+            writer.release()
+            writer = None
+
+        # Optional audio mux — uses ffmpeg if installed. If the user
+        # selected an audio panel, take the audio from its source video
+        # over the panel's [start..end] frame range, padding with silence
+        # to match the output duration when the audio range is shorter.
+        if body.audio_panel_image_name:
+            audio_panel = next(
+                (p for _, _, p in range_panels if p.image_name == body.audio_panel_image_name),
+                None,
+            )
+            audio_path = loaded_videos.get(body.audio_panel_image_name) if audio_panel else None
+            if audio_panel and audio_path:
+                try:
+                    src_info = _get_video_info(audio_path)
+                    panel_fps = src_info.get("fps", float(body.fps)) or float(body.fps)
+                    start_t = audio_panel.frame_start / max(panel_fps, 1.0)
+                    audio_dur = (audio_panel.frame_end - audio_panel.frame_start + 1) / max(panel_fps, 1.0)
+                    output_dur = total_frames / max(float(body.fps), 1.0)
+                    use_dur = min(audio_dur, output_dur)
+                    tmp_out = save_path + ".silent" + os.path.splitext(save_path)[1]
+                    os.replace(save_path, tmp_out)
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-i", tmp_out,
+                        "-ss", f"{start_t:.4f}",
+                        "-t", f"{use_dur:.4f}",
+                        "-i", audio_path,
+                        "-map", "0:v:0", "-map", "1:a:0",
+                        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                        "-shortest",
+                        save_path,
+                    ]
+                    result = _subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                    if result.returncode != 0 or not os.path.exists(save_path) or os.path.getsize(save_path) < 1024:
+                        # Restore silent video if the mux failed
+                        try:
+                            if os.path.exists(save_path):
+                                os.unlink(save_path)
+                        except OSError:
+                            pass
+                        os.replace(tmp_out, save_path)
+                    else:
+                        try:
+                            os.unlink(tmp_out)
+                        except OSError:
+                            pass
+                except FileNotFoundError:
+                    # ffmpeg not available — silently keep the silent video
+                    pass
+                except Exception as e:
+                    print(f"[render_video] audio mux failed: {e}", flush=True)
+
+        with _render_jobs_lock:
+            _render_jobs[job_id]["status"] = "done"
+            _render_jobs[job_id]["output_path"] = save_path
+
+    except Exception as e:
+        with _render_jobs_lock:
+            _render_jobs[job_id]["status"] = "error"
+            _render_jobs[job_id]["error"] = str(e)
+        # Cleanup partial output on error
+        try:
+            if writer is not None:
+                writer.release()
+        except Exception:
+            pass
+        try:
+            if os.path.exists(save_path):
+                os.unlink(save_path)
+        except OSError:
+            pass
+    finally:
+        # Always release captures and restore the original loaded_images
+        for cap in captures.values():
+            try:
+                cap.release()
+            except Exception:
+                pass
+        for name, img in snapshot.items():
+            loaded_images[name] = img
+
+
+@app.get("/api/figure/render-video/{job_id}/progress")
+def render_video_progress(job_id: str):
+    with _render_jobs_lock:
+        job = _render_jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found")
+        return {
+            "status": job["status"],
+            "current": job["current"],
+            "total": job["total"],
+            "output_path": job.get("output_path"),
+            "error": job.get("error"),
+        }
+
+
+@app.post("/api/figure/render-video/{job_id}/cancel")
+def render_video_cancel(job_id: str):
+    with _render_jobs_lock:
+        job = _render_jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found")
+        job["cancel_requested"] = True
+    return {"ok": True}
+
+
 class ProjectSaveRequest(BaseModel):
     path: str
 

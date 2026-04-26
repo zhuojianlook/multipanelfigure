@@ -1196,7 +1196,23 @@ function CropPixelFields({ cropRect, imgNatW, imgNatH, origFullW, origFullH, dis
    Main dialog
    ================================================================ */
 // ── Video Frame Selector Component ──────────────────────────────────────
-function VideoFrameSelector({ imageName, onFrameChange, onFrameImage, frame, setFrame }: { imageName: string; onFrameChange: () => void; onFrameImage?: (b64: string) => void; frame: number; setFrame: (f: number) => void }) {
+function VideoFrameSelector({
+  imageName, onFrameChange, onFrameImage, frame, setFrame,
+  frameStart, setFrameStart, frameEnd, setFrameEnd,
+  playRange, setPlayRange,
+}: {
+  imageName: string;
+  onFrameChange: () => void;
+  onFrameImage?: (b64: string) => void;
+  frame: number;
+  setFrame: (f: number) => void;
+  frameStart: number;
+  setFrameStart: (f: number) => void;
+  frameEnd: number;
+  setFrameEnd: (f: number) => void;
+  playRange: boolean;
+  setPlayRange: (b: boolean) => void;
+}) {
   const [videoInfo, setVideoInfo] = useState<{ frame_count: number; fps: number; duration_sec: number } | null>(null);
   const currentFrame = frame;
   const setCurrentFrame = setFrame;
@@ -1204,10 +1220,24 @@ function VideoFrameSelector({ imageName, onFrameChange, onFrameImage, frame, set
   const [playing, setPlaying] = useState(false);
   const playRef = useRef(false);
   const frameRef = useRef(0);
+  // Local thumb values for the dual-range slider (separate from
+  // committed frameStart/frameEnd so dragging doesn't seek per-pixel).
+  const [rangeDraft, setRangeDraft] = useState<[number, number]>([frameStart, frameEnd]);
 
   useEffect(() => {
-    api.getVideoInfo(imageName).then(info => setVideoInfo(info)).catch(() => {});
-  }, [imageName]);
+    api.getVideoInfo(imageName).then(info => {
+      setVideoInfo(info);
+      // Initialise sensible range defaults on first load if model still
+      // shows the legacy 0/0 (= "not yet configured"): use full clip.
+      if (info.frame_count > 1 && frameStart === 0 && frameEnd === 0) {
+        setFrameStart(0);
+        setFrameEnd(info.frame_count - 1);
+        setRangeDraft([0, info.frame_count - 1]);
+      } else {
+        setRangeDraft([frameStart, frameEnd]);
+      }
+    }).catch(() => {});
+  }, [imageName]); // eslint-disable-line
 
   const seekToFrame = async (frame: number) => {
     setLoading(true);
@@ -1236,9 +1266,7 @@ function VideoFrameSelector({ imageName, onFrameChange, onFrameImage, frame, set
           if (cancelled) return;
           frameRef.current = next;
           setCurrentFrame(next);
-          // During playback, update preview directly from thumbnail for speed
           if (onFrameImage && resp.thumbnail) onFrameImage(resp.thumbnail);
-          // Small delay to allow UI to update
           await new Promise(r => setTimeout(r, 30));
         } catch { break; }
       }
@@ -1250,19 +1278,22 @@ function VideoFrameSelector({ imageName, onFrameChange, onFrameImage, frame, set
   if (!videoInfo) return <Typography variant="caption" sx={{ color: "text.secondary" }}>Loading video info...</Typography>;
 
   const timeStr = videoInfo.fps > 0 ? `${(currentFrame / videoInfo.fps).toFixed(2)}s` : "";
+  const maxFrame = Math.max(0, videoInfo.frame_count - 1);
+  const rangeLen = Math.max(1, rangeDraft[1] - rangeDraft[0] + 1);
+  const rangeDur = videoInfo.fps > 0 ? `${(rangeLen / videoInfo.fps).toFixed(2)}s` : "";
 
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 1, mt: 1 }}>
       <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
         <Typography variant="caption" sx={{ flexShrink: 0, fontSize: "0.65rem" }}>
-          Frame {currentFrame} / {videoInfo.frame_count - 1} {timeStr && `(${timeStr})`}
+          Frame {currentFrame} / {maxFrame} {timeStr && `(${timeStr})`}
         </Typography>
         <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary" }}>
           {videoInfo.fps.toFixed(1)} fps, {videoInfo.duration_sec.toFixed(1)}s
         </Typography>
       </Box>
       <Slider
-        value={currentFrame} min={0} max={Math.max(0, videoInfo.frame_count - 1)} step={1}
+        value={currentFrame} min={0} max={maxFrame} step={1}
         onChange={(_, v) => { setCurrentFrame(v as number); setPlaying(false); }}
         onChangeCommitted={(_, v) => seekToFrame(v as number)}
         sx={{ mt: 0, mx: 1 }}
@@ -1275,13 +1306,57 @@ function VideoFrameSelector({ imageName, onFrameChange, onFrameImage, frame, set
           sx={{ minWidth: 36, px: 0.5, fontSize: "0.85rem" }}>
           {playing ? "⏸" : "▶"}
         </Button>
-        <Button size="small" variant="outlined" onClick={() => seekToFrame(Math.min(videoInfo.frame_count - 1, currentFrame + 1))}
-          disabled={loading || playing || currentFrame >= videoInfo.frame_count - 1} sx={{ minWidth: 28, px: 0.5, fontSize: "0.75rem" }}>⏭</Button>
+        <Button size="small" variant="outlined" onClick={() => seekToFrame(Math.min(maxFrame, currentFrame + 1))}
+          disabled={loading || playing || currentFrame >= maxFrame} sx={{ minWidth: 28, px: 0.5, fontSize: "0.75rem" }}>⏭</Button>
         <TextField type="number" value={currentFrame}
           onChange={(e) => setCurrentFrame(Number(e.target.value))}
           onKeyDown={(e) => { if (e.key === "Enter") seekToFrame(currentFrame); }}
-          size="small" inputProps={{ min: 0, max: videoInfo.frame_count - 1 }}
+          size="small" inputProps={{ min: 0, max: maxFrame }}
           sx={{ width: 70, "& input": { fontSize: "0.7rem", px: 0.75, py: 0.4, textAlign: "center" } }}
+        />
+      </Box>
+
+      {/* ── Video export range ─────────────────────────── */}
+      <Box sx={{ mt: 1, pt: 1, borderTop: 1, borderColor: "divider" }}>
+        <Box sx={{ display: "flex", gap: 1, alignItems: "center", mb: 0.5 }}>
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={playRange}
+                onChange={(e) => setPlayRange(e.target.checked)}
+                size="small"
+                sx={{ p: 0.5 }}
+              />
+            }
+            label={
+              <Typography variant="caption" sx={{ fontSize: "0.65rem" }}>
+                Play range in video export
+              </Typography>
+            }
+            sx={{ ml: 0, mr: 1 }}
+          />
+          <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary" }}>
+            {`${rangeDraft[0]}–${rangeDraft[1]} (${rangeLen} frames${rangeDur ? `, ${rangeDur}` : ""})`}
+          </Typography>
+        </Box>
+        <Slider
+          value={rangeDraft}
+          min={0}
+          max={maxFrame}
+          step={1}
+          onChange={(_, v) => {
+            const arr = v as number[];
+            setRangeDraft([Math.min(arr[0], arr[1]), Math.max(arr[0], arr[1])]);
+          }}
+          onChangeCommitted={(_, v) => {
+            const arr = v as number[];
+            const lo = Math.min(arr[0], arr[1]);
+            const hi = Math.max(arr[0], arr[1]);
+            setFrameStart(lo);
+            setFrameEnd(hi);
+          }}
+          disableSwap
+          sx={{ mt: 0, mx: 1 }}
         />
       </Box>
     </Box>
@@ -1613,6 +1688,9 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   const extImageNameRef = useRef<string>("");
   const [extImageDims, setExtImageDims] = useState<{ w: number; h: number }>({ w: 1000, h: 1000 });
   const [videoFrame, setVideoFrame] = useState(0);
+  const [videoFrameStart, setVideoFrameStart] = useState(0);
+  const [videoFrameEnd, setVideoFrameEnd] = useState(0);
+  const [videoPlayRange, setVideoPlayRange] = useState(false);
   const [selectedAnnotIdx, setSelectedAnnotIdx] = useState<{ type: "symbol" | "line" | "area"; idx: number } | null>(null);
   const [magicWandLoading, setMagicWandLoading] = useState(false);
   const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1666,6 +1744,12 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       if (pu.input_black !== undefined) { pu.input_black_r = pu.input_black; pu.input_black_g = pu.input_black; pu.input_black_b = pu.input_black; delete pu.input_black; }
       if (pu.input_white !== undefined) { pu.input_white_r = pu.input_white; pu.input_white_g = pu.input_white; pu.input_white_b = pu.input_white; delete pu.input_white; }
       setLocal(p);
+      // Hydrate the video range / play-range fields from the model.
+      // Defaults preserve old behaviour for legacy projects.
+      setVideoFrame(p.frame ?? 0);
+      setVideoFrameStart(p.frame_start ?? 0);
+      setVideoFrameEnd(p.frame_end ?? 0);
+      setVideoPlayRange(p.play_range ?? false);
       // Reset per-tab undo/redo history to just the initial snapshot of
       // each tab's fields so each panel edit session starts clean.
       const fresh: Record<TabKey, { stack: Partial<PanelInfo>[]; idx: number }> = {
@@ -2305,11 +2389,31 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
               <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.85rem" }}>
                 🎬 Video Frame Selector
               </Typography>
-              <VideoFrameSelector imageName={local?.image_name || ""} frame={videoFrame} setFrame={setVideoFrame} onFrameChange={() => {
-                refreshPreview();
-              }} onFrameImage={(b64) => {
-                setPreviewB64(b64);
-              }} />
+              <VideoFrameSelector
+                imageName={local?.image_name || ""}
+                frame={videoFrame}
+                setFrame={(f) => {
+                  setVideoFrame(f);
+                  setLocal((prev) => prev ? { ...prev, frame: f } : prev);
+                }}
+                frameStart={videoFrameStart}
+                setFrameStart={(f) => {
+                  setVideoFrameStart(f);
+                  setLocal((prev) => prev ? { ...prev, frame_start: f } : prev);
+                }}
+                frameEnd={videoFrameEnd}
+                setFrameEnd={(f) => {
+                  setVideoFrameEnd(f);
+                  setLocal((prev) => prev ? { ...prev, frame_end: f } : prev);
+                }}
+                playRange={videoPlayRange}
+                setPlayRange={(b) => {
+                  setVideoPlayRange(b);
+                  setLocal((prev) => prev ? { ...prev, play_range: b } : prev);
+                }}
+                onFrameChange={() => { refreshPreview(); }}
+                onFrameImage={(b64) => { setPreviewB64(b64); }}
+              />
             </Box>
           </TabPanel>
         )}

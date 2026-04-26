@@ -272,6 +272,16 @@ class PanelInfo:
     grayscale: bool = False                 # default False
     pseudocolor: str = ""                   # "" = none, or colormap name
 
+    # Video range fields. Default to a static single-frame display (frame
+    # index = current static frame from `frame`). When `play_range` is
+    # True AND the panel's image is a video, a Save → Video render plays
+    # frames [frame_start, frame_end] inclusive at the user's chosen FPS.
+    # Values are clamped to [0, frame_count-1] at render time.
+    frame: int = 0                          # statically displayed frame
+    frame_start: int = 0                    # video play-range start (inclusive)
+    frame_end: int = 0                      # video play-range end (inclusive)
+    play_range: bool = False                # if True → animate across [start..end] in video export
+
 
 # ---------------------------------------------------------------------------
 # Row / Column header (one level, one group)

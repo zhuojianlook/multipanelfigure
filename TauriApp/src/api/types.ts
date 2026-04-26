@@ -177,6 +177,15 @@ export interface PanelInfo {
   invert: boolean;            // default false
   grayscale: boolean;         // default false
   pseudocolor: string;        // "" = none, or colormap name: "hot", "cool", "viridis", "magma", "inferno", "plasma", "green", "red", "blue", "cyan", "magenta", "yellow"
+
+  // Video fields — only meaningful when image_name points to a video
+  // file. `frame` is the statically-displayed frame; `frame_start`,
+  // `frame_end`, `play_range` describe the range to animate during a
+  // Save → Video export. Default to 0/0/0/false on legacy projects.
+  frame?: number;
+  frame_start?: number;
+  frame_end?: number;
+  play_range?: boolean;
 }
 
 // ── Header / axis labels ─────────────────────────────────

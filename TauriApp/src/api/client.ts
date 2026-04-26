@@ -260,6 +260,37 @@ class ApiClient {
     return apiJson("/api/figure/save", "POST", JSON.stringify({ path, format, background, dpi }));
   }
 
+  // ── Render figure as video (animates panels with play_range) ──────────
+
+  async renderVideoFfmpegAvailable(): Promise<{ available: boolean }> {
+    return apiJson("/api/figure/render-video/ffmpeg-available");
+  }
+
+  async renderVideoStart(
+    path: string,
+    format: "mp4" | "avi" = "mp4",
+    fps: number = 30,
+    background: string = "White",
+    dpi: number = 150,
+    audio_panel_image_name: string | null = null,
+  ): Promise<{ job_id: string; total_frames: number }> {
+    return apiJson(
+      "/api/figure/render-video",
+      "POST",
+      JSON.stringify({ path, format, fps, background, dpi, audio_panel_image_name }),
+    );
+  }
+
+  async renderVideoProgress(
+    jobId: string,
+  ): Promise<{ status: "running" | "done" | "error" | "cancelled"; current: number; total: number; output_path?: string; error?: string }> {
+    return apiJson(`/api/figure/render-video/${encodeURIComponent(jobId)}/progress`);
+  }
+
+  async renderVideoCancel(jobId: string): Promise<{ ok: boolean }> {
+    return apiJson(`/api/figure/render-video/${encodeURIComponent(jobId)}/cancel`, "POST");
+  }
+
   // ── Fonts ──────────────────────────────────────────────
 
   async listFonts(): Promise<{ fonts: Record<string, string> }> {
