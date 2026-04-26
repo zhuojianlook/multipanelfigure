@@ -1,9 +1,15 @@
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::process::CommandChild;
 use tauri_plugin_updater::UpdaterExt;
 use std::sync::{Arc, Mutex};
+
+#[derive(serde::Serialize, Clone)]
+struct UpdateProgress {
+    downloaded: u64,
+    total: Option<u64>,
+}
 
 #[tauri::command]
 fn get_sidecar_port(state: tauri::State<'_, SidecarPort>) -> u16 {
@@ -112,14 +118,24 @@ async fn download_and_install_update(
     eprintln!("[updater] Got update: version={}", update.version);
 
     let mut total_downloaded = 0u64;
+    let app_for_progress = app.clone();
+    let app_for_finished = app.clone();
     update.download_and_install(
-        move |chunk, _total| {
+        move |chunk, total| {
             total_downloaded += chunk as u64;
+            // Emit progress to the frontend so the UI can show
+            // "X MB / Y MB" instead of just a spinner. Stderr log is
+            // kept for headless debugging.
+            let _ = app_for_progress.emit(
+                "updater://progress",
+                UpdateProgress { downloaded: total_downloaded, total },
+            );
             if total_downloaded % (1024 * 1024) < chunk as u64 {
                 eprintln!("[updater] Downloaded {} MB", total_downloaded / (1024 * 1024));
             }
         },
-        || {
+        move || {
+            let _ = app_for_finished.emit::<()>("updater://finished", ());
             eprintln!("[updater] Download complete, installing...");
         },
     ).await.map_err(|e| format!("Download/install failed: {}", e))?;

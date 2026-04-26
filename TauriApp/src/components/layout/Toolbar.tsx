@@ -180,6 +180,7 @@ export function Toolbar() {
   const [latestVersion, setLatestVersion] = useState<string | null>(null);
   const [releaseNotes, setReleaseNotes] = useState("");
   const [downloadProgress, setDownloadProgress] = useState(0);
+  const [downloadTotal, setDownloadTotal] = useState<number | null>(null);
   const [updateRef, setUpdateRef] = useState<Awaited<ReturnType<typeof check>> | null>(null);
   const [citationCopied, setCitationCopied] = useState(false);
   const [appVersion, setAppVersion] = useState("...");
@@ -515,36 +516,50 @@ export function Toolbar() {
                   startIcon={<DownloadIcon />}
                   onClick={async () => {
                     const { invoke } = await import("@tauri-apps/api/core");
+                    const { listen } = await import("@tauri-apps/api/event");
                     try {
                       try { await invoke("kill_sidecar"); } catch { /* ignore */ }
                       setUpdateStatus("downloading");
                       setDownloadProgress(0);
+                      setDownloadTotal(null);
 
                       if (updateChannel === "stable" && updateRef) {
                         let downloaded = 0;
                         await updateRef.downloadAndInstall((event) => {
-                          if (event.event === "Started" && event.data.contentLength) {
+                          if (event.event === "Started") {
                             setDownloadProgress(0);
+                            setDownloadTotal(event.data.contentLength ?? null);
                           } else if (event.event === "Progress") {
                             downloaded += event.data.chunkLength;
                             setDownloadProgress(downloaded);
-                          } else if (event.event === "Finished") {
-                            setDownloadProgress(100);
                           }
                         });
                       } else {
                         // Experimental: use Rust command with custom endpoint
-                        // Add 3-minute timeout with browser fallback
+                        // Listen for the same progress events the Rust side
+                        // emits, so the UI can show "X MB / Y MB" exactly
+                        // like the stable path.
+                        const unlisten = await listen<{ downloaded: number; total: number | null }>(
+                          "updater://progress",
+                          (e) => {
+                            setDownloadProgress(e.payload.downloaded);
+                            if (e.payload.total) setDownloadTotal(e.payload.total);
+                          }
+                        );
                         const manifestFile = updateChannel === "experimental" ? "latest-experimental.json" : "latest.json";
                         const manifestUrl = `https://raw.githubusercontent.com/zhuojianlook/multipanelfigure/updater/${manifestFile}`;
                         const timeoutMs = 3 * 60 * 1000;
                         const timeoutPromise = new Promise((_, reject) =>
                           setTimeout(() => reject(new Error("Download timed out after 3 minutes")), timeoutMs)
                         );
-                        await Promise.race([
-                          invoke("download_and_install_update", { manifestUrl }),
-                          timeoutPromise,
-                        ]);
+                        try {
+                          await Promise.race([
+                            invoke("download_and_install_update", { manifestUrl }),
+                            timeoutPromise,
+                          ]);
+                        } finally {
+                          unlisten();
+                        }
                       }
                       setUpdateStatus("ready");
                     } catch (e: unknown) {
@@ -568,16 +583,28 @@ export function Toolbar() {
                 </Button>
               </Alert>
             )}
-            {updateStatus === "downloading" && (
-              <Alert severity="info" sx={{ py: 0.5, fontSize: "0.75rem", width: "100%" }}>
-                <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                  <CircularProgress size={16} />
-                  <Typography sx={{ fontSize: "0.75rem" }}>
-                    Downloading update... {downloadProgress > 0 ? `(${(downloadProgress / 1024 / 1024).toFixed(1)} MB)` : ""}
-                  </Typography>
-                </Box>
-              </Alert>
-            )}
+            {updateStatus === "downloading" && (() => {
+              const dlMB = downloadProgress / 1024 / 1024;
+              const totalMB = downloadTotal ? downloadTotal / 1024 / 1024 : null;
+              const pct = downloadTotal && downloadTotal > 0
+                ? Math.min(100, Math.round((downloadProgress / downloadTotal) * 100))
+                : null;
+              const text = downloadProgress > 0
+                ? (totalMB != null
+                    ? `(${dlMB.toFixed(1)} MB / ${totalMB.toFixed(1)} MB${pct != null ? ` — ${pct}%` : ""})`
+                    : `(${dlMB.toFixed(1)} MB)`)
+                : "";
+              return (
+                <Alert severity="info" sx={{ py: 0.5, fontSize: "0.75rem", width: "100%" }}>
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                    <CircularProgress size={16} />
+                    <Typography sx={{ fontSize: "0.75rem" }}>
+                      Downloading update... {text}
+                    </Typography>
+                  </Box>
+                </Alert>
+              );
+            })()}
             {updateStatus === "ready" && (
               <Alert severity="success" sx={{ py: 0.5, fontSize: "0.75rem", width: "100%" }}>
                 <Typography sx={{ fontWeight: 600, fontSize: "0.8rem" }}>
