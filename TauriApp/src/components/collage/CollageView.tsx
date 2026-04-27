@@ -320,7 +320,7 @@ export function CollageView() {
               const gen = (renderGenRef.current.get(it.id) ?? 0) + 1;
               renderGenRef.current.set(it.id, gen);
               const scale = cur.naturalW > 0 ? cur.w / cur.naturalW : 1;
-              api.renderCollageFigure(cur.projectPath, state.globalHeaderPt, Math.max(0.001, scale))
+              api.renderCollageFigure(cur.projectPath, state.globalHeaderPt, Math.max(0.001, scale), cur.w)
                 .then((resp) => {
                   if (renderGenRef.current.get(it.id) !== gen) return;
                   if (resp?.image && resp.width && resp.height) {

@@ -137,7 +137,7 @@ function CollageSidebar() {
         if (it.kind !== "figure" || !it.projectPath) continue;
         const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
         try {
-          const resp = await api.renderCollageFigure(it.projectPath, pendingPt, Math.max(0.001, scale));
+          const resp = await api.renderCollageFigure(it.projectPath, pendingPt, Math.max(0.001, scale), it.w);
           if (resp?.image && resp.width && resp.height) {
             // The new render's aspect ratio almost always differs
             // from the old one because matplotlib grows fig_h to

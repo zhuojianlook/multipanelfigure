@@ -2469,15 +2469,22 @@ _COLLAGE_STASH_DIR = Path.home() / ".multipanelfigure" / "collage_stash"
 
 class CollageFigureRenderRequest(BaseModel):
     project_path: str
-    """Apply this point size to every header / label in the figure
-    BEFORE rendering, then divide by `scale` so the headers appear at
-    `header_pt` after the collage's downscale. Pass null to render
-    without any override (i.e., as-saved)."""
+    """Target visual point size for headers / labels in the collage
+    (pre-export-DPI). Pass null to render without any override
+    (i.e., as-saved)."""
     header_pt: Optional[int] = None
-    """Collage-side display scale: item.w / item.naturalW. Multiplied
-    in so a 12pt target on a 50% scaled item renders at 24pt
-    pre-scale. Defaults to 1.0 (no compensation)."""
+    """Either: collage-side display scale (item.w / item.naturalW) for
+    the legacy single-pass path, OR — preferred — the literal collage
+    pixel width of the item (item.w in canvas pixels). When item_w is
+    set, the backend ignores `scale` and runs an iterative two-pass
+    render: first pass measures the figure's naturalW with all
+    headers/labels at the target pt; second pass uses the measured
+    naturalW to compute the actual override pt so the rendered
+    headers compensate for the post-override naturalW change.
+    Solves the matching problem for figures with row headers/labels
+    (whose width grows with the override pt)."""
     scale: float = 1.0
+    item_w: Optional[float] = None
 
 
 # Per-process cache of decoded .mpf data, keyed by (absolute path, mtime).
@@ -2549,6 +2556,107 @@ def render_collage_figure(body: CollageFigureRenderRequest):
     if not os.path.isfile(path):
         raise HTTPException(404, f"Project file not found: {path}")
     loaded_cfg, local_images = _load_collage_mpf(path)
+
+    def _apply_header_pt(cfg, new_pt):
+        for level in cfg.column_headers:
+            for hdr in level.headers:
+                hdr.font_size = new_pt
+                for seg in (hdr.styled_segments or []):
+                    seg.font_size = None
+        for level in cfg.row_headers:
+            for hdr in level.headers:
+                hdr.font_size = new_pt
+                for seg in (hdr.styled_segments or []):
+                    seg.font_size = None
+        for lbl in cfg.column_labels:
+            lbl.font_size = new_pt
+            for seg in (lbl.styled_segments or []):
+                seg.font_size = None
+        for lbl in cfg.row_labels:
+            lbl.font_size = new_pt
+            for seg in (lbl.styled_segments or []):
+                seg.font_size = None
+
+    def _render_cfg(cfg_to_render):
+        rows, cols = cfg_to_render.rows, cfg_to_render.cols
+        if local_images:
+            ws = [im.size[0] for im in local_images.values()]
+            hs = [im.size[1] for im in local_images.values()]
+            local_min_dims = (min(ws), min(hs))
+        else:
+            local_min_dims = (100, 100)
+        proc: List[List[Optional[Image.Image]]] = []
+        for r in range(rows):
+            row_imgs: List[Optional[Image.Image]] = []
+            for c in range(cols):
+                panel = cfg_to_render.panels[r][c]
+                if panel.image_name and panel.image_name in local_images:
+                    row_imgs.append(process_panel(
+                        local_images[panel.image_name], panel,
+                        local_min_dims, local_images,
+                        skip_labels=True, skip_symbols=True,
+                    ))
+                else:
+                    row_imgs.append(None)
+            proc.append(row_imgs)
+        col_max_w = [
+            max((proc[r][c].size[0] for r in range(rows) if proc[r][c] is not None),
+                default=local_min_dims[0]) for c in range(cols)
+        ]
+        row_max_h = [
+            max((proc[r][c].size[1] for c in range(cols) if proc[r][c] is not None),
+                default=local_min_dims[1]) for r in range(rows)
+        ]
+        for r in range(rows):
+            for c in range(cols):
+                if proc[r][c] is None:
+                    proc[r][c] = Image.new("RGB", (col_max_w[c], row_max_h[r]), "white")
+        full_res_sizes_local: Dict = {}
+        for r in range(rows):
+            for c in range(cols):
+                panel = cfg_to_render.panels[r][c]
+                if panel.image_name and panel.image_name in local_images:
+                    orig_img = local_images[panel.image_name]
+                    if panel.crop_image and panel.crop and len(panel.crop) == 4:
+                        full_res_sizes_local[(r, c)] = (panel.crop[2] - panel.crop[0], panel.crop[3] - panel.crop[1])
+                    else:
+                        full_res_sizes_local[(r, c)] = orig_img.size
+        fig_bytes = assemble_figure(cfg_to_render, proc, dpi=150, full_res_sizes=full_res_sizes_local)
+        img_obj = Image.open(io.BytesIO(fig_bytes)).convert("RGBA")
+        return img_obj
+
+    # Two-pass iterative path (preferred). Measures the figure's
+    # post-override naturalW with a quick first pass, then uses that
+    # measured width to compute the actually-correct compensation pt.
+    # Without this, figures with row headers / row labels end up with
+    # ~10-25% mismatched header sizes because matplotlib grows fig_w
+    # to fit the larger labels and the pre-render scale calculation
+    # was using the OLD naturalW.
+    if body.header_pt and body.header_pt > 0 and body.item_w and body.item_w > 0:
+        # Pass 1: render with all headers at target_pt — gives a
+        # baseline that already INCLUDES the layout shifts caused by
+        # changing header pt. The second pass then trues up.
+        cfg_p1 = _copy.deepcopy(loaded_cfg)
+        _apply_header_pt(cfg_p1, body.header_pt)
+        img_p1 = _render_cfg(cfg_p1)
+        scale_p1 = body.item_w / max(1, img_p1.width)
+        new_pt = max(1, int(round(body.header_pt / max(0.001, scale_p1))))
+        # Pass 2: render at the corrected pt. The corrected pt's
+        # render width will be very close to but not always
+        # identical to img_p1.width — typically within a few percent
+        # for figures with row labels, exactly the same for figures
+        # without. Returning pass 2's bytes gives the user the
+        # rendered output that matches their target pt visually.
+        cfg_p2 = _copy.deepcopy(loaded_cfg)
+        _apply_header_pt(cfg_p2, new_pt)
+        img_p2 = _render_cfg(cfg_p2)
+        out_buf = io.BytesIO()
+        img_p2.save(out_buf, format="PNG")
+        return {
+            "image": base64.b64encode(out_buf.getvalue()).decode("ascii"),
+            "width": img_p2.width,
+            "height": img_p2.height,
+        }
 
     # Apply header-size override if requested. Compensates for the
     # collage's downscale: target_pt × (1 / scale) so the visible

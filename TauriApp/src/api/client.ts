@@ -346,16 +346,27 @@ class ApiClient {
   /** Stateless render of a saved .mpf with optional header-pt override.
    *  Doesn't touch the live builder state — the user can stay in
    *  collage mode while we re-render figures with normalised header
-   *  sizes. */
+   *  sizes.
+   *
+   *  Pass `itemW` (collage-canvas pixel width of the item) to engage
+   *  the two-pass iterative renderer. The backend measures the
+   *  figure's post-override naturalW and compensates for it, so
+   *  figures with row headers / labels (whose width grows with
+   *  header pt) still come out at the right visual size. The legacy
+   *  `scale` parameter is kept for the case where itemW isn't
+   *  available — it's a one-pass approximation that's accurate only
+   *  for figures without row labels. */
   async renderCollageFigure(
     projectPath: string,
     headerPt: number | null,
     scale: number,
+    itemW?: number,
   ): Promise<{ image: string; width: number; height: number }> {
     return apiJson("/api/collage/render-figure", "POST", JSON.stringify({
       project_path: projectPath,
       header_pt: headerPt,
       scale,
+      item_w: itemW ?? null,
     }));
   }
 
