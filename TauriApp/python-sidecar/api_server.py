@@ -2480,25 +2480,26 @@ class CollageFigureRenderRequest(BaseModel):
     scale: float = 1.0
 
 
-@app.post("/api/collage/render-figure")
-def render_collage_figure(body: CollageFigureRenderRequest):
-    """Stateless render of a saved .mpf into a PNG, optionally
-    re-targeting all header/label point sizes so multiple figures
-    in the same collage end up with visually-uniform header sizes
-    once the collage scales them. Does NOT touch the live cfg /
-    loaded_images globals — the user's current builder state is
-    preserved."""
-    import copy as _copy
-    path = os.path.expanduser(body.project_path.strip())
-    if not os.path.dirname(path):
-        path = os.path.join(os.path.expanduser("~"), "Documents", path)
-    if not os.path.isfile(path):
-        raise HTTPException(404, f"Project file not found: {path}")
+# Per-process cache of decoded .mpf data, keyed by (absolute path, mtime).
+# Re-renders for the global-header-pt feature otherwise re-decompress the
+# zip + decode every image on every call, which dominates the wall-time
+# for a typical 4-panel project (~2-3 sec per render).
+_collage_mpf_cache: Dict[str, dict] = {}
+_COLLAGE_CACHE_MAX = 12  # rough LRU cap; collage size is usually small
+
+
+def _load_collage_mpf(path: str):
+    """Return (FigureConfig, dict[name → PIL.Image]) for the .mpf at
+    `path`. Caches the parsed result per-process keyed by (path, mtime)
+    so subsequent collage renders skip the zip decompression entirely.
+    Mutating images is unsafe — process_panel already img.copy()s, so
+    callers can share the cached PIL objects safely."""
+    mtime = os.path.getmtime(path)
+    hit = _collage_mpf_cache.get(path)
+    if hit and hit.get("mtime") == mtime:
+        return hit["cfg"], hit["images"]
     loaded_cfg, img_bytes_dict, _font_bytes = load_project(path)
     loaded_cfg.ensure_grid()
-    # Build a local PIL-image dict — videos render their first frame
-    # like load_proj does so headers/labels don't choke on missing
-    # bitmap data.
     local_images: Dict[str, Image.Image] = {}
     for name, data in img_bytes_dict.items():
         if _is_video(name):
@@ -2514,6 +2515,40 @@ def render_collage_figure(body: CollageFigureRenderRequest):
                     pass
         else:
             local_images[name] = Image.open(io.BytesIO(data)).convert("RGB")
+    _collage_mpf_cache[path] = {"mtime": mtime, "cfg": loaded_cfg, "images": local_images}
+    # Naive size cap — drop the oldest entry when we exceed the limit.
+    if len(_collage_mpf_cache) > _COLLAGE_CACHE_MAX:
+        oldest = next(iter(_collage_mpf_cache))
+        if oldest != path:
+            del _collage_mpf_cache[oldest]
+    return loaded_cfg, local_images
+
+
+@app.post("/api/collage/render-figure")
+def render_collage_figure(body: CollageFigureRenderRequest):
+    """Stateless render of a saved .mpf into a PNG, optionally
+    re-targeting all header/label point sizes so multiple figures
+    in the same collage end up with visually-uniform header sizes
+    once the collage scales them. Does NOT touch the live cfg /
+    loaded_images globals — the user's current builder state is
+    preserved.
+
+    Performance notes:
+    - The .mpf zip is parsed once per file via _load_collage_mpf and
+      cached for the session, so subsequent calls (especially the
+      auto-rerender on resize) skip the expensive decompression.
+    - DPI defaults to 150 here instead of 300; the collage display
+      reduces every figure significantly anyway, and a 4× pixel
+      reduction roughly halves matplotlib's render time without
+      visible loss in the collage view. The Save Collage path can
+      always re-up to 300 DPI later if needed for export."""
+    import copy as _copy
+    path = os.path.expanduser(body.project_path.strip())
+    if not os.path.dirname(path):
+        path = os.path.join(os.path.expanduser("~"), "Documents", path)
+    if not os.path.isfile(path):
+        raise HTTPException(404, f"Project file not found: {path}")
+    loaded_cfg, local_images = _load_collage_mpf(path)
 
     # Apply header-size override if requested. Compensates for the
     # collage's downscale: target_pt × (1 / scale) so the visible
@@ -2595,7 +2630,10 @@ def render_collage_figure(body: CollageFigureRenderRequest):
                 else:
                     full_res_sizes2[(r, c)] = orig_img.size
 
-    fig_bytes = assemble_figure(cfg2, processed, full_res_sizes=full_res_sizes2)
+    # Reduced DPI (vs the default 300) — the collage display-scales
+    # every figure aggressively, so 150 keeps headers/text crisp while
+    # cutting matplotlib's render time roughly in half.
+    fig_bytes = assemble_figure(cfg2, processed, dpi=150, full_res_sizes=full_res_sizes2)
     img_out = Image.open(io.BytesIO(fig_bytes)).convert("RGBA")
     out_buf = io.BytesIO()
     img_out.save(out_buf, format="PNG")

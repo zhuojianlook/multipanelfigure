@@ -138,11 +138,21 @@ function CollageSidebar() {
         const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
         try {
           const resp = await api.renderCollageFigure(it.projectPath, pendingPt, Math.max(0.001, scale));
-          if (resp?.image) {
+          if (resp?.image && resp.width && resp.height) {
+            // The new render's aspect ratio almost always differs
+            // from the old one because matplotlib grows fig_h to
+            // accommodate larger headers. Preserve item.w as the
+            // user's chosen footprint, and recompute item.h from the
+            // new aspect — otherwise objectFit:"fill" stretches the
+            // PNG and the headers come out distorted (this was the
+            // "headers don't end up the same size" bug).
+            const newAspect = resp.width / resp.height;
+            const newH = it.w / newAspect;
             updateItem(it.id, {
               src: `data:image/png;base64,${resp.image}`,
-              naturalW: resp.width || it.naturalW,
-              naturalH: resp.height || it.naturalH,
+              naturalW: resp.width,
+              naturalH: resp.height,
+              h: newH,
             });
             succeeded++;
           } else {

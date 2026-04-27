@@ -323,11 +323,20 @@ export function CollageView() {
               api.renderCollageFigure(cur.projectPath, state.globalHeaderPt, Math.max(0.001, scale))
                 .then((resp) => {
                   if (renderGenRef.current.get(it.id) !== gen) return;
-                  if (resp?.image) {
+                  if (resp?.image && resp.width && resp.height) {
+                    // Preserve item.w as the user's chosen footprint
+                    // and recompute item.h from the new aspect — the
+                    // post-override render's fig_h almost always
+                    // differs from before, and stretching to the
+                    // user's old item.h is what made headers come
+                    // out the wrong visual size.
+                    const newAspect = resp.width / resp.height;
+                    const newH = cur.w / newAspect;
                     state.updateItem(cur.id, {
                       src: `data:image/png;base64,${resp.image}`,
-                      naturalW: resp.width || cur.naturalW,
-                      naturalH: resp.height || cur.naturalH,
+                      naturalW: resp.width,
+                      naturalH: resp.height,
+                      h: newH,
                     });
                   }
                 })
