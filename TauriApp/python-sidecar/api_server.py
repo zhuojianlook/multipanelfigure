@@ -2467,6 +2467,145 @@ import re as _re_stash
 _COLLAGE_STASH_DIR = Path.home() / ".multipanelfigure" / "collage_stash"
 
 
+class CollageFigureRenderRequest(BaseModel):
+    project_path: str
+    """Apply this point size to every header / label in the figure
+    BEFORE rendering, then divide by `scale` so the headers appear at
+    `header_pt` after the collage's downscale. Pass null to render
+    without any override (i.e., as-saved)."""
+    header_pt: Optional[int] = None
+    """Collage-side display scale: item.w / item.naturalW. Multiplied
+    in so a 12pt target on a 50% scaled item renders at 24pt
+    pre-scale. Defaults to 1.0 (no compensation)."""
+    scale: float = 1.0
+
+
+@app.post("/api/collage/render-figure")
+def render_collage_figure(body: CollageFigureRenderRequest):
+    """Stateless render of a saved .mpf into a PNG, optionally
+    re-targeting all header/label point sizes so multiple figures
+    in the same collage end up with visually-uniform header sizes
+    once the collage scales them. Does NOT touch the live cfg /
+    loaded_images globals — the user's current builder state is
+    preserved."""
+    import copy as _copy
+    path = os.path.expanduser(body.project_path.strip())
+    if not os.path.dirname(path):
+        path = os.path.join(os.path.expanduser("~"), "Documents", path)
+    if not os.path.isfile(path):
+        raise HTTPException(404, f"Project file not found: {path}")
+    loaded_cfg, img_bytes_dict, _font_bytes = load_project(path)
+    loaded_cfg.ensure_grid()
+    # Build a local PIL-image dict — videos render their first frame
+    # like load_proj does so headers/labels don't choke on missing
+    # bitmap data.
+    local_images: Dict[str, Image.Image] = {}
+    for name, data in img_bytes_dict.items():
+        if _is_video(name):
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(name).suffix)
+            tmp.write(data)
+            tmp.close()
+            try:
+                local_images[name] = _extract_video_frame(tmp.name, 0)
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+        else:
+            local_images[name] = Image.open(io.BytesIO(data)).convert("RGB")
+
+    # Apply header-size override if requested. Compensates for the
+    # collage's downscale: target_pt × (1 / scale) so the visible
+    # size after the collage scales the figure is exactly target_pt.
+    cfg2 = _copy.deepcopy(loaded_cfg)
+    if body.header_pt and body.header_pt > 0:
+        new_pt = max(1, int(round(body.header_pt / max(0.001, body.scale))))
+        for level in cfg2.column_headers:
+            for hdr in level.headers:
+                hdr.font_size = new_pt
+                for seg in (hdr.styled_segments or []):
+                    seg.font_size = None
+        for level in cfg2.row_headers:
+            for hdr in level.headers:
+                hdr.font_size = new_pt
+                for seg in (hdr.styled_segments or []):
+                    seg.font_size = None
+        for lbl in cfg2.column_labels:
+            lbl.font_size = new_pt
+            for seg in (lbl.styled_segments or []):
+                seg.font_size = None
+        for lbl in cfg2.row_labels:
+            lbl.font_size = new_pt
+            for seg in (lbl.styled_segments or []):
+                seg.font_size = None
+
+    # Mirror the /api/preview pipeline but against local_images and
+    # cfg2. We deliberately don't downscale below max_preview_px so
+    # the collage receives the figure at full quality — the collage
+    # itself manages display sizing.
+    rows, cols = cfg2.rows, cfg2.cols
+    if loaded_cfg.panels:
+        # Compute min_dims from local images for per-panel processing.
+        if local_images:
+            ws = [im.size[0] for im in local_images.values()]
+            hs = [im.size[1] for im in local_images.values()]
+            local_min_dims = (min(ws), min(hs))
+        else:
+            local_min_dims = (100, 100)
+    else:
+        local_min_dims = (100, 100)
+
+    processed: List[List[Optional[Image.Image]]] = []
+    for r in range(rows):
+        row_imgs: List[Optional[Image.Image]] = []
+        for c in range(cols):
+            panel = cfg2.panels[r][c]
+            if panel.image_name and panel.image_name in local_images:
+                row_imgs.append(process_panel(
+                    local_images[panel.image_name], panel,
+                    local_min_dims, local_images,
+                    skip_labels=True, skip_symbols=True,
+                ))
+            else:
+                row_imgs.append(None)
+        processed.append(row_imgs)
+
+    col_max_w = [
+        max((processed[r][c].size[0] for r in range(rows) if processed[r][c] is not None),
+            default=local_min_dims[0]) for c in range(cols)
+    ]
+    row_max_h = [
+        max((processed[r][c].size[1] for c in range(cols) if processed[r][c] is not None),
+            default=local_min_dims[1]) for r in range(rows)
+    ]
+    for r in range(rows):
+        for c in range(cols):
+            if processed[r][c] is None:
+                processed[r][c] = Image.new("RGB", (col_max_w[c], row_max_h[r]), "white")
+
+    full_res_sizes2: Dict = {}
+    for r in range(rows):
+        for c in range(cols):
+            panel = cfg2.panels[r][c]
+            if panel.image_name and panel.image_name in local_images:
+                orig_img = local_images[panel.image_name]
+                if panel.crop_image and panel.crop and len(panel.crop) == 4:
+                    full_res_sizes2[(r, c)] = (panel.crop[2] - panel.crop[0], panel.crop[3] - panel.crop[1])
+                else:
+                    full_res_sizes2[(r, c)] = orig_img.size
+
+    fig_bytes = assemble_figure(cfg2, processed, full_res_sizes=full_res_sizes2)
+    img_out = Image.open(io.BytesIO(fig_bytes)).convert("RGBA")
+    out_buf = io.BytesIO()
+    img_out.save(out_buf, format="PNG")
+    return {
+        "image": base64.b64encode(out_buf.getvalue()).decode("ascii"),
+        "width": img_out.width,
+        "height": img_out.height,
+    }
+
+
 @app.delete("/api/collage/stash/{item_id}")
 def delete_collage_stash(item_id: str):
     """Delete a stashed .mpf for the given collage item id. The id

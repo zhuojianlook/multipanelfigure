@@ -78,11 +78,18 @@ export type CollageState = {
   gridVisible: boolean;
   snapEnabled: boolean;
   gridStep: number;
+  /** Target visual point size for ALL figure-kind item headers /
+   *  primary labels in the collage. Null = no normalisation (each
+   *  item shows headers at its own pt × its collage scale). When
+   *  set, the renderer compensates per-item so headers land at this
+   *  pt regardless of how the user has scaled the figure. */
+  globalHeaderPt: number | null;
 
   setMode: (m: WorkspaceMode) => void;
   setGridVisible: (v: boolean) => void;
   setSnapEnabled: (v: boolean) => void;
   setGridStep: (n: number) => void;
+  setGlobalHeaderPt: (pt: number | null) => void;
 
   addItem: (item: Omit<CollageItem, "id" | "z" | "rotation" | "kind" | "projectPath"> & Partial<Pick<CollageItem, "rotation" | "kind" | "projectPath">>) => string;
   updateItem: (id: string, patch: Partial<CollageItem>) => void;
@@ -97,7 +104,7 @@ export type CollageState = {
 
 const STORAGE_KEY = "mpfig_collage_v1";
 
-type Persisted = Pick<CollageState, "items" | "canvasW" | "canvasH" | "background" | "gridVisible" | "snapEnabled" | "gridStep">;
+type Persisted = Pick<CollageState, "items" | "canvasW" | "canvasH" | "background" | "gridVisible" | "snapEnabled" | "gridStep" | "globalHeaderPt">;
 
 function loadInitial(): Persisted {
   try {
@@ -121,6 +128,7 @@ function loadInitial(): Persisted {
           gridVisible: data.gridVisible ?? true,
           snapEnabled: data.snapEnabled ?? true,
           gridStep: data.gridStep || DEFAULT_GRID_STEP,
+          globalHeaderPt: typeof data.globalHeaderPt === "number" ? data.globalHeaderPt : null,
         };
       }
     }
@@ -135,6 +143,7 @@ function loadInitial(): Persisted {
     gridVisible: true,
     snapEnabled: true,
     gridStep: DEFAULT_GRID_STEP,
+    globalHeaderPt: null,
   };
 }
 
@@ -148,6 +157,7 @@ function persist(s: Persisted) {
       gridVisible: s.gridVisible,
       snapEnabled: s.snapEnabled,
       gridStep: s.gridStep,
+      globalHeaderPt: s.globalHeaderPt,
     }));
   } catch {
     /* quota — ignore */
@@ -164,6 +174,7 @@ export const useCollageStore = create<CollageState>()(
     setGridVisible: (v) => { set((s) => { s.gridVisible = v; }); persist(get()); },
     setSnapEnabled: (v) => { set((s) => { s.snapEnabled = v; }); persist(get()); },
     setGridStep: (n) => { set((s) => { s.gridStep = Math.max(2, Math.min(500, Math.round(n))); }); persist(get()); },
+    setGlobalHeaderPt: (pt) => { set((s) => { s.globalHeaderPt = pt; }); persist(get()); },
 
     addItem: (item) => {
       const id = `item_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;

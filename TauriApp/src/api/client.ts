@@ -343,6 +343,22 @@ class ApiClient {
     await apiJson(`/api/collage/stash/${encodeURIComponent(itemId)}`, "DELETE");
   }
 
+  /** Stateless render of a saved .mpf with optional header-pt override.
+   *  Doesn't touch the live builder state — the user can stay in
+   *  collage mode while we re-render figures with normalised header
+   *  sizes. */
+  async renderCollageFigure(
+    projectPath: string,
+    headerPt: number | null,
+    scale: number,
+  ): Promise<{ image: string; width: number; height: number }> {
+    return apiJson("/api/collage/render-figure", "POST", JSON.stringify({
+      project_path: projectPath,
+      header_pt: headerPt,
+      scale,
+    }));
+  }
+
   // ── Measurements ────────────────────────────────────────
 
   async getMeasurements(): Promise<{ measurements: Array<{ panel: string; name: string; type: string; value: string }> }> {

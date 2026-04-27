@@ -106,21 +106,125 @@ function Spinner({
 
 /* ── main component ───────────────────────────────────── */
 
-/* The sidebar is multipanel-builder-only for now. CollageSidebar is
-   a deliberately empty placeholder — its eventual collage-specific
-   tools are TBD per spec. Keeping the route at the top means the
-   builder hooks below are only mounted when the builder is active,
-   so we don't accidentally fire builder-side data fetches while the
-   user is in collage mode. */
+/* CollageSidebar — collage-specific tools. Currently:
+     • Global header point size — a single pt setting that, when
+       applied, re-renders every figure-kind item in the collage
+       with header sizes compensated for that item's collage scale,
+       so all figures show headers at the same visual size.
+   Builder-side hooks are NOT mounted here, so the builder doesn't
+   thrash the API while the user is in collage mode. */
 function CollageSidebar() {
+  const items = useCollageStore((s) => s.items);
+  const globalHeaderPt = useCollageStore((s) => s.globalHeaderPt);
+  const setGlobalHeaderPt = useCollageStore((s) => s.setGlobalHeaderPt);
+  const updateItem = useCollageStore((s) => s.updateItem);
+  const [applyBusy, setApplyBusy] = useState(false);
+  const [pendingPt, setPendingPt] = useState<number>(globalHeaderPt ?? 12);
+  const figureItemCount = items.filter((it) => it.kind === "figure" && it.projectPath).length;
+
+  const applyNow = async () => {
+    if (figureItemCount === 0) {
+      window.alert("No figure items in the collage to re-render. Add a figure with a saved .mpf path first.");
+      return;
+    }
+    setApplyBusy(true);
+    let succeeded = 0;
+    let failed = 0;
+    try {
+      for (const it of useCollageStore.getState().items) {
+        if (it.kind !== "figure" || !it.projectPath) continue;
+        const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
+        try {
+          const resp = await api.renderCollageFigure(it.projectPath, pendingPt, Math.max(0.001, scale));
+          if (resp?.image) {
+            updateItem(it.id, {
+              src: `data:image/png;base64,${resp.image}`,
+              naturalW: resp.width || it.naturalW,
+              naturalH: resp.height || it.naturalH,
+            });
+            succeeded++;
+          } else {
+            failed++;
+          }
+        } catch (e) {
+          console.error("[collage] render with header override failed for", it.name, e);
+          failed++;
+        }
+      }
+      setGlobalHeaderPt(pendingPt);
+    } finally {
+      setApplyBusy(false);
+    }
+    window.alert(
+      `Re-rendered ${succeeded} figure${succeeded === 1 ? "" : "s"} at ${pendingPt} pt header size` +
+      (failed > 0 ? ` (${failed} failed — check console; the .mpf may have been moved or the path is wrong).` : "."),
+    );
+  };
+
+  const clearOverride = () => {
+    setGlobalHeaderPt(null);
+    window.alert(
+      "Global header size cleared. Existing collage items keep their last rendered preview — re-add or update individual figures to revert to their saved header sizes.",
+    );
+  };
+
   return (
-    <Box sx={{ p: 2, color: "text.secondary", fontSize: "0.7rem" }}>
-      <Typography variant="caption" sx={{ display: "block", letterSpacing: 1.2, fontSize: "0.6rem", textTransform: "uppercase", mb: 1 }}>
+    <Box sx={{ p: 2, display: "flex", flexDirection: "column", gap: 1.5 }}>
+      <Typography variant="caption" sx={{ display: "block", letterSpacing: 1.2, fontSize: "0.6rem", textTransform: "uppercase", color: "text.secondary" }}>
         Collage Tools
       </Typography>
-      <Typography variant="caption" sx={{ fontStyle: "italic" }}>
-        Sidebar tools for the Collage Assembly will be added in a follow-up.
-      </Typography>
+
+      <Box>
+        <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mb: 0.5, display: "block" }}>
+          Global header size (pt)
+        </Typography>
+        <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary", mb: 1, display: "block", lineHeight: 1.4 }}>
+          Re-renders every figure-kind item so its headers / primary labels
+          appear at this point size after the collage downscale, regardless
+          of the figure's individual scale. Run again after resizing items.
+        </Typography>
+        <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", mb: 1 }}>
+          <TextField
+            type="number"
+            size="small"
+            value={pendingPt}
+            onChange={(e) => setPendingPt(Math.max(1, Math.min(200, Number(e.target.value) || 12)))}
+            inputProps={{ min: 1, max: 200, step: 1 }}
+            sx={{
+              width: 64,
+              "& input": { fontSize: "0.7rem", py: 0.5, textAlign: "center", colorScheme: "dark" },
+              "& input[type=number]::-webkit-inner-spin-button, & input[type=number]::-webkit-outer-spin-button": {
+                filter: "invert(1)", opacity: 1,
+              },
+            }}
+          />
+          <Button
+            variant="contained"
+            size="small"
+            disabled={applyBusy || figureItemCount === 0}
+            onClick={applyNow}
+            sx={{ fontSize: "0.65rem", textTransform: "none", flex: 1 }}
+          >
+            {applyBusy ? "Rendering…" : `Apply to ${figureItemCount} fig${figureItemCount === 1 ? "" : "s"}`}
+          </Button>
+        </Box>
+        <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary", display: "block" }}>
+          {globalHeaderPt
+            ? `Currently locked: ${globalHeaderPt} pt`
+            : "Currently free (each figure uses its own header sizes)"}
+        </Typography>
+        {globalHeaderPt !== null && (
+          <Button
+            size="small"
+            variant="text"
+            color="warning"
+            onClick={clearOverride}
+            sx={{ fontSize: "0.6rem", textTransform: "none", mt: 0.5, p: 0, minWidth: 0 }}
+          >
+            Clear lock
+          </Button>
+        )}
+      </Box>
     </Box>
   );
 }
