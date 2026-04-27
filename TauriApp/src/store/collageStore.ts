@@ -41,12 +41,13 @@ export type CollageItem = {
   rotation: number;
   /** Stacking order. Higher z is drawn later (on top). */
   z: number;
-  /** Absolute path to the stashed .mpf project for figure-kind items.
-   *  Set when the user clicks "Add to Collage" — lets the Multi-Panel
-   *  Builder button restore that figure's full editor state on click.
-   *  Null for image-kind items and for any figure that pre-dates this
-   *  field. */
-  stashPath: string | null;
+  /** Absolute path of the .mpf this figure-kind item came from.
+   *  Set when the user saves their project before clicking
+   *  "Add to Collage" (and on subsequent re-renders). The Multi-Panel
+   *  Builder button uses it to round-trip back to that figure's
+   *  editor. Doubles as a uniqueness key — a single .mpf can appear
+   *  at most once in the collage. Null for image-kind items. */
+  projectPath: string | null;
 };
 
 export type WorkspaceMode = "builder" | "collage";
@@ -83,7 +84,7 @@ export type CollageState = {
   setSnapEnabled: (v: boolean) => void;
   setGridStep: (n: number) => void;
 
-  addItem: (item: Omit<CollageItem, "id" | "z" | "rotation" | "kind" | "stashPath"> & Partial<Pick<CollageItem, "rotation" | "kind" | "stashPath">>) => string;
+  addItem: (item: Omit<CollageItem, "id" | "z" | "rotation" | "kind" | "projectPath"> & Partial<Pick<CollageItem, "rotation" | "kind" | "projectPath">>) => string;
   updateItem: (id: string, patch: Partial<CollageItem>) => void;
   removeItem: (id: string) => void;
   moveItem: (id: string, dx: number, dy: number) => void;
@@ -105,9 +106,11 @@ function loadInitial(): Persisted {
       const data = JSON.parse(raw);
       if (data && Array.isArray(data.items)) {
         // Migrate older collage items that pre-date later fields.
+        // The 0.1.145 build briefly used `stashPath`; rename to
+        // `projectPath` while preserving any existing values.
         const items = data.items.map((it: any) => ({
           kind: it.kind || "image",
-          stashPath: it.stashPath ?? null,
+          projectPath: it.projectPath ?? it.stashPath ?? null,
           ...it,
         })) as CollageItem[];
         return {
@@ -172,7 +175,7 @@ export const useCollageStore = create<CollageState>()(
           z: maxZ + 1,
           rotation: item.rotation ?? 0,
           kind: item.kind ?? "image",
-          stashPath: item.stashPath ?? null,
+          projectPath: item.projectPath ?? null,
         } as CollageItem);
         s.selectedId = id;
       });

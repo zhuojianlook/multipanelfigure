@@ -13,8 +13,7 @@
 import { Box, IconButton, Tooltip, Typography, Chip } from "@mui/material";
 import DeleteIcon from "@mui/icons-material/Delete";
 import VerticalAlignTopIcon from "@mui/icons-material/VerticalAlignTop";
-import { useCollageStore, type CollageItem } from "../../store/collageStore";
-import { api } from "../../api/client";
+import { useCollageStore } from "../../store/collageStore";
 
 export function CollageStrip() {
   const items = useCollageStore((s) => s.items);
@@ -22,18 +21,9 @@ export function CollageStrip() {
   const setSelectedId = useCollageStore((s) => s.setSelectedId);
   const removeItem = useCollageStore((s) => s.removeItem);
   const bringToFront = useCollageStore((s) => s.bringToFront);
-
-  /** Remove an item AND clean up its stash file. Stash deletion is
-   *  best-effort — if the backend can't reach it we still drop the
-   *  item from the collage. */
-  const removeItemAndStash = async (it: CollageItem) => {
-    try {
-      await api.deleteCollageStash(it.id);
-    } catch {
-      /* ignore — orphaned stash will be cleaned up on next reset */
-    }
-    removeItem(it.id);
-  };
+  // Removing a collage item NEVER touches the user's .mpf on disk —
+  // the file lives where they saved it (or got loaded from); collage
+  // membership is purely a reference.
 
   return (
     <Box
@@ -129,13 +119,13 @@ export function CollageStrip() {
                     <VerticalAlignTopIcon sx={{ fontSize: 12 }} />
                   </IconButton>
                 </Tooltip>
-                <Tooltip title="Remove this item">
+                <Tooltip title="Remove this item from the collage (your project file stays on disk)">
                   <IconButton
                     size="small"
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (window.confirm(`Remove "${it.name}" from the collage?`)) {
-                        removeItemAndStash(it);
+                      if (window.confirm(`Remove "${it.name}" from the collage? Your saved .mpf file is not deleted.`)) {
+                        removeItem(it.id);
                       }
                     }}
                     sx={{ width: 18, height: 18, color: "#ff8a80" }}

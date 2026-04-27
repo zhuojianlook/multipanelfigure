@@ -273,24 +273,66 @@ function CollageWorkspaceControls() {
   const itemCount = useCollageStore((s) => s.items.length);
   const selectedId = useCollageStore((s) => s.selectedId);
   const configDirty = useFigureStore((s) => s.configDirty);
+  const currentProjectPath = useFigureStore((s) => s.currentProjectPath);
+  const saveProject = useFigureStore((s) => s.saveProject);
   const loadProject = useFigureStore((s) => s.loadProject);
 
-  const handleAddToCollage = async () => {
-    if (configDirty) {
-      const ok = window.confirm(
-        "You have unsaved changes in the multi-panel builder.\n\n" +
-        "Adding to the collage uses the current rendered preview. The " +
-        "builder state is auto-stashed under ~/.multipanelfigure/" +
-        "collage_stash/ so clicking Multi-Panel Builder later restores " +
-        "this exact figure. Save your own .mpf separately if you want " +
-        "a permanent copy in your Documents.\n\n" +
-        "Continue and add to collage?",
-      );
-      if (!ok) return;
+  /** Make sure the current project lives at a known on-disk path before
+   *  we add it to the collage. If the user has never saved (or hit
+   *  "New" since the last save) we open the Tauri save-as dialog and
+   *  require them to commit a destination. Returns the path on
+   *  success, null if the user cancels. */
+  const ensureProjectSaved = async (): Promise<string | null> => {
+    if (currentProjectPath && !configDirty) {
+      return currentProjectPath;
     }
+    // Either unsaved (no path yet) or modified since last save. Both
+    // get the same prompt — the user picks (or re-confirms) the
+    // destination, we save, and the path becomes the source of truth.
+    let path = currentProjectPath;
     try {
-      // Render at full preview quality (matplotlib pipeline) so the
-      // collage shows the same labels/headers/scale bars the user sees.
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const picked = await save({
+        defaultPath: currentProjectPath || "project.mpf",
+        filters: [{ name: "Project", extensions: ["mpf"] }],
+      });
+      if (!picked) return null;
+      path = typeof picked === "string" ? picked : (picked as { path: string }).path;
+    } catch {
+      // Not in Tauri (browser preview) — fall back to a default path
+      // under ~/Documents so the flow is at least testable.
+      const fallback = window.prompt(
+        "Enter a path for the project (.mpf):",
+        currentProjectPath || "~/Documents/project.mpf",
+      );
+      if (!fallback) return null;
+      path = fallback;
+    }
+    if (!path) return null;
+    await saveProject(path);
+    // saveProject updates currentProjectPath in the store. Re-read it
+    // to get the canonicalised value (the backend may add .mpf).
+    const after = useFigureStore.getState().currentProjectPath || path;
+    return after;
+  };
+
+  const handleAddToCollage = async () => {
+    let projectPath: string | null;
+    try {
+      projectPath = await ensureProjectSaved();
+    } catch (e) {
+      console.error("[collage] save before add failed:", e);
+      window.alert("Could not save the project. Add to Collage cancelled.");
+      return;
+    }
+    if (!projectPath) return; // user cancelled the save dialog
+
+    // Uniqueness check — the same .mpf can appear at most once in a
+    // collage. If a duplicate exists, offer to refresh that item
+    // (re-render with the latest state) instead of adding a second.
+    const existing = useCollageStore.getState().items.find((i) => i.projectPath === projectPath);
+
+    try {
       const resp = await api.getPreview();
       if (!resp?.image) {
         window.alert("Preview is empty — add some images to your panels first.");
@@ -299,35 +341,42 @@ function CollageWorkspaceControls() {
       const naturalW = resp.width || 0;
       const naturalH = resp.height || 0;
       const aspect = naturalH > 0 ? naturalW / naturalH : 1;
+
+      if (existing) {
+        const ok = window.confirm(
+          `"${existing.name}" (${projectPath}) is already in the collage.\n\n` +
+          "Update it with the latest rendered preview? (Position and size " +
+          "stay where you put them.)",
+        );
+        if (!ok) return;
+        // Refresh the item in place. Keep x/y/w/h; update the source
+        // image bytes + natural dims so future resizes use the new
+        // aspect ratio if it changed.
+        updateItem(existing.id, {
+          src: `data:image/png;base64,${resp.image}`,
+          naturalW,
+          naturalH,
+        });
+        setMode("collage");
+        return;
+      }
+
       const targetMax = 600;
       const w = aspect >= 1 ? targetMax : targetMax * aspect;
       const h = aspect >= 1 ? targetMax / aspect : targetMax;
       const offset = itemCount * 24;
-      const id = addItem({
+      addItem({
         kind: "figure",
         src: `data:image/png;base64,${resp.image}`,
-        name: `Figure ${itemCount + 1}`,
+        name: projectPath.split("/").pop()?.replace(/\.mpf$/i, "") || `Figure ${itemCount + 1}`,
         x: 40 + offset,
         y: 40 + offset,
         w,
         h,
         naturalW,
         naturalH,
+        projectPath,
       });
-      // Stash the current project so the collage can later restore
-      // this exact builder state. Stash filename keyed by the new
-      // item's id (alphanumeric/underscore only — matches the backend
-      // sanitisation regex).
-      const stashPath = `~/.multipanelfigure/collage_stash/${id}.mpf`;
-      try {
-        await api.saveProject(stashPath);
-        updateItem(id, { stashPath });
-      } catch (e) {
-        // Stashing is a nice-to-have; don't block the collage add if it
-        // fails (e.g. read-only home directory). The button just won't
-        // round-trip back to this figure's editor.
-        console.warn("[collage] stash save failed:", e);
-      }
       setMode("collage");
     } catch (e) {
       console.error("Add to collage failed:", e);
@@ -336,28 +385,29 @@ function CollageWorkspaceControls() {
   };
 
   /** Multi-Panel Builder click in collage mode. If a figure-kind item
-   *  is selected and has a stashPath, ask whether to load that
-   *  figure's editor. Otherwise just toggle the workspace. */
+   *  is selected and has a projectPath, ask whether to load that
+   *  .mpf in the builder. Otherwise just toggle the workspace. */
   const handleBuilderClick = async () => {
     if (mode !== "collage") {
       setMode("collage");
       return;
     }
     const selected = useCollageStore.getState().items.find((i) => i.id === selectedId);
-    if (selected && selected.kind === "figure" && selected.stashPath) {
+    if (selected && selected.kind === "figure" && selected.projectPath) {
       const ok = window.confirm(
         `Open "${selected.name}" in the Multi-Panel Builder?\n\n` +
-        "Your current builder state will be replaced by the snapshot taken " +
-        "when this figure was added to the collage.",
+        `This will load ${selected.projectPath} into the builder, replacing ` +
+        "your current builder state.",
       );
       if (!ok) return;
       try {
-        await loadProject(selected.stashPath);
+        await loadProject(selected.projectPath);
       } catch (e) {
-        console.error("[collage] load stash failed:", e);
+        console.error("[collage] load project failed:", e);
         window.alert(
-          "Could not restore the original builder state for this figure " +
-          "(stash may have been deleted). Switching to the builder anyway.",
+          "Could not load the project file. It may have been moved or " +
+          "deleted. Switching to the builder anyway — use Sidebar → Load " +
+          "Project to pick a new path.",
         );
       }
     }
@@ -369,8 +419,8 @@ function CollageWorkspaceControls() {
       <Tooltip
         title={
           mode === "collage"
-            ? selectedId && useCollageStore.getState().items.find((i) => i.id === selectedId)?.kind === "figure"
-              ? "Open this figure in the Multi-Panel Builder"
+            ? selectedId && useCollageStore.getState().items.find((i) => i.id === selectedId)?.kind === "figure" && useCollageStore.getState().items.find((i) => i.id === selectedId)?.projectPath
+              ? "Open this figure's project file in the Multi-Panel Builder"
               : "Back to Multi-Panel Builder"
             : "Open Collage Assembly"
         }

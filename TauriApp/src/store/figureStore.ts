@@ -34,6 +34,13 @@ interface FigureState {
   previewLoading: boolean;
   apiError: string | null;
   configDirty: boolean;     // true when local changes haven't been previewed
+  /** Absolute path of the .mpf the user last saved or loaded. Cleared
+   *  by "New". Used by the collage's Add-to-Collage / Multi-Panel
+   *  Builder round-trip to remember which project a figure-kind item
+   *  came from — collage items now store the user's chosen path
+   *  rather than an auto-generated stash, so the user is in control
+   *  of where their work lives on disk. */
+  currentProjectPath: string | null;
   drawerPanels: PanelInfo[];
   drawerThumbnails: Record<number, string>;  // drawerIdx → processed base64 PNG
   imageGroups: ImageGroup[];
@@ -256,6 +263,7 @@ export const useFigureStore = create<FigureState>()(
     previewLoading: false,
     apiError: null,
     configDirty: false,
+    currentProjectPath: null,
     drawerPanels: [],
     drawerThumbnails: {},
     imageGroups: [],
@@ -1228,6 +1236,11 @@ export const useFigureStore = create<FigureState>()(
       try {
         await get().syncToBackend();
         await api.saveProject(path);
+        // Remember the path so subsequent "Add to Collage" actions can
+        // associate the rendered figure with this on-disk project,
+        // and so the collage's Multi-Panel Builder button can offer
+        // to reload it.
+        set((s) => { s.currentProjectPath = path; s.configDirty = false; });
       } catch (err) {
         console.error("Save project failed", err);
       }
@@ -1246,6 +1259,8 @@ export const useFigureStore = create<FigureState>()(
               thumbnailB64: resp.thumbnails[name] ?? "",
             };
           }
+          s.currentProjectPath = path;
+          s.configDirty = false;
         });
         get().requestPreview();
       } catch (err) {
