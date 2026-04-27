@@ -116,7 +116,9 @@ function Spinner({
 function CollageSidebar() {
   const items = useCollageStore((s) => s.items);
   const globalHeaderPt = useCollageStore((s) => s.globalHeaderPt);
+  const autoRenderOnResize = useCollageStore((s) => s.autoRenderOnResize);
   const setGlobalHeaderPt = useCollageStore((s) => s.setGlobalHeaderPt);
+  const setAutoRenderOnResize = useCollageStore((s) => s.setAutoRenderOnResize);
   const updateItem = useCollageStore((s) => s.updateItem);
   const [applyBusy, setApplyBusy] = useState(false);
   const [pendingPt, setPendingPt] = useState<number>(globalHeaderPt ?? 12);
@@ -224,6 +226,32 @@ function CollageSidebar() {
             Clear lock
           </Button>
         )}
+
+        {/* Auto-re-render toggle. Meaningful only when a header lock
+            is set; we leave it visible regardless so the user can
+            pre-configure the behaviour before locking. */}
+        <Box sx={{ display: "flex", alignItems: "center", mt: 1, gap: 0.5 }}>
+          <input
+            type="checkbox"
+            id="collage-auto-rerender"
+            checked={autoRenderOnResize}
+            onChange={(e) => setAutoRenderOnResize(e.target.checked)}
+            style={{ accentColor: "#4FC3F7", cursor: "pointer" }}
+          />
+          <Typography
+            component="label"
+            htmlFor="collage-auto-rerender"
+            variant="caption"
+            sx={{ fontSize: "0.65rem", cursor: "pointer", lineHeight: 1.3 }}
+          >
+            Re-render on resize
+          </Typography>
+        </Box>
+        <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", display: "block", lineHeight: 1.3, mt: 0.25 }}>
+          When the lock is set, dragging a figure's resize handle re-renders
+          it automatically so the global pt size keeps holding through
+          scale changes.
+        </Typography>
       </Box>
     </Box>
   );

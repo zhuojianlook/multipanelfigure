@@ -35,6 +35,7 @@ import {
   DEFAULT_CANVAS_H,
 } from "../../store/collageStore";
 import { useFigureStore } from "../../store/figureStore";
+import { api } from "../../api/client";
 import { CollageStrip } from "./CollageStrip";
 
 type Corner = "nw" | "ne" | "sw" | "se";
@@ -64,6 +65,12 @@ export function CollageView() {
   const containerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const projectInputRef = useRef<HTMLInputElement>(null);
+  /** Per-item render generation. Each resize-triggered re-render
+   *  bumps the gen for that item; if the response comes back when a
+   *  newer gen has already been queued, we drop the stale result so
+   *  rapid successive resizes can't overwrite each other out of
+   *  order. */
+  const renderGenRef = useRef<Map<string, number>>(new Map());
 
   // Pan + user-zoom state. The display scale that gets applied to the
   // canvas wrapper is fitScale × userZoom, where fitScale is the
@@ -295,6 +302,39 @@ export function CollageView() {
           const onUp = () => {
             window.removeEventListener("mousemove", onMove);
             window.removeEventListener("mouseup", onUp);
+            // Auto-rerender on resize: when the user has set a global
+            // header pt and the auto toggle is on, fire a stateless
+            // render of this figure-kind item with a scale that
+            // matches its newly-resized footprint. Use a per-item
+            // generation counter to prevent stale responses from
+            // overwriting newer renders if the user keeps resizing.
+            const state = useCollageStore.getState();
+            const cur = state.items.find((i) => i.id === it.id);
+            if (
+              state.autoRenderOnResize &&
+              state.globalHeaderPt &&
+              cur &&
+              cur.kind === "figure" &&
+              cur.projectPath
+            ) {
+              const gen = (renderGenRef.current.get(it.id) ?? 0) + 1;
+              renderGenRef.current.set(it.id, gen);
+              const scale = cur.naturalW > 0 ? cur.w / cur.naturalW : 1;
+              api.renderCollageFigure(cur.projectPath, state.globalHeaderPt, Math.max(0.001, scale))
+                .then((resp) => {
+                  if (renderGenRef.current.get(it.id) !== gen) return;
+                  if (resp?.image) {
+                    state.updateItem(cur.id, {
+                      src: `data:image/png;base64,${resp.image}`,
+                      naturalW: resp.width || cur.naturalW,
+                      naturalH: resp.height || cur.naturalH,
+                    });
+                  }
+                })
+                .catch((e) => {
+                  console.warn("[collage] auto-rerender on resize failed:", e);
+                });
+            }
           };
           window.addEventListener("mousemove", onMove);
           window.addEventListener("mouseup", onUp);
