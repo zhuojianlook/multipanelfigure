@@ -358,6 +358,14 @@ export const useFigureStore = create<FigureState>()(
 
     updateGridSize: async (rows, cols) => {
       try {
+        // Flush the entire local cfg first. Without this, any in-flight
+        // patchPanel from a recent edit (e.g., the user just adjusted a
+        // crop and immediately changed grid size) can race patchGrid;
+        // patchGrid's response would carry stale panel data and overwrite
+        // the local crop. syncToBackend PUTs the full cfg, so when
+        // patchGrid runs the backend already has the latest panels +
+        // labels + headers.
+        await get().syncToBackend();
         const cfg = await api.patchGrid(rows, cols, get().config?.spacing ?? 0.02);
         set((s) => {
           s.config = cfg;

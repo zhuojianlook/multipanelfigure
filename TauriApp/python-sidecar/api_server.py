@@ -168,6 +168,44 @@ def _extract_video_frame(video_path: str, frame_num: int = 0) -> Image.Image:
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return Image.fromarray(frame_rgb)
 
+
+# Per-panel video frame cache. Keys are (video_name, frame_num, mtime)
+# so a video file replacement invalidates entries for that name. Bounded
+# LRU-ish — drop the oldest when we exceed _VIDEO_FRAME_CACHE_MAX so a
+# pathological frame-scrub session can't run away with memory.
+_video_frame_cache: Dict[tuple, Image.Image] = {}
+_VIDEO_FRAME_CACHE_MAX = 128
+
+
+def _get_panel_image(panel) -> Optional[Image.Image]:
+    """Return the PIL image for *panel*, honouring its per-panel
+    `frame` field for video sources so multiple panels using the
+    same video name can each show a different frame. Falls back to
+    loaded_images for non-video sources or unknown names.
+    """
+    name = getattr(panel, "image_name", None)
+    if not name:
+        return None
+    if name in loaded_videos:
+        path = loaded_videos[name]
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0.0
+        frame_num = int(getattr(panel, "frame", 0) or 0)
+        key = (name, frame_num, mtime)
+        cached = _video_frame_cache.get(key)
+        if cached is not None:
+            return cached
+        img = _extract_video_frame(path, frame_num)
+        _video_frame_cache[key] = img
+        if len(_video_frame_cache) > _VIDEO_FRAME_CACHE_MAX:
+            first_key = next(iter(_video_frame_cache))
+            if first_key != key:
+                del _video_frame_cache[first_key]
+        return img
+    return loaded_images.get(name)
+
 def _is_tiff(filename: str) -> bool:
     return Path(filename).suffix.lower() in {'.tif', '.tiff'}
 
@@ -1195,7 +1233,7 @@ def get_histogram(r: int, c: int):
     panel = cfg.panels[r][c]
     if not panel.image_name or panel.image_name not in loaded_images:
         return {"r": [], "g": [], "b": [], "bit_depth": 8, "max_val": 255}
-    img = loaded_images[panel.image_name]
+    img = _get_panel_image(panel) or loaded_images[panel.image_name]
     arr = np.array(img)
     if arr.ndim == 2:
         arr = np.stack([arr, arr, arr], axis=-1)
@@ -1230,7 +1268,7 @@ def get_panel_preview(r: int, c: int):
     panel_copy.symbols = []
     panel_copy.lines = []
     panel_copy.areas = []
-    processed = process_panel(loaded_images[panel.image_name], panel_copy, min_dims, loaded_images, skip_labels=True, skip_symbols=True)
+    processed = process_panel(_get_panel_image(panel) or loaded_images[panel.image_name], panel_copy, min_dims, loaded_images, skip_labels=True, skip_symbols=True)
     proc_w, proc_h = processed.size  # full processed dimensions before thumbnail
     processed.thumbnail((1200, 1200), Image.LANCZOS)
     buf = io.BytesIO()
@@ -1262,7 +1300,7 @@ def patch_panel_and_preview(r: int, c: int, body: PanelPatchAndPreview):
     panel_copy.symbols = []
     panel_copy.lines = []
     panel_copy.areas = []
-    processed = process_panel(loaded_images[panel.image_name], panel_copy, min_dims, loaded_images, skip_labels=True, skip_symbols=True)
+    processed = process_panel(_get_panel_image(panel) or loaded_images[panel.image_name], panel_copy, min_dims, loaded_images, skip_labels=True, skip_symbols=True)
     proc_w, proc_h = processed.size
     processed.thumbnail((1200, 1200), Image.LANCZOS)
     buf = io.BytesIO()
@@ -1298,7 +1336,7 @@ def get_panel_rendered_preview(r: int, c: int):
     saved_zoom = panel.add_zoom_inset
     panel.add_zoom_inset = False
     processed = process_panel(
-        loaded_images[panel.image_name], panel, min_dims, loaded_images,
+        _get_panel_image(panel) or loaded_images[panel.image_name], panel, min_dims, loaded_images,
         skip_labels=True, skip_symbols=True)
     panel.add_zoom_inset = saved_zoom
 
@@ -1329,7 +1367,7 @@ def get_panel_rendered_preview(r: int, c: int):
 
     # Use the SAME symbol rendering as the full figure
     # Pass original (uncropped) image for consistent size scaling
-    orig_img = loaded_images[panel.image_name]
+    orig_img = _get_panel_image(panel) or loaded_images[panel.image_name]
     _add_panel_symbols(fig, axes_grid, cfg, 1, 1,
                        [[processed]], panel_override=(r, c),
                        original_images=[[orig_img]])
@@ -1359,7 +1397,7 @@ def auto_adjust(r: int, c: int, body: AutoAdjustRequest):
     if not panel.image_name or panel.image_name not in loaded_images:
         raise HTTPException(400, "No image assigned to panel")
 
-    img = loaded_images[panel.image_name].convert("RGB")
+    img = (_get_panel_image(panel) or loaded_images[panel.image_name]).convert("RGB")
     arr = np.array(img, dtype=np.float32)
     gray = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
 
@@ -1424,7 +1462,7 @@ def magic_wand_select(r: int, c: int, body: MagicWandRequest):
 
     # Use the image with rotation + crop applied (skip heavy color adjustments for speed)
     # Use local overrides if provided (EditPanelDialog sends unsaved state)
-    img = loaded_images[panel.image_name].copy().convert("RGB")
+    img = (_get_panel_image(panel) or loaded_images[panel.image_name]).copy().convert("RGB")
     rotation = body.rotation if body.rotation is not None else (getattr(panel, 'rotation', 0) or 0)
     crop = body.crop if body.crop is not None else (panel.crop if panel.crop_image else None)
     crop_image = body.crop_image if body.crop_image is not None else panel.crop_image
@@ -1505,7 +1543,7 @@ def get_measurements():
             panel = cfg.panels[r][c]
             if not panel.image_name or panel.image_name not in loaded_images:
                 continue
-            img = loaded_images[panel.image_name]
+            img = _get_panel_image(panel) or loaded_images[panel.image_name]
             iw, ih = img.size
             # Apply crop dimensions if cropped
             if panel.crop_image and panel.crop:
@@ -1547,8 +1585,9 @@ def generate_preview():
         for c in range(cols):
             panel = cfg.panels[r][c]
             if panel.image_name and panel.image_name in loaded_images:
+                src_img = _get_panel_image(panel) or loaded_images[panel.image_name]
                 img = process_panel(
-                    loaded_images[panel.image_name], panel,
+                    src_img, panel,
                     min_dims, loaded_images, skip_labels=True, skip_symbols=True)
                 # Downscale for preview if image is large
                 if img and max(img.size) > max_preview_px:
@@ -1635,7 +1674,7 @@ def generate_preview():
         for c in range(cols):
             panel = cfg.panels[r][c]
             if panel.image_name and panel.image_name in loaded_images:
-                orig_img = loaded_images[panel.image_name]
+                orig_img = _get_panel_image(panel) or loaded_images[panel.image_name]
                 if panel.crop_image and panel.crop and len(panel.crop) == 4:
                     full_res_sizes[(r, c)] = (panel.crop[2] - panel.crop[0], panel.crop[3] - panel.crop[1])
                 else:
@@ -1679,7 +1718,7 @@ def save_figure(body: SaveFigureRequest):
             panel = cfg.panels[r][c]
             if panel.image_name and panel.image_name in loaded_images:
                 row_imgs.append(process_panel(
-                    loaded_images[panel.image_name], panel,
+                    _get_panel_image(panel) or loaded_images[panel.image_name], panel,
                     min_dims, loaded_images, skip_labels=True, skip_symbols=True))
             else:
                 row_imgs.append(None)
@@ -1758,7 +1797,7 @@ def save_figure(body: SaveFigureRequest):
         for c in range(cols):
             panel = cfg.panels[r][c]
             if panel.image_name and panel.image_name in loaded_images:
-                orig_img = loaded_images[panel.image_name]
+                orig_img = _get_panel_image(panel) or loaded_images[panel.image_name]
                 if panel.crop_image and panel.crop and len(panel.crop) == 4:
                     full_res_sizes2[(r, c)] = (panel.crop[2] - panel.crop[0], panel.crop[3] - panel.crop[1])
                 else:
