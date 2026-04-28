@@ -2414,6 +2414,63 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 onFrameChange={() => { refreshPreview(); }}
                 onFrameImage={(b64) => { setPreviewB64(b64); }}
               />
+              {/* Sync seek to other panels using the SAME video in this
+                  row / column. Anchors on local.frame so the user gets
+                  what they currently see, not what's on disk. */}
+              {config && local?.image_name && (
+                <Box sx={{ display: "flex", gap: 0.5, flexWrap: "wrap" }}>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    sx={{ fontSize: "0.6rem", textTransform: "none" }}
+                    onClick={() => {
+                      if (!config || !local) return;
+                      const tgt = local.frame ?? 0;
+                      const name = local.image_name;
+                      const updatePanel = useFigureStore.getState().updatePanel;
+                      let applied = 0;
+                      for (let c2 = 0; c2 < config.cols; c2++) {
+                        if (c2 === col) continue;
+                        const p2 = config.panels[row]?.[c2];
+                        if (p2?.image_name && p2.image_name === name) {
+                          updatePanel(row, c2, { frame: tgt });
+                          applied++;
+                        }
+                      }
+                      alert(applied === 0
+                        ? "No other panels in this row use the same video."
+                        : `Synced ${applied} panel${applied === 1 ? "" : "s"} in row ${row + 1} to frame ${tgt}.`);
+                    }}
+                  >
+                    Sync seek to row
+                  </Button>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    sx={{ fontSize: "0.6rem", textTransform: "none" }}
+                    onClick={() => {
+                      if (!config || !local) return;
+                      const tgt = local.frame ?? 0;
+                      const name = local.image_name;
+                      const updatePanel = useFigureStore.getState().updatePanel;
+                      let applied = 0;
+                      for (let r2 = 0; r2 < config.rows; r2++) {
+                        if (r2 === row) continue;
+                        const p2 = config.panels[r2]?.[col];
+                        if (p2?.image_name && p2.image_name === name) {
+                          updatePanel(r2, col, { frame: tgt });
+                          applied++;
+                        }
+                      }
+                      alert(applied === 0
+                        ? "No other panels in this column use the same video."
+                        : `Synced ${applied} panel${applied === 1 ? "" : "s"} in column ${col + 1} to frame ${tgt}.`);
+                    }}
+                  >
+                    Sync seek to column
+                  </Button>
+                </Box>
+              )}
             </Box>
           </TabPanel>
         )}
