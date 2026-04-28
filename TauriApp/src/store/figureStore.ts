@@ -1337,6 +1337,20 @@ export const useFigureStore = create<FigureState>()(
           s.configDirty = false;
         });
         get().requestPreview();
+        // Repopulate per-panel processed thumbnails (crop, levels,
+        // pseudocolor, etc.). Without this, every panel cell falls back
+        // to the raw uploaded image — so a cropped/processed panel would
+        // suddenly appear uncropped right after a project load. We fire
+        // these in parallel and don't await: the dialog returns
+        // immediately, and each cell pops in as its render completes.
+        const cfg = resp.config;
+        for (let r = 0; r < cfg.rows; r++) {
+          for (let c = 0; c < cfg.cols; c++) {
+            if (cfg.panels[r]?.[c]?.image_name) {
+              get().refreshPanelThumbnail(r, c).catch(console.error);
+            }
+          }
+        }
       } catch (err) {
         console.error("Load project failed", err);
         // Re-throw so callers (e.g., the Sidebar's Load Project dialog)
