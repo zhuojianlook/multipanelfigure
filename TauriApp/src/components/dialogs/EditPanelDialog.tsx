@@ -1691,6 +1691,10 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   const [videoFrameStart, setVideoFrameStart] = useState(0);
   const [videoFrameEnd, setVideoFrameEnd] = useState(0);
   const [videoPlayRange, setVideoPlayRange] = useState(false);
+  // Result dialog for the "Sync seek to row/column" actions. Replaces a
+  // raw window.alert() with the same MUI Dialog style used by the
+  // toolbar's "New" confirmation, so the popup matches the app theme.
+  const [syncSeekResult, setSyncSeekResult] = useState<{ title: string; message: string } | null>(null);
   const [selectedAnnotIdx, setSelectedAnnotIdx] = useState<{ type: "symbol" | "line" | "area"; idx: number } | null>(null);
   const [magicWandLoading, setMagicWandLoading] = useState(false);
   const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2437,9 +2441,12 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                           applied++;
                         }
                       }
-                      alert(applied === 0
-                        ? "No other panels in this row use the same video."
-                        : `Synced ${applied} panel${applied === 1 ? "" : "s"} in row ${row + 1} to frame ${tgt}.`);
+                      setSyncSeekResult({
+                        title: "Sync seek to row",
+                        message: applied === 0
+                          ? "No other panels in this row use the same video."
+                          : `Synced ${applied} panel${applied === 1 ? "" : "s"} in row ${row + 1} to frame ${tgt}.`,
+                      });
                     }}
                   >
                     Sync seek to row
@@ -2462,9 +2469,12 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                           applied++;
                         }
                       }
-                      alert(applied === 0
-                        ? "No other panels in this column use the same video."
-                        : `Synced ${applied} panel${applied === 1 ? "" : "s"} in column ${col + 1} to frame ${tgt}.`);
+                      setSyncSeekResult({
+                        title: "Sync seek to column",
+                        message: applied === 0
+                          ? "No other panels in this column use the same video."
+                          : `Synced ${applied} panel${applied === 1 ? "" : "s"} in column ${col + 1} to frame ${tgt}.`,
+                      });
                     }}
                   >
                     Sync seek to column
@@ -5927,6 +5937,24 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
           Apply
         </Button>
       </DialogActions>
+      {/* Sync seek to row/column result. Sits inside the EditPanelDialog
+          render so it's visually anchored to the Edit Panel context.
+          maxWidth=xs keeps it compact for a short status message. */}
+      <Dialog
+        open={!!syncSeekResult}
+        onClose={() => setSyncSeekResult(null)}
+        maxWidth="xs"
+      >
+        <DialogTitle>{syncSeekResult?.title ?? ""}</DialogTitle>
+        <DialogContent>
+          <Typography>{syncSeekResult?.message ?? ""}</Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button variant="contained" onClick={() => setSyncSeekResult(null)}>
+            OK
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Dialog>
   );
 }
