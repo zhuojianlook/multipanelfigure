@@ -1200,6 +1200,7 @@ function VideoFrameSelector({
   imageName, onFrameChange, onFrameImage, frame, setFrame,
   frameStart, setFrameStart, frameEnd, setFrameEnd,
   playRange, setPlayRange,
+  returnToSelectedOnEnd, setReturnToSelectedOnEnd,
 }: {
   imageName: string;
   onFrameChange: () => void;
@@ -1212,6 +1213,8 @@ function VideoFrameSelector({
   setFrameEnd: (f: number) => void;
   playRange: boolean;
   setPlayRange: (b: boolean) => void;
+  returnToSelectedOnEnd: boolean;
+  setReturnToSelectedOnEnd: (b: boolean) => void;
 }) {
   const [videoInfo, setVideoInfo] = useState<{ frame_count: number; fps: number; duration_sec: number } | null>(null);
   const currentFrame = frame;
@@ -1333,6 +1336,24 @@ function VideoFrameSelector({
                 Play range in video export
               </Typography>
             }
+            sx={{ ml: 0, mr: 1 }}
+          />
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={returnToSelectedOnEnd}
+                disabled={!playRange}
+                onChange={(e) => setReturnToSelectedOnEnd(e.target.checked)}
+                size="small"
+                sx={{ p: 0.5 }}
+              />
+            }
+            label={
+              <Typography variant="caption" sx={{ fontSize: "0.65rem" }}>
+                Return to selected frame on end
+              </Typography>
+            }
+            title="When this panel's range ends before others finish, snap back to the static-selected frame instead of holding on the last range frame."
             sx={{ ml: 0, mr: 1 }}
           />
           <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary" }}>
@@ -1691,6 +1712,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   const [videoFrameStart, setVideoFrameStart] = useState(0);
   const [videoFrameEnd, setVideoFrameEnd] = useState(0);
   const [videoPlayRange, setVideoPlayRange] = useState(false);
+  const [videoReturnToSelectedOnEnd, setVideoReturnToSelectedOnEnd] = useState(false);
   // Result dialog for the "Sync seek to row/column" actions. Replaces a
   // raw window.alert() with the same MUI Dialog style used by the
   // toolbar's "New" confirmation, so the popup matches the app theme.
@@ -1754,6 +1776,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       setVideoFrameStart(p.frame_start ?? 0);
       setVideoFrameEnd(p.frame_end ?? 0);
       setVideoPlayRange(p.play_range ?? false);
+      setVideoReturnToSelectedOnEnd(p.return_to_selected_on_end ?? false);
       // Reset per-tab undo/redo history to just the initial snapshot of
       // each tab's fields so each panel edit session starts clean.
       const fresh: Record<TabKey, { stack: Partial<PanelInfo>[]; idx: number }> = {
@@ -2414,6 +2437,11 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 setPlayRange={(b) => {
                   setVideoPlayRange(b);
                   setLocal((prev) => prev ? { ...prev, play_range: b } : prev);
+                }}
+                returnToSelectedOnEnd={videoReturnToSelectedOnEnd}
+                setReturnToSelectedOnEnd={(b) => {
+                  setVideoReturnToSelectedOnEnd(b);
+                  setLocal((prev) => prev ? { ...prev, return_to_selected_on_end: b } : prev);
                 }}
                 onFrameChange={() => { refreshPreview(); }}
                 onFrameImage={(b64) => { setPreviewB64(b64); }}

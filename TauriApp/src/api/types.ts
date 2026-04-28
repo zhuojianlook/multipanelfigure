@@ -186,6 +186,12 @@ export interface PanelInfo {
   frame_start?: number;
   frame_end?: number;
   play_range?: boolean;
+  /** When this panel's play range is shorter than the longest range
+   *  in the export, what should it show after its own range ends?
+   *    false (default) → hold on frame_end (last frame of range)
+   *    true            → snap back to `frame` (the static-selected
+   *                      frame the user chose outside the range) */
+  return_to_selected_on_end?: boolean;
 }
 
 // ── Header / axis labels ─────────────────────────────────

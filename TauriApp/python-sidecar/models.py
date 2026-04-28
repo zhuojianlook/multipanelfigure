@@ -281,6 +281,12 @@ class PanelInfo:
     frame_start: int = 0                    # video play-range start (inclusive)
     frame_end: int = 0                      # video play-range end (inclusive)
     play_range: bool = False                # if True → animate across [start..end] in video export
+    # When the panel's play range is shorter than the longest range in
+    # the export, what should the panel show after its own range ends?
+    #   False (default) → hold on frame_end (current behaviour)
+    #   True            → jump back to `frame` (the static-selected
+    #                     frame the user picked outside of the range)
+    return_to_selected_on_end: bool = False
 
 
 # ---------------------------------------------------------------------------

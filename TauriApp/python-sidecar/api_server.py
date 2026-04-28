@@ -1980,36 +1980,41 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
     from PIL import Image as _PIL
 
     rows, cols = cfg.rows, cfg.cols
-    snapshot: Dict[str, Image.Image] = {}
     captures: Dict[str, "_cv2.VideoCapture"] = {}
     writer = None
     try:
-        # Snapshot loaded_images for video panels so we can restore them
-        # after the render — assemble_figure reads from loaded_images and
-        # we'll be swapping each panel's image to the current animated
-        # frame in turn.
-        for _, _, p in range_panels:
-            if p.image_name in loaded_images:
-                snapshot[p.image_name] = loaded_images[p.image_name]
-
-        # Open one VideoCapture per video panel (faster than re-opening
-        # for every output frame).
-        for _, _, p in range_panels:
-            path = loaded_videos.get(p.image_name)
+        # Open one VideoCapture per UNIQUE video name (not per panel) so
+        # multiple panels sharing the same video reuse a single capture
+        # and just seek to per-panel frames per output index. Without
+        # this de-dup, two panels using the same video would share their
+        # range — exactly the user-reported bug.
+        unique_video_names = {p.image_name for _, _, p in range_panels if p.image_name in loaded_videos}
+        for name in unique_video_names:
+            path = loaded_videos.get(name)
             if path:
-                captures[p.image_name] = _cv2.VideoCapture(path)
+                captures[name] = _cv2.VideoCapture(path)
 
         for frame_idx in range(total_frames):
             with _render_jobs_lock:
                 if _render_jobs[job_id]["cancel_requested"]:
                     raise RuntimeError("Cancelled by user")
 
-            # Update each play_range panel's loaded_images entry to the
-            # frame that should display at this output index. Panels
-            # whose range is shorter than the longest hold on their last
-            # frame (per spec).
-            for _, _, p in range_panels:
-                src_frame = min(p.frame_start + frame_idx, p.frame_end)
+            # Per-panel image for this output frame_idx, keyed by (r, c)
+            # — replaces the previous shared loaded_images[name] mutation
+            # so two panels using the same video can each show their own
+            # frame independently.
+            panel_images: Dict[Tuple[int, int], Image.Image] = {}
+            for r, c, p in range_panels:
+                range_len = max(1, p.frame_end - p.frame_start + 1)
+                if frame_idx < range_len:
+                    src_frame = p.frame_start + frame_idx
+                elif getattr(p, "return_to_selected_on_end", False):
+                    # Panel's range has ended and the user opted in to
+                    # snap back to the statically-selected frame.
+                    src_frame = int(getattr(p, "frame", 0) or 0)
+                else:
+                    # Default: hold on the last frame of the range.
+                    src_frame = p.frame_end
                 cap = captures.get(p.image_name)
                 if cap is None:
                     continue
@@ -2018,17 +2023,32 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
                 if not ok:
                     continue
                 rgb = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2RGB)
-                loaded_images[p.image_name] = _PIL.fromarray(rgb)
+                panel_images[(r, c)] = _PIL.fromarray(rgb)
 
-            # Mirror the save_figure pipeline for this frame.
+            # Mirror the save_figure pipeline for this output frame.
             processed: List[List[Optional[Image.Image]]] = []
             for r in range(rows):
                 row_imgs = []
                 for c in range(cols):
                     panel = cfg.panels[r][c]
-                    if panel.image_name and panel.image_name in loaded_images:
+                    src_img: Optional[Image.Image]
+                    if (r, c) in panel_images:
+                        # Range video panel — per-panel extracted frame
+                        # for THIS output index.
+                        src_img = panel_images[(r, c)]
+                    elif panel.image_name and panel.image_name in loaded_videos:
+                        # Static (non-range) video panel — show the
+                        # panel's own selected frame, panel-aware so
+                        # shared video sources don't alias.
+                        src_img = _get_panel_image(panel)
+                    elif panel.image_name and panel.image_name in loaded_images:
+                        # Plain image panel.
+                        src_img = loaded_images[panel.image_name]
+                    else:
+                        src_img = None
+                    if src_img is not None:
                         row_imgs.append(process_panel(
-                            loaded_images[panel.image_name], panel,
+                            src_img, panel,
                             min_dims, loaded_images,
                             skip_labels=True, skip_symbols=True,
                         ))
@@ -2218,14 +2238,14 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
         except OSError:
             pass
     finally:
-        # Always release captures and restore the original loaded_images
+        # Always release captures. No loaded_images restore is needed
+        # any more — the worker uses a per-panel image dict instead of
+        # mutating the global cache, so there's nothing to put back.
         for cap in captures.values():
             try:
                 cap.release()
             except Exception:
                 pass
-        for name, img in snapshot.items():
-            loaded_images[name] = img
 
 
 @app.get("/api/figure/render-video/{job_id}/progress")
