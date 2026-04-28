@@ -125,9 +125,59 @@ interface FigureState {
 
   // Check if reducing grid would lose images
   checkGridResizeConflict: (newRows: number, newCols: number) => string[];
+
+  /** Re-letter every panel's auto-numbering label to match its
+   *  current (row, col) position. Triggered automatically on grid
+   *  resize / swap / drawer move; also exposed as a manual button
+   *  so users can fix legacy projects whose letters got out of sync
+   *  before auto-renumbering existed. */
+  renumberPanels: () => void;
 }
 
 // ── Helpers ──────────────────────────────────────────────
+
+/** Compute the auto-letter label for a panel at (row, col) in a
+ *  `cols`-wide grid: a, b, …, z, aa, ab, …  Mirrors the formula
+ *  used by setPanelImage when an auto-label is first created. */
+function _autoLetterFor(row: number, col: number, cols: number): string {
+  const idx = row * cols + col;
+  return idx < 26
+    ? String.fromCharCode(97 + idx)
+    : `${String.fromCharCode(97 + Math.floor(idx / 26) - 1)}${String.fromCharCode(97 + (idx % 26))}`;
+}
+
+/** Re-letter the auto-numbering label on a single panel, in place.
+ *  Returns true if anything changed. Only acts on labels that look
+ *  auto-managed:
+ *    - linked_to_header is true (the marker setPanelImage stamps), and
+ *    - current text matches /^[a-z]{1,2}$/ (so manually-typed strings
+ *      survive even if linked_to_header was left on).
+ *  Clears styled_segments since they referenced characters that no
+ *  longer exist in the new text. */
+function _relabelAutoLetter(panel: { labels?: { text: string; linked_to_header?: boolean; styled_segments?: unknown[] }[] }, row: number, col: number, cols: number): boolean {
+  const lbl = panel.labels?.[0];
+  if (!lbl || !lbl.linked_to_header) return false;
+  if (!/^[a-z]{1,2}$/.test(lbl.text || "")) return false;
+  const wanted = _autoLetterFor(row, col, cols);
+  if (lbl.text === wanted) return false;
+  lbl.text = wanted;
+  if (lbl.styled_segments && lbl.styled_segments.length) lbl.styled_segments = [];
+  return true;
+}
+
+/** Re-letter every panel in the grid. Used when the grid size
+ *  changes (cols altered → all letter indices shift) or when many
+ *  panels rearrange at once. */
+function _renumberAllAutoLetters(cfg: { rows: number; cols: number; panels: { labels?: { text: string; linked_to_header?: boolean; styled_segments?: unknown[] }[] }[][] } | null) {
+  if (!cfg) return;
+  for (let r = 0; r < cfg.rows; r++) {
+    for (let c = 0; c < cfg.cols; c++) {
+      const p = cfg.panels[r]?.[c];
+      if (!p) continue;
+      _relabelAutoLetter(p, r, c, cfg.cols);
+    }
+  }
+}
 
 function defaultAxisLabel(text: string, position: string, rotation = 0): AxisLabel {
   return {
@@ -367,11 +417,18 @@ export const useFigureStore = create<FigureState>()(
         // labels + headers.
         await get().syncToBackend();
         const cfg = await api.patchGrid(rows, cols, get().config?.spacing ?? 0.02);
+        // After the grid changes, every panel's auto-letter index may
+        // shift (cols changed → all letters re-derive). Renumber locally
+        // and push the corrected cfg back so the backend stores the
+        // up-to-date letters.
+        _renumberAllAutoLetters(cfg as unknown as Parameters<typeof _renumberAllAutoLetters>[0]);
         set((s) => {
           s.config = cfg;
           s.panelThumbnails = {};
           s.configDirty = true;
         });
+        // Push renumbered cfg to backend (best-effort).
+        get().syncToBackend().catch(console.error);
         get().requestPreview();
       } catch (err) {
         console.error("Failed to update grid", err);
@@ -967,6 +1024,12 @@ export const useFigureStore = create<FigureState>()(
         const tmp = { ...p1 };
         s.config.panels[r1][c1] = { ...p2 };
         s.config.panels[r2][c2] = tmp;
+        // The two cells now hold each other's panels — their
+        // auto-letter labels travelled with the panel object and are
+        // wrong for the new positions. Re-letter both.
+        const cols = s.config.cols;
+        _relabelAutoLetter(s.config.panels[r1][c1] as unknown as Parameters<typeof _relabelAutoLetter>[0], r1, c1, cols);
+        _relabelAutoLetter(s.config.panels[r2][c2] as unknown as Parameters<typeof _relabelAutoLetter>[0], r2, c2, cols);
         // Swap processed thumbnails too
         const t1 = s.panelThumbnails[`${r1}-${c1}`];
         const t2 = s.panelThumbnails[`${r2}-${c2}`];
@@ -1035,6 +1098,9 @@ export const useFigureStore = create<FigureState>()(
         }
         // Move drawer panel to cell and restore its thumbnail
         s.config.panels[r][c] = { ...drawerPanel };
+        // Re-letter the destination cell — the panel just landed at a
+        // new grid position, so its auto-label needs to match (r, c).
+        _relabelAutoLetter(s.config.panels[r][c] as unknown as Parameters<typeof _relabelAutoLetter>[0], r, c, s.config.cols);
         if (s.drawerThumbnails[drawerIdx]) {
           s.panelThumbnails[thumbKey] = s.drawerThumbnails[drawerIdx];
         }
@@ -1303,6 +1369,17 @@ export const useFigureStore = create<FigureState>()(
         }
       }
       return conflicts;
+    },
+
+    renumberPanels: () => {
+      set((s) => {
+        if (!s.config) return;
+        _renumberAllAutoLetters(s.config as unknown as Parameters<typeof _renumberAllAutoLetters>[0]);
+        s.configDirty = true;
+      });
+      // Push the renumbered cfg so the backend renders match.
+      get().syncToBackend().catch(console.error);
+      get().requestPreview();
     },
   })),
 );

@@ -436,6 +436,26 @@ function BuilderSidebar() {
         </Box>
       </Field>
 
+      {/* Renumber panels — manually re-letters every panel's auto label
+          to match its current (row, col). Useful for projects from
+          before grid-resize / swap auto-renumbering landed, or to clean
+          up after a series of drag operations. Custom-typed labels
+          (linked_to_header off, or text not /^[a-z]{1,2}$/) are skipped. */}
+      <Box sx={{ px: 1.5, mt: 0.5 }}>
+        <Button
+          size="small"
+          variant="outlined"
+          fullWidth
+          onClick={() => {
+            const renumberPanels = useFigureStore.getState().renumberPanels;
+            if (renumberPanels) renumberPanels();
+          }}
+          sx={{ fontSize: "0.65rem", textTransform: "none" }}
+        >
+          Renumber panels (a, b, c…)
+        </Button>
+      </Box>
+
       <Divider sx={{ my: 1 }} />
 
       {/* ── SCALE BARS (Resolution Presets) ────────────── */}
