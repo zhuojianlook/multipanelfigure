@@ -21,6 +21,7 @@ import {
   ListItem,
   ListItemText,
   ListItemSecondaryAction,
+  CircularProgress,
 } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import RemoveIcon from "@mui/icons-material/Remove";
@@ -298,6 +299,15 @@ function BuilderSidebar() {
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [loadDialogOpen, setLoadDialogOpen] = useState(false);
   const [projectPath, setProjectPath] = useState("");
+  // Project-load progress. The backend's /api/project/load can take
+  // many seconds for large .mpf files (zip decompression of all
+  // images + matplotlib font cache warm-up + first preview render),
+  // so we lock the dialog and show a spinner until the round-trip
+  // completes. Indeterminate because the backend doesn't stream
+  // progress events today; switching to determinate later just
+  // means swapping CircularProgress's `value` prop.
+  const [loadingProject, setLoadingProject] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // Analysis dialog
   const [analysisOpen, setAnalysisOpen] = useState(false);
@@ -1020,7 +1030,21 @@ function BuilderSidebar() {
       </Dialog>
 
       {/* ── Load Project Dialog ──────────────────────── */}
-      <Dialog open={loadDialogOpen} onClose={() => setLoadDialogOpen(false)} maxWidth="sm" fullWidth>
+      <Dialog
+        open={loadDialogOpen}
+        onClose={(_, reason) => {
+          // Don't allow backdrop or ESC dismissal mid-load — the user
+          // would land in a half-applied state with no recourse.
+          if (loadingProject) return;
+          if (reason === "backdropClick" || reason === "escapeKeyDown") {
+            setLoadDialogOpen(false);
+          } else {
+            setLoadDialogOpen(false);
+          }
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
         <DialogTitle>Load Project</DialogTitle>
         <DialogContent>
           <Box>
@@ -1029,9 +1053,13 @@ function BuilderSidebar() {
                 autoFocus fullWidth size="small"
                 label="File path"
                 value={projectPath}
+                disabled={loadingProject}
                 onChange={(e) => setProjectPath(e.target.value)}
               />
-              <Button variant="outlined" size="small" sx={{ minWidth: 80, flexShrink: 0 }}
+              <Button
+                variant="outlined" size="small"
+                sx={{ minWidth: 80, flexShrink: 0 }}
+                disabled={loadingProject}
                 onClick={async () => {
                   try {
                     const { open } = await import("@tauri-apps/plugin-dialog");
@@ -1048,21 +1076,59 @@ function BuilderSidebar() {
             <Typography variant="caption" sx={{ color: "text.secondary", ml: 1.5, mt: 0.25, display: "block", fontSize: "0.65rem" }}>
               Enter full path to .mpf file. In web preview, Browse pre-fills ~/Documents/.
             </Typography>
+            {/* Loading indicator. Indeterminate because the backend's
+                /api/project/load is one-shot — once we have streaming
+                progress events for project load, swap to determinate. */}
+            {loadingProject && (
+              <Box sx={{ display: "flex", alignItems: "center", gap: 1.5, mt: 2, px: 1, py: 1.5, bgcolor: "action.hover", borderRadius: 1 }}>
+                <CircularProgress size={20} />
+                <Box sx={{ flex: 1 }}>
+                  <Typography variant="caption" sx={{ display: "block", fontWeight: 600 }}>
+                    Loading project…
+                  </Typography>
+                  <Typography variant="caption" sx={{ display: "block", color: "text.secondary", fontSize: "0.65rem" }}>
+                    Decompressing images, restoring config, rendering preview.
+                    Larger files take longer.
+                  </Typography>
+                </Box>
+              </Box>
+            )}
+            {loadError && !loadingProject && (
+              <Typography variant="caption" sx={{ display: "block", color: "error.main", mt: 1.5, fontSize: "0.65rem" }}>
+                {loadError}
+              </Typography>
+            )}
           </Box>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => { setLoadDialogOpen(false); setProjectPath(""); }}>Cancel</Button>
+          <Button
+            disabled={loadingProject}
+            onClick={() => {
+              setLoadDialogOpen(false);
+              setProjectPath("");
+              setLoadError(null);
+            }}
+          >Cancel</Button>
           <Button
             variant="contained"
-            disabled={!projectPath}
+            disabled={!projectPath || loadingProject}
             onClick={async () => {
-              if (projectPath) {
+              if (!projectPath) return;
+              setLoadError(null);
+              setLoadingProject(true);
+              try {
                 await loadProject(projectPath);
                 setLoadDialogOpen(false);
+                setProjectPath("");
+              } catch (e) {
+                console.error("[load project] failed:", e);
+                setLoadError(e instanceof Error ? e.message : String(e));
+              } finally {
+                setLoadingProject(false);
               }
             }}
           >
-            Load
+            {loadingProject ? "Loading…" : "Load"}
           </Button>
         </DialogActions>
       </Dialog>

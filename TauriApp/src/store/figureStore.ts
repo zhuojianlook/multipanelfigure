@@ -1339,6 +1339,10 @@ export const useFigureStore = create<FigureState>()(
         get().requestPreview();
       } catch (err) {
         console.error("Load project failed", err);
+        // Re-throw so callers (e.g., the Sidebar's Load Project dialog)
+        // can surface a useful error in the UI instead of pretending the
+        // load succeeded after a silently-swallowed exception.
+        throw err;
       }
     },
 
