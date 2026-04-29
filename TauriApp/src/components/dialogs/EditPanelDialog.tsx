@@ -5817,7 +5817,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                               }}
                               onMouseDown={(e) => {
                                 e.preventDefault(); e.stopPropagation();
-                                const imgEl = (e.currentTarget.closest("[style]")?.parentElement?.querySelector("img")) as HTMLImageElement | null;
+                                // DOM walk: corner handle → source-rect → wrapper.
+                                // The previous `closest("[style]")` matched the
+                                // first ancestor with an inline style attribute,
+                                // which is unpredictable since MUI's sx compiles
+                                // to emotion classes (not inline style). It often
+                                // landed on the dialog backdrop, whose
+                                // getBoundingClientRect bears no relation to the
+                                // panel image — so dx/dy scaled by the wrong rect
+                                // and the source rectangle "jumped" on tiny drags.
+                                const imgEl = e.currentTarget.parentElement?.parentElement?.querySelector("img") as HTMLImageElement | null;
                                 if (!imgEl) return;
                                 const startX = e.clientX, startY = e.clientY;
                                 const startZi = { ...zi };
@@ -5927,7 +5936,13 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         }}
                         onMouseDown={(ev) => {
                           ev.preventDefault(); ev.stopPropagation();
-                          const imgEl2 = ev.currentTarget.closest("[style]")?.parentElement?.querySelector("img") as HTMLImageElement;
+                          // Same fix as the source-rect corner handles: walk
+                          // the DOM explicitly (handle → target-rect →
+                          // wrapper) instead of using closest("[style]"),
+                          // which lands on whichever ancestor first has an
+                          // inline style attribute and is therefore
+                          // unpredictable under MUI's emotion-based sx.
+                          const imgEl2 = ev.currentTarget.parentElement?.parentElement?.querySelector("img") as HTMLImageElement | null;
                           if (!imgEl2) return;
                           const rect2 = imgEl2.getBoundingClientRect();
                           const startMX = ev.clientX;
