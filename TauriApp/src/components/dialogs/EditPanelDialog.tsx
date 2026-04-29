@@ -1700,6 +1700,13 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   void historyVersion;
 
   const [previewB64, setPreviewB64] = useState<string>("");
+  // Natural dimensions of the rendered preview (post-crop / -process).
+  // Drives the preview wrapper's aspect-ratio so the image consistently
+  // fills the available pane regardless of how small the cropped output
+  // is. Without this, a 200×150 cropped result rendered as a 200px-wide
+  // image inside a 1000px pane — looking unhelpfully tiny.
+  const [previewNatW, setPreviewNatW] = useState(0);
+  const [previewNatH, setPreviewNatH] = useState(0);
   const [processedW, setProcessedW] = useState(0);
   const [processedH, setProcessedH] = useState(0);
   const [renderedPreviewB64, setRenderedPreviewB64] = useState<string>("");
@@ -4537,10 +4544,28 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
           {/* -- Right: Live Preview with draggable labels ----------- */}
           <Box sx={{ flex: 1, display: "flex", alignItems: "flex-start", justifyContent: "center", p: 1, bgcolor: "action.hover", borderRadius: 2, border: "1px solid", borderColor: "divider", maxHeight: "70vh", overflow: "hidden" }}>
             {previewB64 ? (
-              <Box sx={{ display: "flex", alignItems: "flex-start", justifyContent: "center", width: "100%", height: "100%" }}>
-                {/* Wrapper that matches the image's actual rendered dimensions
-                    so CSS overlay percentages align precisely with the image */}
-                <Box sx={{ position: "relative", display: "inline-block", maxWidth: "100%", maxHeight: "68vh" }}>
+              <Box sx={{ display: "flex", alignItems: "center", justifyContent: "center", width: "100%", height: "100%" }}>
+                {/* Wrapper sized via CSS aspect-ratio to the rendered
+                    preview's natural dimensions. Combined with width:100%
+                    and max-height:68vh, the browser fills the available
+                    area (height- or width-bound, whichever bites first)
+                    while preserving aspect — so a small crop result is
+                    blown up to fill the pane instead of rendering at its
+                    tiny natural size. Overlays inside continue to use
+                    percentage-based positioning, which now maps to the
+                    enlarged image footprint correctly. */}
+                <Box sx={{
+                  position: "relative",
+                  width: "100%",
+                  maxWidth: "100%",
+                  maxHeight: "68vh",
+                  aspectRatio: previewNatW > 0 && previewNatH > 0
+                    ? `${previewNatW} / ${previewNatH}`
+                    : undefined,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}>
                 {(() => {
                   // Use PIL-rendered preview on Adjustments, Labels, Scale Bar tabs.
                   // Annotations tab (4) uses base preview + SVG overlays for responsive drag.
@@ -4552,7 +4577,23 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       component="img"
                       src={`data:image/png;base64,${useRendered ? renderedPreviewB64 : previewB64}`}
                       alt="Panel preview"
-                      sx={{ maxWidth: "100%", maxHeight: "68vh", display: "block", borderRadius: 1 }}
+                      onLoad={(e) => {
+                        const img = e.currentTarget as HTMLImageElement;
+                        if (img.naturalWidth && img.naturalHeight) {
+                          setPreviewNatW(img.naturalWidth);
+                          setPreviewNatH(img.naturalHeight);
+                        }
+                      }}
+                      sx={{
+                        // Fill the aspect-ratio'd wrapper. objectFit:contain
+                        // is a safety net — since the wrapper aspect matches
+                        // the image, no letterboxing actually occurs.
+                        width: "100%",
+                        height: "100%",
+                        objectFit: "contain",
+                        display: "block",
+                        borderRadius: 1,
+                      }}
                       draggable={false}
                     />
                   );
