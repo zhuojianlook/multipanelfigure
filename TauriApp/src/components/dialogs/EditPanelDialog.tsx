@@ -38,7 +38,11 @@ import {
   Tooltip,
   Alert,
   CircularProgress,
+  Accordion,
+  AccordionSummary,
+  AccordionDetails,
 } from "@mui/material";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import DeleteIcon from "@mui/icons-material/Delete";
 import AddIcon from "@mui/icons-material/Add";
 import AutoFixHighIcon from "@mui/icons-material/AutoFixHigh";
@@ -4131,7 +4135,41 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
               label={<Typography variant="caption" sx={{ fontSize: "0.8rem" }}>Enable Zoom Inset</Typography>}
             />
             {local.add_zoom_inset && local.zoom_inset && (
-              <>
+              <Accordion
+                defaultExpanded
+                disableGutters
+                sx={{
+                  bgcolor: "transparent",
+                  boxShadow: "none",
+                  border: "1px solid",
+                  borderColor: "divider",
+                  borderRadius: 1,
+                  "&:before": { display: "none" },
+                }}
+              >
+                <AccordionSummary
+                  expandIcon={<ExpandMoreIcon />}
+                  sx={{
+                    minHeight: 36,
+                    "& .MuiAccordionSummary-content": { my: 0.5 },
+                  }}
+                >
+                  {/* Title summarises the current inset so a collapsed
+                      group still tells the user what it is. */}
+                  <Typography variant="caption" sx={{ fontSize: "0.75rem", fontWeight: 600 }}>
+                    Zoom Inset 1
+                  </Typography>
+                  <Typography variant="caption" sx={{ ml: 1, fontSize: "0.65rem", color: "text.secondary" }}>
+                    {local.zoom_inset.inset_type}
+                    {local.zoom_inset.inset_type === "Standard Zoom" && local.zoom_inset.zoom_factor
+                      ? ` · ${local.zoom_inset.zoom_factor.toFixed(1)}×`
+                      : ""}
+                    {local.zoom_inset.inset_type === "Adjacent Panel" && local.zoom_inset.side
+                      ? ` · ${local.zoom_inset.side}`
+                      : ""}
+                  </Typography>
+                </AccordionSummary>
+                <AccordionDetails sx={{ pt: 1, pb: 1.5, px: 1.5, display: "flex", flexDirection: "column", gap: 1.5 }}>
                 <FormControl size="small" fullWidth>
                   <InputLabel>Inset Type</InputLabel>
                   <Select
@@ -4313,16 +4351,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                           </Box>
                           <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.7rem", mt: 1, display: "block" }}>External Crop Area</Typography>
                           <Box sx={{ display: "flex", gap: 1 }}>
-                            <TextField label="X" type="number" value={local.zoom_inset.x_inset ?? 0}
+                            <TextField label="X" type="number" onFocus={(e) => (e.target as HTMLInputElement).select()} value={local.zoom_inset.x_inset ?? 0}
                               onChange={(e) => updateLocal({ zoom_inset: { ...local.zoom_inset!, x_inset: Number(e.target.value) } })}
                               size="small" sx={{ flex: 1, "& input": { fontSize: "0.8rem", px: 1, py: 0.75 } }} />
-                            <TextField label="Y" type="number" value={local.zoom_inset.y_inset ?? 0}
+                            <TextField label="Y" type="number" onFocus={(e) => (e.target as HTMLInputElement).select()} value={local.zoom_inset.y_inset ?? 0}
                               onChange={(e) => updateLocal({ zoom_inset: { ...local.zoom_inset!, y_inset: Number(e.target.value) } })}
                               size="small" sx={{ flex: 1, "& input": { fontSize: "0.8rem", px: 1, py: 0.75 } }} />
-                            <TextField label="W" type="number" value={local.zoom_inset.width_inset ?? 100}
+                            <TextField label="W" type="number" onFocus={(e) => (e.target as HTMLInputElement).select()} value={local.zoom_inset.width_inset ?? 100}
                               onChange={(e) => updateLocal({ zoom_inset: { ...local.zoom_inset!, width_inset: Number(e.target.value) } })}
                               size="small" sx={{ flex: 1, "& input": { fontSize: "0.8rem", px: 1, py: 0.75 } }} />
-                            <TextField label="H" type="number" value={local.zoom_inset.height_inset ?? 100}
+                            <TextField label="H" type="number" onFocus={(e) => (e.target as HTMLInputElement).select()} value={local.zoom_inset.height_inset ?? 100}
                               onChange={(e) => updateLocal({ zoom_inset: { ...local.zoom_inset!, height_inset: Number(e.target.value) } })}
                               size="small" sx={{ flex: 1, "& input": { fontSize: "0.8rem", px: 1, py: 0.75 } }} />
                           </Box>
@@ -4335,12 +4373,20 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   </Box>
                 ) : null}
 
-                <Typography variant="caption" sx={{ fontWeight: 600, mt: 2 }}>Zoom Area</Typography>
+                {/* Both Standard Zoom and Adjacent Panel use the SAME
+                    rectangle on the source image; the historical name
+                    "Zoom Area" was confusingly different from the
+                    "Source Area" label used in the Adjacent Panel
+                    branch. Unified to "Source Area" so the two
+                    branches don't look like duplicate but unrelated
+                    sets of fields. */}
+                <Typography variant="caption" sx={{ fontWeight: 600, mt: 2 }}>Source Area</Typography>
                 <Divider />
                 <Box sx={{ display: "flex", gap: 1 }}>
                   <TextField
                     label="X"
                     type="number"
+                    onFocus={(e) => (e.target as HTMLInputElement).select()}
                     value={local.zoom_inset.x}
                     onChange={(e) =>
                       updateLocal({
@@ -4354,6 +4400,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   <TextField
                     label="Y"
                     type="number"
+                    onFocus={(e) => (e.target as HTMLInputElement).select()}
                     value={local.zoom_inset.y}
                     onChange={(e) =>
                       updateLocal({
@@ -4367,6 +4414,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   <TextField
                     label="W"
                     type="number"
+                    onFocus={(e) => (e.target as HTMLInputElement).select()}
                     value={local.zoom_inset.width}
                     onChange={(e) =>
                       updateLocal({
@@ -4380,6 +4428,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   <TextField
                     label="H"
                     type="number"
+                    onFocus={(e) => (e.target as HTMLInputElement).select()}
                     value={local.zoom_inset.height}
                     onChange={(e) =>
                       updateLocal({
@@ -4425,6 +4474,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   <TextField
                     label="Rect width"
                     type="number"
+                    onFocus={(e) => (e.target as HTMLInputElement).select()}
                     value={local.zoom_inset.rectangle_width}
                     onChange={(e) =>
                       updateLocal({
@@ -4438,6 +4488,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   <TextField
                     label="Line width"
                     type="number"
+                    onFocus={(e) => (e.target as HTMLInputElement).select()}
                     value={local.zoom_inset.line_width}
                     onChange={(e) =>
                       updateLocal({
@@ -4515,16 +4566,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     {/* Source area */}
                     <Typography variant="caption" sx={{ fontWeight: 600, mt: 1 }}>Source Area</Typography>
                     <Box sx={{ display: "flex", gap: 1 }}>
-                      <TextField label="X" type="number" value={local.zoom_inset.x} onChange={(e) =>
+                      <TextField label="X" type="number" onFocus={(e) => (e.target as HTMLInputElement).select()} value={local.zoom_inset.x} onChange={(e) =>
                         updateLocal({ zoom_inset: { ...local.zoom_inset!, x: Number(e.target.value) } })
                       } size="small" sx={{ flex: 1, "& input": { fontSize: "0.8rem", px: 1, py: 0.75 } }} />
-                      <TextField label="Y" type="number" value={local.zoom_inset.y} onChange={(e) =>
+                      <TextField label="Y" type="number" onFocus={(e) => (e.target as HTMLInputElement).select()} value={local.zoom_inset.y} onChange={(e) =>
                         updateLocal({ zoom_inset: { ...local.zoom_inset!, y: Number(e.target.value) } })
                       } size="small" sx={{ flex: 1, "& input": { fontSize: "0.8rem", px: 1, py: 0.75 } }} />
-                      <TextField label="W" type="number" value={local.zoom_inset.width} onChange={(e) =>
+                      <TextField label="W" type="number" onFocus={(e) => (e.target as HTMLInputElement).select()} value={local.zoom_inset.width} onChange={(e) =>
                         updateLocal({ zoom_inset: { ...local.zoom_inset!, width: Number(e.target.value) } })
                       } size="small" sx={{ flex: 1, "& input": { fontSize: "0.8rem", px: 1, py: 0.75 } }} />
-                      <TextField label="H" type="number" value={local.zoom_inset.height} onChange={(e) =>
+                      <TextField label="H" type="number" onFocus={(e) => (e.target as HTMLInputElement).select()} value={local.zoom_inset.height} onChange={(e) =>
                         updateLocal({ zoom_inset: { ...local.zoom_inset!, height: Number(e.target.value) } })
                       } size="small" sx={{ flex: 1, "& input": { fontSize: "0.8rem", px: 1, py: 0.75 } }} />
                     </Box>
@@ -4535,7 +4586,8 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 )}
 
                 {/* Separate Image options */}
-              </>
+                </AccordionDetails>
+              </Accordion>
             )}
           </Box>
         </TabPanel>
