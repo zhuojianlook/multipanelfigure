@@ -16,22 +16,23 @@
    so it still represents the snapped physical length exactly.
    ────────────────────────────────────────────────────────── */
 
-export function niceScaleBarUm(v: number): number {
-  if (!isFinite(v) || v <= 0) return 1;
+export function niceScaleBarUm(v: number, mode: "round" | "floor" = "round"): number {
+  if (!isFinite(v) || v <= 0) return mode === "floor" ? 0.01 : 1;
+  const snap = (x: number, step: number) => {
+    const k = mode === "floor" ? Math.floor(x / step) : Math.round(x / step);
+    return k * step;
+  };
   if (v < 0.1) {
-    return Math.max(0.01, Math.round(v * 100) / 100);
+    return Math.max(0.01, snap(v, 0.01));
   }
   if (v < 1) {
-    return Math.round(v * 10) / 10;
+    return Math.max(0.1, snap(v, 0.1));
   }
   if (v < 5) {
-    return Math.max(1, Math.round(v));
+    return Math.max(1, snap(v, 1));
   }
   // v ≥ 5 — snap to multiples of 5 within the local decade.
-  // For v in [5, 50): multiples of 5 (5, 10, 15, 20, ...)
-  // For v in [50, 500): multiples of 50 (50, 100, 150, ...)
-  // For v in [500, 5000): multiples of 500, etc.
   const exp = Math.floor(Math.log10(v));
   const base5 = 5 * Math.pow(10, exp - 1);
-  return Math.max(base5, Math.round(v / base5) * base5);
+  return Math.max(base5, snap(v, base5));
 }

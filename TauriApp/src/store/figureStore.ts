@@ -30,6 +30,7 @@ interface FigureState {
   config: FigureConfig | null;
   loadedImages: Record<string, LoadedImage>;
   panelThumbnails: Record<string, string>;   // "r-c" → processed base64 PNG
+  panelProcessedSizes: Record<string, { w: number; h: number }>;  // "r-c" → backend processed pixel size (pre-normalize)
   fonts: string[];
   previewImageB64: string | null;
   previewLoading: boolean;
@@ -407,6 +408,7 @@ export const useFigureStore = create<FigureState>()(
     config: null,
     loadedImages: {},
     panelThumbnails: {},
+    panelProcessedSizes: {},
     fonts: [],
     previewImageB64: null,
     previewLoading: false,
@@ -694,10 +696,27 @@ export const useFigureStore = create<FigureState>()(
               const w = Math.max(1, Number(zi.width) || 1);
               const ratio = w / srcCoordW(sp);
               const newMpp = sp.scale_bar.micron_per_pixel * ratio;
-              // Snap the bar length to a "nice" value (multiples of 5
-              // when ≥5, integers / 0.1 increments below) so the
-              // cascaded values are easy to read in a figure caption.
-              const newBar = niceScaleBarUm(sp.scale_bar.bar_length_microns * ratio);
+              // Compute the target's native pixel width so we can cap
+              // the bar at ≤ 1/4 of it. The target's native width is
+              // source_processed_w × ratio × zoom_factor. Use the
+              // cached processed_w (populated by refreshPanelThumbnail
+              // from /api/panel-preview) when available; otherwise
+              // approximate via srcCoordW for image-bearing sources
+              // (which equals processed_w when cropped).
+              const srcKey = `${sr}-${sc}`;
+              const srcProcW = (s as { panelProcessedSizes?: Record<string, { w: number }> }).panelProcessedSizes?.[srcKey]?.w
+                ?? srcCoordW(sp);
+              const zoomF = Number(zi.zoom_factor) || 1;
+              const targetNativeW = Math.max(1, srcProcW * ratio * zoomF);
+              const maxBarMicrons = 0.25 * targetNativeW * newMpp;
+              const rawBar = sp.scale_bar.bar_length_microns * ratio;
+              const cappedBar = Math.min(rawBar, maxBarMicrons);
+              // Snap to a "nice" value (multiples of 5 when ≥ 5,
+              // integers / 0.1 increments below). Use floor mode when
+              // the cap kicked in so we never EXCEED 1/4 of the
+              // target's width.
+              const wasCapped = cappedBar < rawBar - 1e-9;
+              const newBar = niceScaleBarUm(cappedBar, wasCapped ? "floor" : "round");
               const curMpp = tp.scale_bar?.micron_per_pixel ?? 0;
               const curBar = tp.scale_bar?.bar_length_microns ?? 0;
               if (Math.abs(curMpp - newMpp) > 1e-9 || Math.abs(curBar - newBar) > 1e-6) {
@@ -755,6 +774,14 @@ export const useFigureStore = create<FigureState>()(
         if (resp.image) {
           set((s) => {
             s.panelThumbnails[`${row}-${col}`] = resp.image;
+            // Also remember the processed size so the cascade can
+            // compute the 1/4-of-target-width bar guardrail without
+            // a round-trip to the backend on every drag tick.
+            const pw = (resp as { processed_width?: number }).processed_width;
+            const ph = (resp as { processed_height?: number }).processed_height;
+            if (typeof pw === "number" && typeof ph === "number" && pw > 0 && ph > 0) {
+              s.panelProcessedSizes[`${row}-${col}`] = { w: pw, h: ph };
+            }
           });
         }
       } catch {

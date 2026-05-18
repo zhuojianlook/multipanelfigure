@@ -5912,17 +5912,15 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   const sbDispH = sbPrevEl?.clientHeight || 400;
                   // The bar's "source coord width" — what matplotlib
                   // treats as 1 unit of bar_length_px. That's the
-                  // PROCESSED image's natural pixel width (post-crop /
-                  // post-normalize, whatever the dialog preview shows).
-                  // We get it directly from the displayed image's
-                  // naturalWidth (cached as previewNatW). Falling back
-                  // to crop_w / origFullW / 1000 only when the preview
-                  // hasn't loaded yet — without these fallbacks the
-                  // inline bar showed at a wrong offset on cropped
-                  // image-bearing panels (assumed full pre-crop width)
-                  // and on zoom-target panels (defaulted to 1000).
-                  const sbActW = previewNatW > 0
-                    ? previewNatW
+                  // backend's PROCESSED image width (post-crop / cascade
+                  // / pre-normalize), returned as `processed_width` by
+                  // /api/panel-preview. Using previewNatW here was
+                  // wrong because the displayed PNG can be larger
+                  // (we upscale for crispness without changing the
+                  // data range). Now the inline bar's visual fraction
+                  // matches the figure's bar.
+                  const sbActW = processedW > 0
+                    ? processedW
                     : (local.crop_image && local.crop && local.crop.length === 4)
                       ? Math.max(1, local.crop[2] - local.crop[0])
                       : (origFullW > 0 ? origFullW : 1000);
@@ -6012,7 +6010,11 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         const rect = imgEl.getBoundingClientRect();
                         const px = Math.max(0, Math.min(100, ((ev.clientX - rect.left) / rect.width) * 100));
                         const py = Math.max(0, Math.min(100, ((ev.clientY - rect.top) / rect.height) * 100));
-                        updateLocal({ scale_bar: { ...local.scale_bar!, position_x: Math.round(px), position_y: Math.round(py), position_preset: "Custom", bar_position: [px / 100, py / 100] } });
+                        // localRef so updates compound correctly
+                        // across mousemoves (see other drag handler).
+                        const curSb = localRef.current?.scale_bar;
+                        if (!curSb) return;
+                        updateLocal({ scale_bar: { ...curSb, position_x: Math.round(px), position_y: Math.round(py), position_preset: "Custom", bar_position: [px / 100, py / 100] } });
                       };
                       const onUp = () => {
                         window.removeEventListener("mousemove", onMove);
@@ -6090,9 +6092,15 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                           const rect = imgEl.getBoundingClientRect();
                           const px = Math.max(0, Math.min(100, ((ev.clientX - rect.left) / rect.width) * 100));
                           const py = Math.max(0, Math.min(100, ((ev.clientY - rect.top) / rect.height) * 100));
-                          // Auto-switch to Custom on first drag movement
-                          // (no-op if already Custom).
-                          updateLocal({ scale_bar: { ...local.scale_bar!, position_x: Math.round(px), position_y: Math.round(py), position_preset: "Custom", bar_position: [px / 100, py / 100] } });
+                          // Use localRef so each mousemove sees the
+                          // LATEST scale_bar (closure on `local` would
+                          // pin to the value at mousedown — after one
+                          // updateLocal call the stale `local.scale_bar`
+                          // gets re-applied, undoing subsequent edits
+                          // and effectively breaking the drag).
+                          const curSb = localRef.current?.scale_bar;
+                          if (!curSb) return;
+                          updateLocal({ scale_bar: { ...curSb, position_x: Math.round(px), position_y: Math.round(py), position_preset: "Custom", bar_position: [px / 100, py / 100] } });
                         };
                         const onUp = () => {
                           window.removeEventListener("mousemove", onMove);
