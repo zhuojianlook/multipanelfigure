@@ -2075,7 +2075,14 @@ def generate_preview():
     _apply_adjacent_zoom_insets(cfg, processed, rows, cols)
     _apply_zoom_target_self_overlays(cfg, processed, rows, cols)
 
-    # Build full-res sizes for zoom inset line positioning
+    # Build full-res sizes for zoom inset line positioning.
+    # For adjacent-zoom TARGET panels (no image_name), use the
+    # dialog's 1000-px canvas convention so the source-rect overlay
+    # the user drew on them lands in the same place as the rect
+    # shown in the Edit Panel dialog (which falls back to ziActualW
+    # = 1000 when origFullW is 0). Without this, figure_builder
+    # would use the synth's actual size (e.g. 200×200) and draw the
+    # rect off-image whenever zi.x exceeded the synth width.
     full_res_sizes = {}
     for r in range(rows):
         for c in range(cols):
@@ -2086,6 +2093,11 @@ def generate_preview():
                     full_res_sizes[(r, c)] = (panel.crop[2] - panel.crop[0], panel.crop[3] - panel.crop[1])
                 else:
                     full_res_sizes[(r, c)] = orig_img.size
+            elif not panel.image_name and getattr(panel, "add_zoom_inset", False):
+                # Zoom-target panel that itself has an outgoing inset
+                # — record the 1000-px canvas size so figure_builder
+                # scales zi.x/y correctly when drawing the rect.
+                full_res_sizes[(r, c)] = (1000, 1000)
 
     fig_bytes = assemble_figure(cfg, processed, full_res_sizes=full_res_sizes)
     fig_img = Image.open(io.BytesIO(fig_bytes))
@@ -2160,6 +2172,10 @@ def save_figure(body: SaveFigureRequest):
                     full_res_sizes2[(r, c)] = (panel.crop[2] - panel.crop[0], panel.crop[3] - panel.crop[1])
                 else:
                     full_res_sizes2[(r, c)] = orig_img.size
+            elif not panel.image_name and getattr(panel, "add_zoom_inset", False):
+                # See /api/preview: zoom-target source with an
+                # outgoing inset → 1000-px canvas convention.
+                full_res_sizes2[(r, c)] = (1000, 1000)
     fig_bytes = assemble_figure(cfg, processed, dpi=body.dpi, full_res_sizes=full_res_sizes2)
     save_path = os.path.expanduser(body.path.strip())
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
