@@ -557,13 +557,22 @@ const parsePlotKey = (k: string): { tabId: string; plotId: string } => {
   return { tabId: k.slice(0, sep), plotId: k.slice(sep + 1) };
 };
 
-// ── Python starter for zoom-inset pixel pipelines ───────────
-// Seeded into the editor when the user opens Analysis with at
-// least one flagged inset but no other measurements to seed an
-// R tab from. Demonstrates the inputs[key]['image'] interface
-// and the three output helpers.
+// ─────────────────────────────────────────────────────────────
+// Python / MATLAB pipelines are for IMAGE DATA EXTRACTION only —
+// plotting is delegated to R (better-looking figures, consistent
+// styling with the rest of the analysis). Each pipeline:
+//   • computes per-source numeric values from the inset pixels,
+//   • writes them as CSV via mpfig_data(...) — that table can
+//     then be sent into an R tab for plotting,
+//   • optionally writes a derived image via mpfig_image(...) for
+//     downstream use in the figure.
+// ─────────────────────────────────────────────────────────────
+
+// "Custom" starter — empty template the user fills in. Includes
+// the contract docstring so beginners know what's available.
 const PYTHON_STARTER_CODE = `# ============================================================
 # Python pipeline — runs against zoom-inset pixels.
+# Use this to EXTRACT numeric data; let R plot it afterwards.
 #
 # Available globals:
 #   inputs[key]   → dict with:
@@ -573,102 +582,191 @@ const PYTHON_STARTER_CODE = `# =================================================
 #       label  : str — human-readable "R1C1 · inset 1 (...)"
 #       row, col, inset_index — original grid coords
 #
-# Output helpers:
-#   mpfig_plot()          → save current matplotlib figure into
-#                           the Analysis plot timeline.
+# Output helpers (data only — no plotting):
 #   mpfig_data(rows, name)→ save CSV (DataFrame / dict / list).
 #   mpfig_image(arr, name)→ save numpy / PIL image to the
-#                           "Python images" strip below.
-#
-# Click "Run Python" in the top right to execute.
+#                           "Python images" strip (for use as a
+#                           Separate Image inset later).
 # ============================================================
 
 import numpy as np
-import matplotlib.pyplot as plt
 
 rows = []
 for key, src in inputs.items():
     img = src["image"]               # H x W x 3, uint8
-    r_mean = float(np.mean(img[..., 0]))
-    g_mean = float(np.mean(img[..., 1]))
-    b_mean = float(np.mean(img[..., 2]))
-    print(f"{src['label']}: R={r_mean:.1f}  G={g_mean:.1f}  B={b_mean:.1f}")
+    gray = img.mean(axis=2)          # luminance
     rows.append({
         "source": src["label"],
-        "R": r_mean, "G": g_mean, "B": b_mean,
+        "mean_gray": float(gray.mean()),
+        "std_gray": float(gray.std()),
+        "min_gray": float(gray.min()),
+        "max_gray": float(gray.max()),
     })
-mpfig_data(rows, name="channel_means")
-
-# Quick histogram of the FIRST source's intensity (luminance)
-if inputs:
-    first = next(iter(inputs.values()))
-    lum = first["image"].mean(axis=2)
-    plt.figure(figsize=(5, 3))
-    plt.hist(lum.ravel(), bins=64, color="#4caf50", alpha=0.85)
-    plt.title(f"Intensity histogram — {first['label']}")
-    plt.xlabel("Luminance"); plt.ylabel("Pixel count")
-    mpfig_plot("histogram.png")
-    # Also save a thresholded copy back to the images strip
-    mask = (lum > 128).astype(np.uint8)
-    out = first["image"].copy()
-    out[mask == 0] = 0
-    mpfig_image(out, name="thresholded")
+mpfig_data(rows, name="pixel_summary")
 `;
 
-// ── MATLAB / Octave starter for zoom-inset pipelines ────────
-// Auto-inserted when the user switches the engine selector to
-// MATLAB on a tab whose code matches the Python starter.
+// "Custom" MATLAB starter — data extraction only.
 const MATLAB_STARTER_CODE = `% =============================================================
 % MATLAB / Octave pipeline — runs against zoom-inset pixels.
+% Use this to EXTRACT numeric data; let R plot it afterwards.
 %
-% Available variables (after \`load('inputs.mat')\` runs in the harness):
+% Available variables (after \`load('inputs.mat')\`):
 %   inputs.<safe_key>.image  — uint8 H x W x 3 matrix
-%   inputs.<safe_key>.width
-%   inputs.<safe_key>.height
 %   inputs.<safe_key>.label  — human-readable source name
 %
-% Output helpers:
-%   mpfig_plot(name)             — save current figure to timeline
-%   mpfig_data(struct, name)     — save CSV (struct of column vectors)
-%   mpfig_image(arr, name)       — save image (uint8 or normalised)
-%
-% Click "Run MATLAB" in the top right to execute.
+% Output helpers (data only — no plotting):
+%   mpfig_data(struct, name)  — save CSV (struct of column vectors)
+%   mpfig_image(arr, name)    — save image to the images strip
 % =============================================================
 
 keys = fieldnames(inputs);
-rmeans = zeros(numel(keys), 1);
-gmeans = zeros(numel(keys), 1);
-bmeans = zeros(numel(keys), 1);
-labels = cell(numel(keys), 1);
-
+labels   = cell(numel(keys), 1);
+mean_g   = zeros(numel(keys), 1);
+std_g    = zeros(numel(keys), 1);
+min_g    = zeros(numel(keys), 1);
+max_g    = zeros(numel(keys), 1);
 for k = 1:numel(keys)
   src = inputs.(keys{k});
-  img = src.image;
-  rmeans(k) = mean(mean(double(img(:,:,1))));
-  gmeans(k) = mean(mean(double(img(:,:,2))));
-  bmeans(k) = mean(mean(double(img(:,:,3))));
+  gray = mean(double(src.image), 3);
   labels{k} = src.label;
-  fprintf('%s: R=%.1f G=%.1f B=%.1f\\n', src.label, rmeans(k), gmeans(k), bmeans(k));
+  mean_g(k) = mean(gray(:));
+  std_g(k)  = std(gray(:));
+  min_g(k)  = min(gray(:));
+  max_g(k)  = max(gray(:));
 end
-
-mpfig_data(struct('source', {labels}, 'R', rmeans, 'G', gmeans, 'B', bmeans), 'channel_means');
-
-% Histogram of the first source's luminance
-if ~isempty(keys)
-  first = inputs.(keys{1});
-  lum = mean(double(first.image), 3);
-  figure;
-  hist(lum(:), 64);
-  title(['Intensity histogram — ' first.label]);
-  xlabel('Luminance'); ylabel('Pixel count');
-  mpfig_plot('histogram');
-  % Save a thresholded copy back to the images strip
-  mask = uint8(lum > 128);
-  out = first.image;
-  out(repmat(~mask, [1 1 3])) = 0;
-  mpfig_image(out, 'thresholded');
-end
+mpfig_data(struct('source', {labels}, 'mean_gray', mean_g, 'std_gray', std_g, ...
+                  'min_gray', min_g, 'max_gray', max_g), 'pixel_summary');
 `;
+
+// ── Preset registry ─────────────────────────────────────────
+// Each preset has a label, an engine-specific code generator,
+// and an optional "needs reference" flag that surfaces a
+// reference-inset selector in the UI. Code generators receive
+// the reference key (if any) and the safe-name mapping for
+// MATLAB so the snippets address inputs correctly.
+
+type PipelinePreset = "custom" | "haze";
+
+interface PresetSpec {
+  label: string;
+  needsReference: boolean;
+  description: string;
+  generatePython: (referenceKey: string | null) => string;
+  generateMatlab: (referenceKey: string | null) => string;
+}
+
+// MATLAB safe-key mirror of the backend's `key_map`: backend
+// replaces non-alnum chars in `key` with `_` and prefixes `k_`.
+// Keep this in sync with `_extract_inset_image` / run-matlab.
+function matlabSafeKey(key: string): string {
+  return "k_" + key.replace(/[^a-zA-Z0-9]/g, "_");
+}
+
+const PIPELINE_PRESETS: Record<PipelinePreset, PresetSpec> = {
+  custom: {
+    label: "Custom",
+    needsReference: false,
+    description: "Empty template — write your own analysis.",
+    generatePython: () => PYTHON_STARTER_CODE,
+    generateMatlab: () => MATLAB_STARTER_CODE,
+  },
+  haze: {
+    label: "Haze analysis",
+    needsReference: true,
+    description:
+      "Compares grayscale mean of each inset to a reference inset. " +
+      "Output: per-source mean_gray, delta_vs_reference, and " +
+      "ratio_to_reference. Useful for haze / fog / contrast " +
+      "quantification against a clean control region.",
+    generatePython: (refKey) => {
+      const refLit = refKey ? `"${refKey}"` : "None";
+      return `# ============================================================
+# HAZE ANALYSIS — compares each inset's grayscale mean against
+# a reference inset. Output: per-source mean_gray,
+# delta_vs_reference (mean - ref_mean), ratio_to_reference
+# (mean / ref_mean). Plot the resulting CSV from an R tab.
+# ============================================================
+
+import numpy as np
+
+REFERENCE_KEY = ${refLit}  # set by the Reference selector above
+
+if REFERENCE_KEY is None or REFERENCE_KEY not in inputs:
+    raise SystemExit("Pick a reference inset above before running haze analysis.")
+
+ref_img = inputs[REFERENCE_KEY]["image"]
+ref_label = inputs[REFERENCE_KEY]["label"]
+ref_mean = float(np.mean(ref_img.mean(axis=2)))
+print(f"Reference: {ref_label} → mean_gray = {ref_mean:.3f}")
+
+rows = []
+for key, src in inputs.items():
+    gray = src["image"].mean(axis=2)
+    m = float(gray.mean())
+    rows.append({
+        "source": src["label"],
+        "key": key,
+        "is_reference": (key == REFERENCE_KEY),
+        "mean_gray": m,
+        "delta_vs_reference": m - ref_mean,
+        "ratio_to_reference": m / ref_mean if ref_mean != 0 else float("nan"),
+    })
+
+# Sort with the reference first
+rows.sort(key=lambda r: (not r["is_reference"], r["source"]))
+mpfig_data(rows, name="haze_analysis")
+`;
+    },
+    generateMatlab: (refKey) => {
+      const refLit = refKey ? `'${matlabSafeKey(refKey)}'` : "''";
+      return `% =============================================================
+% HAZE ANALYSIS — compares each inset's grayscale mean against
+% a reference inset. Output: per-source mean_gray,
+% delta_vs_reference, ratio_to_reference. Plot in R afterwards.
+% =============================================================
+
+REFERENCE_KEY = ${refLit};
+
+if isempty(REFERENCE_KEY) || ~isfield(inputs, REFERENCE_KEY)
+  error('Pick a reference inset above before running haze analysis.');
+end
+
+ref = inputs.(REFERENCE_KEY);
+ref_mean = mean(mean(mean(double(ref.image), 3)));
+fprintf('Reference: %s → mean_gray = %.3f\\n', ref.label, ref_mean);
+
+keys = fieldnames(inputs);
+n = numel(keys);
+sources   = cell(n, 1);
+key_col   = cell(n, 1);
+is_ref    = false(n, 1);
+mean_gray = zeros(n, 1);
+delta     = zeros(n, 1);
+ratio     = zeros(n, 1);
+for k = 1:n
+  src = inputs.(keys{k});
+  m = mean(mean(mean(double(src.image), 3)));
+  sources{k}   = src.label;
+  key_col{k}   = keys{k};
+  is_ref(k)    = strcmp(keys{k}, REFERENCE_KEY);
+  mean_gray(k) = m;
+  delta(k)     = m - ref_mean;
+  if ref_mean ~= 0
+    ratio(k) = m / ref_mean;
+  else
+    ratio(k) = NaN;
+  end
+end
+
+mpfig_data(struct( ...
+  'source', {sources}, 'key', {key_col}, ...
+  'is_reference', is_ref, 'mean_gray', mean_gray, ...
+  'delta_vs_reference', delta, 'ratio_to_reference', ratio), ...
+  'haze_analysis');
+`;
+    },
+  },
+};
 
 export function AnalysisDialog({ open, onClose, measurements }: Props) {
   // R status
@@ -695,6 +793,13 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
   /** Which engine the secondary run button currently dispatches.
    *  Persists across runs so the user's last choice is remembered. */
   const [pipelineEngine, setPipelineEngine] = useState<"python" | "matlab">("python");
+  /** Active pipeline preset. Choosing one regenerates the editor
+   *  contents (only when the current text matches the previous
+   *  preset's generated code — custom edits are preserved). */
+  const [pipelinePreset, setPipelinePreset] = useState<PipelinePreset>("custom");
+  /** For haze analysis: which inset key is the reference. Auto-
+   *  defaults to the first available source. */
+  const [hazeReferenceKey, setHazeReferenceKey] = useState<string>("");
 
   // Zoom inset sources marked `include_in_analysis`. Refreshed on
   // dialog open so the Python / MATLAB pipeline button stays
@@ -710,6 +815,13 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
   // Modified images produced by the most recent pipeline run —
   // surfaced as a small horizontal strip below the console.
   const [pyImages, setPyImages] = useState<Array<{ name: string; image: string }>>([]);
+  // CSV tables from the most recent pipeline run — Python/MATLAB
+  // pipelines are data-extraction only (per spec), so the tables
+  // bucket gets its own dedicated panel with a "Send to R tab"
+  // affordance per table (creates a new R tab whose `data` table
+  // is populated from this CSV — the user then picks a plot type
+  // and runs as usual).
+  const [pyTables, setPyTables] = useState<AnalysisTable[]>([]);
 
   // Modal preview key and selection are GLOBAL across tabs so the
   // top strip can mix plots from different tabs.
@@ -986,6 +1098,13 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
       .then((r) => {
         const list = r.sources || [];
         setInsetSources(list);
+        // Default haze-analysis reference to the FIRST source so the
+        // preset is immediately runnable without an extra click.
+        if (list.length > 0) {
+          setHazeReferenceKey((cur) => cur && list.some((s) => s.key === cur) ? cur : list[0].key);
+        } else {
+          setHazeReferenceKey("");
+        }
         // Stash on the closure so the tab-seeding logic below can
         // pick a Python starter when there are no measurements but
         // the user has flagged insets for analysis.
@@ -1191,6 +1310,102 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
   // zoom inset flagged `include_in_analysis`. Outputs route into the
   // same plot timeline + table cache that R runs use; modified
   // images go into `pyImages` (rendered below the data panel).
+  // Push a pipeline-output table into a new R tab. The R script
+  // reads the CSV INLINE via `read.csv(text = "...")` so it
+  // travels with the tab (round-trips through save/load and is
+  // self-contained — no fragile filesystem path). The default
+  // plot is a bar chart of the first numeric column grouped by
+  // the first string column; the user can edit afterwards.
+  const sendTableToRTab = useCallback((tbl: AnalysisTable) => {
+    const id = makeTabId();
+    const lines = (tbl.csv || "").split(/\r?\n/).filter((l) => l.length > 0);
+    const header = (lines[0] || "").split(",");
+    // Detect first non-source column as the default y axis.
+    const stringCol = header[0] || "source";
+    let yCol = "value";
+    if (lines.length > 1) {
+      const firstRow = lines[1].split(",");
+      for (let i = 0; i < header.length; i++) {
+        const v = firstRow[i];
+        if (v !== undefined && v !== "" && !Number.isNaN(parseFloat(v.replace(/[^0-9.\-]/g, "")))) {
+          yCol = header[i];
+          break;
+        }
+      }
+    }
+    const escapedCsv = (tbl.csv || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const code = `# ============================================================
+#  R plot for pipeline output: ${tbl.name}
+#
+#  CSV was generated by the Python / MATLAB pipeline above and
+#  pasted inline below. Edit the ggplot block to taste; the
+#  default is a bar chart of the first numeric column.
+# ============================================================
+library(ggplot2)
+library(ggprism)
+
+data <- read.csv(text = "${escapedCsv}", stringsAsFactors = FALSE)
+
+mpfig_plot("${tbl.name}.png")
+ggplot(data, aes(x = ${stringCol}, y = ${yCol})) +
+  geom_col(aes(fill = ${stringCol}), width = 0.7) +
+  theme_prism() +
+  labs(title = "${tbl.name}", x = NULL, y = "${yCol}") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 30, hjust = 1))
+`;
+    setTabs((prev) => {
+      const taken = new Set(prev.map((t) => t.name));
+      let candidate = `R: ${tbl.name}`;
+      let i = 2;
+      while (taken.has(candidate)) { candidate = `R: ${tbl.name} (${i++})`; }
+      const tab: CodeTab = {
+        id,
+        name: candidate,
+        measureType: "all",
+        plotType: "bar",
+        statTest: "none",
+        code,
+        plots: [],
+      };
+      return [...prev, tab];
+    });
+    setActiveTabId(id);
+    setConsoleOut((prev) => prev + `\n=== Sent table '${tbl.name}' to a new R tab. Press Run to plot. ===\n`);
+  }, []);
+
+  // Generate the preset's starter code for the current engine /
+  // reference choice. Single source of truth used by:
+  //   • Engine swap auto-fill (Python ↔ MATLAB)
+  //   • Preset change auto-fill
+  //   • Reference change auto-fill (haze analysis)
+  const generatePresetCode = useCallback(
+    (engine: "python" | "matlab", preset: PipelinePreset, refKey: string): string => {
+      const spec = PIPELINE_PRESETS[preset];
+      const ref = spec.needsReference ? (refKey || null) : null;
+      return engine === "python" ? spec.generatePython(ref) : spec.generateMatlab(ref);
+    },
+    [],
+  );
+
+  // Whenever the user toggles the preset OR (for haze) picks a new
+  // reference, replace the active tab's code IF it still matches
+  // any of the other preset×engine outputs — keeps custom edits
+  // intact while allowing rapid preset swapping.
+  useEffect(() => {
+    if (!activeTab || !open) return;
+    const cur = activeTab.code || "";
+    const matchesAnyPreset = (Object.keys(PIPELINE_PRESETS) as PipelinePreset[]).some((pk) => {
+      const spec = PIPELINE_PRESETS[pk];
+      const py = spec.generatePython(spec.needsReference ? hazeReferenceKey || null : null).trim();
+      const ml = spec.generateMatlab(spec.needsReference ? hazeReferenceKey || null : null).trim();
+      return cur.trim() === py || cur.trim() === ml;
+    });
+    if (!matchesAnyPreset && cur.trim().length > 0) return;  // user-edited — leave alone
+    const next = generatePresetCode(pipelineEngine, pipelinePreset, hazeReferenceKey);
+    if (next !== cur) updateActiveTab({ code: next });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pipelinePreset, hazeReferenceKey, pipelineEngine, activeTabId]);
+
   const handleRunPython = async () => {
     if (!activeTab) return;
     if (insetSources.length === 0) {
@@ -1205,6 +1420,7 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
     setSelectedPlotKeys(dropTabKeys(tabId));
     setSelectedPlot((cur) => (cur && parsePlotKey(cur).tabId === tabId ? null : cur));
     setPyImages([]);
+    setPyTables([]);
     try {
       const result = await api.runPython(
         activeTab.code,
@@ -1227,6 +1443,7 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
         return next;
       });
       setPyImages(result.images || []);
+      setPyTables(tablesFromRun);
       const out = (result.stdout || "") + (result.stderr ? `\n${result.stderr}` : "");
       setConsoleOut((prev) => prev +
         `\n=== Run Python [${activeTab.name}] (${insetSources.length} source${insetSources.length === 1 ? "" : "s"}) ===\n` +
@@ -1263,6 +1480,7 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
     setSelectedPlotKeys(dropTabKeys(tabId));
     setSelectedPlot((cur) => (cur && parsePlotKey(cur).tabId === tabId ? null : cur));
     setPyImages([]);
+    setPyTables([]);
     try {
       const result = await api.runMatlab(
         activeTab.code,
@@ -1285,6 +1503,7 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
         return next;
       });
       setPyImages(result.images || []);
+      setPyTables(tablesFromRun);
       const kind = result.kind ? `(${result.kind})` : "";
       const out = (result.stdout || "") + (result.stderr ? `\n${result.stderr}` : "");
       setConsoleOut((prev) => prev +
@@ -2057,10 +2276,56 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
               address a specific one (`inputs[key]`). The strip only
               appears when at least one inset is flagged. */}
           {insetSources.length > 0 && (
-            <Box sx={{ px: 1, py: 0.5, borderBottom: "1px solid", borderColor: "divider", maxHeight: 130, overflowY: "auto" }}>
+            <Box sx={{ px: 1, py: 0.5, borderBottom: "1px solid", borderColor: "divider", maxHeight: 220, overflowY: "auto" }}>
               <Typography variant="caption" sx={{ fontSize: "0.6rem", fontWeight: 700, color: "secondary.main", letterSpacing: 0.5, textTransform: "uppercase", display: "block", mb: 0.5 }}>
                 Inset sources ({insetSources.length}) — pixel inputs for {pipelineEngine === "python" ? "Python" : "MATLAB"} pipelines
               </Typography>
+              {/* Preset selector + (for presets that need it) a
+                  reference-inset picker. Picking a preset auto-fills
+                  the editor; the user can still edit afterwards. */}
+              <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", mb: 0.75, flexWrap: "wrap" }}>
+                <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary", mr: 0.25 }}>Preset:</Typography>
+                <Select
+                  size="small"
+                  value={pipelinePreset}
+                  onChange={(e) => setPipelinePreset(e.target.value as PipelinePreset)}
+                  sx={{ fontSize: "0.65rem", height: 26, minWidth: 140,
+                        "& .MuiSelect-select": { py: 0.4, px: 1 } }}
+                >
+                  {(Object.keys(PIPELINE_PRESETS) as PipelinePreset[]).map((pk) => (
+                    <MenuItem key={pk} value={pk} sx={{ fontSize: "0.7rem" }}>
+                      {PIPELINE_PRESETS[pk].label}
+                    </MenuItem>
+                  ))}
+                </Select>
+                {PIPELINE_PRESETS[pipelinePreset].needsReference && (
+                  <>
+                    <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary", ml: 0.5, mr: 0.25 }}>
+                      Reference:
+                    </Typography>
+                    <Select
+                      size="small"
+                      value={insetSources.some((s) => s.key === hazeReferenceKey) ? hazeReferenceKey : ""}
+                      onChange={(e) => setHazeReferenceKey(e.target.value)}
+                      displayEmpty
+                      sx={{ fontSize: "0.65rem", height: 26, minWidth: 180, maxWidth: 260,
+                            "& .MuiSelect-select": { py: 0.4, px: 1, textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap" } }}
+                    >
+                      <MenuItem value="" disabled sx={{ fontSize: "0.7rem" }}>(pick reference)</MenuItem>
+                      {insetSources.map((s) => (
+                        <MenuItem key={s.key} value={s.key} sx={{ fontSize: "0.7rem" }}>
+                          {s.label}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                  </>
+                )}
+                <Tooltip placement="top" title={PIPELINE_PRESETS[pipelinePreset].description}>
+                  <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", fontStyle: "italic", ml: 0.5, cursor: "help" }}>
+                    ⓘ what does this do?
+                  </Typography>
+                </Tooltip>
+              </Box>
               <Box sx={{ display: "flex", gap: 0.75, flexWrap: "wrap" }}>
                 {insetSources.map((s) => (
                   <Tooltip
@@ -2191,6 +2456,57 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
                 {consoleRunning ? "…" : "Run"}
               </Button>
             </Box>
+            {/* Pipeline data outputs — CSVs from mpfig_data() calls.
+                Each table gets a "Send to R tab" button that creates
+                a new R tab whose `data` is populated from the CSV,
+                so the user can plot it with the R+ggprism toolkit
+                (Python / MATLAB pipelines are deliberately
+                plot-free — image analysis on the pixel side, plots
+                on the R side). */}
+            {pyTables.length > 0 && (
+              <Box sx={{ px: 1, pb: 0.5 }}>
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, mb: 0.25 }}>
+                  <Typography variant="caption" sx={{ fontSize: "0.6rem", fontWeight: 700, color: "secondary.main", letterSpacing: 0.5, textTransform: "uppercase" }}>
+                    Pipeline data ({pyTables.length})
+                  </Typography>
+                  <Box sx={{ flex: 1 }} />
+                  <Button size="small" sx={{ fontSize: "0.55rem", textTransform: "none", minWidth: 0, p: 0.25 }}
+                    onClick={() => setPyTables([])}>Clear</Button>
+                </Box>
+                <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
+                  {pyTables.map((tbl) => {
+                    const lines = (tbl.csv || "").split(/\r?\n/).filter((l) => l.length > 0);
+                    const rowCount = Math.max(0, lines.length - 1);
+                    const colCount = lines[0] ? lines[0].split(",").length : 0;
+                    return (
+                      <Box key={tbl.id} sx={{ border: "1px solid", borderColor: "divider", borderRadius: 0.5, p: 0.5, display: "flex", flexDirection: "column", gap: 0.25, minWidth: 160, bgcolor: "background.default" }}>
+                        <Tooltip placement="top" title={
+                          <pre style={{ margin: 0, fontSize: 10, maxHeight: 240, overflow: "auto", whiteSpace: "pre" }}>{tbl.csv}</pre>
+                        }>
+                          <Typography variant="caption" sx={{ fontSize: "0.65rem", fontWeight: 700, cursor: "help" }}>{tbl.name}</Typography>
+                        </Tooltip>
+                        <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>
+                          {rowCount} row{rowCount === 1 ? "" : "s"} × {colCount} col{colCount === 1 ? "" : "s"}
+                        </Typography>
+                        <Box sx={{ display: "flex", gap: 0.25, mt: 0.25 }}>
+                          <Button size="small" variant="outlined" color="secondary"
+                            sx={{ fontSize: "0.55rem", textTransform: "none", py: 0, minWidth: 0, flex: 1, lineHeight: 1.4 }}
+                            onClick={() => sendTableToRTab(tbl)}>
+                            Send to R tab
+                          </Button>
+                          <Button size="small" component="a"
+                            href={`data:text/csv;base64,${btoa(unescape(encodeURIComponent(tbl.csv || "")))}`}
+                            download={`${tbl.name}.csv`}
+                            sx={{ fontSize: "0.55rem", textTransform: "none", py: 0, minWidth: 0 }}>
+                            ⬇ CSV
+                          </Button>
+                        </Box>
+                      </Box>
+                    );
+                  })}
+                </Box>
+              </Box>
+            )}
             {/* Python-pipeline image outputs — modified images saved
                 via `mpfig_image()` from the last Python run. Each
                 tile has a Download link so the user can save the
