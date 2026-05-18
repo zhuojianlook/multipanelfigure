@@ -3625,6 +3625,15 @@ class PyAnalysisRequest(BaseModel):
     # `inputs[key]` → a dict { image: np.ndarray (HxWx3 uint8),
     # width: int, height: int, label: str }.
     sources: List[Dict[str, object]] = []
+    # Extra inputs piped from upstream nodes in the analysis graph.
+    # Each entry: { key, kind, label?, image_b64?, csv? }.
+    #   kind="image" → decoded into the same inputs[key] shape as a
+    #                  source (image / width / height / label).
+    #   kind="table" → exposed as inputs[key]["table"] (list of dicts
+    #                  parsed from the CSV via csv.DictReader).
+    # Lets a downstream Python node operate on a prior node's
+    # outputs without going through the inset registry.
+    extra_inputs: List[Dict[str, object]] = []
     timeout_sec: int = 30
 
 
@@ -3681,6 +3690,34 @@ def run_python_pipeline(body: PyAnalysisRequest):
             except Exception as _e:
                 import sys as __s
                 print(f"[run-python] extract failed for {s}: {_e}", file=__s.stderr, flush=True)
+        # Pipe upstream-node outputs in as additional inputs[key]
+        # entries — same shape as inset-sourced inputs so the user
+        # code doesn't need to special-case them.
+        for x in (body.extra_inputs or []):
+            try:
+                key = str(x.get("key", ""))
+                kind = str(x.get("kind", ""))
+                label = str(x.get("label") or key)
+                if not key:
+                    continue
+                if kind == "image" and x.get("image_b64"):
+                    raw = base64.b64decode(str(x["image_b64"]))
+                    img = Image.open(io.BytesIO(raw)).convert("RGB")
+                    arr = _np.asarray(img)
+                    inputs_dict[key] = {
+                        "image": arr,
+                        "width": int(arr.shape[1]),
+                        "height": int(arr.shape[0]),
+                        "label": label,
+                    }
+                elif kind == "table" and x.get("csv"):
+                    import csv as _csv
+                    reader = _csv.DictReader(io.StringIO(str(x["csv"])))
+                    rows = list(reader)
+                    inputs_dict[key] = {"table": rows, "label": label}
+            except Exception as _e:
+                import sys as __s
+                print(f"[run-python] extra_input {x.get('key')!r} decode failed: {_e}", file=__s.stderr, flush=True)
         with open(inputs_pickle, "wb") as f:
             _pickle.dump(inputs_dict, f)
 
@@ -3915,6 +3952,7 @@ def check_matlab_installed():
 class MatlabAnalysisRequest(BaseModel):
     code: str
     sources: List[Dict[str, object]] = []
+    extra_inputs: List[Dict[str, object]] = []
     timeout_sec: int = 60
 
 
@@ -3989,6 +4027,48 @@ def run_matlab_pipeline(body: MatlabAnalysisRequest):
             except Exception as _e:
                 import sys as __s
                 print(f"[run-matlab] extract failed for {s}: {_e}", file=__s.stderr, flush=True)
+        # Pipe upstream-node outputs in as additional inputs.<safe>
+        # entries. Field names must start with a letter for MATLAB,
+        # so we reuse the matlabSafeKey scheme.
+        for x in (body.extra_inputs or []):
+            try:
+                key = str(x.get("key", ""))
+                kind = str(x.get("kind", ""))
+                label = str(x.get("label") or key)
+                if not key:
+                    continue
+                safe = "k_" + key.replace("-", "_").replace(".", "_").replace("/", "_")
+                if kind == "image" and x.get("image_b64"):
+                    raw = base64.b64decode(str(x["image_b64"]))
+                    img = Image.open(io.BytesIO(raw)).convert("RGB")
+                    arr = _np.asarray(img)
+                    inputs_struct[safe] = {
+                        "image": arr,
+                        "width": int(arr.shape[1]),
+                        "height": int(arr.shape[0]),
+                        "label": label,
+                    }
+                elif kind == "table" and x.get("csv"):
+                    # Tables get exposed as inputs.<safe>.table — a
+                    # struct of column vectors. MATLAB consumer:
+                    # `inputs.<safe>.table.<column>`
+                    import csv as _csv
+                    reader = _csv.DictReader(io.StringIO(str(x["csv"])))
+                    rows = list(reader)
+                    if rows:
+                        cols = {col: [r.get(col, "") for r in rows] for col in rows[0].keys()}
+                        # Try to coerce numeric columns to float arrays
+                        for col, vals in list(cols.items()):
+                            try:
+                                cols[col] = _np.asarray([float(v) for v in vals])
+                            except Exception:
+                                cols[col] = vals  # keep as list of strings
+                        inputs_struct[safe] = {"table": cols, "label": label}
+                    else:
+                        inputs_struct[safe] = {"table": {}, "label": label}
+            except Exception as _e:
+                import sys as __s
+                print(f"[run-matlab] extra_input {x.get('key')!r} decode failed: {_e}", file=__s.stderr, flush=True)
         try:
             _savemat(inputs_mat, {"inputs": inputs_struct}, do_compression=True)
         except Exception as _e:
