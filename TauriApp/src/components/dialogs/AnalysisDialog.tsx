@@ -461,65 +461,6 @@ function buildRCode(plotKey: string, statKey: string, rows: DataRow[], measureTy
 
 `;
 
-// ── Python starter for zoom-inset pixel pipelines ───────────
-// Seeded into the editor when the user opens Analysis with at
-// least one inset flagged include_in_analysis but no other
-// measurements to seed an R tab from. Demonstrates the three
-// output helpers (mpfig_plot, mpfig_data, mpfig_image) and the
-// shape of inputs[].
-const PYTHON_STARTER_CODE = `# ============================================================
-# Python pipeline — runs against zoom-inset pixels.
-#
-# Available globals:
-#   inputs[key]   → dict with:
-#       image  : uint8 numpy array, shape (H, W, 3) — RGB pixels
-#       width  : int
-#       height : int
-#       label  : str — human-readable "R1C1 · inset 1 (...)"
-#       row, col, inset_index — original grid coords
-#
-# Output helpers:
-#   mpfig_plot()          → save current matplotlib figure into
-#                           the Analysis plot timeline.
-#   mpfig_data(rows, name)→ save CSV (DataFrame / dict / list).
-#   mpfig_image(arr, name)→ save numpy / PIL image to the
-#                           "Python images" strip below.
-#
-# Click "Run Python" in the top right to execute.
-# ============================================================
-
-import numpy as np
-import matplotlib.pyplot as plt
-
-rows = []
-for key, src in inputs.items():
-    img = src["image"]               # H x W x 3, uint8
-    r_mean = float(np.mean(img[..., 0]))
-    g_mean = float(np.mean(img[..., 1]))
-    b_mean = float(np.mean(img[..., 2]))
-    print(f"{src['label']}: R={r_mean:.1f}  G={g_mean:.1f}  B={b_mean:.1f}")
-    rows.append({
-        "source": src["label"],
-        "R": r_mean, "G": g_mean, "B": b_mean,
-    })
-mpfig_data(rows, name="channel_means")
-
-# Quick histogram of the FIRST source's intensity (luminance)
-if inputs:
-    first = next(iter(inputs.values()))
-    lum = first["image"].mean(axis=2)
-    plt.figure(figsize=(5, 3))
-    plt.hist(lum.ravel(), bins=64, color="#4caf50", alpha=0.85)
-    plt.title(f"Intensity histogram — {first['label']}")
-    plt.xlabel("Luminance"); plt.ylabel("Pixel count")
-    mpfig_plot("histogram.png")
-    # Also save a thresholded copy back to the images strip
-    mask = (lum > 128).astype(np.uint8)
-    out = first["image"].copy()
-    out[mask == 0] = 0
-    mpfig_image(out, name="thresholded")
-`;
-
   // ── Libraries ──
   let libs = `# ── Libraries ───────────────────────────────────────────────
 library(ggplot2)
@@ -616,6 +557,119 @@ const parsePlotKey = (k: string): { tabId: string; plotId: string } => {
   return { tabId: k.slice(0, sep), plotId: k.slice(sep + 1) };
 };
 
+// ── Python starter for zoom-inset pixel pipelines ───────────
+// Seeded into the editor when the user opens Analysis with at
+// least one flagged inset but no other measurements to seed an
+// R tab from. Demonstrates the inputs[key]['image'] interface
+// and the three output helpers.
+const PYTHON_STARTER_CODE = `# ============================================================
+# Python pipeline — runs against zoom-inset pixels.
+#
+# Available globals:
+#   inputs[key]   → dict with:
+#       image  : uint8 numpy array, shape (H, W, 3) — RGB pixels
+#       width  : int
+#       height : int
+#       label  : str — human-readable "R1C1 · inset 1 (...)"
+#       row, col, inset_index — original grid coords
+#
+# Output helpers:
+#   mpfig_plot()          → save current matplotlib figure into
+#                           the Analysis plot timeline.
+#   mpfig_data(rows, name)→ save CSV (DataFrame / dict / list).
+#   mpfig_image(arr, name)→ save numpy / PIL image to the
+#                           "Python images" strip below.
+#
+# Click "Run Python" in the top right to execute.
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+rows = []
+for key, src in inputs.items():
+    img = src["image"]               # H x W x 3, uint8
+    r_mean = float(np.mean(img[..., 0]))
+    g_mean = float(np.mean(img[..., 1]))
+    b_mean = float(np.mean(img[..., 2]))
+    print(f"{src['label']}: R={r_mean:.1f}  G={g_mean:.1f}  B={b_mean:.1f}")
+    rows.append({
+        "source": src["label"],
+        "R": r_mean, "G": g_mean, "B": b_mean,
+    })
+mpfig_data(rows, name="channel_means")
+
+# Quick histogram of the FIRST source's intensity (luminance)
+if inputs:
+    first = next(iter(inputs.values()))
+    lum = first["image"].mean(axis=2)
+    plt.figure(figsize=(5, 3))
+    plt.hist(lum.ravel(), bins=64, color="#4caf50", alpha=0.85)
+    plt.title(f"Intensity histogram — {first['label']}")
+    plt.xlabel("Luminance"); plt.ylabel("Pixel count")
+    mpfig_plot("histogram.png")
+    # Also save a thresholded copy back to the images strip
+    mask = (lum > 128).astype(np.uint8)
+    out = first["image"].copy()
+    out[mask == 0] = 0
+    mpfig_image(out, name="thresholded")
+`;
+
+// ── MATLAB / Octave starter for zoom-inset pipelines ────────
+// Auto-inserted when the user switches the engine selector to
+// MATLAB on a tab whose code matches the Python starter.
+const MATLAB_STARTER_CODE = `% =============================================================
+% MATLAB / Octave pipeline — runs against zoom-inset pixels.
+%
+% Available variables (after \`load('inputs.mat')\` runs in the harness):
+%   inputs.<safe_key>.image  — uint8 H x W x 3 matrix
+%   inputs.<safe_key>.width
+%   inputs.<safe_key>.height
+%   inputs.<safe_key>.label  — human-readable source name
+%
+% Output helpers:
+%   mpfig_plot(name)             — save current figure to timeline
+%   mpfig_data(struct, name)     — save CSV (struct of column vectors)
+%   mpfig_image(arr, name)       — save image (uint8 or normalised)
+%
+% Click "Run MATLAB" in the top right to execute.
+% =============================================================
+
+keys = fieldnames(inputs);
+rmeans = zeros(numel(keys), 1);
+gmeans = zeros(numel(keys), 1);
+bmeans = zeros(numel(keys), 1);
+labels = cell(numel(keys), 1);
+
+for k = 1:numel(keys)
+  src = inputs.(keys{k});
+  img = src.image;
+  rmeans(k) = mean(mean(double(img(:,:,1))));
+  gmeans(k) = mean(mean(double(img(:,:,2))));
+  bmeans(k) = mean(mean(double(img(:,:,3))));
+  labels{k} = src.label;
+  fprintf('%s: R=%.1f G=%.1f B=%.1f\\n', src.label, rmeans(k), gmeans(k), bmeans(k));
+end
+
+mpfig_data(struct('source', {labels}, 'R', rmeans, 'G', gmeans, 'B', bmeans), 'channel_means');
+
+% Histogram of the first source's luminance
+if ~isempty(keys)
+  first = inputs.(keys{1});
+  lum = mean(double(first.image), 3);
+  figure;
+  hist(lum(:), 64);
+  title(['Intensity histogram — ' first.label]);
+  xlabel('Luminance'); ylabel('Pixel count');
+  mpfig_plot('histogram');
+  % Save a thresholded copy back to the images strip
+  mask = uint8(lum > 128);
+  out = first.image;
+  out(repmat(~mask, [1 1 3])) = 0;
+  mpfig_image(out, 'thresholded');
+end
+`;
+
 export function AnalysisDialog({ open, onClose, measurements }: Props) {
   // R status
   const [rInstalled, setRInstalled] = useState<boolean | null>(null);
@@ -636,15 +690,25 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
   const [activeTabId, setActiveTabId] = useState<string>("");
   const [running, setRunning] = useState(false);
   const [runningPy, setRunningPy] = useState(false);
+  const [runningMatlab, setRunningMatlab] = useState(false);
+  const [matlabInfo, setMatlabInfo] = useState<{ installed: boolean; kind: string }>({ installed: false, kind: "" });
+  /** Which engine the secondary run button currently dispatches.
+   *  Persists across runs so the user's last choice is remembered. */
+  const [pipelineEngine, setPipelineEngine] = useState<"python" | "matlab">("python");
 
   // Zoom inset sources marked `include_in_analysis`. Refreshed on
-  // dialog open so the Python pipeline button stays current.
+  // dialog open so the Python / MATLAB pipeline button stays
+  // current. Each entry carries a small thumbnail so the Analysis
+  // dialog can show the user exactly which pixels the pipelines
+  // will operate on.
   const [insetSources, setInsetSources] = useState<Array<{
     key: string; row: number; col: number; inset_index: number;
     label: string;
+    natural_width: number; natural_height: number;
+    thumbnail: string;
   }>>([]);
-  // Modified images produced by the most recent Python pipeline run
-  // — surfaced as a small horizontal strip below the data panel.
+  // Modified images produced by the most recent pipeline run —
+  // surfaced as a small horizontal strip below the console.
   const [pyImages, setPyImages] = useState<Array<{ name: string; image: string }>>([]);
 
   // Modal preview key and selection are GLOBAL across tabs so the
@@ -911,6 +975,12 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
     // Refresh the list of zoom-inset sources flagged include_in_analysis
     // so the "Run as Python" button knows what inputs to feed into the
     // pipeline. Cheap (just metadata, no pixel extraction).
+    // Probe MATLAB / Octave availability so we can show / hide
+    // the Run MATLAB button. Cached on state; one call per open.
+    api.checkMatlab()
+      .then((m) => setMatlabInfo({ installed: !!m.installed, kind: m.kind || "" }))
+      .catch(() => setMatlabInfo({ installed: false, kind: "" }));
+
     let insetSourcesForSeed: typeof insetSources = [];
     api.listInsetAnalysisSources()
       .then((r) => {
@@ -1166,6 +1236,65 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
         (err instanceof Error ? err.message : String(err)) + "\n");
     } finally {
       setRunningPy(false);
+    }
+  };
+
+  // Run the ACTIVE tab's code as a MATLAB / Octave pipeline against
+  // every flagged zoom inset. Mirrors handleRunPython end-to-end —
+  // same flow into the plot timeline + Python-images strip — only
+  // the backend interpreter differs.
+  const handleRunMatlab = async () => {
+    if (!activeTab) return;
+    if (insetSources.length === 0) {
+      setConsoleOut((prev) => prev +
+        "\n=== Run as MATLAB ===\nNo zoom insets are marked 'Include in Analysis'. " +
+        "Open an Edit Panel → Zoom Inset tab and tick the checkbox first.\n");
+      return;
+    }
+    if (!matlabInfo.installed) {
+      setConsoleOut((prev) => prev +
+        "\n=== Run as MATLAB ===\nNo MATLAB / Octave interpreter detected. " +
+        "Install Octave (free) from https://octave.org/ or MATLAB from MathWorks.\n");
+      return;
+    }
+    setRunningMatlab(true);
+    updateActiveTab({ plots: [] });
+    const tabId = activeTab.id;
+    setSelectedPlotKeys(dropTabKeys(tabId));
+    setSelectedPlot((cur) => (cur && parsePlotKey(cur).tabId === tabId ? null : cur));
+    setPyImages([]);
+    try {
+      const result = await api.runMatlab(
+        activeTab.code,
+        insetSources.map((s) => ({
+          key: s.key, row: s.row, col: s.col, inset_index: s.inset_index, label: s.label,
+        })),
+      );
+      const tablesFromRun: AnalysisTable[] = (result.tables ?? []).map((t) => ({
+        id: makeTableId(), name: t.name, csv: t.csv,
+      }));
+      const fresh: AnalysisPlot[] = result.plots.map((b64) => ({
+        id: makePlotId(),
+        b64,
+        tables: tablesFromRun.length > 0 ? tablesFromRun : undefined,
+      }));
+      setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, plots: fresh } : t)));
+      setSelectedPlotKeys((prev) => {
+        const next = new Set(prev);
+        fresh.forEach((p) => next.add(plotKey(tabId, p.id)));
+        return next;
+      });
+      setPyImages(result.images || []);
+      const kind = result.kind ? `(${result.kind})` : "";
+      const out = (result.stdout || "") + (result.stderr ? `\n${result.stderr}` : "");
+      setConsoleOut((prev) => prev +
+        `\n=== Run MATLAB ${kind} [${activeTab.name}] (${insetSources.length} source${insetSources.length === 1 ? "" : "s"}) ===\n` +
+        (out.trim() || "(no console output)") + "\n");
+    } catch (err) {
+      setConsoleOut((prev) => prev + `\n=== Run MATLAB [${activeTab.name}] failed ===\n` +
+        (err instanceof Error ? err.message : String(err)) + "\n");
+    } finally {
+      setRunningMatlab(false);
     }
   };
 
@@ -1862,17 +1991,46 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
             >
               {running ? "Running..." : "Run"}
             </Button>
-            {/* Run the current tab as a Python pipeline against every
-                zoom inset flagged "Include in Analysis". Disabled if
-                no insets are flagged — tooltip explains why. The R
-                Run button stays primary; this is a secondary action
-                for the pixel-analysis workflow. */}
+            {/* Engine selector + dispatch for pipeline runs against
+                the flagged zoom insets. Python is always available;
+                MATLAB requires a host install of Octave or MATLAB. */}
+            <Select
+              size="small"
+              value={pipelineEngine}
+              onChange={(e) => {
+                const next = e.target.value as "python" | "matlab";
+                setPipelineEngine(next);
+                // Auto-swap the editor's starter when the user is still
+                // on a default snippet AND it doesn't match the new
+                // engine. Preserves any custom edits — only stock
+                // PYTHON_STARTER_CODE / MATLAB_STARTER_CODE get swapped.
+                if (activeTab) {
+                  const cur = activeTab.code || "";
+                  if (next === "matlab" && cur.trim() === PYTHON_STARTER_CODE.trim()) {
+                    updateActiveTab({ code: MATLAB_STARTER_CODE });
+                  } else if (next === "python" && cur.trim() === MATLAB_STARTER_CODE.trim()) {
+                    updateActiveTab({ code: PYTHON_STARTER_CODE });
+                  }
+                }
+              }}
+              disabled={running || runningPy || runningMatlab}
+              sx={{ fontSize: "0.65rem", py: 0, height: 28, minWidth: 84,
+                    "& .MuiSelect-select": { py: 0.4, px: 1 } }}
+            >
+              <MenuItem value="python" sx={{ fontSize: "0.7rem" }}>
+                🐍 Python
+              </MenuItem>
+              <MenuItem value="matlab" disabled={!matlabInfo.installed} sx={{ fontSize: "0.7rem" }}>
+                📐 MATLAB{matlabInfo.kind ? ` (${matlabInfo.kind})` : ""}
+                {!matlabInfo.installed && " — not detected"}
+              </MenuItem>
+            </Select>
             <Tooltip
               placement="top"
               title={
                 insetSources.length === 0
-                  ? "Open an Edit Panel → Zoom Inset tab and tick 'Include in Analysis' to expose a region for Python pipelines."
-                  : `Run as Python with ${insetSources.length} inset source${insetSources.length === 1 ? "" : "s"}: ${insetSources.map((s) => s.label).join(", ")}`
+                  ? "Open an Edit Panel → Zoom Inset tab and tick 'Include in Analysis' to expose a region for pipelines."
+                  : `Run as ${pipelineEngine === "python" ? "Python" : "MATLAB/Octave"} with ${insetSources.length} inset source${insetSources.length === 1 ? "" : "s"}: ${insetSources.map((s) => s.label).join(", ")}`
               }
             >
               <span>
@@ -1880,16 +2038,85 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
                   size="small"
                   variant="outlined"
                   color="secondary"
-                  startIcon={runningPy ? <CircularProgress size={12} /> : <PlayArrowIcon sx={{ fontSize: 14 }} />}
-                  disabled={running || runningPy || !activeTab || insetSources.length === 0}
-                  onClick={handleRunPython}
+                  startIcon={(runningPy || runningMatlab) ? <CircularProgress size={12} /> : <PlayArrowIcon sx={{ fontSize: 14 }} />}
+                  disabled={running || runningPy || runningMatlab || !activeTab || insetSources.length === 0 || (pipelineEngine === "matlab" && !matlabInfo.installed)}
+                  onClick={pipelineEngine === "python" ? handleRunPython : handleRunMatlab}
                   sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25 }}
                 >
-                  {runningPy ? "Running Py..." : `Run Python (${insetSources.length})`}
+                  {(runningPy || runningMatlab) ? "Running…" : `Run ${pipelineEngine === "python" ? "Python" : "MATLAB"} (${insetSources.length})`}
                 </Button>
               </span>
             </Tooltip>
           </Box>
+
+          {/* Zoom-inset preview strip — shows the exact pixels every
+              flagged inset exposes to the pipeline. Each tile has the
+              source's label + dimensions and a thumbnail; clicking
+              copies the source's `key` into the clipboard so the user
+              can drop it straight into their script if they want to
+              address a specific one (`inputs[key]`). The strip only
+              appears when at least one inset is flagged. */}
+          {insetSources.length > 0 && (
+            <Box sx={{ px: 1, py: 0.5, borderBottom: "1px solid", borderColor: "divider", maxHeight: 130, overflowY: "auto" }}>
+              <Typography variant="caption" sx={{ fontSize: "0.6rem", fontWeight: 700, color: "secondary.main", letterSpacing: 0.5, textTransform: "uppercase", display: "block", mb: 0.5 }}>
+                Inset sources ({insetSources.length}) — pixel inputs for {pipelineEngine === "python" ? "Python" : "MATLAB"} pipelines
+              </Typography>
+              <Box sx={{ display: "flex", gap: 0.75, flexWrap: "wrap" }}>
+                {insetSources.map((s) => (
+                  <Tooltip
+                    key={s.key}
+                    placement="top"
+                    title={
+                      <Box>
+                        <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.7rem", display: "block" }}>{s.label}</Typography>
+                        <Typography variant="caption" sx={{ fontSize: "0.65rem", display: "block" }}>
+                          {s.natural_width}×{s.natural_height} px ({pipelineEngine === "python" ? `inputs["${s.key}"]` : `inputs.k_${s.key.replace(/[^a-z0-9]/gi, "_")}`})
+                        </Typography>
+                        <Typography variant="caption" sx={{ fontSize: "0.6rem", fontStyle: "italic" }}>Click to copy key</Typography>
+                      </Box>
+                    }
+                  >
+                    <Box
+                      onClick={() => { navigator.clipboard?.writeText(s.key).catch(() => { /* ignore */ }); }}
+                      sx={{
+                        cursor: "pointer",
+                        border: "1px solid",
+                        borderColor: "divider",
+                        borderRadius: 0.5,
+                        p: 0.5,
+                        display: "flex",
+                        flexDirection: "column",
+                        alignItems: "center",
+                        gap: 0.25,
+                        minWidth: 70,
+                        bgcolor: "background.default",
+                        "&:hover": { borderColor: "secondary.main" },
+                      }}
+                    >
+                      {s.thumbnail ? (
+                        <Box
+                          component="img"
+                          src={`data:image/png;base64,${s.thumbnail}`}
+                          alt={s.label}
+                          sx={{ width: 60, height: 60, objectFit: "contain" }}
+                        />
+                      ) : (
+                        <Box sx={{ width: 60, height: 60, bgcolor: "action.disabledBackground", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                          <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.disabled" }}>no preview</Typography>
+                        </Box>
+                      )}
+                      <Typography variant="caption" sx={{ fontSize: "0.55rem", maxWidth: 70, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }}>
+                        R{s.row + 1}C{s.col + 1}·{s.inset_index + 1}
+                      </Typography>
+                      <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", lineHeight: 1 }}>
+                        {s.natural_width}×{s.natural_height}
+                      </Typography>
+                    </Box>
+                  </Tooltip>
+                ))}
+              </Box>
+            </Box>
+          )}
 
           {/* Code editor — CodeMirror 6 with R syntax highlighting.
               Bound to the ACTIVE tab. Switching tabs swaps the value. */}

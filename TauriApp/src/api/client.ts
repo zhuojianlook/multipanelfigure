@@ -410,7 +410,10 @@ class ApiClient {
   }
 
   /** List zoom insets across the grid that have `include_in_analysis`
-   *  enabled. Used by the Analysis tab's Python pipeline selector. */
+   *  enabled. Used by the Analysis tab's Python / MATLAB pipeline
+   *  source list. Includes a base64 thumbnail per inset so the
+   *  Analysis dialog can show the user exactly which pixels its
+   *  pipelines will operate on. */
   async listInsetAnalysisSources(): Promise<{
     sources: Array<{
       key: string;
@@ -421,9 +424,41 @@ class ApiClient {
       x: number; y: number; width: number; height: number;
       zoom_factor: number;
       label: string;
+      natural_width: number;
+      natural_height: number;
+      /** Base64 PNG (no data: prefix). Up to 256 px on the long edge. */
+      thumbnail: string;
     }>;
   }> {
     return apiJson("/api/analysis/inset-sources");
+  }
+
+  /** Detect whether a MATLAB-compatible interpreter (Octave or MATLAB)
+   *  is available on the host. The Analysis dialog hides the Run MATLAB
+   *  button when this returns `installed: false`. */
+  async checkMatlab(): Promise<{ installed: boolean; kind: string; path: string }> {
+    return apiJson("/api/analysis/check-matlab");
+  }
+
+  /** Run a MATLAB / Octave pipeline against the requested zoom-inset
+   *  regions. The script can `load("inputs.mat")` to get
+   *  `inputs.<safe_key>.image` (uint8 H×W×3 matrix), and call
+   *  `mpfig_plot(name)`, `mpfig_data(table, name)`, `mpfig_image(arr, name)`
+   *  to push outputs back into the Analysis timeline. */
+  async runMatlab(
+    code: string,
+    sources: Array<{ key: string; row: number; col: number; inset_index: number; label?: string }>,
+    timeoutSec: number = 60,
+  ): Promise<{
+    success: boolean;
+    kind?: string;
+    stdout: string;
+    stderr: string;
+    plots: string[];
+    tables: { name: string; csv: string }[];
+    images: { name: string; image: string }[];
+  }> {
+    return apiJson("/api/analysis/run-matlab", "POST", JSON.stringify({ code, sources, timeout_sec: timeoutSec }));
   }
 
   /** Run a Python pipeline against the requested zoom-inset regions.

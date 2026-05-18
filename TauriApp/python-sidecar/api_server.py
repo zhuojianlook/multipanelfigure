@@ -3465,15 +3465,18 @@ def run_r_console(body: RConsoleRequest):
 #                                            stdout / stderr / plots /
 #                                            tables / modified images
 
-def _collect_analysis_insets():
+def _collect_analysis_insets(include_thumbnails: bool = True):
     """Walk the current config and return one entry per zoom inset
     where `include_in_analysis` is true. The entry carries the inset's
-    label (panel coords + inset index), location, and dimensions so
-    the frontend can display a selector.
+    label (panel coords + inset index), location, dimensions, AND
+    (when `include_thumbnails` is True) a base64 PNG thumbnail so the
+    Analysis dialog can show the user exactly which pixels its
+    pipelines will operate on.
 
-    The actual cropped pixels are extracted lazily by
-    `_extract_inset_image()` when the user runs a pipeline, so we
-    don't pay the crop cost on every list call.
+    Thumbnails go through `_extract_inset_image()` so they reflect
+    the same cascade / crop math the runner uses; the result is then
+    PIL-thumbnailed to ≤256 px on the long edge to keep payload size
+    sane (a high-res inset would otherwise be ~MB).
     """
     out: List[Dict[str, object]] = []
     if cfg is None:
@@ -3487,7 +3490,7 @@ def _collect_analysis_insets():
                     continue
                 if not getattr(zi, "include_in_analysis", False):
                     continue
-                out.append({
+                entry: Dict[str, object] = {
                     "key": f"r{r}c{c}_i{idx}",
                     "row": r,
                     "col": c,
@@ -3496,7 +3499,25 @@ def _collect_analysis_insets():
                     "x": zi.x, "y": zi.y, "width": zi.width, "height": zi.height,
                     "zoom_factor": zi.zoom_factor,
                     "label": f"R{r+1}C{c+1} · inset {idx+1} ({zi.inset_type})",
-                })
+                    "natural_width": 0,
+                    "natural_height": 0,
+                    "thumbnail": "",
+                }
+                if include_thumbnails:
+                    try:
+                        img = _extract_inset_image(r, c, idx)
+                        if img is not None:
+                            entry["natural_width"] = int(img.size[0])
+                            entry["natural_height"] = int(img.size[1])
+                            thumb = img.copy()
+                            thumb.thumbnail((256, 256), Image.LANCZOS)
+                            buf = io.BytesIO()
+                            thumb.convert("RGB").save(buf, format="PNG")
+                            entry["thumbnail"] = base64.b64encode(buf.getvalue()).decode("ascii")
+                    except Exception as _e:
+                        import sys as _s
+                        print(f"[inset-sources] thumb extract failed for ({r},{c}) inset {idx}: {_e}", file=_s.stderr, flush=True)
+                out.append(entry)
     return out
 
 
@@ -3839,6 +3860,312 @@ except Exception:
 
         return {
             "success": result.returncode == 0,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "plots": plots_b64,
+            "tables": tables_out,
+            "images": images_out,
+        }
+
+
+def _find_matlab_executable() -> Tuple[Optional[str], str]:
+    """Locate a MATLAB-or-compatible interpreter on the host. Returns
+    (path, kind) where kind ∈ {"matlab", "octave", ""}.
+
+    Octave is preferred when both are installed because it starts in
+    ~1 s while MATLAB takes 15-30 s and consumes a license. The user
+    can override by editing this list. Detection is best-effort:
+      • shutil.which("octave") / which("matlab")
+      • common install paths on macOS / Linux / Windows
+    """
+    import shutil as _shutil
+    # 1. Octave (free, fast startup)
+    p = _shutil.which("octave")
+    if p:
+        return p, "octave"
+    for candidate in [
+        "/opt/homebrew/bin/octave", "/usr/local/bin/octave", "/usr/bin/octave",
+        "/Applications/Octave.app/Contents/Resources/usr/bin/octave",
+    ]:
+        if os.path.isfile(candidate):
+            return candidate, "octave"
+    # 2. MATLAB (commercial, slow startup)
+    p = _shutil.which("matlab")
+    if p:
+        return p, "matlab"
+    for candidate in [
+        "/Applications/MATLAB_R2024b.app/bin/matlab",
+        "/Applications/MATLAB_R2024a.app/bin/matlab",
+        "/Applications/MATLAB_R2023b.app/bin/matlab",
+        "/Applications/MATLAB_R2023a.app/bin/matlab",
+    ]:
+        if os.path.isfile(candidate):
+            return candidate, "matlab"
+    return None, ""
+
+
+@app.get("/api/analysis/check-matlab")
+def check_matlab_installed():
+    """Tell the frontend whether the Run MATLAB button should be
+    enabled, and which interpreter it'd use."""
+    path, kind = _find_matlab_executable()
+    return {"installed": bool(path), "kind": kind, "path": path or ""}
+
+
+class MatlabAnalysisRequest(BaseModel):
+    code: str
+    sources: List[Dict[str, object]] = []
+    timeout_sec: int = 60
+
+
+@app.post("/api/analysis/run-matlab")
+def run_matlab_pipeline(body: MatlabAnalysisRequest):
+    """Execute the user's MATLAB / Octave code with the requested
+    inset images available as `inputs.<key>.image` (uint8 H×W×3
+    matrix). Returns stdout, stderr, plots / tables / images saved
+    via the matching helper functions:
+        mpfig_plot(figHandle, name)
+        mpfig_data(table, name)
+        mpfig_image(arr, name)
+
+    The harness writes `inputs.mat` (via scipy.io.savemat from
+    Python) so the script can `load("inputs.mat")` and immediately
+    have `inputs.<key>.image` in scope. Output paths go through
+    fixed temp directories so we can collect after the run, the
+    same way the Python pipeline works.
+    """
+    import sys as _sys
+    import numpy as _np
+    try:
+        from scipy.io import savemat as _savemat
+    except ImportError:
+        return {"success": False, "stdout": "",
+                "stderr": "scipy is required for the MATLAB pipeline (savemat). "
+                          "Install scipy in the sidecar's Python environment.",
+                "plots": [], "tables": [], "images": []}
+
+    matlab_path, kind = _find_matlab_executable()
+    if not matlab_path:
+        return {"success": False, "stdout": "",
+                "stderr": "Neither Octave nor MATLAB found. Install Octave from "
+                          "https://octave.org/ (free) or MATLAB from MathWorks.",
+                "plots": [], "tables": [], "images": []}
+
+    code = (body.code or "").strip()
+    if not code:
+        return {"success": False, "stdout": "", "stderr": "Empty code.",
+                "plots": [], "tables": [], "images": []}
+    sources_in = body.sources or []
+    timeout_sec = max(1, min(int(body.timeout_sec or 60), 600))
+
+    with tempfile.TemporaryDirectory(prefix="mpfig_matlab_") as tmpdir:
+        # Extract inset images and bundle into a .mat the script
+        # can `load`. MATLAB struct field names can't start with a
+        # digit, so we sanitise keys (the original key is kept as
+        # the field `label`).
+        inputs_mat = os.path.join(tmpdir, "inputs.mat")
+        inputs_struct: Dict[str, Dict[str, object]] = {}
+        key_map: Dict[str, str] = {}  # safe → original
+        for s in sources_in:
+            try:
+                orig = str(s.get("key", ""))
+                r = int(s.get("row", -1)); c = int(s.get("col", -1))
+                i = int(s.get("inset_index", -1))
+                if not orig or r < 0 or c < 0 or i < 0:
+                    continue
+                img = _extract_inset_image(r, c, i)
+                if img is None:
+                    continue
+                arr = _np.asarray(img.convert("RGB"))
+                safe = "k_" + orig.replace("-", "_").replace(".", "_")
+                key_map[safe] = orig
+                inputs_struct[safe] = {
+                    "image": arr,
+                    "width": int(arr.shape[1]),
+                    "height": int(arr.shape[0]),
+                    "label": str(s.get("label") or orig),
+                    "row": r, "col": c, "inset_index": i,
+                }
+            except Exception as _e:
+                import sys as __s
+                print(f"[run-matlab] extract failed for {s}: {_e}", file=__s.stderr, flush=True)
+        try:
+            _savemat(inputs_mat, {"inputs": inputs_struct}, do_compression=True)
+        except Exception as _e:
+            return {"success": False, "stdout": "", "stderr": f"savemat failed: {_e}",
+                    "plots": [], "tables": [], "images": []}
+
+        plot_dir = os.path.join(tmpdir, "plots")
+        table_dir = os.path.join(tmpdir, "tables")
+        image_dir = os.path.join(tmpdir, "images")
+        os.makedirs(plot_dir, exist_ok=True)
+        os.makedirs(table_dir, exist_ok=True)
+        os.makedirs(image_dir, exist_ok=True)
+
+        # MATLAB / Octave harness. Both share enough syntax for this
+        # to work in either interpreter.
+        harness_template = """% Auto-generated harness — do not edit by hand
+_MPFIG_INPUTS_PATH = '__INPUTS_PATH__';
+_MPFIG_PLOT_DIR    = '__PLOT_DIR__';
+_MPFIG_TABLE_DIR   = '__TABLE_DIR__';
+_MPFIG_IMAGE_DIR   = '__IMAGE_DIR__';
+
+load(_MPFIG_INPUTS_PATH);  % defines `inputs`
+
+_mpfig_plot_count = 0;
+_mpfig_table_count = 0;
+_mpfig_image_count = 0;
+
+function mpfig_plot(name)
+  global _MPFIG_PLOT_DIR _mpfig_plot_count
+  _mpfig_plot_count = _mpfig_plot_count + 1;
+  if nargin < 1 || isempty(name)
+    name = sprintf('plot_%d.png', _mpfig_plot_count);
+  end
+  if ~ischar(name)
+    name = char(name);
+  end
+  fp = fullfile(_MPFIG_PLOT_DIR, name);
+  print(gcf(), fp, '-dpng', '-r150');
+end
+
+function mpfig_data(tbl, name)
+  global _MPFIG_TABLE_DIR _mpfig_table_count
+  _mpfig_table_count = _mpfig_table_count + 1;
+  if nargin < 2 || isempty(name)
+    name = sprintf('table_%d', _mpfig_table_count);
+  end
+  fp = fullfile(_MPFIG_TABLE_DIR, [char(name) '.csv']);
+  if isstruct(tbl)
+    fns = fieldnames(tbl);
+    n = 0;
+    for k = 1:numel(fns)
+      n = max(n, numel(tbl.(fns{k})));
+    end
+    fid = fopen(fp, 'w');
+    fprintf(fid, '%s', fns{1});
+    for k = 2:numel(fns); fprintf(fid, ',%s', fns{k}); end
+    fprintf(fid, '\\n');
+    for i = 1:n
+      for k = 1:numel(fns)
+        v = tbl.(fns{k});
+        if iscell(v); cell_v = v{min(i, numel(v))}; else; cell_v = v(min(i, numel(v))); end
+        if k > 1; fprintf(fid, ','); end
+        if ischar(cell_v); fprintf(fid, '%s', cell_v); else; fprintf(fid, '%g', cell_v); end
+      end
+      fprintf(fid, '\\n');
+    end
+    fclose(fid);
+  elseif isnumeric(tbl)
+    csvwrite(fp, tbl);
+  else
+    fid = fopen(fp, 'w'); fprintf(fid, '%s\\n', char(tbl)); fclose(fid);
+  end
+end
+
+function mpfig_image(arr, name)
+  global _MPFIG_IMAGE_DIR _mpfig_image_count
+  _mpfig_image_count = _mpfig_image_count + 1;
+  if nargin < 2 || isempty(name)
+    name = sprintf('image_%d', _mpfig_image_count);
+  end
+  fp = fullfile(_MPFIG_IMAGE_DIR, [char(name) '.png']);
+  if isa(arr, 'uint8')
+    imwrite(arr, fp);
+  else
+    mn = min(arr(:)); mx = max(arr(:));
+    if mx > mn
+      arr = uint8(255 * (arr - mn) / (mx - mn));
+    else
+      arr = uint8(zeros(size(arr)));
+    end
+    imwrite(arr, fp);
+  end
+end
+
+global _MPFIG_PLOT_DIR _MPFIG_TABLE_DIR _MPFIG_IMAGE_DIR
+global _mpfig_plot_count _mpfig_table_count _mpfig_image_count
+
+try
+__USER_CODE__
+catch _err
+  fprintf(2, '%s\\n', _err.message);
+  if isfield(_err, 'stack')
+    for _ii = 1:numel(_err.stack)
+      fprintf(2, '  at %s line %d\\n', _err.stack(_ii).name, _err.stack(_ii).line);
+    end
+  end
+  exit(1);
+end
+"""
+        harness = (
+            harness_template
+            .replace("__INPUTS_PATH__", inputs_mat.replace("\\", "/"))
+            .replace("__PLOT_DIR__", plot_dir.replace("\\", "/"))
+            .replace("__TABLE_DIR__", table_dir.replace("\\", "/"))
+            .replace("__IMAGE_DIR__", image_dir.replace("\\", "/"))
+            .replace("__USER_CODE__", code)
+        )
+
+        script_path = os.path.join(tmpdir, "pipeline.m")
+        with open(script_path, "w") as f:
+            f.write(harness)
+
+        try:
+            if kind == "octave":
+                # `--no-gui --no-window-system` keeps Octave headless;
+                # `-q` suppresses the welcome banner.
+                cmd = [matlab_path, "--no-gui", "--no-window-system", "-q", script_path]
+            else:
+                # MATLAB: `-batch` evaluates and exits, suppresses
+                # the splash. Pass the script content via -batch
+                # since MATLAB doesn't accept a .m file as the
+                # entry directly without a function block.
+                cmd = [matlab_path, "-batch",
+                       "run('" + script_path.replace("'", "''") + "')",
+                       "-nosplash", "-nodesktop"]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout_sec, cwd=tmpdir,
+            )
+        except subprocess.TimeoutExpired:
+            return {"success": False, "stdout": "",
+                    "stderr": f"{kind.upper()} pipeline timed out after {timeout_sec} seconds.",
+                    "plots": [], "tables": [], "images": []}
+        except Exception as e:
+            return {"success": False, "stdout": "", "stderr": str(e),
+                    "plots": [], "tables": [], "images": []}
+
+        plots_b64: List[str] = []
+        for png_path in sorted(glob_mod.glob(os.path.join(plot_dir, "*.*"))):
+            try:
+                with open(png_path, "rb") as pf:
+                    plots_b64.append(base64.b64encode(pf.read()).decode())
+            except Exception:
+                pass
+        tables_out: List[Dict[str, str]] = []
+        for csv_path in sorted(glob_mod.glob(os.path.join(table_dir, "*.csv"))):
+            try:
+                with open(csv_path, "r", encoding="utf-8") as cf:
+                    tables_out.append({
+                        "name": os.path.splitext(os.path.basename(csv_path))[0],
+                        "csv": cf.read(),
+                    })
+            except Exception:
+                pass
+        images_out: List[Dict[str, str]] = []
+        for img_path in sorted(glob_mod.glob(os.path.join(image_dir, "*.*"))):
+            try:
+                with open(img_path, "rb") as pf:
+                    images_out.append({
+                        "name": os.path.splitext(os.path.basename(img_path))[0],
+                        "image": base64.b64encode(pf.read()).decode(),
+                    })
+            except Exception:
+                pass
+
+        return {
+            "success": result.returncode == 0,
+            "kind": kind,
             "stdout": result.stdout,
             "stderr": result.stderr,
             "plots": plots_b64,
