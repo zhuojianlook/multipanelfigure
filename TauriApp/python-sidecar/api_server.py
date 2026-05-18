@@ -3457,6 +3457,396 @@ def run_r_console(body: RConsoleRequest):
             return {"success": False, "stdout": "", "stderr": str(e)}
 
 
+# ── Python pipelines on zoom-inset pixels ──────────────────────────────────
+# These let the user run custom Python against the cropped pixels of
+# any inset they marked "Include in Analysis" on a panel. Two endpoints:
+#   GET  /api/analysis/inset-sources       → list available regions
+#   POST /api/analysis/run-python          → execute user code, return
+#                                            stdout / stderr / plots /
+#                                            tables / modified images
+
+def _collect_analysis_insets():
+    """Walk the current config and return one entry per zoom inset
+    where `include_in_analysis` is true. The entry carries the inset's
+    label (panel coords + inset index), location, and dimensions so
+    the frontend can display a selector.
+
+    The actual cropped pixels are extracted lazily by
+    `_extract_inset_image()` when the user runs a pipeline, so we
+    don't pay the crop cost on every list call.
+    """
+    out: List[Dict[str, object]] = []
+    if cfg is None:
+        return out
+    for r in range(cfg.rows):
+        for c in range(cfg.cols):
+            panel = cfg.panels[r][c]
+            insets = _panel_zoom_insets(panel)
+            for idx, zi in enumerate(insets):
+                if zi is None:
+                    continue
+                if not getattr(zi, "include_in_analysis", False):
+                    continue
+                out.append({
+                    "key": f"r{r}c{c}_i{idx}",
+                    "row": r,
+                    "col": c,
+                    "inset_index": idx,
+                    "inset_type": zi.inset_type,
+                    "x": zi.x, "y": zi.y, "width": zi.width, "height": zi.height,
+                    "zoom_factor": zi.zoom_factor,
+                    "label": f"R{r+1}C{c+1} · inset {idx+1} ({zi.inset_type})",
+                })
+    return out
+
+
+def _extract_inset_image(row: int, col: int, inset_index: int) -> Optional[Image.Image]:
+    """Return the cropped + zoomed PIL image for the inset at
+    (row, col)[inset_index]. Mirrors the cascade / draw_standard_zoom
+    logic so the analysis pipeline operates on EXACTLY the same pixels
+    that appear in the inset on the final figure.
+
+    Returns None if the inset doesn't exist or can't be extracted
+    (panel has no source image, indices out of range, etc.).
+    """
+    if cfg is None or row < 0 or col < 0 or row >= cfg.rows or col >= cfg.cols:
+        return None
+    panel = cfg.panels[row][col]
+    insets = _panel_zoom_insets(panel)
+    if inset_index < 0 or inset_index >= len(insets):
+        return None
+    zi = insets[inset_index]
+    if zi is None:
+        return None
+    # Standard / Separate insets read from the panel's own image
+    # (or an external image for Separate). Adjacent insets render
+    # into another cell — we still want THIS panel's selection
+    # crop for the pixels (zoom_factor × source rect), not the
+    # final assembled cell, so the analysis is repeatable across
+    # render-context changes.
+    src_img = _get_panel_image(panel) if panel.image_name else None
+    if src_img is None:
+        # Try the synthesised path for image-less zoom-target
+        # panels — extract by running the cascade and reading
+        # the cell whose source is `panel`.
+        rows, cols = cfg.rows, cfg.cols
+        processed_grid: List[List[Optional[Image.Image]]] = [[None] * cols for _ in range(rows)]
+        for sr in range(rows):
+            for sc in range(cols):
+                sp = cfg.panels[sr][sc]
+                spi = _get_panel_image(sp) if sp.image_name else None
+                if spi is None:
+                    continue
+                saved_z = sp.add_zoom_inset
+                sp.add_zoom_inset = False
+                try:
+                    processed_grid[sr][sc] = process_panel(
+                        spi, sp, min_dims, loaded_images,
+                        skip_labels=True, skip_symbols=True,
+                    )
+                finally:
+                    sp.add_zoom_inset = saved_z
+        _apply_adjacent_zoom_insets(cfg, processed_grid, rows, cols)
+        synth = processed_grid[row][col]
+        if synth is None or synth.size == (1, 1):
+            return None
+        # Crop the inset region from the synth.
+        sw, sh = synth.size
+        x = max(0, min(int(zi.x), sw - 1))
+        y = max(0, min(int(zi.y), sh - 1))
+        w = max(1, min(int(zi.width), sw - x))
+        h = max(1, min(int(zi.height), sh - y))
+        region = synth.crop((x, y, x + w, y + h))
+        zw = max(1, int(zi.width * zi.zoom_factor))
+        zh = max(1, int(zi.height * zi.zoom_factor))
+        return region.resize((zw, zh), Image.LANCZOS)
+    # Image-bearing panel — process through process_panel first so
+    # crop / rotation / levels are applied, then take the inset crop.
+    panel_copy = _from_dict(PanelInfo, _to_dict(panel))
+    panel_copy.add_zoom_inset = False
+    panel_copy.add_scale_bar = False
+    panel_copy.labels = []
+    panel_copy.symbols = []
+    panel_copy.lines = []
+    panel_copy.areas = []
+    img = process_panel(src_img, panel_copy, min_dims, loaded_images, skip_labels=True, skip_symbols=True)
+    iw, ih = img.size
+    x = max(0, min(int(zi.x), iw - 1))
+    y = max(0, min(int(zi.y), ih - 1))
+    w = max(1, min(int(zi.width), iw - x))
+    h = max(1, min(int(zi.height), ih - y))
+    rot = float(getattr(zi, "rotation", 0) or 0)
+    if abs(rot) > 0.01:
+        cx_r = x + w / 2.0
+        cy_r = y + h / 2.0
+        rotated = img.rotate(rot, center=(cx_r, cy_r), resample=Image.BICUBIC)
+        region = rotated.crop((x, y, x + w, y + h))
+    else:
+        region = img.crop((x, y, x + w, y + h))
+    zw = max(1, int(w * zi.zoom_factor))
+    zh = max(1, int(h * zi.zoom_factor))
+    return region.resize((zw, zh), Image.LANCZOS)
+
+
+@app.get("/api/analysis/inset-sources")
+def list_inset_analysis_sources():
+    """List every zoom inset across the grid whose `include_in_analysis`
+    flag is set. The Analysis tab uses this to populate its source
+    selector — running a Python pipeline lets the user pick any of
+    these regions as the input dataset."""
+    return {"sources": _collect_analysis_insets()}
+
+
+class PyAnalysisRequest(BaseModel):
+    code: str
+    # Sources the pipeline can read. Each entry: { key, row, col,
+    # inset_index }. The runner injects them into the script as
+    # `inputs[key]` → a dict { image: np.ndarray (HxWx3 uint8),
+    # width: int, height: int, label: str }.
+    sources: List[Dict[str, object]] = []
+    timeout_sec: int = 30
+
+
+@app.post("/api/analysis/run-python")
+def run_python_pipeline(body: PyAnalysisRequest):
+    """Execute the user's Python code with the requested inset images
+    available as `inputs`. Return stdout, stderr, any plots saved via
+    `mpfig_plot(...)`, any CSV tables saved via `mpfig_data(...)`, and
+    any modified images saved via `mpfig_image(...)`.
+
+    The code runs in a subprocess with a wall-clock timeout (default
+    30 s, capped at 600 s) so a runaway loop or accidental
+    `while True` can't hang the sidecar. Inputs are passed via a
+    pickled file in a temp dir — not as command-line args — so
+    multi-MB images don't blow the argv length limit. Standard
+    libraries available: PIL/Pillow, numpy, OpenCV (cv2), scipy,
+    scikit-image, matplotlib — whatever the sidecar's own venv has
+    (since we use the same `sys.executable`).
+    """
+    import sys as _sys
+    import pickle as _pickle
+    import textwrap as _textwrap
+    import numpy as _np
+    code = (body.code or "").strip()
+    if not code:
+        return {"success": False, "stdout": "", "stderr": "Empty code.",
+                "plots": [], "tables": [], "images": []}
+    sources_in = body.sources or []
+    timeout_sec = max(1, min(int(body.timeout_sec or 30), 600))
+
+    with tempfile.TemporaryDirectory(prefix="mpfig_py_") as tmpdir:
+        # Materialise each requested inset to numpy bytes ahead of
+        # time and stash in a pickle the worker reads.
+        inputs_pickle = os.path.join(tmpdir, "inputs.pkl")
+        inputs_dict: Dict[str, Dict[str, object]] = {}
+        for s in sources_in:
+            try:
+                key = str(s.get("key", ""))
+                r = int(s.get("row", -1)); c = int(s.get("col", -1))
+                i = int(s.get("inset_index", -1))
+                if not key or r < 0 or c < 0 or i < 0:
+                    continue
+                img = _extract_inset_image(r, c, i)
+                if img is None:
+                    continue
+                arr = _np.asarray(img.convert("RGB"))
+                inputs_dict[key] = {
+                    "image": arr,
+                    "width": int(arr.shape[1]),
+                    "height": int(arr.shape[0]),
+                    "label": str(s.get("label") or key),
+                    "row": r, "col": c, "inset_index": i,
+                }
+            except Exception as _e:
+                import sys as __s
+                print(f"[run-python] extract failed for {s}: {_e}", file=__s.stderr, flush=True)
+        with open(inputs_pickle, "wb") as f:
+            _pickle.dump(inputs_dict, f)
+
+        plot_dir = os.path.join(tmpdir, "plots")
+        table_dir = os.path.join(tmpdir, "tables")
+        image_dir = os.path.join(tmpdir, "images")
+        os.makedirs(plot_dir, exist_ok=True)
+        os.makedirs(table_dir, exist_ok=True)
+        os.makedirs(image_dir, exist_ok=True)
+
+        # Harness script wraps the user's code with:
+        #   • `inputs` dict pre-loaded from the pickle.
+        #   • `mpfig_plot()` — save current matplotlib figure into
+        #     the analysis-tab plot timeline.
+        #   • `mpfig_data()` — save CSV from DataFrame / dict / list.
+        #   • `mpfig_image()` — save a numpy/PIL image to the image
+        #     timeline (user can drag it back into the main figure).
+        #
+        # NOTE: this is a plain template (NOT an f-string) so we can
+        # contain literal `{` / `}` in the body without escaping
+        # every brace. We substitute the four path placeholders and
+        # the user code via simple string `.replace()` calls.
+        harness_template = '''import sys, os, pickle, traceback
+import numpy as np
+from PIL import Image
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+
+_INPUTS_PATH = r"__INPUTS_PATH__"
+_PLOT_DIR = r"__PLOT_DIR__"
+_TABLE_DIR = r"__TABLE_DIR__"
+_IMAGE_DIR = r"__IMAGE_DIR__"
+
+with open(_INPUTS_PATH, "rb") as _f:
+    inputs = pickle.load(_f)
+
+_plot_count = [0]
+_table_count = [0]
+_image_count = [0]
+
+def mpfig_plot(filename=None, **savefig_kwargs):
+    """Save the current matplotlib figure into the analysis-tab
+    plot timeline. Call after building a figure with plt."""
+    if plt is None:
+        return
+    _plot_count[0] += 1
+    if not filename:
+        filename = "plot_" + str(_plot_count[0]) + ".png"
+    if not filename.lower().endswith((".png", ".jpg", ".jpeg")):
+        filename += ".png"
+    path = os.path.join(_PLOT_DIR, filename)
+    fig = plt.gcf()
+    fig.savefig(path, dpi=savefig_kwargs.pop("dpi", 150), bbox_inches="tight", **savefig_kwargs)
+    plt.close(fig)
+
+def mpfig_data(rows, name="table"):
+    """Save a CSV table into the analysis tab's data section.
+    `rows` may be a pandas DataFrame, a dict of column→list, a
+    list of dicts, or a list of lists."""
+    import csv as _csv
+    _table_count[0] += 1
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in str(name))[:64] or "table"
+    path = os.path.join(_TABLE_DIR, safe + ".csv")
+    try:
+        import pandas as _pd
+        if isinstance(rows, _pd.DataFrame):
+            rows.to_csv(path, index=False)
+            return
+    except Exception:
+        pass
+    if isinstance(rows, dict):
+        keys = list(rows.keys())
+        n = max((len(v) for v in rows.values()), default=0)
+        with open(path, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(keys)
+            for i in range(n):
+                w.writerow([rows[k][i] if i < len(rows[k]) else "" for k in keys])
+    elif isinstance(rows, (list, tuple)) and rows and isinstance(rows[0], dict):
+        keys = list(rows[0].keys())
+        with open(path, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(keys)
+            for r in rows:
+                w.writerow([r.get(k, "") for k in keys])
+    elif isinstance(rows, (list, tuple)):
+        with open(path, "w", newline="") as f:
+            w = _csv.writer(f)
+            for r in rows:
+                w.writerow(r if isinstance(r, (list, tuple)) else [r])
+    else:
+        with open(path, "w") as f:
+            f.write(str(rows))
+
+def mpfig_image(arr, name="image"):
+    """Save a NumPy array or PIL image into the analysis tab's
+    image timeline."""
+    _image_count[0] += 1
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in str(name))[:64] or "image"
+    path = os.path.join(_IMAGE_DIR, safe + ".png")
+    if isinstance(arr, Image.Image):
+        arr.save(path)
+    else:
+        a = np.asarray(arr)
+        if a.dtype != np.uint8:
+            mn, mx = float(np.min(a)), float(np.max(a))
+            if mx > mn:
+                a = ((a - mn) / (mx - mn) * 255.0).astype(np.uint8)
+            else:
+                a = np.zeros_like(a, dtype=np.uint8)
+        Image.fromarray(a).save(path)
+
+try:
+__USER_CODE__
+except Exception:
+    traceback.print_exc()
+    sys.exit(1)
+'''
+        harness = (
+            harness_template
+            .replace("__INPUTS_PATH__", inputs_pickle.replace("\\", "/"))
+            .replace("__PLOT_DIR__", plot_dir.replace("\\", "/"))
+            .replace("__TABLE_DIR__", table_dir.replace("\\", "/"))
+            .replace("__IMAGE_DIR__", image_dir.replace("\\", "/"))
+            .replace("__USER_CODE__", _textwrap.indent(code, "    "))
+        )
+        script_path = os.path.join(tmpdir, "pipeline.py")
+        with open(script_path, "w") as f:
+            f.write(harness)
+
+        try:
+            result = subprocess.run(
+                [_sys.executable, script_path],
+                capture_output=True, text=True, timeout=timeout_sec, cwd=tmpdir,
+            )
+        except subprocess.TimeoutExpired:
+            return {"success": False, "stdout": "",
+                    "stderr": f"Python pipeline timed out after {timeout_sec} seconds.",
+                    "plots": [], "tables": [], "images": []}
+        except Exception as e:
+            return {"success": False, "stdout": "", "stderr": str(e),
+                    "plots": [], "tables": [], "images": []}
+
+        # Collect outputs
+        plots_b64: List[str] = []
+        for png_path in sorted(glob_mod.glob(os.path.join(plot_dir, "*.*"))):
+            try:
+                with open(png_path, "rb") as pf:
+                    plots_b64.append(base64.b64encode(pf.read()).decode())
+            except Exception:
+                pass
+        tables_out: List[Dict[str, str]] = []
+        for csv_path in sorted(glob_mod.glob(os.path.join(table_dir, "*.csv"))):
+            try:
+                with open(csv_path, "r", encoding="utf-8") as cf:
+                    tables_out.append({
+                        "name": os.path.splitext(os.path.basename(csv_path))[0],
+                        "csv": cf.read(),
+                    })
+            except Exception:
+                pass
+        images_out: List[Dict[str, str]] = []
+        for img_path in sorted(glob_mod.glob(os.path.join(image_dir, "*.*"))):
+            try:
+                with open(img_path, "rb") as pf:
+                    images_out.append({
+                        "name": os.path.splitext(os.path.basename(img_path))[0],
+                        "image": base64.b64encode(pf.read()).decode(),
+                    })
+            except Exception:
+                pass
+
+        return {
+            "success": result.returncode == 0,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "plots": plots_b64,
+            "tables": tables_out,
+            "images": images_out,
+        }
+
+
 # ── Entry Point ────────────────────────────────────────────────────────────
 
 def main():

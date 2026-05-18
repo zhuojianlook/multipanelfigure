@@ -409,6 +409,42 @@ class ApiClient {
     return apiJson("/api/analysis/run-console", "POST", JSON.stringify({ command, rscript_path: rscriptPath || null }));
   }
 
+  /** List zoom insets across the grid that have `include_in_analysis`
+   *  enabled. Used by the Analysis tab's Python pipeline selector. */
+  async listInsetAnalysisSources(): Promise<{
+    sources: Array<{
+      key: string;
+      row: number;
+      col: number;
+      inset_index: number;
+      inset_type: string;
+      x: number; y: number; width: number; height: number;
+      zoom_factor: number;
+      label: string;
+    }>;
+  }> {
+    return apiJson("/api/analysis/inset-sources");
+  }
+
+  /** Run a Python pipeline against the requested zoom-inset regions.
+   *  The harness exposes `inputs[key]` → { image: np.ndarray, ... } for
+   *  each source, and `mpfig_plot()`, `mpfig_data()`, `mpfig_image()`
+   *  helpers to push outputs back to the Analysis tab. */
+  async runPython(
+    code: string,
+    sources: Array<{ key: string; row: number; col: number; inset_index: number; label?: string }>,
+    timeoutSec: number = 30,
+  ): Promise<{
+    success: boolean;
+    stdout: string;
+    stderr: string;
+    plots: string[];
+    tables: { name: string; csv: string }[];
+    images: { name: string; image: string }[];
+  }> {
+    return apiJson("/api/analysis/run-python", "POST", JSON.stringify({ code, sources, timeout_sec: timeoutSec }));
+  }
+
   // ── Image Thumbnail ──────────────────────────────────────
 
   async getImageThumb(name: string): Promise<{ thumbnail: string }> {

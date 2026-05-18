@@ -576,6 +576,17 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
   const [tabs, setTabs] = useState<CodeTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string>("");
   const [running, setRunning] = useState(false);
+  const [runningPy, setRunningPy] = useState(false);
+
+  // Zoom inset sources marked `include_in_analysis`. Refreshed on
+  // dialog open so the Python pipeline button stays current.
+  const [insetSources, setInsetSources] = useState<Array<{
+    key: string; row: number; col: number; inset_index: number;
+    label: string;
+  }>>([]);
+  // Modified images produced by the most recent Python pipeline run
+  // — surfaced as a small horizontal strip below the data panel.
+  const [pyImages, setPyImages] = useState<Array<{ name: string; image: string }>>([]);
 
   // Modal preview key and selection are GLOBAL across tabs so the
   // top strip can mix plots from different tabs.
@@ -838,6 +849,13 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
     const panels = new Set(measurements.map((m) => m.panel));
     setSelectedPanels(panels);
 
+    // Refresh the list of zoom-inset sources flagged include_in_analysis
+    // so the "Run as Python" button knows what inputs to feed into the
+    // pipeline. Cheap (just metadata, no pixel extraction).
+    api.listInsetAnalysisSources()
+      .then((r) => setInsetSources(r.sources || []))
+      .catch(() => setInsetSources([]));
+
     if (tabs.length > 0) return; // user's existing tabs are preserved
 
     // Build the rows we WOULD see with all panels selected, ignoring
@@ -1011,6 +1029,58 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
       setConsoleOut((prev) => prev + `\n=== Run [${activeTab.name}] failed ===\n` + (err instanceof Error ? err.message : String(err)) + "\n");
     } finally {
       setRunning(false);
+    }
+  };
+
+  // Run the ACTIVE tab's code as a Python pipeline against every
+  // zoom inset flagged `include_in_analysis`. Outputs route into the
+  // same plot timeline + table cache that R runs use; modified
+  // images go into `pyImages` (rendered below the data panel).
+  const handleRunPython = async () => {
+    if (!activeTab) return;
+    if (insetSources.length === 0) {
+      setConsoleOut((prev) => prev +
+        "\n=== Run as Python ===\nNo zoom insets are marked 'Include in Analysis'. " +
+        "Open an Edit Panel → Zoom Inset tab and tick the checkbox first.\n");
+      return;
+    }
+    setRunningPy(true);
+    updateActiveTab({ plots: [] });
+    const tabId = activeTab.id;
+    setSelectedPlotKeys(dropTabKeys(tabId));
+    setSelectedPlot((cur) => (cur && parsePlotKey(cur).tabId === tabId ? null : cur));
+    setPyImages([]);
+    try {
+      const result = await api.runPython(
+        activeTab.code,
+        insetSources.map((s) => ({
+          key: s.key, row: s.row, col: s.col, inset_index: s.inset_index, label: s.label,
+        })),
+      );
+      const tablesFromRun: AnalysisTable[] = (result.tables ?? []).map((t) => ({
+        id: makeTableId(), name: t.name, csv: t.csv,
+      }));
+      const fresh: AnalysisPlot[] = result.plots.map((b64) => ({
+        id: makePlotId(),
+        b64,
+        tables: tablesFromRun.length > 0 ? tablesFromRun : undefined,
+      }));
+      setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, plots: fresh } : t)));
+      setSelectedPlotKeys((prev) => {
+        const next = new Set(prev);
+        fresh.forEach((p) => next.add(plotKey(tabId, p.id)));
+        return next;
+      });
+      setPyImages(result.images || []);
+      const out = (result.stdout || "") + (result.stderr ? `\n${result.stderr}` : "");
+      setConsoleOut((prev) => prev +
+        `\n=== Run Python [${activeTab.name}] (${insetSources.length} source${insetSources.length === 1 ? "" : "s"}) ===\n` +
+        (out.trim() || "(no console output)") + "\n");
+    } catch (err) {
+      setConsoleOut((prev) => prev + `\n=== Run Python [${activeTab.name}] failed ===\n` +
+        (err instanceof Error ? err.message : String(err)) + "\n");
+    } finally {
+      setRunningPy(false);
     }
   };
 
@@ -1701,12 +1771,39 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
               size="small"
               variant="contained"
               startIcon={running ? <CircularProgress size={12} /> : <PlayArrowIcon sx={{ fontSize: 14 }} />}
-              disabled={running || !rInstalled || !activeTab}
+              disabled={running || runningPy || !rInstalled || !activeTab}
               onClick={handleRun}
               sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25 }}
             >
               {running ? "Running..." : "Run"}
             </Button>
+            {/* Run the current tab as a Python pipeline against every
+                zoom inset flagged "Include in Analysis". Disabled if
+                no insets are flagged — tooltip explains why. The R
+                Run button stays primary; this is a secondary action
+                for the pixel-analysis workflow. */}
+            <Tooltip
+              placement="top"
+              title={
+                insetSources.length === 0
+                  ? "Open an Edit Panel → Zoom Inset tab and tick 'Include in Analysis' to expose a region for Python pipelines."
+                  : `Run as Python with ${insetSources.length} inset source${insetSources.length === 1 ? "" : "s"}: ${insetSources.map((s) => s.label).join(", ")}`
+              }
+            >
+              <span>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  color="secondary"
+                  startIcon={runningPy ? <CircularProgress size={12} /> : <PlayArrowIcon sx={{ fontSize: 14 }} />}
+                  disabled={running || runningPy || !activeTab || insetSources.length === 0}
+                  onClick={handleRunPython}
+                  sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25 }}
+                >
+                  {runningPy ? "Running Py..." : `Run Python (${insetSources.length})`}
+                </Button>
+              </span>
+            </Tooltip>
           </Box>
 
           {/* Code editor — CodeMirror 6 with R syntax highlighting.
@@ -1782,6 +1879,66 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
                 {consoleRunning ? "…" : "Run"}
               </Button>
             </Box>
+            {/* Python-pipeline image outputs — modified images saved
+                via `mpfig_image()` from the last Python run. Each
+                tile has a Download link so the user can save the
+                processed image and drop it into the figure timeline
+                (or use it as a Separate Image inset). Cleared on
+                each new Python run. */}
+            {pyImages.length > 0 && (
+              <Box sx={{ px: 1, pb: 0.5 }}>
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, mb: 0.25 }}>
+                  <Typography variant="caption" sx={{ fontSize: "0.6rem", fontWeight: 700, color: "secondary.main", letterSpacing: 0.5, textTransform: "uppercase" }}>
+                    Python images
+                  </Typography>
+                  <Box sx={{ flex: 1 }} />
+                  <Button
+                    size="small"
+                    sx={{ fontSize: "0.55rem", textTransform: "none", minWidth: 0, p: 0.25 }}
+                    onClick={() => setPyImages([])}
+                  >
+                    Clear
+                  </Button>
+                </Box>
+                <Box sx={{ display: "flex", gap: 0.5, overflowX: "auto", py: 0.25 }}>
+                  {pyImages.map((im, i) => (
+                    <Box
+                      key={`${im.name}-${i}`}
+                      sx={{
+                        flexShrink: 0,
+                        border: "1px solid",
+                        borderColor: "divider",
+                        borderRadius: 0.5,
+                        p: 0.5,
+                        display: "flex",
+                        flexDirection: "column",
+                        alignItems: "center",
+                        gap: 0.25,
+                      }}
+                    >
+                      <Box
+                        component="img"
+                        src={`data:image/png;base64,${im.image}`}
+                        alt={im.name}
+                        sx={{ width: 80, height: 80, objectFit: "contain", bgcolor: "background.default" }}
+                      />
+                      <Typography variant="caption" sx={{ fontSize: "0.55rem", maxWidth: 80, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {im.name}
+                      </Typography>
+                      <Button
+                        size="small"
+                        component="a"
+                        href={`data:image/png;base64,${im.image}`}
+                        download={`${im.name}.png`}
+                        sx={{ fontSize: "0.5rem", textTransform: "none", py: 0, minWidth: 0, lineHeight: 1.2 }}
+                      >
+                        Download
+                      </Button>
+                    </Box>
+                  ))}
+                </Box>
+              </Box>
+            )}
           </Box>
         </Box>
         </Box>{/* end Data + R Code row */}

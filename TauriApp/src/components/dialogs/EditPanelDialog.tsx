@@ -286,6 +286,7 @@ function defaultZoomInset(): ZoomInsetSettings {
     zoom_label: null,
     rotation: 0,
     id: makeInsetId(),
+    include_in_analysis: false,
     // parent_inset_id left undefined — root insets have no parent.
   };
 }
@@ -5549,6 +5550,38 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         block now. */}
                   </>
                 )}
+
+                {/* ── Include in Analysis ──────────────────────────
+                    When checked, this inset's cropped pixels are
+                    surfaced as an input dataset on the Analysis tab,
+                    where the user can run custom Python pipelines
+                    against the region (intensity histograms,
+                    segmentation, custom region statistics, etc.).
+                    The resulting plots / tables / modified images
+                    flow into the Analysis timeline like R outputs. */}
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      size="small"
+                      checked={!!local.zoom_inset.include_in_analysis}
+                      onChange={(e) => {
+                        const zi = local.zoom_inset!;
+                        updateLocal({ zoom_inset: { ...zi, include_in_analysis: e.target.checked } });
+                      }}
+                    />
+                  }
+                  label={
+                    <Tooltip
+                      placement="top"
+                      title="Expose this inset's cropped pixels to the Analysis tab. You'll be able to run custom Python on the selected region and add the results to the analysis timeline."
+                    >
+                      <Typography variant="caption" sx={{ fontSize: "0.75rem" }}>
+                        Include in Analysis
+                      </Typography>
+                    </Tooltip>
+                  }
+                  sx={{ mt: 0.5, alignSelf: "flex-start" }}
+                />
 
                 {/* ── Scale Bar on the inset ─────────────────────────
                     Three modes:

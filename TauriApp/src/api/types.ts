@@ -169,6 +169,12 @@ export interface ZoomInsetSettings {
    *  un-tilted content. 0 = no rotation. Optional for backwards
    *  compat with projects saved before this field. */
   rotation?: number;
+  /** When true, this inset's cropped pixels are surfaced as an
+   *  input dataset on the Analysis tab so the user can run custom
+   *  Python pipelines on them (intensity histograms, segmentation
+   *  masks, custom region statistics, etc.). Optional / defaults
+   *  to false for backwards compat. */
+  include_in_analysis?: boolean;
 }
 
 // ── Panel information ────────────────────────────────────

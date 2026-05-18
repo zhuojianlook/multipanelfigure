@@ -229,6 +229,13 @@ class ZoomInsetSettings:
     # un-tilted content. 0 = no rotation, full 360° range allowed.
     rotation: float = 0.0
 
+    # When True, this inset's cropped pixels are exposed to the
+    # Analysis tab as an input dataset that user Python pipelines
+    # can operate on (compute pixel intensities, segment, etc.).
+    # Default False so existing projects don't pollute the analysis
+    # selector. Persists across save/load.
+    include_in_analysis: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Parked panel (for parking drawer)
