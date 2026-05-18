@@ -855,56 +855,88 @@ function BuilderSidebar() {
 
       {/* ── ANALYSIS ───────────────────────────────────── */}
       <SectionTitle>Analysis</SectionTitle>
+      {(() => {
+        // Count zoom insets flagged include_in_analysis — those are
+        // pixel-analysis sources, an independent reason to enter the
+        // Analysis dialog (the user might have no line / area
+        // measurements but still want to run Python pipelines on a
+        // marked inset).
+        let insetCount = 0;
+        if (config) {
+          for (let r = 0; r < config.rows; r++) {
+            for (let c = 0; c < config.cols; c++) {
+              const p = config.panels[r]?.[c];
+              if (!p?.add_zoom_inset) continue;
+              const arr = (p.zoom_insets && p.zoom_insets.length > 0)
+                ? p.zoom_insets
+                : (p.zoom_inset ? [p.zoom_inset] : []);
+              for (const zi of arr) {
+                if (zi && (zi as { include_in_analysis?: boolean }).include_in_analysis) insetCount++;
+              }
+            }
+          }
+        }
+        const hasAnything = computedMeasurements.length > 0 || insetCount > 0;
+        return (
       <Box sx={{ px: 1.5, display: "flex", flexDirection: "column", gap: 0.5 }}>
-        {computedMeasurements.length === 0 ? (
+        {!hasAnything ? (
           <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.disabled" }}>
-            No measurements. Add lines/areas with "measure" enabled in panel settings.
+            No measurements yet. Add lines / areas with "measure" enabled, or tick "Include in Analysis" on a zoom inset.
           </Typography>
         ) : (
           <>
           {/* Group measurements by panel */}
-          <Box sx={{ maxHeight: 200, overflowY: "auto" }}>
-            {(() => {
-              const grouped = new Map<string, typeof computedMeasurements>();
-              computedMeasurements.forEach(m => {
-                if (!grouped.has(m.panel)) grouped.set(m.panel, []);
-                grouped.get(m.panel)!.push(m);
-              });
-              return Array.from(grouped.entries()).map(([panel, measurements]) => (
-                <Box key={panel} sx={{ mb: 0.5 }}>
-                  <Typography variant="caption" sx={{ fontSize: "0.6rem", fontWeight: 700, color: "text.primary", display: "block", mb: 0.25 }}>
-                    {panel}
-                  </Typography>
-                  {measurements.map((m, i) => (
-                    <Box key={i} sx={{ display: "flex", alignItems: "center", pl: 1, py: 0.1 }}>
-                      <StraightenIcon sx={{ fontSize: 10, mr: 0.5, color: "text.secondary" }} />
-                      <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>
-                        {m.name}:&nbsp;
-                      </Typography>
-                      <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "primary.main", fontWeight: 600 }}>
-                        {m.value}
-                      </Typography>
-                    </Box>
-                  ))}
-                </Box>
-              ));
-            })()}
-          </Box>
+          {computedMeasurements.length > 0 && (
+            <Box sx={{ maxHeight: 200, overflowY: "auto" }}>
+              {(() => {
+                const grouped = new Map<string, typeof computedMeasurements>();
+                computedMeasurements.forEach(m => {
+                  if (!grouped.has(m.panel)) grouped.set(m.panel, []);
+                  grouped.get(m.panel)!.push(m);
+                });
+                return Array.from(grouped.entries()).map(([panel, measurements]) => (
+                  <Box key={panel} sx={{ mb: 0.5 }}>
+                    <Typography variant="caption" sx={{ fontSize: "0.6rem", fontWeight: 700, color: "text.primary", display: "block", mb: 0.25 }}>
+                      {panel}
+                    </Typography>
+                    {measurements.map((m, i) => (
+                      <Box key={i} sx={{ display: "flex", alignItems: "center", pl: 1, py: 0.1 }}>
+                        <StraightenIcon sx={{ fontSize: 10, mr: 0.5, color: "text.secondary" }} />
+                        <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>
+                          {m.name}:&nbsp;
+                        </Typography>
+                        <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "primary.main", fontWeight: 600 }}>
+                          {m.value}
+                        </Typography>
+                      </Box>
+                    ))}
+                  </Box>
+                ));
+              })()}
+            </Box>
+          )}
+          {insetCount > 0 && (
+            <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "secondary.main", fontStyle: "italic" }}>
+              {insetCount} zoom inset{insetCount === 1 ? "" : "s"} marked for pixel analysis — open Analysis to run Python.
+            </Typography>
+          )}
           <Box sx={{ display: "flex", gap: 0.5 }}>
-            <Button size="small" variant="text" sx={{ fontSize: "0.55rem", textTransform: "none", flex: 1 }}
-              onClick={() => {
-                // Value + Unit as separate columns so the measurement
-                // unit is explicitly recorded, not just embedded in text.
-                const csv = ["Panel,Name,Type,Value,Unit",
-                  ...computedMeasurements.map(m =>
-                    `${m.panel},${m.name},${m.type},${m.numeric ?? m.value},${m.unit ?? ""}`)].join("\n");
-                const blob = new Blob([csv], { type: "text/csv" });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement("a");
-                a.href = url; a.download = "measurements.csv"; a.click();
-                URL.revokeObjectURL(url);
-              }}
-            >Export CSV</Button>
+            {computedMeasurements.length > 0 && (
+              <Button size="small" variant="text" sx={{ fontSize: "0.55rem", textTransform: "none", flex: 1 }}
+                onClick={() => {
+                  // Value + Unit as separate columns so the measurement
+                  // unit is explicitly recorded, not just embedded in text.
+                  const csv = ["Panel,Name,Type,Value,Unit",
+                    ...computedMeasurements.map(m =>
+                      `${m.panel},${m.name},${m.type},${m.numeric ?? m.value},${m.unit ?? ""}`)].join("\n");
+                  const blob = new Blob([csv], { type: "text/csv" });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement("a");
+                  a.href = url; a.download = "measurements.csv"; a.click();
+                  URL.revokeObjectURL(url);
+                }}
+              >Export CSV</Button>
+            )}
             <Button size="small" variant="outlined" sx={{ fontSize: "0.55rem", textTransform: "none", flex: 1 }}
               onClick={() => setAnalysisOpen(true)}
             >Open Analysis</Button>
@@ -912,6 +944,8 @@ function BuilderSidebar() {
           </>
         )}
       </Box>
+      );
+      })()}
 
       <Divider sx={{ my: 1 }} />
 

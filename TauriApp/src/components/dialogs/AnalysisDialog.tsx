@@ -461,6 +461,65 @@ function buildRCode(plotKey: string, statKey: string, rows: DataRow[], measureTy
 
 `;
 
+// ── Python starter for zoom-inset pixel pipelines ───────────
+// Seeded into the editor when the user opens Analysis with at
+// least one inset flagged include_in_analysis but no other
+// measurements to seed an R tab from. Demonstrates the three
+// output helpers (mpfig_plot, mpfig_data, mpfig_image) and the
+// shape of inputs[].
+const PYTHON_STARTER_CODE = `# ============================================================
+# Python pipeline — runs against zoom-inset pixels.
+#
+# Available globals:
+#   inputs[key]   → dict with:
+#       image  : uint8 numpy array, shape (H, W, 3) — RGB pixels
+#       width  : int
+#       height : int
+#       label  : str — human-readable "R1C1 · inset 1 (...)"
+#       row, col, inset_index — original grid coords
+#
+# Output helpers:
+#   mpfig_plot()          → save current matplotlib figure into
+#                           the Analysis plot timeline.
+#   mpfig_data(rows, name)→ save CSV (DataFrame / dict / list).
+#   mpfig_image(arr, name)→ save numpy / PIL image to the
+#                           "Python images" strip below.
+#
+# Click "Run Python" in the top right to execute.
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+rows = []
+for key, src in inputs.items():
+    img = src["image"]               # H x W x 3, uint8
+    r_mean = float(np.mean(img[..., 0]))
+    g_mean = float(np.mean(img[..., 1]))
+    b_mean = float(np.mean(img[..., 2]))
+    print(f"{src['label']}: R={r_mean:.1f}  G={g_mean:.1f}  B={b_mean:.1f}")
+    rows.append({
+        "source": src["label"],
+        "R": r_mean, "G": g_mean, "B": b_mean,
+    })
+mpfig_data(rows, name="channel_means")
+
+# Quick histogram of the FIRST source's intensity (luminance)
+if inputs:
+    first = next(iter(inputs.values()))
+    lum = first["image"].mean(axis=2)
+    plt.figure(figsize=(5, 3))
+    plt.hist(lum.ravel(), bins=64, color="#4caf50", alpha=0.85)
+    plt.title(f"Intensity histogram — {first['label']}")
+    plt.xlabel("Luminance"); plt.ylabel("Pixel count")
+    mpfig_plot("histogram.png")
+    # Also save a thresholded copy back to the images strip
+    mask = (lum > 128).astype(np.uint8)
+    out = first["image"].copy()
+    out[mask == 0] = 0
+    mpfig_image(out, name="thresholded")
+`;
+
   // ── Libraries ──
   let libs = `# ── Libraries ───────────────────────────────────────────────
 library(ggplot2)
@@ -852,9 +911,35 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
     // Refresh the list of zoom-inset sources flagged include_in_analysis
     // so the "Run as Python" button knows what inputs to feed into the
     // pipeline. Cheap (just metadata, no pixel extraction).
+    let insetSourcesForSeed: typeof insetSources = [];
     api.listInsetAnalysisSources()
-      .then((r) => setInsetSources(r.sources || []))
+      .then((r) => {
+        const list = r.sources || [];
+        setInsetSources(list);
+        // Stash on the closure so the tab-seeding logic below can
+        // pick a Python starter when there are no measurements but
+        // the user has flagged insets for analysis.
+        insetSourcesForSeed = list;
+        // If the dialog opened with no tabs AND no measurements but
+        // there ARE insets, seed a Python starter tab so the Run
+        // Python button has something sensible to execute.
+        if (tabs.length === 0 && measurements.length === 0 && list.length > 0) {
+          const id = makeTabId();
+          const starter: CodeTab = {
+            id,
+            name: "Python: insets",
+            measureType: "all",
+            plotType: "bar",
+            statTest: "none",
+            code: PYTHON_STARTER_CODE,
+            plots: [],
+          };
+          setTabs([starter]);
+          setActiveTabId(id);
+        }
+      })
       .catch(() => setInsetSources([]));
+    void insetSourcesForSeed;  // not used outside the promise
 
     if (tabs.length > 0) return; // user's existing tabs are preserved
 
