@@ -607,6 +607,13 @@ export function Toolbar() {
           <Button onClick={() => setNewConfirmOpen(false)}>Cancel</Button>
           <Button variant="contained" color="error" onClick={async () => {
             setNewConfirmOpen(false);
+            // "New" is a deliberate reset — clear the persisted collage
+            // so any stash of analysis plots doesn't outlive this
+            // session, and signal the beforeunload handler to skip
+            // its analysis-plots warning so the upcoming reload
+            // actually runs (otherwise the browser cancels it).
+            try { useCollageStore.getState().clear(); } catch { /* store not ready */ }
+            (window as unknown as { __mpfigAllowUnload?: boolean }).__mpfigAllowUnload = true;
             try {
               // Preserve user-defined scale bars
               const savedScales = await api.getResolutions().catch(() => ({}));

@@ -61,8 +61,16 @@ interface FigureState {
   updatePanel: (row: number, col: number, patch: Partial<PanelInfo>) => void;
   refreshPanelThumbnail: (row: number, col: number) => Promise<void>;
 
-  updateColumnLabel: (colIdx: number, text: string) => void;
-  updateRowLabel: (rowIdx: number, text: string) => void;
+  // `opts.skipSync` updates the store config only — no debounced
+  // backend patch / preview refresh. Used while the user is actively
+  // typing in a header/label field; the deferred sync is flushed by
+  // `flushHeaderEdits()` once the field loses focus, so the preview
+  // doesn't churn on every keystroke.
+  updateColumnLabel: (colIdx: number, text: string, opts?: { skipSync?: boolean }) => void;
+  updateRowLabel: (rowIdx: number, text: string, opts?: { skipSync?: boolean }) => void;
+  // Patch all four header/label arrays to the backend and request a
+  // single preview refresh. Called on blur of a header/label editor.
+  flushHeaderEdits: () => void;
 
   addColumnHeaderLevel: () => void;
   removeColumnHeaderLevel: (levelIdx: number) => void;
@@ -71,6 +79,7 @@ interface FigureState {
     level: number,
     groupIdx: number,
     text: string,
+    opts?: { skipSync?: boolean },
   ) => void;
   addRowHeaderLevel: () => void;
   removeRowHeaderLevel: (levelIdx: number) => void;
@@ -89,11 +98,13 @@ interface FigureState {
     level: number,
     groupIdx: number,
     patch: Partial<Pick<HeaderGroup, "font_size" | "font_name" | "font_style" | "default_color" | "position" | "styled_segments">>,
+    opts?: { skipSync?: boolean },
   ) => void;
   updateLabelFormatting: (
     axis: "col" | "row",
     index: number,
     patch: Partial<Pick<import("../api/types").AxisLabel, "font_size" | "font_name" | "font_style" | "default_color" | "position" | "distance" | "rotation" | "styled_segments">>,
+    opts?: { skipSync?: boolean },
   ) => void;
 
   // Header level swapping
@@ -105,8 +116,12 @@ interface FigureState {
   movePanelToDrawer: (r: number, c: number, drawerIdx: number) => void;
   movePanelFromDrawer: (drawerIdx: number, r: number, c: number) => void;
 
-  uploadImages: (files: File[]) => Promise<void>;
-  uploadImagesFromPaths: (filePaths: string[]) => Promise<void>;
+  /** Upload File objects (e.g. drag-drop in browser dev mode, or
+   *  analysis plots being pushed onto the timeline) through the
+   *  backend. Returns the canonical names the backend assigned so
+   *  callers can map their inputs to loadedImages entries. */
+  uploadImages: (files: File[]) => Promise<string[]>;
+  uploadImagesFromPaths: (filePaths: string[]) => Promise<string[]>;
   removeImage: (name: string) => Promise<void>;
 
   // Image group management
@@ -165,15 +180,93 @@ function _relabelAutoLetter(panel: { labels?: { text: string; linked_to_header?:
   return true;
 }
 
-/** Re-letter every panel in the grid. Used when the grid size
- *  changes (cols altered → all letter indices shift) or when many
- *  panels rearrange at once. */
-function _renumberAllAutoLetters(cfg: { rows: number; cols: number; panels: { labels?: { text: string; linked_to_header?: boolean; styled_segments?: unknown[] }[] }[][] } | null) {
+/** True when SOME other panel in `cfg` has an Adjacent-Panel zoom
+ *  inset pointing at (row, col). Walks both the legacy singular
+ *  `zoom_inset` and the new `zoom_insets[]` array so panels with
+ *  multiple adjacent insets all have their targets recognised. */
+function _isAdjacentZoomTarget(
+  cfg: { rows: number; cols: number; panels: { add_zoom_inset?: boolean; zoom_inset?: { inset_type?: string; side?: string } | null; zoom_insets?: { inset_type?: string; side?: string }[] }[][] },
+  row: number, col: number,
+): boolean {
+  for (let r = 0; r < cfg.rows; r++) {
+    for (let c = 0; c < cfg.cols; c++) {
+      const p = cfg.panels[r]?.[c];
+      if (!p?.add_zoom_inset) continue;
+      const insets = (p.zoom_insets && p.zoom_insets.length > 0)
+        ? p.zoom_insets
+        : (p.zoom_inset ? [p.zoom_inset] : []);
+      for (const zi of insets) {
+        if (zi.inset_type !== "Adjacent Panel") continue;
+        const side = zi.side || "Right";
+        let tr = r, tc = c;
+        if (side === "Top") tr--; else if (side === "Bottom") tr++;
+        else if (side === "Left") tc--; else if (side === "Right") tc++;
+        if (tr === row && tc === col) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Adjacent-zoom target panels never go through setPanelImage (the
+ *  user doesn't drag an image onto them — the renderer paints them
+ *  with the zoomed source). They were therefore missing the default
+ *  auto-letter label that every other panel gets on assignment.
+ *
+ *  This helper creates that label on a zoom-target panel the first
+ *  time it's seen without one. Returns true when it inserted a label.
+ *  Subsequent runs of `_relabelAutoLetter` then keep the letter in
+ *  sync with the panel's (row, col) just like for image-bearing
+ *  panels. */
+function _ensureZoomTargetLabel(
+  panel: { labels?: { text: string; linked_to_header?: boolean; styled_segments?: unknown[]; [k: string]: unknown }[] },
+  row: number, col: number, cols: number,
+): boolean {
+  if (panel.labels && panel.labels.length > 0) return false;
+  const letter = _autoLetterFor(row, col, cols);
+  if (!panel.labels) panel.labels = [];
+  panel.labels.push({
+    text: letter,
+    font_path: null,
+    font_name: "arial.ttf",
+    font_size: 20,
+    font_style: [],
+    color: "#FFFFFF",
+    position_x: 3,
+    position_y: 3,
+    rotation: 0,
+    default_color: "#FFFFFF",
+    position_preset: "Top-Left",
+    edge_distance: 3,
+    linked_to_header: true,
+    styled_segments: [],
+  } as unknown as { text: string; linked_to_header?: boolean; styled_segments?: unknown[] });
+  return true;
+}
+
+/** Re-letter every panel in the grid AND ensure both image-bearing
+ *  panels and zoom-target panels have their default auto-letter
+ *  label. Used when the grid size changes (cols altered → all
+ *  letter indices shift), when many panels rearrange at once, or
+ *  when a new adjacent zoom inset is committed (so the newly-promoted
+ *  target cell gets its letter immediately). Promoting image-bearing
+ *  panels here is a safety net for cases where setPanelImage's
+ *  auto-label didn't run (loaded projects, direct config edits, …).
+ */
+function _renumberAllAutoLetters(cfg: { rows: number; cols: number; panels: { image_name?: string; labels?: { text: string; linked_to_header?: boolean; styled_segments?: unknown[] }[]; add_zoom_inset?: boolean; zoom_inset?: { inset_type?: string; side?: string } | null; zoom_insets?: { inset_type?: string; side?: string }[] }[][] } | null) {
   if (!cfg) return;
   for (let r = 0; r < cfg.rows; r++) {
     for (let c = 0; c < cfg.cols; c++) {
       const p = cfg.panels[r]?.[c];
       if (!p) continue;
+      const isImagePanel = !!(p.image_name && p.image_name.trim());
+      const isZoomTarget = _isAdjacentZoomTarget(cfg, r, c);
+      // Promote either image-bearing or zoom-target cells to have a
+      // default auto-label first (so _relabelAutoLetter below has
+      // something to relabel). Empty cells stay label-less.
+      if (isImagePanel || isZoomTarget) {
+        _ensureZoomTargetLabel(p, r, c, cfg.cols);
+      }
       _relabelAutoLetter(p, r, c, cfg.cols);
     }
   }
@@ -296,6 +389,11 @@ function buildDefaultConfig(rows: number, cols: number): FigureConfig {
 
 let previewTimer: ReturnType<typeof setTimeout> | null = null;
 let syncTimer: ReturnType<typeof setTimeout> | null = null;
+// True when a header/label edit (text OR formatting/colour/style) has been
+// applied to the store with `skipSync` and not yet pushed to the backend.
+// flushHeaderEdits() consults this so it can no-op when nothing is pending
+// (and so the closeToolbar + onBlur double-fire collapses to one flush).
+let headerEditsPending = false;
 // Monotonic sequence for preview requests so an older in-flight GET
 // response can't overwrite a newer one (race condition seen as a
 // "ghost" of the previous header state appearing in the preview).
@@ -511,17 +609,64 @@ export const useFigureStore = create<FigureState>()(
     },
 
     updatePanel: (row, col, patch) => {
+      // Detect whether THIS patch touches adjacent zoom-inset state.
+      // If it does we have to walk the grid afterwards to promote any
+      // newly-created target panels with default auto-letter labels
+      // (those cells never go through setPanelImage so they'd
+      // otherwise stay label-less). The patch can carry inset state
+      // via `add_zoom_inset`, `zoom_inset`, or the newer `zoom_insets`
+      // array — any of those gates the work.
+      const touchesZoom =
+        Object.prototype.hasOwnProperty.call(patch, "add_zoom_inset") ||
+        Object.prototype.hasOwnProperty.call(patch, "zoom_inset") ||
+        Object.prototype.hasOwnProperty.call(patch, "zoom_insets");
+      // Track which OTHER cells got their labels mutated so we know
+      // which to push back to the backend below.
+      const touchedAdjacent: Array<{ r: number; c: number }> = [];
+
       set((s) => {
         if (s.config && s.config.panels[row] && s.config.panels[row][col]) {
           Object.assign(s.config.panels[row][col], patch);
           s.configDirty = true;
         }
+        if (touchesZoom && s.config) {
+          // Snapshot each panel's labels[0].text before the relabel so
+          // we know which adjacent-zoom targets actually changed.
+          const before: Record<string, string | undefined> = {};
+          for (let r2 = 0; r2 < s.config.rows; r2++) {
+            for (let c2 = 0; c2 < s.config.cols; c2++) {
+              before[`${r2},${c2}`] = s.config.panels[r2]?.[c2]?.labels?.[0]?.text;
+            }
+          }
+          _renumberAllAutoLetters(s.config as unknown as Parameters<typeof _renumberAllAutoLetters>[0]);
+          for (let r2 = 0; r2 < s.config.rows; r2++) {
+            for (let c2 = 0; c2 < s.config.cols; c2++) {
+              if (r2 === row && c2 === col) continue; // source already pushed below
+              const after = s.config.panels[r2]?.[c2]?.labels?.[0]?.text;
+              if (after !== before[`${r2},${c2}`]) {
+                touchedAdjacent.push({ r: r2, c: c2 });
+              }
+            }
+          }
+        }
       });
+
       const panel = get().config?.panels[row]?.[col];
       if (panel) {
         api.patchPanel(row, col, panel as unknown as Record<string, unknown>)
           .then(() => get().refreshPanelThumbnail(row, col))
           .catch(console.error);
+      }
+      // Push label fixups for any neighbouring panels the relabel pass
+      // touched (newly-promoted zoom targets). Fire in parallel; their
+      // thumbnails get refreshed when the patch resolves.
+      for (const { r: rr, c: cc } of touchedAdjacent) {
+        const p2 = get().config?.panels[rr]?.[cc];
+        if (p2) {
+          api.patchPanel(rr, cc, p2 as unknown as Record<string, unknown>)
+            .then(() => get().refreshPanelThumbnail(rr, cc))
+            .catch(console.error);
+        }
       }
       get().requestPreview();
     },
@@ -539,8 +684,8 @@ export const useFigureStore = create<FigureState>()(
       }
     },
 
-    updateColumnLabel: (colIdx, text) => {
-      console.log("[mpf] updateColumnLabel", { colIdx, text: JSON.stringify(text) });
+    updateColumnLabel: (colIdx, text, opts) => {
+      console.log("[mpf] updateColumnLabel", { colIdx, text: JSON.stringify(text), skipSync: !!opts?.skipSync });
       set((s) => {
         if (s.config && colIdx < s.config.column_labels.length) {
           const lbl = s.config.column_labels[colIdx];
@@ -562,6 +707,7 @@ export const useFigureStore = create<FigureState>()(
           s.configDirty = true;
         }
       });
+      if (opts?.skipSync) { headerEditsPending = true; return; }  // typing — defer to flushHeaderEdits() on blur
       if (syncTimer) clearTimeout(syncTimer);
       syncTimer = setTimeout(async () => {
         const cfg = get().config;
@@ -575,8 +721,8 @@ export const useFigureStore = create<FigureState>()(
       }, 200);
     },
 
-    updateRowLabel: (rowIdx, text) => {
-      console.log("[mpf] updateRowLabel", { rowIdx, text: JSON.stringify(text) });
+    updateRowLabel: (rowIdx, text, opts) => {
+      console.log("[mpf] updateRowLabel", { rowIdx, text: JSON.stringify(text), skipSync: !!opts?.skipSync });
       set((s) => {
         if (s.config && rowIdx < s.config.row_labels.length) {
           const lbl = s.config.row_labels[rowIdx];
@@ -590,6 +736,7 @@ export const useFigureStore = create<FigureState>()(
           s.configDirty = true;
         }
       });
+      if (opts?.skipSync) { headerEditsPending = true; return; }  // typing — defer to flushHeaderEdits() on blur
       if (syncTimer) clearTimeout(syncTimer);
       syncTimer = setTimeout(async () => {
         const cfg = get().config;
@@ -631,8 +778,8 @@ export const useFigureStore = create<FigureState>()(
       }
     },
 
-    updateHeaderGroupText: (axis, level, groupIdx, text) => {
-      console.log("[mpf] updateHeaderGroupText", { axis, level, groupIdx, text: JSON.stringify(text), len: text.length });
+    updateHeaderGroupText: (axis, level, groupIdx, text, opts) => {
+      console.log("[mpf] updateHeaderGroupText", { axis, level, groupIdx, text: JSON.stringify(text), len: text.length, skipSync: !!opts?.skipSync });
       set((s) => {
         if (!s.config) return;
         const headers = axis === "col" ? s.config.column_headers : s.config.row_headers;
@@ -655,6 +802,10 @@ export const useFigureStore = create<FigureState>()(
           s.configDirty = true;
         }
       });
+      // While the user is actively typing (skipSync) we update the
+      // store only — no backend patch, no preview refresh. The
+      // deferred sync is flushed by flushHeaderEdits() on blur.
+      if (opts?.skipSync) { headerEditsPending = true; return; }
       if (syncTimer) clearTimeout(syncTimer);
       syncTimer = setTimeout(async () => {
         const cfg = get().config;
@@ -678,6 +829,37 @@ export const useFigureStore = create<FigureState>()(
         }
         get().requestPreview();
       }, 200);
+    },
+
+    // Flush any deferred header/label edits: patch all four
+    // header/label arrays to the backend, then request ONE preview
+    // refresh. Wired to the blur event of every header/label editor
+    // so the preview updates once the user finishes typing, not on
+    // each keystroke.
+    flushHeaderEdits: () => {
+      // No deferred header/label edit outstanding — nothing to push, and
+      // skipping here means a focus-in/focus-out with no edits (or the
+      // closeToolbar + editor-onBlur double-fire) doesn't spam the backend
+      // with redundant patch+preview round-trips.
+      if (!headerEditsPending) return;
+      headerEditsPending = false;
+      if (syncTimer) { clearTimeout(syncTimer); syncTimer = null; }
+      const cfg = get().config;
+      if (!cfg) return;
+      (async () => {
+        try {
+          await Promise.all([
+            api.patchColumnHeaders(cfg.column_headers),
+            api.patchRowHeaders(cfg.row_headers),
+            api.patchColumnLabels(cfg.column_labels),
+            api.patchRowLabels(cfg.row_labels),
+          ]);
+          console.log("[mpf] flushHeaderEdits patched all header/label arrays");
+        } catch (e) {
+          console.error("[mpf] flushHeaderEdits failed", e);
+        }
+        get().requestPreview();
+      })();
     },
 
     addRowHeaderLevel: () => {
@@ -928,7 +1110,7 @@ export const useFigureStore = create<FigureState>()(
 
     // ── Header / label formatting ─────────────────────────
 
-    updateHeaderGroupFormatting: (axis, level, groupIdx, patch) => {
+    updateHeaderGroupFormatting: (axis, level, groupIdx, patch, opts) => {
       set((s) => {
         if (!s.config) return;
         const headers = axis === "col" ? s.config.column_headers : s.config.row_headers;
@@ -953,6 +1135,12 @@ export const useFigureStore = create<FigureState>()(
           s.configDirty = true;
         }
       });
+      // Styling change applied via the floating toolbar (colour, font,
+      // size, bold/italic, per-character segments). Like text typing,
+      // defer the backend push + preview render to flushHeaderEdits()
+      // when the header/label editing context loses focus — otherwise
+      // every colour/style tweak triggers its own preview render (lag).
+      if (opts?.skipSync) { headerEditsPending = true; return; }
       if (syncTimer) clearTimeout(syncTimer);
       syncTimer = setTimeout(async () => {
         const cfg = get().config;
@@ -979,7 +1167,7 @@ export const useFigureStore = create<FigureState>()(
       }, 150);
     },
 
-    updateLabelFormatting: (axis, index, patch) => {
+    updateLabelFormatting: (axis, index, patch, opts) => {
       set((s) => {
         if (!s.config) return;
         const labels = axis === "col" ? s.config.column_labels : s.config.row_labels;
@@ -987,7 +1175,6 @@ export const useFigureStore = create<FigureState>()(
           Object.assign(labels[index], patch);
           // 1.5: Sync font_size across ALL primary labels (both axes) for consistency
           if (patch.font_size !== undefined) {
-            const otherLabels = axis === "col" ? s.config.row_labels : s.config.column_labels;
             for (const lbl of [...s.config.column_labels, ...s.config.row_labels]) {
               lbl.font_size = patch.font_size;
             }
@@ -995,6 +1182,9 @@ export const useFigureStore = create<FigureState>()(
           s.configDirty = true;
         }
       });
+      // See updateHeaderGroupFormatting — defer styling pushes to
+      // flushHeaderEdits() on blur so the preview renders once, not per tweak.
+      if (opts?.skipSync) { headerEditsPending = true; return; }
       if (syncTimer) clearTimeout(syncTimer);
       syncTimer = setTimeout(async () => {
         const cfg = get().config;
@@ -1134,10 +1324,12 @@ export const useFigureStore = create<FigureState>()(
           s.apiError = null;
         });
         get().requestPreview();
+        return names;
       } catch (err) {
         console.error("Upload failed", err);
         const msg = err instanceof Error ? err.message : String(err);
         set((s) => { s.apiError = `Image upload failed: ${msg}`; });
+        return [];
       } finally {
         set((s) => {
           s.pendingUploads = s.pendingUploads.filter((n) => !pendingNames.includes(n));
@@ -1166,10 +1358,12 @@ export const useFigureStore = create<FigureState>()(
           s.apiError = null;
         });
         get().requestPreview();
+        return names;
       } catch (err) {
         console.error("Upload from paths failed", err);
         const msg = err instanceof Error ? err.message : String(err);
         set((s) => { s.apiError = `Image upload failed: ${msg}`; });
+        return [];
       } finally {
         set((s) => {
           s.pendingUploads = s.pendingUploads.filter((n) => !pendingNames.includes(n));
@@ -1309,7 +1503,11 @@ export const useFigureStore = create<FigureState>()(
     saveProject: async (path) => {
       try {
         await get().syncToBackend();
-        await api.saveProject(path);
+        // Pull the latest analysis snapshot from the dedicated bridge
+        // store — the AnalysisDialog publishes it on every state change.
+        // Imported lazily to avoid a circular import on module load.
+        const analysisSnapshot = (await import("./analysisStore")).useAnalysisStore.getState().snapshot;
+        await api.saveProject(path, analysisSnapshot ?? null);
         // Remember the path so subsequent "Add to Collage" actions can
         // associate the rendered figure with this on-disk project,
         // and so the collage's Multi-Panel Builder button can offer
@@ -1336,6 +1534,19 @@ export const useFigureStore = create<FigureState>()(
           s.currentProjectPath = path;
           s.configDirty = false;
         });
+        // Push any analysis blob into the bridge store; the dialog
+        // observes `hydrate` and rebuilds its tabs/plots from it.
+        if (resp.analysis) {
+          (await import("./analysisStore")).useAnalysisStore.getState().requestHydrate(resp.analysis);
+        } else {
+          // Loaded a project that has no analysis state — clear out
+          // whatever was hanging around so the dialog is empty too.
+          (await import("./analysisStore")).useAnalysisStore.getState().requestHydrate({
+            manifest: { version: 1, tabs: [], activeTabId: "", tableMeta: {} },
+            plots: {},
+            tables: {},
+          });
+        }
         get().requestPreview();
         // Repopulate per-panel processed thumbnails (crop, levels,
         // pseudocolor, etc.). Without this, every panel cell falls back

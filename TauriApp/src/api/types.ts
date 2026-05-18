@@ -53,6 +53,15 @@ export interface SymbolSettings {
   color: string;
   size: number;
   rotation: number;
+  /** Arrow / NarrowTriangle only: cross-axis thickness multiplier (1.0 = default).
+   *  Optional for backwards compat with projects saved before this field. */
+  width?: number;
+  /** Outline shapes: border line style — "solid" | "dashed" | "dotted". */
+  border_style?: string;
+  /** Outline shapes: centre fill colour ("" = outline only). */
+  fill_color?: string;
+  /** Outline shapes: centre fill opacity, 0-100 %. */
+  fill_opacity?: number;
   label_text: string;
   label_color: string;
   label_offset_x: number;
@@ -95,6 +104,7 @@ export interface AreaAnnotation {
   border_width: number;
   show_measure: boolean;
   measure_text: string;
+  measure_unit?: string;       // "km" | "m" | "cm" | "mm" | "um" | "nm" (area unit)
   measure_font_size: number;
   measure_color: string;
   measure_font_name: string;
@@ -108,6 +118,11 @@ export interface ZoomInsetSettings {
   rectangle_width: number;
   line_color: string;
   line_width: number;
+  /** Line style for the selection-box outline and the connecting
+   *  lines, set independently. One of "solid", "dashed", "dotted",
+   *  "dash-dot". Optional for backwards compat (defaults to "solid"). */
+  rectangle_style?: string;
+  line_style?: string;
   x: number;
   y: number;
   width: number;
@@ -127,6 +142,33 @@ export interface ZoomInsetSettings {
   margin_offset: number;
   scale_bar: ScaleBarSettings | null;
   zoom_label: LabelSettings | null;
+  /** Standard / Separate insets: when true, the inset draws the
+   *  source panel's scale bar at zoomed scale (mpp ÷ zoom_factor).
+   *  When false but `scale_bar` is set, a custom bar is drawn
+   *  instead. When both are unset, no bar is drawn on the inset.
+   *  Has no effect on Adjacent Panel insets — those use the
+   *  target cell's own scale_bar. Optional for backwards compat. */
+  show_scale_bar_in_zoom?: boolean;
+  /** Stable id assigned at creation. Used by `parent_inset_id` to
+   *  refer to the inset that spawned this one (for cascade-inherit
+   *  scalebar semantics). Optional for backwards compat with
+   *  projects saved before this field. */
+  id?: string;
+  /** When set: this inset was SPAWNED from another inset on the
+   *  same parent panel (the one referenced by id). "Inherit"
+   *  scalebar on this inset derives from the parent inset's
+   *  effective scalebar × this zoom_factor — so spawned chains
+   *  cascade scaling correctly even when an intermediate inset
+   *  uses a Custom bar. Unset / empty = no parent inset (the root
+   *  panel is the inherit-source). */
+  parent_inset_id?: string;
+  /** Source-rectangle rotation in degrees (clockwise). The
+   *  rendered zoom output is ALWAYS axis-aligned — the backend
+   *  rotates the source image inversely around the rectangle's
+   *  centre before cropping, so the resulting inset shows
+   *  un-tilted content. 0 = no rotation. Optional for backwards
+   *  compat with projects saved before this field. */
+  rotation?: number;
 }
 
 // ── Panel information ────────────────────────────────────
@@ -288,6 +330,21 @@ export interface ProjectLoadResponse {
   config: FigureConfig;
   image_names: string[];
   thumbnails: Record<string, string>;
+  /** Analysis state previously saved into the .mpf zip (tabs, plots,
+   *  tables). Null when the project was saved without it. */
+  analysis?: AnalysisPayload | null;
+}
+
+/** Wire-format for the analysis blob stuffed into / pulled out of a
+ *  .mpf zip. The backend stores `plots` as binary PNG files and
+ *  `tables` as utf-8 CSV files keyed by id; both are transported
+ *  as base64 (plots) and raw text (tables) in this JSON envelope.
+ *  `manifest` is arbitrary frontend-defined JSON — currently it
+ *  holds the tabs array with per-plot/per-table id references. */
+export interface AnalysisPayload {
+  manifest: unknown;
+  plots: Record<string, string>;   // {id: base64 PNG}
+  tables: Record<string, string>;  // {id: CSV text}
 }
 
 export interface ImageGroup {

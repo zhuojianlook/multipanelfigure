@@ -320,6 +320,11 @@ function GroupRow({ group, loadedImages, usedNames, selectedImage, onRename, onD
   onRemoveImage: (name: string) => Promise<void>;
 }) {
   const [dragOver, setDragOver] = useState(false);
+  // Each group is individually collapsible — when there are many groups,
+  // collapsing the ones you're not working with keeps this strip short so
+  // it doesn't squeeze the preview / panel planner below it. Collapsed
+  // groups still accept drag-and-drop drops (the handler is on the row).
+  const [collapsed, setCollapsed] = useState(false);
 
   return (
     <div
@@ -327,7 +332,7 @@ function GroupRow({ group, loadedImages, usedNames, selectedImage, onRename, onD
       style={{
         borderColor: "var(--c-border)",
         backgroundColor: dragOver ? "rgba(33,150,243,0.08)" : undefined,
-        minHeight: 56,
+        minHeight: collapsed ? 30 : 56,
       }}
       onDragOver={(e) => {
         if (e.dataTransfer.types.includes("application/x-image-name")) {
@@ -344,8 +349,16 @@ function GroupRow({ group, loadedImages, usedNames, selectedImage, onRename, onD
         if (imgName) onDropImage(imgName);
       }}
     >
-      {/* Group name + delete */}
+      {/* Collapse toggle + group name + delete */}
       <div className="flex items-center gap-0.5 flex-none" style={{ minWidth: 80 }}>
+        <IconButton
+          size="small"
+          onClick={() => setCollapsed((c) => !c)}
+          sx={{ p: 0.25 }}
+          title={collapsed ? "Expand group" : "Collapse group"}
+        >
+          {collapsed ? <ExpandMoreIcon sx={{ fontSize: 14 }} /> : <ExpandLessIcon sx={{ fontSize: 14 }} />}
+        </IconButton>
         <EditableName value={group.name} onChange={onRename} />
         <IconButton
           size="small"
@@ -357,28 +370,36 @@ function GroupRow({ group, loadedImages, usedNames, selectedImage, onRename, onD
         </IconButton>
       </div>
 
-      {/* Group images */}
-      <div className="flex items-center gap-1.5 overflow-x-auto flex-1">
-        {group.imageNames.length === 0 ? (
-          <span className="text-[9px] italic" style={{ color: "var(--c-text-dim)" }}>
-            Drag images here
-          </span>
-        ) : (
-          group.imageNames.map((name) => {
-            const img = loadedImages[name];
-            if (!img) return null;
-            return (
-              <ImageTile
-                key={name}
-                img={img}
-                inUse={usedNames.has(name)}
-                isSelected={selectedImage === name}
-                onRemove={() => onRemoveImage(name)}
-              />
-            );
-          })
-        )}
-      </div>
+      {/* Group images — or, when collapsed, a one-line image-count summary */}
+      {collapsed ? (
+        <span className="text-[9px] flex-1" style={{ color: "var(--c-text-dim)" }}>
+          {group.imageNames.length === 0
+            ? "empty"
+            : `${group.imageNames.length} image${group.imageNames.length === 1 ? "" : "s"}`}
+        </span>
+      ) : (
+        <div className="flex items-center gap-1.5 overflow-x-auto flex-1">
+          {group.imageNames.length === 0 ? (
+            <span className="text-[9px] italic" style={{ color: "var(--c-text-dim)" }}>
+              Drag images here
+            </span>
+          ) : (
+            group.imageNames.map((name) => {
+              const img = loadedImages[name];
+              if (!img) return null;
+              return (
+                <ImageTile
+                  key={name}
+                  img={img}
+                  inUse={usedNames.has(name)}
+                  isSelected={selectedImage === name}
+                  onRemove={() => onRemoveImage(name)}
+                />
+              );
+            })
+          )}
+        </div>
+      )}
     </div>
   );
 }

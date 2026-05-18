@@ -243,6 +243,7 @@ export function PanelGrid() {
   const updateColumnLabel = useFigureStore((s) => s.updateColumnLabel);
   const updateRowLabel = useFigureStore((s) => s.updateRowLabel);
   const updateHeaderGroupText = useFigureStore((s) => s.updateHeaderGroupText);
+  const flushHeaderEdits = useFigureStore((s) => s.flushHeaderEdits);
   const addColumnHeaderLevel = useFigureStore((s) => s.addColumnHeaderLevel);
   const addRowHeaderLevel = useFigureStore((s) => s.addRowHeaderLevel);
   const removeColumnHeaderLevel = useFigureStore((s) => s.removeColumnHeaderLevel);
@@ -332,9 +333,28 @@ export function PanelGrid() {
   );
 
   const closeToolbar = () => {
+    // Closing the toolbar = the user is done with this header/label editing
+    // context. Flush any deferred text + styling edits now so the preview
+    // catches up once. (No-ops via the store's headerEditsPending guard if
+    // nothing is pending, so this is safe to call unconditionally.)
+    flushHeaderEdits();
     setToolbarAnchor(null);
     setToolbarTarget(null);
     setSelectionPreview("");
+  };
+
+  // Editor blur handler. Flushes deferred text + styling edits to the
+  // backend + refreshes the preview once — UNLESS focus is moving INTO
+  // the floating toolbar (colour picker, font dropdown, size field). In
+  // that case the user is mid-styling: skip the flush so e.g. opening the
+  // colour picker doesn't trigger its own preview render. The eventual
+  // blur to somewhere outside the toolbar (or closeToolbar) flushes it.
+  const handleHeaderEditorBlur = (e?: React.FocusEvent<HTMLElement>) => {
+    const rt = e?.relatedTarget as HTMLElement | null;
+    if (rt && typeof rt.closest === "function" && rt.closest(".MuiPopover-paper")) {
+      return;
+    }
+    flushHeaderEdits();
   };
 
   // Close the floating toolbar when the user clicks anywhere that isn't
@@ -527,9 +547,11 @@ export function PanelGrid() {
       newSegs = out;
     }
 
-    updateHeaderGroupText(axis, level, groupIdx, newText);
+    // skipSync: Shift+Enter happens mid-edit (field keeps focus), so
+    // the preview refresh is deferred to the eventual blur.
+    updateHeaderGroupText(axis, level, groupIdx, newText, { skipSync: true });
     if (newSegs.length > 0) {
-      updateHeaderGroupFormatting(axis, level, groupIdx, { styled_segments: newSegs });
+      updateHeaderGroupFormatting(axis, level, groupIdx, { styled_segments: newSegs }, { skipSync: true });
     }
     return start + 1;
   };
@@ -579,13 +601,14 @@ export function PanelGrid() {
       newSegs = out;
     }
 
+    // skipSync: mid-edit (field keeps focus) — preview deferred to blur.
     if (axis === "col") {
-      updateColumnLabel(index, newText);
+      updateColumnLabel(index, newText, { skipSync: true });
     } else {
-      updateRowLabel(index, newText);
+      updateRowLabel(index, newText, { skipSync: true });
     }
     if (newSegs.length > 0) {
-      updateLabelFormatting(axis, index, { styled_segments: newSegs });
+      updateLabelFormatting(axis, index, { styled_segments: newSegs }, { skipSync: true });
     }
     return start + 1;
   };
@@ -815,9 +838,9 @@ export function PanelGrid() {
     applyStylingPatch({ font_size: size }, () => {
       if (!toolbarTarget) return;
       if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
-        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { font_size: size });
+        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { font_size: size }, { skipSync: true });
       } else if ((toolbarTarget.type === "colLabel" || toolbarTarget.type === "rowLabel") && toolbarTarget.index !== undefined) {
-        updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { font_size: size });
+        updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { font_size: size }, { skipSync: true });
       }
     });
   };
@@ -826,9 +849,9 @@ export function PanelGrid() {
     applyStylingPatch({ font_name: name }, () => {
       if (!toolbarTarget) return;
       if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
-        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { font_name: name });
+        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { font_name: name }, { skipSync: true });
       } else if ((toolbarTarget.type === "colLabel" || toolbarTarget.type === "rowLabel") && toolbarTarget.index !== undefined) {
-        updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { font_name: name });
+        updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { font_name: name }, { skipSync: true });
       }
     });
   };
@@ -906,9 +929,9 @@ export function PanelGrid() {
       if (ei >= 0) elementCurrent.splice(ei, 1);
       else elementCurrent.push(style);
       if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
-        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { font_style: elementCurrent });
+        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { font_style: elementCurrent }, { skipSync: true });
       } else if ((toolbarTarget.type === "colLabel" || toolbarTarget.type === "rowLabel") && toolbarTarget.index !== undefined) {
-        updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { font_style: elementCurrent });
+        updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { font_style: elementCurrent }, { skipSync: true });
       }
     });
   };
@@ -1221,7 +1244,7 @@ export function PanelGrid() {
           group.default_color || "#000000",
           patch,
         );
-        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { styled_segments: nextSegs });
+        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { styled_segments: nextSegs }, { skipSync: true });
       } else {
         fullPatchFn();
       }
@@ -1237,7 +1260,7 @@ export function PanelGrid() {
           lbl.default_color || "#000000",
           patch,
         );
-        updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { styled_segments: nextSegs });
+        updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { styled_segments: nextSegs }, { skipSync: true });
       } else {
         fullPatchFn();
       }
@@ -1271,9 +1294,9 @@ export function PanelGrid() {
     applyStylingPatch({ color }, () => {
       if (!toolbarTarget) return;
       if (toolbarTarget.type === "header" && toolbarTarget.level !== undefined && toolbarTarget.groupIdx !== undefined) {
-        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { default_color: color, styled_segments: [] });
+        updateHeaderGroupFormatting(toolbarTarget.axis, toolbarTarget.level, toolbarTarget.groupIdx, { default_color: color, styled_segments: [] }, { skipSync: true });
       } else if ((toolbarTarget.type === "colLabel" || toolbarTarget.type === "rowLabel") && toolbarTarget.index !== undefined) {
-        updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { default_color: color, styled_segments: [] });
+        updateLabelFormatting(toolbarTarget.axis, toolbarTarget.index, { default_color: color, styled_segments: [] }, { skipSync: true });
       }
     });
   };
@@ -1621,11 +1644,14 @@ export function PanelGrid() {
                       lineHeight: 1.2,
                     }}
                     onTextChange={(newText) => {
-                      updateHeaderGroupText("col", li, gi, newText);
+                      // skipSync: store-only update while typing; the
+                      // preview refresh is deferred to onBlur below.
+                      updateHeaderGroupText("col", li, gi, newText, { skipSync: true });
                       if (newText === "" && (group.styled_segments?.length ?? 0) > 0) {
-                        updateHeaderGroupFormatting("col", li, gi, { styled_segments: [] });
+                        updateHeaderGroupFormatting("col", li, gi, { styled_segments: [] }, { skipSync: true });
                       }
                     }}
+                    onBlur={handleHeaderEditorBlur}
                     onActivate={activateEditor}
                     onSelectionNonEmpty={handleEditorSelectionChange}
                     onSelectionCleared={handleEditorSelectionCleared}
@@ -1755,11 +1781,12 @@ export function PanelGrid() {
                   lineHeight: 1.2,
                 }}
                 onTextChange={(newText) => {
-                  updateColumnLabel(ci, newText);
+                  updateColumnLabel(ci, newText, { skipSync: true });
                   if (newText === "" && (lbl.styled_segments?.length ?? 0) > 0) {
-                    updateLabelFormatting("col", ci, { styled_segments: [] });
+                    updateLabelFormatting("col", ci, { styled_segments: [] }, { skipSync: true });
                   }
                 }}
+                onBlur={handleHeaderEditorBlur}
                 onActivate={activateEditor}
                 onSelectionNonEmpty={handleEditorSelectionChange}
                 onSelectionCleared={handleEditorSelectionCleared}
@@ -1996,11 +2023,12 @@ export function PanelGrid() {
                           : { minHeight: "28px" }),
                       }}
                       onTextChange={(newText) => {
-                        updateHeaderGroupText("row", li, gi, newText);
+                        updateHeaderGroupText("row", li, gi, newText, { skipSync: true });
                         if (newText === "" && (group.styled_segments?.length ?? 0) > 0) {
-                          updateHeaderGroupFormatting("row", li, gi, { styled_segments: [] });
+                          updateHeaderGroupFormatting("row", li, gi, { styled_segments: [] }, { skipSync: true });
                         }
                       }}
+                      onBlur={handleHeaderEditorBlur}
                       onActivate={activateEditor}
                       onSelectionNonEmpty={handleEditorSelectionChange}
                       onSelectionCleared={handleEditorSelectionCleared}
@@ -2241,11 +2269,12 @@ export function PanelGrid() {
                         : { minHeight: "28px", width: "100%" }),
                     }}
                     onTextChange={(newText) => {
-                      updateRowLabel(ri, newText);
+                      updateRowLabel(ri, newText, { skipSync: true });
                       if (newText === "" && (rlbl?.styled_segments?.length ?? 0) > 0) {
-                        updateLabelFormatting("row", ri, { styled_segments: [] });
+                        updateLabelFormatting("row", ri, { styled_segments: [] }, { skipSync: true });
                       }
                     }}
+                    onBlur={handleHeaderEditorBlur}
                     onActivate={activateEditor}
                     onSelectionNonEmpty={handleEditorSelectionChange}
                     onSelectionCleared={handleEditorSelectionCleared}

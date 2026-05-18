@@ -84,6 +84,67 @@ export function AppShell() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Warn on app close if analysis plots were moved into the Collage
+  // Assembly. The collage builder is still a work in progress — it does
+  // NOT save to disk, so those plots only persist in this app's local
+  // storage and could be lost. Prompt the user to download them first.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        const win = getCurrentWindow();
+        const off = await win.onCloseRequested(async (event) => {
+          const hasAnalysisPlots = useCollageStore
+            .getState()
+            .items.some((it) => it.fromAnalysis);
+          if (!hasAnalysisPlots) return; // nothing at risk — allow close
+          event.preventDefault();
+          const { confirm } = await import("@tauri-apps/plugin-dialog");
+          const closeAnyway = await confirm(
+            "You've moved analysis plots into the Collage Assembly.\n\n" +
+              "The collage builder is still a work in progress — it does NOT " +
+              "save to disk, so those plots only persist in this app's local " +
+              "storage and could be lost.\n\n" +
+              'Download them first via the Analysis dialog → Plots → ' +
+              '"Download all to disk".\n\nClose anyway?',
+            { title: "Unsaved analysis plots", kind: "warning" },
+          );
+          if (closeAnyway) await win.destroy();
+        });
+        if (cancelled) off();
+        else unlisten = off;
+      } catch {
+        // Not running under Tauri (e.g. browser dev preview) — fall back
+        // to the browser's generic beforeunload prompt. Skipped when
+        // an intentional reload was just requested (see
+        // `window.__mpfigAllowUnload = true;` set by the New button
+        // and similar reset paths) — otherwise the implicit prompt
+        // gets auto-cancelled in headless contexts and a programmatic
+        // `window.location.reload()` quietly turns into a no-op.
+        const handler = (e: BeforeUnloadEvent) => {
+          const w = window as unknown as { __mpfigAllowUnload?: boolean };
+          if (w.__mpfigAllowUnload) {
+            w.__mpfigAllowUnload = false; // one-shot
+            return;
+          }
+          if (useCollageStore.getState().items.some((it) => it.fromAnalysis)) {
+            e.preventDefault();
+            e.returnValue = "";
+          }
+        };
+        window.addEventListener("beforeunload", handler);
+        if (cancelled) window.removeEventListener("beforeunload", handler);
+        else unlisten = () => window.removeEventListener("beforeunload", handler);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
   // Handle OS file drops via HTML5 drag-drop (works with dragDropEnabled: false)
   const [fileDragOver, setFileDragOver] = useState(false);
   const handleGlobalDragOver = useCallback((e: React.DragEvent) => {

@@ -24,7 +24,10 @@ function rot(points: Point[], angleDeg: number): Point[] {
   return points.map(([x, y]) => [x * cos - y * sin, x * sin + y * cos]);
 }
 
-export function getSymbolPolys(shape: string, rotation: number = 0): SymbolData {
+/** `width` is a cross-axis thickness multiplier used ONLY by the
+ *  direction-based symbols (Arrow, NarrowTriangle) — it scales the shape
+ *  perpendicular to its pointing direction. All other shapes ignore it. */
+export function getSymbolPolys(shape: string, rotation: number = 0, width: number = 1.0): SymbolData {
   let fill: Point[][] = [];
   let stroke: Point[][] = [];
   let filled = false;
@@ -32,14 +35,32 @@ export function getSymbolPolys(shape: string, rotation: number = 0): SymbolData 
   // ── TIP-BASED: (0,0) = tip ──
 
   if (shape === "Arrow") {
-    const shaft: Point[] = [[0, 0], [-0.6, 0]];
-    const head: Point[] = [[0, 0], [-0.22, -0.1], [-0.22, 0.1]];
-    stroke = [rot(shaft, rotation)];
-    fill = [rot(head, rotation)];
+    // Single filled polygon — a clean arrow with a sharp tip. See
+    // symbol_defs.py for the full rationale: rendering the arrow as ONE
+    // filled polygon (not a stroked shaft + filled head) makes it look
+    // identical in the edit-panel SVG overlay and the final figure,
+    // because stroke width has no shared unit across the render paths.
+    // head_len >> head_hw gives the pointed tip.
+    const headLen = 0.38;            // length (unaffected by width)
+    const headHW = 0.11 * width;     // head base half-width
+    const shaftLen = 0.6;            // total length (unaffected by width)
+    const shaftHW = 0.03 * width;    // shaft half-thickness
+    const arrow: Point[] = [
+      [0.0, 0.0],               // tip
+      [-headLen, -headHW],      // head back, upper
+      [-headLen, -shaftHW],     // head -> shaft junction, upper
+      [-shaftLen, -shaftHW],    // shaft tail, upper
+      [-shaftLen, shaftHW],     // shaft tail, lower
+      [-headLen, shaftHW],      // head -> shaft junction, lower
+      [-headLen, headHW],       // head back, lower
+    ];
+    fill = [rot(arrow, rotation)];
     filled = true;
   } else if (shape === "NarrowTriangle") {
-    // Tip at origin pointing RIGHT (same direction as Arrow at rot=0)
-    const pts: Point[] = [[0, 0], [-1.0, -0.12], [-1.0, 0.12]];
+    // Tip at origin pointing RIGHT (same direction as Arrow at rot=0).
+    // `width` scales the base half-width.
+    const hw = 0.12 * width;
+    const pts: Point[] = [[0, 0], [-1.0, -hw], [-1.0, hw]];
     fill = [rot(pts, rotation)];
     filled = true;
   } else if (shape === "Arrowhead") {
@@ -99,9 +120,9 @@ export function getSymbolPolys(shape: string, rotation: number = 0): SymbolData 
 }
 
 export function symbolToSvgPoints(
-  shape: string, cx: number, cy: number, sz: number, rotation: number = 0
+  shape: string, cx: number, cy: number, sz: number, rotation: number = 0, width: number = 1.0
 ): { fillPolys: string[]; strokePolys: string[]; filled: boolean } {
-  const data = getSymbolPolys(shape, rotation);
+  const data = getSymbolPolys(shape, rotation, width);
   const fillPolys = data.fill.map((poly) =>
     poly.map(([x, y]) => `${cx + x * sz},${cy + y * sz}`).join(" ")
   );

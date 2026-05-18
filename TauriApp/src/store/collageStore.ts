@@ -48,6 +48,10 @@ export type CollageItem = {
    *  editor. Doubles as a uniqueness key — a single .mpf can appear
    *  at most once in the collage. Null for image-kind items. */
   projectPath: string | null;
+  /** True when this item was an analysis plot moved here from the
+   *  Analysis dialog. The collage builder doesn't yet save to disk,
+   *  so on app-close we warn the user to download any such plots. */
+  fromAnalysis?: boolean;
 };
 
 export type WorkspaceMode = "builder" | "collage";

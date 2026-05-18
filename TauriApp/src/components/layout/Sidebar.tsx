@@ -316,7 +316,7 @@ function BuilderSidebar() {
   const [scaleInverted, setScaleInverted] = useState(false);
 
   // Computed measurements from backend
-  const [computedMeasurements, setComputedMeasurements] = useState<Array<{ panel: string; name: string; type: string; value: string }>>([]);
+  const [computedMeasurements, setComputedMeasurements] = useState<Array<{ panel: string; name: string; type: string; value: string; numeric?: number; unit?: string }>>([]);
   useEffect(() => {
     // Fetch measurements whenever config changes (lines/areas may have been added)
     if (!config) return;
@@ -818,7 +818,19 @@ function BuilderSidebar() {
             type="checkbox"
             checked={config.normalize_widths ?? false}
             onChange={(e) => {
-              const updated = { ...config, normalize_widths: e.target.checked };
+              // When the user FIRST enables normalize, default the
+              // mode to "height" — Match-height is the common case
+              // for grids of microscopy panels (each row should share
+              // the same on-screen height regardless of source aspect
+              // ratio). Preserve whatever was last picked on
+              // re-enables. Width-only mode is still selectable
+              // explicitly via the dropdown below.
+              const enabled = e.target.checked;
+              const nextMode =
+                enabled && (!config.normalize_mode || config.normalize_mode === "width")
+                  ? "height"
+                  : (config.normalize_mode ?? "height");
+              const updated = { ...config, normalize_widths: enabled, normalize_mode: nextMode };
               setConfig(updated);
               api.updateConfig(updated).catch(console.error);
             }}
@@ -829,7 +841,7 @@ function BuilderSidebar() {
           <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
             <Typography variant="caption" sx={{ color: "text.secondary" }}>Mode</Typography>
             <select
-              value={config.normalize_mode ?? "width"}
+              value={config.normalize_mode ?? "height"}
               onChange={(e) => {
                 const updated = { ...config, normalize_mode: e.target.value };
                 setConfig(updated);
@@ -837,8 +849,8 @@ function BuilderSidebar() {
               }}
               style={{ fontSize: "0.65rem", backgroundColor: "var(--c-surface2)", color: "var(--c-text)", border: "1px solid var(--c-border)", borderRadius: 4, padding: "2px 4px" }}
             >
-              <option value="width">Match width</option>
               <option value="height">Match height</option>
+              <option value="width">Match width</option>
             </select>
           </Box>
         )}
@@ -886,7 +898,11 @@ function BuilderSidebar() {
           <Box sx={{ display: "flex", gap: 0.5 }}>
             <Button size="small" variant="text" sx={{ fontSize: "0.55rem", textTransform: "none", flex: 1 }}
               onClick={() => {
-                const csv = ["Panel,Name,Type,Value", ...computedMeasurements.map(m => `${m.panel},${m.name},${m.type},${m.value}`)].join("\n");
+                // Value + Unit as separate columns so the measurement
+                // unit is explicitly recorded, not just embedded in text.
+                const csv = ["Panel,Name,Type,Value,Unit",
+                  ...computedMeasurements.map(m =>
+                    `${m.panel},${m.name},${m.type},${m.numeric ?? m.value},${m.unit ?? ""}`)].join("\n");
                 const blob = new Blob([csv], { type: "text/csv" });
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement("a");

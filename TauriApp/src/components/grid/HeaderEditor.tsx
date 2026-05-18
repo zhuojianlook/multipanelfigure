@@ -13,6 +13,7 @@
 import { useRef } from "react";
 import type {
   CSSProperties,
+  FocusEvent as ReactFocusEvent,
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
 } from "react";
@@ -40,6 +41,12 @@ export interface HeaderEditorProps {
   className?: string;
   style?: CSSProperties;
   onTextChange: (text: string) => void;
+  /** Fired when the editor loses focus. Parents use this to flush
+   *  deferred text + styling edits to the backend + refresh the preview
+   *  once, instead of on every keystroke / style tweak. The FocusEvent is
+   *  forwarded so the parent can inspect `relatedTarget` (e.g. skip the
+   *  flush when focus is moving into the floating toolbar). */
+  onBlur?: (e: ReactFocusEvent<HTMLDivElement>) => void;
   onActivate: (target: HeaderEditorTarget, handle: StyledTextEditorHandle) => void;
   onSelectionNonEmpty?: (sel: { start: number; end: number }) => void;
   /** Fired when the editor's selection collapses or the user edits the
@@ -66,6 +73,7 @@ export function HeaderEditor(props: HeaderEditorProps) {
     className,
     style,
     onTextChange,
+    onBlur,
     onActivate,
     onSelectionNonEmpty,
     onSelectionCleared,
@@ -109,6 +117,7 @@ export function HeaderEditor(props: HeaderEditorProps) {
       onFocus={() => {
         if (ref.current) onActivate(target, ref.current);
       }}
+      onBlur={(e) => onBlur?.(e)}
       onSelectionChange={(sel) => {
         // Only forward NON-EMPTY selections. A collapsed selection isn't
         // a meaningful "user wants this range" signal — and collapse

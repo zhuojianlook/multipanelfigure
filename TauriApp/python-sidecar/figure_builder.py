@@ -892,10 +892,30 @@ def _add_row_headers(fig, axes, header_levels: List[HeaderLevel],
             gap_inches = max(gap_inches, 0.04)
             dist_x = _inches_to_frac(gap_inches, fig_w)
 
-            if hdr.position == "Left":
-                cx = base_x_left - dist_x
+            # Rotated row headers are drawn with va="center", so `cx` is the
+            # CENTRE of the (possibly multi-line) text block — and a
+            # multi-line block is `num_lines` lines THICK perpendicular to
+            # the baseline. Without correction, a multi-line SECONDARY
+            # header's inner edge reaches back `num_lines/2` lines toward
+            # the panels and overlaps the (typically single-line) PRIMARY
+            # header — `base_x_left` only advanced by the primary tier's
+            # own width. Shift `cx` outward by half the block thickness so
+            # the inner edge lands `dist_x` clear, exactly like column
+            # headers (which use edge-anchored va="bottom"/"top") and like
+            # the matching fix in _add_row_labels. Non-rotated row headers
+            # stack multi-line text along the row axis, not toward
+            # neighbouring tiers, so they need no correction.
+            if abs(hdr.rotation or 0) > 1:
+                hdr_lines = _count_header_lines(hdr)
+                block_w_in = (hdr.font_size / 72.0) * (1.0 + 1.2 * (hdr_lines - 1))
+                edge_correction = _inches_to_frac(block_w_in * 0.5, fig_w)
             else:
-                cx = base_x_right + dist_x
+                edge_correction = 0.0
+
+            if hdr.position == "Left":
+                cx = base_x_left - dist_x - edge_correction
+            else:
+                cx = base_x_right + dist_x + edge_correction
 
             text_idx_before = len(fig.texts)
             _draw_colored_text(fig, cx, cy, segments, fp,
@@ -1017,12 +1037,24 @@ def _add_row_labels(fig, axes, labels: List[AxisLabel], rows: int, cols: int):
 
         # NOTE: no auto-wrap — see the column-header block above.
         dist_frac = lbl.distance * ref / fig_w
-        # For rotated text with ha="center", the text center (not edge)
-        # sits at the coordinate.  Add half the font height so the nearest
-        # text edge is at the same visual distance as column labels.
+        # For rotated text with ha="center", the text BLOCK CENTRE (not its
+        # edge) sits at the coordinate. Shift it out by half the block's
+        # thickness so the edge NEAREST the panel lands `dist_frac` away —
+        # matching column labels (which use va="bottom" and so anchor the
+        # edge directly).
+        #
+        # CRITICAL: a rotated multi-line label is `num_lines` lines THICK
+        # perpendicular to the baseline. Correcting by only half a single
+        # font height (the old behaviour) left multi-line row labels
+        # crowding the panel — their extra lines stacked straight into the
+        # gap. Use the same multi-line width estimate as the row-HEADER
+        # spacing code so an N-line row label keeps the same panel gap as
+        # a 1-line one. For num_lines == 1 this reduces to the previous
+        # `font_h * 0.5`, so single-line labels are unaffected.
         if abs(rot) > 1:
-            font_h_frac = (lbl.font_size / 72.0) / fig_w  # font height in inches → fig frac
-            edge_correction = font_h_frac * 0.5
+            num_lines = len((lbl.text or "").split("\n"))
+            block_w_in = (lbl.font_size / 72.0) * (1.0 + 1.2 * (num_lines - 1))
+            edge_correction = (block_w_in / fig_w) * 0.5
         else:
             edge_correction = 0
         if lbl.position == "Left":
@@ -1122,14 +1154,22 @@ def _add_panel_symbols(fig, axes, cfg, rows: int, cols: int,
             if img is None:
                 continue
             iw, ih = img.size
-            # Convert symbol size from abstract units to data coordinates.
-            # We want size to behave like font_size (absolute visual size).
-            # Use axes transform: size_inches = sym.size / 72
-            # data_units_per_inch = iw / (axes_width_inches)
-            bbox = ax.get_position()
-            ax_w_inches = bbox.width * fig.get_figwidth()
-            data_per_inch = iw / max(ax_w_inches, 0.1)
-            scale_factor = data_per_inch / 72.0  # converts points to data units
+            # Symbol size is a FRACTION of the panel image width, against the
+            # same fixed 216-px reference used by the frontend SVG overlay in
+            # the edit panel (`sym.size * imageWidth / 216`) and by
+            # image_processing.draw_symbols (`sym.size * ref_w / 216`).
+            #
+            # The previous formula scaled by the panel's rendered width in
+            # INCHES (axes_width_inches), so the same sym.size rendered at a
+            # different on-figure size than the edit-panel preview showed
+            # unless the panel happened to be exactly 3in wide — the
+            # user-reported "symbols look a different size in the final
+            # preview vs the edit panel preview". Using the shared 216-px
+            # reference makes the symbol the same fraction of the panel in
+            # both the edit overlay and the rendered figure (WYSIWYG).
+            scale_factor = iw / 216.0
+            # matplotlib line-style strings for the border_style options.
+            _ls_map = {"solid": "-", "dashed": "--", "dotted": ":"}
             for sym in panel.symbols:
                 from symbol_defs import symbol_to_pixels
                 from matplotlib.patches import Polygon as MplPolygon
@@ -1140,28 +1180,45 @@ def _add_panel_symbols(fig, axes, cfg, rows: int, cols: int,
                 color = sym.color
                 # Stroke scales with symbol size for visibility
                 lw = max(0.8, min(2.5, sz / 20))
+                # Arrow / NarrowTriangle cross-axis thickness multiplier.
+                sym_width = float(getattr(sym, "width", 1.0) or 1.0)
+                # Outline shapes: border line style + optional centre fill.
+                border_ls = _ls_map.get(getattr(sym, "border_style", "solid") or "solid", "-")
+                fill_color = getattr(sym, "fill_color", "") or ""
+                fill_alpha = max(0.0, min(1.0, float(getattr(sym, "fill_opacity", 100.0) or 0.0) / 100.0))
 
-                data = symbol_to_pixels(sym.shape, cx, cy, sz, sym.rotation)
+                data = symbol_to_pixels(sym.shape, cx, cy, sz, sym.rotation, sym_width)
 
                 # Draw filled polygons
                 for poly in data["fill"]:
                     if len(poly) >= 3:
                         if data["filled"]:
+                            # Solid shapes (Arrow, NarrowTriangle, Arrowhead)
                             patch = MplPolygon(poly, closed=True,
                                              facecolor=color, edgecolor=color,
                                              lw=0.3, clip_on=False)
                         else:
-                            patch = MplPolygon(poly, closed=True,
-                                             fill=False, edgecolor=color,
-                                             lw=lw, clip_on=False)
+                            # Outline shapes (Triangle, Star, Rectangle,
+                            # Ellipse): styled border + optional centre fill.
+                            if fill_color and fill_alpha > 0:
+                                patch = MplPolygon(poly, closed=True,
+                                                 facecolor=fill_color, alpha=fill_alpha,
+                                                 edgecolor=color, lw=lw,
+                                                 linestyle=border_ls, clip_on=False)
+                            else:
+                                patch = MplPolygon(poly, closed=True,
+                                                 fill=False, edgecolor=color,
+                                                 lw=lw, linestyle=border_ls,
+                                                 clip_on=False)
                         ax.add_patch(patch)
 
-                # Draw stroke lines
+                # Draw stroke lines (Cross, Asterisk) — honour border_style.
                 for polyline in data["stroke"]:
                     if len(polyline) >= 2:
                         xs = [p[0] for p in polyline]
                         ys = [p[1] for p in polyline]
                         ax.plot(xs, ys, color=color, lw=lw, clip_on=False,
+                                linestyle=border_ls,
                                 solid_capstyle='round')
 
                 # Symbol text label
@@ -1217,13 +1274,35 @@ def _add_panel_scale_bars(fig, axes, cfg, rows: int, cols: int,
             bar_length_px = int(sb.bar_length_microns / max(sb.micron_per_pixel, 1e-9))
             bar_height = sb.bar_height
 
-            # If image was normalized (scaled up), scale bar dimensions too
-            if pre_norm_sizes and not panel_override:
-                pre = pre_norm_sizes[r][c]
+            # Detect adjacent-zoom target panels — they have no image
+            # of their own; the image is a synthesised crop from a
+            # source. For these the bar's PHYSICAL THICKNESS and TEXT
+            # SIZE should look the same as the source's, so we skip
+            # the normalize-scale-factor amplification on those two
+            # axes (the bar LENGTH still scales — that's what carries
+            # the inherited physical-length semantic).
+            is_zoom_target = not (panel.image_name and panel.image_name.strip())
+
+            # If image was normalized (scaled up), scale bar dimensions too.
+            # When `panel_override` is set, `pre_norm_sizes` is interpreted
+            # the same way — the dialog preview endpoint upscales small
+            # synthesised images (zoom targets) to give matplotlib enough
+            # pixels for crisp text, and passes pre-norm sizes so the bar
+            # rescales to match.
+            if pre_norm_sizes:
+                pre_row = pre_norm_sizes[r] if r < len(pre_norm_sizes) else None
+                pre = pre_row[c] if pre_row and c < len(pre_row) else None
                 if pre and pre[0] > 0:
                     nsf = iw / pre[0]
                     bar_length_px = int(bar_length_px * nsf)
-                    bar_height = int(bar_height * nsf)
+                    if not is_zoom_target:
+                        bar_height = int(bar_height * nsf)
+                    # else: keep bar_height at its stored value so
+                    # the visual thickness matches the source panel's.
+                    # (Font size stays at the stored point value — at
+                    # the higher DPI introduced by normalize / upscale,
+                    # matplotlib rasterises crisper text naturally; no
+                    # divide-by-nsf compensation needed.)
 
             # Position relative to image content area (not padding)
             edge_frac = sb.edge_distance / 100.0
@@ -1263,7 +1342,7 @@ def _add_panel_scale_bars(fig, axes, cfg, rows: int, cols: int,
                 # Clean display: remove trailing zeros
                 label_text = f"{bar_in_unit:g} {unit_display}"
 
-            # Render text using matplotlib fonts (same quality as column/row labels)
+            # Render text using matplotlib fonts (same quality as column/row labels).
             fp = _font_props(
                 getattr(sb, 'font_path', None),
                 getattr(sb, 'font_name', 'arial.ttf'),
@@ -1293,83 +1372,152 @@ def _add_panel_scale_bars(fig, axes, cfg, rows: int, cols: int,
 
 # ── Adjacent Panel zoom cross-panel lines ─────────────────────────────────
 
+def _panel_zoom_insets_iter(panel):
+    """Yield zoom-inset entries for a panel — array first, legacy
+    singular as fallback. Mirrors image_processing._iter_zoom_insets
+    but kept local so this module doesn't pull in image_processing."""
+    if not getattr(panel, "add_zoom_inset", False):
+        return
+    arr = list(getattr(panel, "zoom_insets", None) or [])
+    if arr:
+        for zi in arr:
+            yield zi
+        return
+    legacy = getattr(panel, "zoom_inset", None)
+    if legacy is not None:
+        yield legacy
+
+
 def _draw_adjacent_zoom_lines(fig, axes, cfg, rows, cols, processed_images, orig_sizes):
-    """Draw connecting lines from source rect to adjacent panel zoomed image."""
+    """Draw connecting lines from source rect to adjacent panel zoomed image.
+
+    Iterates every Adjacent Panel zoom inset on every source panel,
+    so a panel with multiple adjacent insets gets its lines drawn for
+    each target. Standard / Separate insets are skipped here — their
+    connector lines are drawn directly inside the source panel by
+    image_processing._draw_standard_zoom / _draw_separate_zoom."""
     from matplotlib.patches import ConnectionPatch
 
     for r in range(rows):
         for c in range(cols):
             panel = cfg.panels[r][c]
-            if not panel.add_zoom_inset or not panel.zoom_inset:
-                continue
-            zi = panel.zoom_inset
-            if zi.inset_type != "Adjacent Panel":
-                continue
+            for zi in _panel_zoom_insets_iter(panel):
+                if zi.inset_type != "Adjacent Panel":
+                    continue
 
-            ar, ac = r, c
-            side = zi.side or "Right"
-            if side == "Top": ar -= 1
-            elif side == "Bottom": ar += 1
-            elif side == "Left": ac -= 1
-            elif side == "Right": ac += 1
-            if not (0 <= ar < rows and 0 <= ac < cols):
-                continue
+                ar, ac = r, c
+                side = zi.side or "Right"
+                if side == "Top": ar -= 1
+                elif side == "Bottom": ar += 1
+                elif side == "Left": ac -= 1
+                elif side == "Right": ac += 1
+                if not (0 <= ar < rows and 0 <= ac < cols):
+                    continue
 
-            src_ax = axes[r, c] if axes.ndim == 2 else axes[r * cols + c]
-            tgt_ax = axes[ar, ac] if axes.ndim == 2 else axes[ar * cols + ac]
+                src_ax = axes[r, c] if axes.ndim == 2 else axes[r * cols + c]
+                tgt_ax = axes[ar, ac] if axes.ndim == 2 else axes[ar * cols + ac]
 
-            # Source rect corners in source image data coordinates
-            # (no padding offset needed — PIL draws rect at zi.x, zi.y on original image,
-            #  padding centers it, so data coords include padding offset)
-            src_orig = orig_sizes.get((r, c), (1, 1))
-            src_padded = processed_images[r][c].size if processed_images[r][c] else src_orig
-            spad_x = (src_padded[0] - src_orig[0]) / 2
-            spad_y = (src_padded[1] - src_orig[1]) / 2
-            sx1 = spad_x + zi.x
-            sy1 = spad_y + zi.y
-            sx2 = spad_x + zi.x + zi.width
-            sy2 = spad_y + zi.y + zi.height
+                # Source rect corners in source image data coordinates
+                # (no padding offset needed — PIL draws rect at zi.x, zi.y on original image,
+                #  padding centers it, so data coords include padding offset)
+                src_orig = orig_sizes.get((r, c), (1, 1))
+                src_padded = processed_images[r][c].size if processed_images[r][c] else src_orig
+                spad_x = (src_padded[0] - src_orig[0]) / 2
+                spad_y = (src_padded[1] - src_orig[1]) / 2
 
-            # Target zoomed image position within padded target image
-            tgt_orig = orig_sizes.get((ar, ac), (1, 1))
-            tgt_padded = processed_images[ar][ac].size if processed_images[ar][ac] else tgt_orig
-            tpx = (tgt_padded[0] - tgt_orig[0]) / 2
-            tpy = (tgt_padded[1] - tgt_orig[1]) / 2
-            # Corners of actual zoomed content in target data coords
-            tl_x, tl_y = tpx, tpy                          # top-left
-            br_x, br_y = tpx + tgt_orig[0], tpy + tgt_orig[1]  # bottom-right
+                # Compute the 4 source corners (rotated when zi.rotation != 0).
+                # CSS-style rotation matrix in y-down coords:
+                # x' = dx·cosR - dy·sinR, y' = dx·sinR + dy·cosR.
+                rot_deg = float(getattr(zi, "rotation", 0) or 0)
+                if abs(rot_deg) > 0.01:
+                    import math as _math
+                    rad = _math.radians(rot_deg)
+                    cR, sR = _math.cos(rad), _math.sin(rad)
+                    cx_src = spad_x + zi.x + zi.width / 2.0
+                    cy_src = spad_y + zi.y + zi.height / 2.0
 
-            color = zi.line_color or "#FF0000"
-            bg = (cfg.background or "white").lower()
-            if color.lower() in ("#ffffff", "white", "#fff") and bg in ("white", "#ffffff", "#fff"):
-                color = "#333333"
-            lw = max(0.5, zi.line_width * 0.5)
+                    def _rot_corner(px, py):
+                        dx = px - cx_src
+                        dy = py - cy_src
+                        return (cx_src + dx * cR - dy * sR, cy_src + dx * sR + dy * cR)
 
-            # Connect source corners to target zoomed image corners
-            if side == "Right":
-                pairs = [((sx2, sy1), (tl_x, tl_y)), ((sx2, sy2), (tl_x, br_y))]
-            elif side == "Left":
-                pairs = [((sx1, sy1), (br_x, tl_y)), ((sx1, sy2), (br_x, br_y))]
-            elif side == "Top":
-                pairs = [((sx1, sy1), (tl_x, br_y)), ((sx2, sy1), (br_x, br_y))]
-            else:
-                pairs = [((sx1, sy2), (tl_x, tl_y)), ((sx2, sy2), (br_x, tl_y))]
+                    src_corners = [
+                        _rot_corner(spad_x + zi.x, spad_y + zi.y),
+                        _rot_corner(spad_x + zi.x + zi.width, spad_y + zi.y),
+                        _rot_corner(spad_x + zi.x + zi.width, spad_y + zi.y + zi.height),
+                        _rot_corner(spad_x + zi.x, spad_y + zi.y + zi.height),
+                    ]
+                else:
+                    src_corners = [
+                        (spad_x + zi.x, spad_y + zi.y),
+                        (spad_x + zi.x + zi.width, spad_y + zi.y),
+                        (spad_x + zi.x + zi.width, spad_y + zi.y + zi.height),
+                        (spad_x + zi.x, spad_y + zi.y + zi.height),
+                    ]
 
-            # Render the figure to finalize transforms before computing coordinates
-            fig.canvas.draw()
+                # Pick the two source corners CLOSEST (by rotated
+                # screen position) to the adjacent panel direction,
+                # then re-order them by the PERPENDICULAR axis so
+                # `s_top` is the visually-upper (Right/Left) or
+                # visually-left (Top/Bottom) of the pair. This
+                # prevents the cross-panel lines from crossing each
+                # other at rotations like 60° where the two
+                # rightmost-projecting corners are at different y.
+                if side == "Right" or side == "Left":
+                    key_side = (lambda i: -src_corners[i][0]) if side == "Right" else (lambda i: src_corners[i][0])
+                    picked = sorted(range(4), key=key_side)[:2]
+                    picked.sort(key=lambda i: src_corners[i][1])  # upper first
+                else:
+                    key_side = (lambda i: src_corners[i][1]) if side == "Top" else (lambda i: -src_corners[i][1])
+                    picked = sorted(range(4), key=key_side)[:2]
+                    picked.sort(key=lambda i: src_corners[i][0])  # left first
+                s_top, s_bot = src_corners[picked[0]], src_corners[picked[1]]
 
-            for (src_pt, tgt_pt) in pairs:
-                # Convert data coords to figure fraction using finalized transforms
-                src_fig = (src_ax.transData + fig.transFigure.inverted()).transform(src_pt)
-                tgt_fig = (tgt_ax.transData + fig.transFigure.inverted()).transform(tgt_pt)
+                # Target zoomed image position within padded target image
+                tgt_orig = orig_sizes.get((ar, ac), (1, 1))
+                tgt_padded = processed_images[ar][ac].size if processed_images[ar][ac] else tgt_orig
+                tpx = (tgt_padded[0] - tgt_orig[0]) / 2
+                tpy = (tgt_padded[1] - tgt_orig[1]) / 2
+                # Corners of actual zoomed content in target data coords
+                tl_x, tl_y = tpx, tpy                          # top-left
+                br_x, br_y = tpx + tgt_orig[0], tpy + tgt_orig[1]  # bottom-right
 
-                import matplotlib.lines as mlines
-                line = mlines.Line2D(
-                    [src_fig[0], tgt_fig[0]], [src_fig[1], tgt_fig[1]],
-                    transform=fig.transFigure,
-                    color=color, linewidth=lw, alpha=0.8,
-                    clip_on=False, zorder=100)
-                fig.add_artist(line)
+                # Honour the user-specified line colour verbatim — no
+                # background-aware override so the rendered adjacent
+                # zoom inset retains exactly the colours configured
+                # in the zoom-inset settings.
+                color = zi.line_color or "#FF0000"
+                lw = max(0.5, zi.line_width * 0.5)
+
+                # Connect rotated source tangent corners to target zoomed
+                # image corners. For Right/Left: top src tangent → top
+                # dst corner, bottom src tangent → bottom dst corner.
+                # For Top/Bottom: left src tangent → left dst corner,
+                # right src tangent → right dst corner.
+                if side == "Right":
+                    pairs = [(s_top, (tl_x, tl_y)), (s_bot, (tl_x, br_y))]
+                elif side == "Left":
+                    pairs = [(s_top, (br_x, tl_y)), (s_bot, (br_x, br_y))]
+                elif side == "Top":
+                    pairs = [(s_top, (tl_x, br_y)), (s_bot, (br_x, br_y))]
+                else:
+                    pairs = [(s_top, (tl_x, tl_y)), (s_bot, (br_x, tl_y))]
+
+                # Render the figure to finalize transforms before computing coordinates
+                fig.canvas.draw()
+
+                for (src_pt, tgt_pt) in pairs:
+                    # Convert data coords to figure fraction using finalized transforms
+                    src_fig = (src_ax.transData + fig.transFigure.inverted()).transform(src_pt)
+                    tgt_fig = (tgt_ax.transData + fig.transFigure.inverted()).transform(tgt_pt)
+
+                    import matplotlib.lines as mlines
+                    line = mlines.Line2D(
+                        [src_fig[0], tgt_fig[0]], [src_fig[1], tgt_fig[1]],
+                        transform=fig.transFigure,
+                        color=color, linewidth=lw, alpha=0.8,
+                        clip_on=False, zorder=100)
+                    fig.add_artist(line)
 
 
 
@@ -1649,182 +1797,288 @@ def assemble_figure(cfg: FigureConfig,
                 facecolor=fig.get_facecolor(), edgecolor="none")
     plt.close(fig)
 
-    # Post-render: draw Adjacent Panel zoom connecting lines via PIL
+    # Post-render: draw Adjacent Panel zoom connecting lines via PIL.
+    # Iterates panel.zoom_insets so multiple adjacent insets per panel
+    # all get connectors. has_adj_zoom is the same fast-path detection,
+    # extended to recognise the array.
     buf.seek(0)
+    def _has_adjacent_zoom(p):
+        for _zi in _panel_zoom_insets_iter(p):
+            if _zi.inset_type == "Adjacent Panel":
+                return True
+        return False
     has_adj_zoom = any(
-        cfg.panels[r][c].add_zoom_inset and cfg.panels[r][c].zoom_inset
-        and cfg.panels[r][c].zoom_inset.inset_type == "Adjacent Panel"
+        _has_adjacent_zoom(cfg.panels[r][c])
         for r in range(rows) for c in range(cols)
     )
     if has_adj_zoom:
         out_img = Image.open(buf).convert("RGB")
         ow, oh = out_img.size
-        draw_out = ImageDraw.Draw(out_img)
+        # Use cv2.LINE_AA via the _AAImage wrapper so cross-panel
+        # connector lines and target rect borders draw as smooth
+        # straight lines at any angle — no supersampling/Lanczos
+        # blur. Falls back to PIL draw.line only on the (rare) cv2
+        # import failure.
+        from image_processing import _AAImage
+        try:
+            draw_out = _AAImage(out_img)
+            _adj_use_aa = True
+        except Exception:
+            draw_out = ImageDraw.Draw(out_img)
+            _adj_use_aa = False
 
         for r in range(rows):
             for c in range(cols):
                 panel = cfg.panels[r][c]
-                if not panel.add_zoom_inset or not panel.zoom_inset:
-                    continue
-                zi = panel.zoom_inset
-                if zi.inset_type != "Adjacent Panel":
-                    continue
-                ar, ac = r, c
-                side = zi.side or "Right"
-                if side == "Top": ar -= 1
-                elif side == "Bottom": ar += 1
-                elif side == "Left": ac -= 1
-                elif side == "Right": ac += 1
-                if not (0 <= ar < rows and 0 <= ac < cols):
-                    continue
+                for zi in _panel_zoom_insets_iter(panel):
+                    if zi.inset_type != "Adjacent Panel":
+                        continue
+                    ar, ac = r, c
+                    side = zi.side or "Right"
+                    if side == "Top": ar -= 1
+                    elif side == "Bottom": ar += 1
+                    elif side == "Left": ac -= 1
+                    elif side == "Right": ac += 1
+                    if not (0 <= ar < rows and 0 <= ac < cols):
+                        continue
 
-                sp = axes_positions[(r, c)]  # (x0, y0, x1, y1) in figure fraction
-                tp = axes_positions[(ar, ac)]
+                    sp = axes_positions[(r, c)]  # (x0, y0, x1, y1) in figure fraction
+                    tp = axes_positions[(ar, ac)]
 
-                # Helper: convert (frac_x, frac_y) within axes bbox to output pixels
-                # frac_x: 0=left, 1=right of axes
-                # frac_y: 0=top, 1=bottom of axes (imshow convention)
-                def _ax_to_px(bbox, fx, fy):
-                    fig_x = bbox[0] + fx * (bbox[2] - bbox[0])
-                    fig_y = bbox[3] - fy * (bbox[3] - bbox[1])  # bbox[3]=y1=top, fy=0→top
-                    return int(fig_x * ow), int((1 - fig_y) * oh)
+                    # Helper: convert (frac_x, frac_y) within axes bbox to output pixels
+                    # frac_x: 0=left, 1=right of axes
+                    # frac_y: 0=top, 1=bottom of axes (imshow convention)
+                    def _ax_to_px(bbox, fx, fy):
+                        fig_x = bbox[0] + fx * (bbox[2] - bbox[0])
+                        fig_y = bbox[3] - fy * (bbox[3] - bbox[1])  # bbox[3]=y1=top, fy=0→top
+                        return int(fig_x * ow), int((1 - fig_y) * oh)
 
-                # Source rect as fraction of source panel image
-                src_img = original_images[r][c]
-                siw = src_img.size[0] if src_img else 1
-                sih = src_img.size[1] if src_img else 1
-                sfx1 = zi.x / siw
-                sfy1 = zi.y / sih
-                sfx2 = (zi.x + zi.width) / siw
-                sfy2 = (zi.y + zi.height) / sih
+                    # Source rect as fraction of source panel image
+                    src_img = original_images[r][c]
+                    siw = src_img.size[0] if src_img else 1
+                    sih = src_img.size[1] if src_img else 1
+                    sfx1 = zi.x / siw
+                    sfy1 = zi.y / sih
+                    sfx2 = (zi.x + zi.width) / siw
+                    sfy2 = (zi.y + zi.height) / sih
 
-                # Target: zoomed image fills the entire target axes (no separate padding calc needed)
-                # Just use 0,0 to 1,1
+                    # Target: zoomed image fills the entire target axes (no separate padding calc needed)
+                    # Just use 0,0 to 1,1
 
-                # Source corners → output pixels
-                s_tr = _ax_to_px(sp, sfx2, sfy1)  # top-right of source rect
-                s_br = _ax_to_px(sp, sfx2, sfy2)  # bottom-right of source rect
+                    # Source corners → output pixels
+                    s_tr = _ax_to_px(sp, sfx2, sfy1)  # top-right of source rect
+                    s_br = _ax_to_px(sp, sfx2, sfy2)  # bottom-right of source rect
 
-                # Target corners → output pixels
-                t_tl = _ax_to_px(tp, 0, 0)  # top-left of target
-                t_bl = _ax_to_px(tp, 0, 1)  # bottom-left of target
+                    # Target corners → output pixels
+                    t_tl = _ax_to_px(tp, 0, 0)  # top-left of target
+                    t_bl = _ax_to_px(tp, 0, 1)  # bottom-left of target
 
-                zcolor = zi.line_color or "#FF0000"
-                bg2 = (cfg.background or "white").lower()
-                if zcolor.lower() in ("#ffffff", "white", "#fff") and bg2 in ("white", "#ffffff", "#fff"):
-                    zcolor = "#333333"
-                zlw = max(1, zi.line_width)
+                    # Use the configured colour as-is — see comment
+                    # above; we no longer rewrite white-on-white to
+                    # grey so the rendered cross-panel lines match
+                    # exactly what the zoom-inset settings specify.
+                    zcolor = zi.line_color or "#FF0000"
+                    # Independent line styles: rectangle_style for the
+                    # source + target rect outlines, line_style for the
+                    # cross-panel connecting lines.
+                    z_rect_style = getattr(zi, "rectangle_style", "solid") or "solid"
+                    z_line_style = getattr(zi, "line_style", "solid") or "solid"
+                    zlw = max(1, zi.line_width)
 
-                # Compute source rect center position in the output image
-                # Use axes data limits (from imshow) — these reflect the ACTUAL
-                # displayed image dimensions including any padding
-                src_ax_obj = axes[r, c] if axes.ndim == 2 else axes[r * cols + c]
-                xlim = src_ax_obj.get_xlim()
-                ylim = src_ax_obj.get_ylim()
-                # Axes data range (imshow: ylim is inverted, y0=top)
-                data_w = abs(xlim[1] - xlim[0])
-                data_h = abs(ylim[0] - ylim[1])
-                # Full-res dimensions for zi coords
-                frs = full_res_sizes or {}
-                full_w, full_h = frs.get((r, c), (data_w, data_h))
-                # zi center in data coordinates
-                zi_data_x = (zi.x + zi.width / 2) * data_w / max(full_w, 1)
-                zi_data_y = (zi.y + zi.height / 2) * data_h / max(full_h, 1)
-                # Account for padding: if data range > original image, image is centered
-                oi = original_images[r][c]
-                oiw = oi.size[0] if oi else data_w
-                oih = oi.size[1] if oi else data_h
-                # Padding in data coords
-                data_pad_x = (data_w - oiw * data_w / max(full_w, 1) * full_w / max(oiw, 1)) / 2 if full_w != oiw else (data_w - data_w) / 2
-                # Simpler: just compute fraction of axes
-                sel_fx = zi_data_x / data_w
-                sel_fy = zi_data_y / data_h
-                # But if image is padded in axes (data_h > image proportion),
-                # the image starts at an offset
-                img_data_h = oih  # original image height in data coords
-                if data_h > img_data_h:
-                    pad_data_y = (data_h - img_data_h) / 2
-                    zi_data_y_padded = pad_data_y + (zi.y + zi.height / 2) * img_data_h / max(full_h, 1)
-                    sel_fy = zi_data_y_padded / data_h
-                img_data_w = oiw
-                if data_w > img_data_w:
-                    pad_data_x = (data_w - img_data_w) / 2
-                    zi_data_x_padded = pad_data_x + (zi.x + zi.width / 2) * img_data_w / max(full_w, 1)
-                    sel_fx = zi_data_x_padded / data_w
-                # Helper: convert axes fraction to output pixel
-                def _frac_to_px(bbox, fx, fy):
-                    px_x = int((bbox[0] + fx * (bbox[2] - bbox[0])) * ow)
-                    f_y = bbox[3] - fy * (bbox[3] - bbox[1])
-                    px_y = int((1 - f_y) * oh)
-                    return px_x, px_y
+                    # Compute source rect center position in the output image
+                    # Use axes data limits (from imshow) — these reflect the ACTUAL
+                    # displayed image dimensions including any padding
+                    src_ax_obj = axes[r, c] if axes.ndim == 2 else axes[r * cols + c]
+                    xlim = src_ax_obj.get_xlim()
+                    ylim = src_ax_obj.get_ylim()
+                    # Axes data range (imshow: ylim is inverted, y0=top)
+                    data_w = abs(xlim[1] - xlim[0])
+                    data_h = abs(ylim[0] - ylim[1])
+                    # Full-res dimensions for zi coords
+                    frs = full_res_sizes or {}
+                    full_w, full_h = frs.get((r, c), (data_w, data_h))
+                    # zi center in data coordinates
+                    zi_data_x = (zi.x + zi.width / 2) * data_w / max(full_w, 1)
+                    zi_data_y = (zi.y + zi.height / 2) * data_h / max(full_h, 1)
+                    # Account for padding: if data range > original image, image is centered
+                    oi = original_images[r][c]
+                    oiw = oi.size[0] if oi else data_w
+                    oih = oi.size[1] if oi else data_h
+                    # Padding in data coords
+                    data_pad_x = (data_w - oiw * data_w / max(full_w, 1) * full_w / max(oiw, 1)) / 2 if full_w != oiw else (data_w - data_w) / 2
+                    # Simpler: just compute fraction of axes
+                    sel_fx = zi_data_x / data_w
+                    sel_fy = zi_data_y / data_h
+                    # But if image is padded in axes (data_h > image proportion),
+                    # the image starts at an offset
+                    img_data_h = oih  # original image height in data coords
+                    if data_h > img_data_h:
+                        pad_data_y = (data_h - img_data_h) / 2
+                        zi_data_y_padded = pad_data_y + (zi.y + zi.height / 2) * img_data_h / max(full_h, 1)
+                        sel_fy = zi_data_y_padded / data_h
+                    img_data_w = oiw
+                    if data_w > img_data_w:
+                        pad_data_x = (data_w - img_data_w) / 2
+                        zi_data_x_padded = pad_data_x + (zi.x + zi.width / 2) * img_data_w / max(full_w, 1)
+                        sel_fx = zi_data_x_padded / data_w
+                    # Helper: convert axes fraction to output pixel
+                    def _frac_to_px(bbox, fx, fy):
+                        px_x = int((bbox[0] + fx * (bbox[2] - bbox[0])) * ow)
+                        f_y = bbox[3] - fy * (bbox[3] - bbox[1])
+                        px_y = int((1 - f_y) * oh)
+                        return px_x, px_y
 
-                # Compute source rect CORNERS using same padding-aware logic
-                def _zi_to_frac(zx, zy):
-                    fx = zx * data_w / max(full_w, 1) / data_w
-                    fy = zy * data_h / max(full_h, 1) / data_h
-                    if data_h > img_data_h * 1.01:
-                        p_y = (data_h - img_data_h) / 2
-                        fy = (p_y + zy * img_data_h / max(full_h, 1)) / data_h
-                    if data_w > img_data_w * 1.01:
-                        p_x = (data_w - img_data_w) / 2
-                        fx = (p_x + zx * img_data_w / max(full_w, 1)) / data_w
-                    return fx, fy
+                    # Compute source rect CORNERS using same padding-aware logic
+                    def _zi_to_frac(zx, zy):
+                        fx = zx * data_w / max(full_w, 1) / data_w
+                        fy = zy * data_h / max(full_h, 1) / data_h
+                        if data_h > img_data_h * 1.01:
+                            p_y = (data_h - img_data_h) / 2
+                            fy = (p_y + zy * img_data_h / max(full_h, 1)) / data_h
+                        if data_w > img_data_w * 1.01:
+                            p_x = (data_w - img_data_w) / 2
+                            fx = (p_x + zx * img_data_w / max(full_w, 1)) / data_w
+                        return fx, fy
 
-                s_tl_f = _zi_to_frac(zi.x, zi.y)
-                s_tr_f = _zi_to_frac(zi.x + zi.width, zi.y)
-                s_bl_f = _zi_to_frac(zi.x, zi.y + zi.height)
-                s_br_f = _zi_to_frac(zi.x + zi.width, zi.y + zi.height)
+                    # Compute the four rotated source corners (CSS-style
+                    # CW rotation around the rect centre). Pick the
+                    # silhouette tangent corners for the chosen side:
+                    # Right/Left → corners with min/max y, Top/Bottom →
+                    # corners with min/max x. This makes the cross-
+                    # panel lines anchor on the visible rotated rect.
+                    rot_deg2 = float(getattr(zi, "rotation", 0) or 0)
+                    if abs(rot_deg2) > 0.01:
+                        import math as _math2
+                        rad2 = _math2.radians(rot_deg2)
+                        cR2, sR2 = _math2.cos(rad2), _math2.sin(rad2)
+                        cx_z = zi.x + zi.width / 2.0
+                        cy_z = zi.y + zi.height / 2.0
 
-                s_tr_px = _frac_to_px(sp, s_tr_f[0], s_tr_f[1])
-                s_br_px = _frac_to_px(sp, s_br_f[0], s_br_f[1])
-                s_tl_px = _frac_to_px(sp, s_tl_f[0], s_tl_f[1])
-                s_bl_px = _frac_to_px(sp, s_bl_f[0], s_bl_f[1])
+                        def _r_corner(px, py):
+                            dx = px - cx_z
+                            dy = py - cy_z
+                            return (cx_z + dx * cR2 - dy * sR2,
+                                    cy_z + dx * sR2 + dy * cR2)
 
-                # Target: compute zoomed image position within target axes
-                # (same padding-aware logic as source)
-                tgt_ax_obj = axes[ar, ac] if axes.ndim == 2 else axes[ar * cols + ac]
-                t_xlim = tgt_ax_obj.get_xlim()
-                t_ylim = tgt_ax_obj.get_ylim()
-                t_data_w = abs(t_xlim[1] - t_xlim[0])
-                t_data_h = abs(t_ylim[0] - t_ylim[1])
-                tgt_oi = original_images[ar][ac]
-                t_img_w = tgt_oi.size[0] if tgt_oi else t_data_w
-                t_img_h = tgt_oi.size[1] if tgt_oi else t_data_h
-                # Padding fractions within target axes
-                t_pad_fx = max(0, ((t_data_w - t_img_w) / 2) / t_data_w) if t_data_w > t_img_w else 0
-                t_img_fx = t_img_w / t_data_w if t_data_w > t_img_w else 1
-                t_pad_fy = max(0, ((t_data_h - t_img_h) / 2) / t_data_h) if t_data_h > t_img_h else 0
-                t_img_fy = t_img_h / t_data_h if t_data_h > t_img_h else 1
-                # Target image corners within the padded axes
-                t_tl_px = _frac_to_px(tp, t_pad_fx, t_pad_fy)
-                t_tr_px = _frac_to_px(tp, t_pad_fx + t_img_fx, t_pad_fy)
-                t_bl_px = _frac_to_px(tp, t_pad_fx, t_pad_fy + t_img_fy)
-                t_br_px = _frac_to_px(tp, t_pad_fx + t_img_fx, t_pad_fy + t_img_fy)
+                        z_corners = [
+                            _r_corner(zi.x, zi.y),
+                            _r_corner(zi.x + zi.width, zi.y),
+                            _r_corner(zi.x + zi.width, zi.y + zi.height),
+                            _r_corner(zi.x, zi.y + zi.height),
+                        ]
+                    else:
+                        z_corners = [
+                            (zi.x, zi.y),
+                            (zi.x + zi.width, zi.y),
+                            (zi.x + zi.width, zi.y + zi.height),
+                            (zi.x, zi.y + zi.height),
+                        ]
+                    # Closest-corners by rotated screen position +
+                    # perpendicular-axis sort so the pair connects
+                    # to the dst corners on the right sides without
+                    # crossing each other.
+                    if side == "Right" or side == "Left":
+                        key_side = (lambda i: -z_corners[i][0]) if side == "Right" else (lambda i: z_corners[i][0])
+                        picked = sorted(range(4), key=key_side)[:2]
+                        picked.sort(key=lambda i: z_corners[i][1])
+                    else:
+                        key_side = (lambda i: z_corners[i][1]) if side == "Top" else (lambda i: -z_corners[i][1])
+                        picked = sorted(range(4), key=key_side)[:2]
+                        picked.sort(key=lambda i: z_corners[i][0])
+                    z_top, z_bot = z_corners[picked[0]], z_corners[picked[1]]
 
-                # Draw border around zoomed image in target panel
-                border_color = zi.rectangle_color or zcolor
-                bg_lower = (cfg.background or "white").lower()
-                rect_lower = border_color.lower()
-                if rect_lower in ("#ffffff", "white", "#fff") and bg_lower in ("white", "#ffffff", "#fff"):
-                    border_color = "#000000"
-                # Use rectangle for uniform border thickness on all sides
-                draw_out.rectangle(
-                    [t_tl_px, t_br_px],
-                    outline=border_color, width=zlw
-                )
+                    # Convert tangent corners to output pixels via the
+                    # padding-aware fraction helper, plus the original
+                    # 4-corner conversions (still needed below for
+                    # axis-aligned fallback when rot==0).
+                    s_top_f = _zi_to_frac(z_top[0], z_top[1])
+                    s_bot_f = _zi_to_frac(z_bot[0], z_bot[1])
+                    s_top_px = _frac_to_px(sp, s_top_f[0], s_top_f[1])
+                    s_bot_px = _frac_to_px(sp, s_bot_f[0], s_bot_f[1])
 
-                if side == "Right":
-                    draw_out.line([s_tr_px, t_tl_px], fill=zcolor, width=zlw)
-                    draw_out.line([s_br_px, t_bl_px], fill=zcolor, width=zlw)
-                elif side == "Left":
-                    draw_out.line([s_tl_px, t_tr_px], fill=zcolor, width=zlw)
-                    draw_out.line([s_bl_px, t_br_px], fill=zcolor, width=zlw)
-                elif side == "Top":
-                    draw_out.line([s_tl_px, t_bl_px], fill=zcolor, width=zlw)
-                    draw_out.line([s_tr_px, t_br_px], fill=zcolor, width=zlw)
-                else:  # Bottom
-                    draw_out.line([s_bl_px, t_tl_px], fill=zcolor, width=zlw)
-                    draw_out.line([s_br_px, t_tr_px], fill=zcolor, width=zlw)
+                    s_tl_f = _zi_to_frac(zi.x, zi.y)
+                    s_tr_f = _zi_to_frac(zi.x + zi.width, zi.y)
+                    s_bl_f = _zi_to_frac(zi.x, zi.y + zi.height)
+                    s_br_f = _zi_to_frac(zi.x + zi.width, zi.y + zi.height)
+
+                    s_tr_px = _frac_to_px(sp, s_tr_f[0], s_tr_f[1])
+                    s_br_px = _frac_to_px(sp, s_br_f[0], s_br_f[1])
+                    s_tl_px = _frac_to_px(sp, s_tl_f[0], s_tl_f[1])
+                    s_bl_px = _frac_to_px(sp, s_bl_f[0], s_bl_f[1])
+
+                    # Target: compute zoomed image position within target axes
+                    # (same padding-aware logic as source)
+                    tgt_ax_obj = axes[ar, ac] if axes.ndim == 2 else axes[ar * cols + ac]
+                    t_xlim = tgt_ax_obj.get_xlim()
+                    t_ylim = tgt_ax_obj.get_ylim()
+                    t_data_w = abs(t_xlim[1] - t_xlim[0])
+                    t_data_h = abs(t_ylim[0] - t_ylim[1])
+                    tgt_oi = original_images[ar][ac]
+                    t_img_w = tgt_oi.size[0] if tgt_oi else t_data_w
+                    t_img_h = tgt_oi.size[1] if tgt_oi else t_data_h
+                    # Padding fractions within target axes
+                    t_pad_fx = max(0, ((t_data_w - t_img_w) / 2) / t_data_w) if t_data_w > t_img_w else 0
+                    t_img_fx = t_img_w / t_data_w if t_data_w > t_img_w else 1
+                    t_pad_fy = max(0, ((t_data_h - t_img_h) / 2) / t_data_h) if t_data_h > t_img_h else 0
+                    t_img_fy = t_img_h / t_data_h if t_data_h > t_img_h else 1
+                    # Target image corners within the padded axes
+                    t_tl_px = _frac_to_px(tp, t_pad_fx, t_pad_fy)
+                    t_tr_px = _frac_to_px(tp, t_pad_fx + t_img_fx, t_pad_fy)
+                    t_bl_px = _frac_to_px(tp, t_pad_fx, t_pad_fy + t_img_fy)
+                    t_br_px = _frac_to_px(tp, t_pad_fx + t_img_fx, t_pad_fy + t_img_fy)
+
+                    # Draw border around zoomed image in target panel.
+                    # Use the configured rectangle colour verbatim so
+                    # the adjacent zoom inset's coloring spec is
+                    # retained (no background-aware override).
+                    border_color = zi.rectangle_color or zcolor
+
+                    # Helper closures so the call sites stay readable
+                    # whether we're drawing via _AAImage (cv2.LINE_AA,
+                    # supports dashed `style`) or the PIL fallback
+                    # (solid only — only hit when cv2 is unavailable).
+                    if _adj_use_aa:
+                        def _r(xy, outline, width, style="solid"):
+                            x1, y1 = xy[0]; x2, y2 = xy[1]
+                            draw_out.rectangle((x1, y1, x2, y2), outline, width, style)
+                        def _l(p1, p2, fill, width, style="solid"):
+                            draw_out.line(p1, p2, fill, width, style)
+                    else:
+                        def _r(xy, outline, width, style="solid"):
+                            draw_out.rectangle(xy, outline=outline, width=width)
+                        def _l(p1, p2, fill, width, style="solid"):
+                            draw_out.line([p1, p2], fill=fill, width=width)
+
+                    # Source rect outline — drawn POST-RENDER here so
+                    # it has the same crispness as the connector lines.
+                    # Previously it was baked into the panel image and
+                    # softened by matplotlib's imshow resampling, which
+                    # made the selection box look blurrier than the
+                    # cross-panel lines. z_corners are already the
+                    # rotation-aware corners (computed above).
+                    src_rect_lw = max(1, zi.rectangle_width)
+                    src_poly_px = [_frac_to_px(sp, *_zi_to_frac(c[0], c[1])) for c in z_corners]
+                    for _i in range(4):
+                        _l(src_poly_px[_i], src_poly_px[(_i + 1) % 4], border_color, src_rect_lw, z_rect_style)
+
+                    # Target rect border uses rectangle_width + style.
+                    _r([t_tl_px, t_br_px], border_color, src_rect_lw, z_rect_style)
+                    if side == "Right":
+                        _l(s_top_px, t_tl_px, zcolor, zlw, z_line_style)
+                        _l(s_bot_px, t_bl_px, zcolor, zlw, z_line_style)
+                    elif side == "Left":
+                        _l(s_top_px, t_tr_px, zcolor, zlw, z_line_style)
+                        _l(s_bot_px, t_br_px, zcolor, zlw, z_line_style)
+                    elif side == "Top":
+                        _l(s_top_px, t_bl_px, zcolor, zlw, z_line_style)
+                        _l(s_bot_px, t_br_px, zcolor, zlw, z_line_style)
+                    else:  # Bottom
+                        _l(s_top_px, t_tl_px, zcolor, zlw, z_line_style)
+                        _l(s_bot_px, t_tr_px, zcolor, zlw, z_line_style)
+
+        # Write AA pixels back to out_img if we drew via _AAImage.
+        if _adj_use_aa:
+            draw_out.finalize()
 
         buf = io.BytesIO()
         out_img.save(buf, format="TIFF" if fmt == "tiff" else "PNG")

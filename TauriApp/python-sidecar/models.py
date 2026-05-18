@@ -82,9 +82,18 @@ class SymbolSettings:
     shape: str = "Arrow"                    # Arrow | Star | Rectangle | Ellipse | Cross | NarrowTriangle | Triangle
     x: float = 50.0                         # percentage 0-100 within panel
     y: float = 50.0                         # percentage 0-100 within panel
-    color: str = "#FF0000"
+    color: str = "#FF0000"                  # outline (and, for filled shapes, fill) colour
     size: float = 25.0                      # size in points (rendered at figure DPI)
     rotation: float = -45.0
+    # Arrow / NarrowTriangle only: cross-axis thickness multiplier
+    # (1.0 = default shape). Lets the user make arrows / triangles
+    # fatter or thinner without changing their overall length.
+    width: float = 1.0
+    # Outline shapes (Triangle / Star / Rectangle / Ellipse / Cross):
+    # border line style + an optional translucent centre fill.
+    border_style: str = "solid"             # solid | dashed | dotted
+    fill_color: str = ""                    # "" = outline only (no centre fill)
+    fill_opacity: float = 100.0             # 0-100 %, applied when fill_color is set
     label_text: str = ""
     label_color: str = "#FFFFFF"
     label_offset_x: int = 0                  # legacy, kept for compat
@@ -167,10 +176,15 @@ class ZoomInsetSettings:
 
     # --- Common fields ---
     zoom_factor: float = 2.0
-    rectangle_color: str = "#FF0000"
-    rectangle_width: int = 1
-    line_color: str = "#FF0000"
-    line_width: int = 1
+    rectangle_color: str = "#808080"
+    rectangle_width: int = 2
+    line_color: str = "#808080"
+    line_width: int = 2
+    # Line styles for the selection box outline and the connecting
+    # lines, set independently. One of: "solid", "dashed", "dotted",
+    # "dash-dot". Default "solid" for backwards compatibility.
+    rectangle_style: str = "solid"
+    line_style: str = "solid"
 
     # --- Standard Zoom fields ---
     x: int = 0
@@ -201,6 +215,19 @@ class ZoomInsetSettings:
     scale_bar: Optional[ScaleBarSettings] = None
     zoom_label: Optional[LabelSettings] = None
     show_scale_bar_in_zoom: bool = False    # show scale bar inside zoomed area
+    # Stable id assigned at creation; used by `parent_inset_id` to
+    # express "this inset was spawned from that one" so the frontend
+    # can cascade scalebar inheritance through nested chains. Both
+    # default to empty strings for projects saved before the fields
+    # existed.
+    id: str = ""
+    parent_inset_id: str = ""
+    # Rotation (degrees, clockwise) of the SOURCE rectangle on the
+    # panel image. The zoomed output is always rendered axis-aligned —
+    # the renderer rotates the panel image inversely around the
+    # rectangle centre and then crops, so the resulting inset shows
+    # un-tilted content. 0 = no rotation, full 360° range allowed.
+    rotation: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -558,9 +585,41 @@ def compute_area_measurement(points: List[Tuple[float, float]], shape: str,
     area_um2 = px_area * (micron_per_pixel ** 2)
     um_per_unit = UNIT_TO_MICRONS.get(unit, 1.0)
     area_in_unit = area_um2 / (um_per_unit ** 2)
-    unit_labels = {"km": "km\u00b2", "m": "m\u00b2", "cm": "cm\u00b2", "mm": "mm\u00b2", "um": "\u03bcm\u00b2", "nm": "nm\u00b2", "pm": "pm\u00b2"}
-    sq = '\u00b2'
-    return f"{area_in_unit:.2f} {unit_labels.get(unit, unit + sq)}"
+    return f"{area_in_unit:.2f} {unit_label(unit, squared=True)}"
+
+
+# Display labels for measurement units. `squared` appends \u00b2 for areas.
+_UNIT_LABELS = {"km": "km", "m": "m", "cm": "cm", "mm": "mm",
+                "um": "\u03bcm", "nm": "nm", "pm": "pm"}
+
+
+def unit_label(unit: str, squared: bool = False) -> str:
+    """Human-readable label for a measurement unit, e.g. 'um' -> '\u00b5m'
+    (or '\u00b5m\u00b2' when `squared` for area measurements)."""
+    base = _UNIT_LABELS.get(unit, unit)
+    return base + "\u00b2" if squared else base
+
+
+def compute_line_measurement_value(points: List[Tuple[float, float]],
+                                   image_width: int, image_height: int,
+                                   micron_per_pixel: float, unit: str) -> float:
+    """Numeric line length in `unit` (NO label). Companion to
+    compute_line_measurement() for callers \u2014 e.g. the Analysis section \u2014
+    that need the value and its unit as SEPARATE structured fields."""
+    px_length = compute_line_length_pixels(points, image_width, image_height)
+    length_um = px_length * micron_per_pixel
+    return length_um / UNIT_TO_MICRONS.get(unit, 1.0)
+
+
+def compute_area_measurement_value(points: List[Tuple[float, float]], shape: str,
+                                   image_width: int, image_height: int,
+                                   micron_per_pixel: float, unit: str) -> float:
+    """Numeric area in `unit`\u00b2 (NO label). Companion to
+    compute_area_measurement() \u2014 see compute_line_measurement_value()."""
+    px_area = compute_area_pixels(points, shape, image_width, image_height)
+    area_um2 = px_area * (micron_per_pixel ** 2)
+    um_per_unit = UNIT_TO_MICRONS.get(unit, 1.0)
+    return area_um2 / (um_per_unit ** 2)
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +680,11 @@ _FIELD_TYPE_MAP = {
     'font_style': ('plain', None),
     'scale_bar': ('dataclass', ScaleBarSettings),
     'zoom_inset': ('dataclass', ZoomInsetSettings),
+    # Multi-inset array — each entry is deserialised through
+    # ZoomInsetSettings so render-time code can call zi.inset_type
+    # etc. instead of dict[...] lookups. Without this hint, nested
+    # arrays come back as plain dicts and break the renderer.
+    'zoom_insets': ('list', ZoomInsetSettings),
     'zoom_label': ('dataclass', LabelSettings),
     'crop': ('tuple', None),
     'bar_position': ('tuple', None),
@@ -800,8 +864,17 @@ def paste_panel_settings(panel: PanelInfo, clipboard: PanelSettingsClipboard,
 # ---------------------------------------------------------------------------
 
 def save_project(cfg: FigureConfig, images: Dict[str, bytes], path: str,
-                  fonts: Dict[str, bytes] = None):
-    """Save a full project: config JSON + images + videos + custom fonts into a .mpf zip."""
+                  fonts: Dict[str, bytes] = None,
+                  analysis: Optional[dict] = None):
+    """Save a full project: config JSON + images + videos + custom fonts into a .mpf zip.
+
+    Optionally bundles an `analysis` payload of the shape:
+        {
+          "manifest": <dict — arbitrary JSON describing tabs, etc.>,
+          "plots":  { "<plot_id>": <bytes>, ... },   # PNG binaries
+          "tables": { "<table_id>": "<csv text>", ... },
+        }
+    Any of the three sub-keys may be missing/empty."""
     import io
     with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as zf:
         zf.writestr('config.json', json.dumps(_to_dict(cfg), indent=2))
@@ -810,13 +883,41 @@ def save_project(cfg: FigureConfig, images: Dict[str, bytes], path: str,
         if fonts:
             for name, font_bytes in fonts.items():
                 zf.writestr(f'fonts/{name}', font_bytes)
+        if analysis:
+            manifest = analysis.get("manifest")
+            if manifest is not None:
+                zf.writestr('analysis/manifest.json', json.dumps(manifest, indent=2))
+            plots = analysis.get("plots") or {}
+            for plot_id, plot_bytes in plots.items():
+                if plot_bytes is None:
+                    continue
+                zf.writestr(f'analysis/plots/{plot_id}.png', plot_bytes)
+            tables = analysis.get("tables") or {}
+            for table_id, csv_text in tables.items():
+                if csv_text is None:
+                    continue
+                zf.writestr(f'analysis/tables/{table_id}.csv', csv_text)
 
 
 def load_project(path: str) -> tuple:
-    """Load a .mpfig zip -> (FigureConfig, Dict[str, bytes], Dict[str, bytes]).
-    Returns (cfg, images_dict, fonts_dict)."""
+    """Load a .mpfig zip -> (FigureConfig, Dict[str, bytes], Dict[str, bytes], Optional[dict]).
+    Returns (cfg, images_dict, fonts_dict, analysis).
+
+    `analysis` is None when the zip has no `analysis/` entries. Otherwise it is a
+    dict of the shape::
+
+        {
+          "manifest": <dict | None>,
+          "plots":  { "<plot_id>": <bytes>, ... },   # raw PNG bytes
+          "tables": { "<table_id>": "<csv text>", ... },
+        }
+    """
     images: Dict[str, bytes] = {}
     fonts: Dict[str, bytes] = {}
+    analysis_manifest = None
+    analysis_plots: Dict[str, bytes] = {}
+    analysis_tables: Dict[str, str] = {}
+    has_analysis = False
     with zipfile.ZipFile(path, 'r') as zf:
         cfg_data = json.loads(zf.read('config.json'))
         cfg = _from_dict(FigureConfig, cfg_data)
@@ -828,4 +929,33 @@ def load_project(path: str) -> tuple:
             elif name.startswith('fonts/') and name != 'fonts/':
                 font_name = name[len('fonts/'):]
                 fonts[font_name] = zf.read(name)
-    return cfg, images, fonts
+            elif name == 'analysis/manifest.json':
+                has_analysis = True
+                try:
+                    analysis_manifest = json.loads(zf.read(name))
+                except Exception:
+                    analysis_manifest = None
+            elif name.startswith('analysis/plots/') and not name.endswith('/'):
+                has_analysis = True
+                base = name[len('analysis/plots/'):]
+                if base.lower().endswith('.png'):
+                    plot_id = base[:-4]
+                else:
+                    plot_id = base
+                analysis_plots[plot_id] = zf.read(name)
+            elif name.startswith('analysis/tables/') and not name.endswith('/'):
+                has_analysis = True
+                base = name[len('analysis/tables/'):]
+                if base.lower().endswith('.csv'):
+                    table_id = base[:-4]
+                else:
+                    table_id = base
+                analysis_tables[table_id] = zf.read(name).decode('utf-8')
+    analysis = None
+    if has_analysis:
+        analysis = {
+            "manifest": analysis_manifest,
+            "plots": analysis_plots,
+            "tables": analysis_tables,
+        }
+    return cfg, images, fonts, analysis

@@ -400,9 +400,18 @@ def draw_symbols(image: Image.Image, symbols: List[SymbolSettings],
         color = sym.color
         lw = max(1, sz // 12)
 
-        data = symbol_to_pixels(sym.shape, cx, cy, sz, sym.rotation)
+        # Arrow / NarrowTriangle cross-axis thickness multiplier.
+        sym_width = float(getattr(sym, "width", 1.0) or 1.0)
+        data = symbol_to_pixels(sym.shape, cx, cy, sz, sym.rotation, sym_width)
         # Stroke width scales with symbol size for visibility on high-res images
         stroke_w = max(2, min(6, sz // 15))
+        # NOTE: this PIL path is legacy/secondary — every live call site
+        # uses skip_symbols=True, so symbols are actually rendered by
+        # figure_builder._add_panel_symbols (final figure) and the SVG
+        # edit-panel overlay, both of which DO honour border_style and the
+        # translucent centre fill. Keeping this path simple (solid outline,
+        # no centre fill) is fine; only `width` is plumbed through so the
+        # symbol_to_pixels signature stays consistent.
 
         # Draw filled polygons
         for poly in data["fill"]:
@@ -676,39 +685,218 @@ def draw_areas(image: Image.Image, areas: List[AreaAnnotation],
 
 
 # -- Zoom-inset drawing -----------------------------------------------------
-def _line_cross(p1, p2, q1, q2):
-    def ccw(a, b, c):
-        return (c[1]-a[1])*(b[0]-a[0]) > (b[1]-a[1])*(c[0]-a[0])
-    return ccw(p1,q1,q2) != ccw(p2,q1,q2) and ccw(p1,p2,q1) != ccw(p1,p2,q2)
+class _AAImage:
+    """PIL-compatible antialiased drawing using cv2's LINE_AA.
+
+    Wraps a PIL Image as a numpy array and exposes line / rectangle /
+    polygon-outline drawing that uses cv2's antialiased line rendering
+    with sub-pixel coordinate precision (`shift` parameter). The
+    sub-pixel positioning is essential for tilted polygon corners —
+    without it, rounded endpoints introduce ~0.5 px offsets that
+    blur the visible line edge after AA.
+
+    For polygon outlines we use `cv2.polylines` (single-call closed
+    polygon) rather than 4 separate `cv2.line` calls so corner joints
+    are handled by cv2 — adjacent line AA gradients don't overlap and
+    blur each other at the corners.
+
+    Call `finalize()` to copy the accumulated drawing back to the
+    PIL image in-place.
+    """
+
+    # Sub-pixel precision: cv2 reads coords as fixed-point with
+    # `shift` fractional bits. shift=4 = 1/16 pixel resolution,
+    # enough to remove the rounding artifacts visible at corners.
+    _SHIFT = 4
+    _SCALE = 1 << 4  # 16
+
+    def __init__(self, img: Image.Image):
+        import cv2
+        import numpy as np
+        self._cv2 = cv2
+        self._np = np
+        self._img = img
+        # We work on an RGB ndarray. cv2 doesn't care about RGB-vs-BGR
+        # interpretation — it just sets pixel values in the order
+        # given. So we pass RGB color tuples that match the array's
+        # channel layout, and the result is correct.
+        self._arr = np.array(img.convert("RGB"))
+        self._alpha = img.split()[-1] if img.mode == "RGBA" else None
+
+    @staticmethod
+    def _hex_to_rgb(hex_str):
+        c = (hex_str or "#000000").lstrip("#")
+        if len(c) == 3:
+            c = "".join(ch * 2 for ch in c)
+        return (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
+
+    def _sp(self, x, y):
+        """Convert (x, y) to cv2's fixed-point sub-pixel form."""
+        return (int(round(x * self._SCALE)), int(round(y * self._SCALE)))
+
+    @staticmethod
+    def _dash_segments(p1, p2, pattern):
+        """Yield (start, end) point pairs for the 'on' portions of a
+        dashed line p1→p2 following the on/off `pattern` (pixel
+        lengths). Used so dashed strokes are still AA per-segment."""
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        length = math.hypot(dx, dy)
+        if length < 1e-6 or not pattern:
+            return
+        ux, uy = dx / length, dy / length
+        pos = 0.0
+        on = True
+        idx = 0
+        guard = 0
+        while pos < length and guard < 100000:
+            guard += 1
+            seg = max(1.0, pattern[idx % len(pattern)])
+            end = min(pos + seg, length)
+            if on:
+                yield ((p1[0] + ux * pos, p1[1] + uy * pos),
+                       (p1[0] + ux * end, p1[1] + uy * end))
+            pos = end
+            on = not on
+            idx += 1
+
+    def line(self, p1, p2, fill, width, style="solid"):
+        pat = _get_dash_pattern(style, width) if style and style != "solid" else None
+        if pat:
+            for (a, b) in self._dash_segments(p1, p2, pat):
+                self._cv2.line(
+                    self._arr, self._sp(a[0], a[1]), self._sp(b[0], b[1]),
+                    self._hex_to_rgb(fill), thickness=max(1, int(width)),
+                    lineType=self._cv2.LINE_AA, shift=self._SHIFT,
+                )
+        else:
+            self._cv2.line(
+                self._arr,
+                self._sp(p1[0], p1[1]),
+                self._sp(p2[0], p2[1]),
+                self._hex_to_rgb(fill),
+                thickness=max(1, int(width)),
+                lineType=self._cv2.LINE_AA,
+                shift=self._SHIFT,
+            )
+
+    def rectangle(self, xy, outline, width, style="solid"):
+        x1, y1, x2, y2 = xy
+        if style and style != "solid":
+            # Draw the 4 edges as dashed AA lines.
+            corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+            for i in range(4):
+                self.line(corners[i], corners[(i + 1) % 4], outline, width, style)
+            return
+        self._cv2.rectangle(
+            self._arr,
+            self._sp(x1, y1),
+            self._sp(x2, y2),
+            self._hex_to_rgb(outline),
+            thickness=max(1, int(width)),
+            lineType=self._cv2.LINE_AA,
+            shift=self._SHIFT,
+        )
+
+    def polygon_outline(self, points, outline, width, style="solid"):
+        """Draw a closed polygon outline. For solid style uses
+        cv2.polylines (single-call, clean corner joints). For dashed
+        styles draws each edge as a dashed AA line."""
+        if style and style != "solid":
+            n = len(points)
+            for i in range(n):
+                self.line(points[i], points[(i + 1) % n], outline, width, style)
+            return
+        pts = self._np.array(
+            [[self._sp(p[0], p[1])] for p in points],
+            dtype=self._np.int32,
+        )
+        self._cv2.polylines(
+            self._arr,
+            [pts],
+            isClosed=True,
+            color=self._hex_to_rgb(outline),
+            thickness=max(1, int(width)),
+            lineType=self._cv2.LINE_AA,
+            shift=self._SHIFT,
+        )
+
+    def finalize(self):
+        result = Image.fromarray(self._arr)
+        if self._alpha is not None:
+            result = result.convert("RGBA")
+            result.putalpha(self._alpha)
+        self._img.paste(result)
 
 
-def _draw_connecting_lines(draw, src_rect, dst_rect, color, width):
+def _draw_connecting_lines(draw, src_rect, dst_rect, color, width, src_corners=None, style="solid"):
     """Draw funnel-shaped connecting lines between two rectangles.
-    Picks the 2 source corners closest to the inset center and
-    the 2 inset corners closest to the source center, then connects
-    them without crossing."""
+
+    Algorithm: pick the two source corners closest to the destination
+    centroid and the two destination corners closest to the source
+    centroid (so the line endpoints sit on the edges of each rect
+    that FACE the other rect), then choose the non-crossing pairing
+    of (s1↔d1, s2↔d2) vs. (s1↔d2, s2↔d1). The "closest corners"
+    approach mirrors the natural zoom-inset funnel — lines emerge
+    from the side of the source rect facing the destination, and
+    don't cut back across the rect's interior.
+
+    `src_corners` (optional) overrides the axis-aligned corner
+    derivation from `src_rect` — used when the source rectangle is
+    rotated so the lines connect to the actual rotated corners
+    instead of the un-rotated bounding box."""
     x1, y1, x2, y2 = src_rect
     tx1, ty1, tx2, ty2 = dst_rect
-    src_corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+    if src_corners is None:
+        src_corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
     dst_corners = [(tx1, ty1), (tx2, ty1), (tx2, ty2), (tx1, ty2)]
-    # Centers
-    src_cx, src_cy = (x1 + x2) / 2, (y1 + y2) / 2
-    dst_cx, dst_cy = (tx1 + tx2) / 2, (ty1 + ty2) / 2
-    # 2 source corners closest to inset center
-    src_by_dist = sorted(range(4), key=lambda i: math.dist(src_corners[i], (dst_cx, dst_cy)))
-    s1, s2 = src_corners[src_by_dist[0]], src_corners[src_by_dist[1]]
-    # 2 inset corners closest to source center
-    dst_by_dist = sorted(range(4), key=lambda i: math.dist(dst_corners[i], (src_cx, src_cy)))
-    d1, d2 = dst_corners[dst_by_dist[0]], dst_corners[dst_by_dist[1]]
-    # Try both pairings, pick non-crossing
-    if _line_cross(s1, d1, s2, d2):
-        d1, d2 = d2, d1  # swap
-    draw.line([s1, d1], fill=color, width=width)
-    draw.line([s2, d2], fill=color, width=width)
+    src_cx = sum(c[0] for c in src_corners) / 4
+    src_cy = sum(c[1] for c in src_corners) / 4
+    dst_cx = sum(c[0] for c in dst_corners) / 4
+    dst_cy = sum(c[1] for c in dst_corners) / 4
+
+    # Two source corners closest to the destination centroid
+    src_sorted = sorted(range(4), key=lambda i: math.hypot(
+        src_corners[i][0] - dst_cx, src_corners[i][1] - dst_cy))
+    s1, s2 = src_corners[src_sorted[0]], src_corners[src_sorted[1]]
+    # Two destination corners closest to the source centroid
+    dst_sorted = sorted(range(4), key=lambda i: math.hypot(
+        dst_corners[i][0] - src_cx, dst_corners[i][1] - src_cy))
+    d1, d2 = dst_corners[dst_sorted[0]], dst_corners[dst_sorted[1]]
+
+    # Non-crossing pairing: swap if the two segments intersect.
+    def _ccw(a, b, c):
+        return (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0])
+
+    def _segments_cross(p1, p2, q1, q2):
+        return (_ccw(p1, q1, q2) != _ccw(p2, q1, q2)
+                and _ccw(p1, p2, q1) != _ccw(p1, p2, q2))
+
+    if _segments_cross(s1, d1, s2, d2):
+        d1, d2 = d2, d1
+
+    # Drawer-agnostic: `_AAImage` has .line(p1, p2, fill, width, style);
+    # PIL's ImageDraw uses .line([p1, p2], fill=, width=) — the PIL
+    # fallback path doesn't dash (it's only hit when cv2 is missing).
+    if isinstance(draw, _AAImage):
+        draw.line(s1, d1, color, width, style)
+        draw.line(s2, d2, color, width, style)
+    else:
+        draw.line([s1, d1], fill=color, width=width)
+        draw.line([s2, d2], fill=color, width=width)
 
 
 def _draw_adjacent_panel_source(img: Image.Image, zi) -> Image.Image:
-    """Draw source rectangle and connecting lines to panel edge for Adjacent Panel zoom."""
+    """Draw source rectangle and connecting lines to panel edge for
+    Adjacent Panel zoom.
+
+    Honours `zi.rotation` (CSS-style clockwise degrees): the rectangle
+    outline is drawn as a rotated 4-corner polygon, and the parallel
+    edge lines emanate from the silhouette-tangent corners (the two
+    extremes perpendicular to the chosen side) so the line ends meet
+    the rotated rect's visible corners — same algorithm as the
+    Standard Zoom funnel and the editor overlay.
+    """
     draw = ImageDraw.Draw(img)
     iw, ih = img.size
     x, y, w, h = zi.x, zi.y, zi.width, zi.height
@@ -717,53 +905,110 @@ def _draw_adjacent_panel_source(img: Image.Image, zi) -> Image.Image:
     line_color = zi.line_color
     line_width = max(1, zi.line_width)
 
-    # Draw source rectangle
-    draw.rectangle([x, y, x + w, y + h], outline=rect_color, width=rect_width)
+    # Compute corner positions (rotated when zi.rotation != 0).
+    rot = float(getattr(zi, "rotation", 0) or 0)
+    if abs(rot) > 0.01:
+        rad = math.radians(rot)
+        cR, sR = math.cos(rad), math.sin(rad)
+        cx = x + w / 2.0
+        cy = y + h / 2.0
 
-    # Draw simple parallel lines from source rect to panel edge
+        def _r(px, py):
+            dx = px - cx
+            dy = py - cy
+            return (cx + dx * cR - dy * sR, cy + dx * sR + dy * cR)
+
+        corners = [_r(x, y), _r(x + w, y), _r(x + w, y + h), _r(x, y + h)]
+    else:
+        corners = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+
+    # Draw the rect outline as a closed polygon so rotation is honoured.
+    for i in range(4):
+        a = (int(corners[i][0]), int(corners[i][1]))
+        b = (int(corners[(i + 1) % 4][0]), int(corners[(i + 1) % 4][1]))
+        draw.line([a, b], fill=rect_color, width=rect_width)
+
+    # Pick the two corners CLOSEST to the adjacent panel by their
+    # actual rotated screen position — that way the lines always
+    # emerge from the visible side facing the adjacent panel, even
+    # under heavy rotation where the original TR/BR corners may have
+    # moved to the wrong side of the rect.
     side = zi.side or "Right"
     if side == "Right":
-        draw.line([(x + w, y), (iw, y)], fill=line_color, width=line_width)
-        draw.line([(x + w, y + h), (iw, y + h)], fill=line_color, width=line_width)
+        # 2 corners with the largest x (rightmost visible corners)
+        order = sorted(range(4), key=lambda i: -corners[i][0])
     elif side == "Left":
-        draw.line([(x, y), (0, y)], fill=line_color, width=line_width)
-        draw.line([(x, y + h), (0, y + h)], fill=line_color, width=line_width)
+        order = sorted(range(4), key=lambda i: corners[i][0])
     elif side == "Top":
-        draw.line([(x, y), (x, 0)], fill=line_color, width=line_width)
-        draw.line([(x + w, y), (x + w, 0)], fill=line_color, width=line_width)
+        order = sorted(range(4), key=lambda i: corners[i][1])
     else:  # Bottom
-        draw.line([(x, y + h), (x, ih)], fill=line_color, width=line_width)
-        draw.line([(x + w, y + h), (x + w, ih)], fill=line_color, width=line_width)
+        order = sorted(range(4), key=lambda i: -corners[i][1])
+    s1, s2 = corners[order[0]], corners[order[1]]
+
+    if side == "Right":
+        draw.line([(int(s1[0]), int(s1[1])), (iw, int(s1[1]))], fill=line_color, width=line_width)
+        draw.line([(int(s2[0]), int(s2[1])), (iw, int(s2[1]))], fill=line_color, width=line_width)
+    elif side == "Left":
+        draw.line([(int(s1[0]), int(s1[1])), (0, int(s1[1]))], fill=line_color, width=line_width)
+        draw.line([(int(s2[0]), int(s2[1])), (0, int(s2[1]))], fill=line_color, width=line_width)
+    elif side == "Top":
+        draw.line([(int(s1[0]), int(s1[1])), (int(s1[0]), 0)], fill=line_color, width=line_width)
+        draw.line([(int(s2[0]), int(s2[1])), (int(s2[0]), 0)], fill=line_color, width=line_width)
+    else:  # Bottom
+        draw.line([(int(s1[0]), int(s1[1])), (int(s1[0]), ih)], fill=line_color, width=line_width)
+        draw.line([(int(s2[0]), int(s2[1])), (int(s2[0]), ih)], fill=line_color, width=line_width)
     return img
 
 
-def draw_zoom_inset(image: Image.Image, panel: PanelInfo,
-                    images_dict: Dict[str, Image.Image]) -> Image.Image:
-    zi = panel.zoom_inset
+def _iter_zoom_insets(panel: PanelInfo):
+    """Return the zoom-inset settings to render for a panel, in z-order
+    (later ones drawn on top). Prefers panel.zoom_insets (the array)
+    when non-empty, else falls back to [panel.zoom_inset] for legacy
+    projects that pre-date the array.
+    """
+    arr = list(getattr(panel, "zoom_insets", None) or [])
+    if arr:
+        return arr
+    legacy = getattr(panel, "zoom_inset", None)
+    if legacy is not None:
+        return [legacy]
+    return []
+
+
+def _draw_one_zoom_inset(img: Image.Image, zi, panel: PanelInfo,
+                        images_dict: Dict[str, Image.Image]) -> Image.Image:
+    """Render a single zoom inset over `img`. Mutates a copy and
+    returns it. Adjacent-panel inset only paints the source rectangle
+    here; the actual zoomed copy lives in the (r±1, c±1) target panel
+    and is patched in at the figure-assembly layer."""
     if zi is None:
-        return image
-    img = image.copy()
+        return img
     if zi.inset_type == "Standard Zoom":
         return _draw_standard_zoom(img, zi, panel, images_dict)
     elif zi.inset_type == "Separate Image":
         return _draw_separate_zoom(img, zi, images_dict, panel)
     elif zi.inset_type == "Adjacent Panel":
-        # Source rectangle — scale zi coords from full-res to processed image size
-        iw, ih = img.size
-        # Get full-res dimensions (before thumbnailing)
-        if panel and panel.crop_image and panel.crop and len(panel.crop) == 4:
-            full_w = panel.crop[2] - panel.crop[0]
-            full_h = panel.crop[3] - panel.crop[1]
-        else:
-            full_w, full_h = iw, ih  # no crop, assume processed = full
-        sx = zi.x * iw / max(full_w, 1)
-        sy = zi.y * ih / max(full_h, 1)
-        sw = zi.width * iw / max(full_w, 1)
-        sh = zi.height * ih / max(full_h, 1)
-        draw = ImageDraw.Draw(img)
-        src_outline = zi.rectangle_color or "#FF0000"
-        draw.rectangle([int(sx), int(sy), int(sx + sw), int(sy + sh)],
-                       outline=src_outline, width=max(1, zi.rectangle_width))
+        # Source rect outline + parallel lines are drawn POST-RENDER
+        # by figure_builder.py on the final figure image — that way
+        # they don't get matplotlib's bilinear-resampling blur that
+        # would otherwise make the rect look softer than the cross-
+        # panel connector lines (which are already post-render).
+        # Nothing to draw on the panel image here.
+        pass
+    return img
+
+
+def draw_zoom_inset(image: Image.Image, panel: PanelInfo,
+                    images_dict: Dict[str, Image.Image]) -> Image.Image:
+    """Draw all zoom insets configured on `panel` over `image`. Honors
+    the new panel.zoom_insets array; falls back to legacy
+    panel.zoom_inset when the array is empty."""
+    insets = _iter_zoom_insets(panel)
+    if not insets:
+        return image
+    img = image.copy()
+    for zi in insets:
+        img = _draw_one_zoom_inset(img, zi, panel, images_dict)
     return img
 
 
@@ -797,7 +1042,21 @@ def _draw_standard_zoom(img: Image.Image, zi, panel=None, images_dict=None) -> I
         zw = max(1, zw); zh = max(1, zh)
         region = region.resize((zw, zh), Image.LANCZOS)
     else:
-        region = img.crop((x, y, x + w, y + h))
+        # Honour zi.rotation. CSS `rotate(+R)` is CLOCKWISE; PIL
+        # `Image.rotate(+R)` is COUNTER-CLOCKWISE. To un-rotate the
+        # CW-tilted CSS rect into an axis-aligned crop, we rotate
+        # the underlying image around the rect's centre by +rot in
+        # PIL (= CCW), so the previously-CW corners return to their
+        # un-rotated positions, and a plain crop at (x, y, w, h)
+        # then yields the upright content of the tilted selection.
+        rot = float(getattr(zi, "rotation", 0) or 0)
+        if abs(rot) > 0.01:
+            cx = x + w / 2.0
+            cy = y + h / 2.0
+            rotated = img.rotate(rot, center=(cx, cy), resample=Image.BICUBIC)
+            region = rotated.crop((x, y, x + w, y + h))
+        else:
+            region = img.crop((x, y, x + w, y + h))
         zw, zh = int(w * zi.zoom_factor), int(h * zi.zoom_factor)
     region = region.resize((zw, zh), Image.LANCZOS)
 
@@ -819,21 +1078,58 @@ def _draw_standard_zoom(img: Image.Image, zi, panel=None, images_dict=None) -> I
     elif zi.scale_bar:
         region = draw_scale_bar(region, zi.scale_bar)
 
-    # Source rectangle
-    draw.rectangle([x, y, x + w, y + h], outline=zi.rectangle_color, width=zi.rectangle_width)
+    # Source rectangle corners (rotated when zi.rotation != 0).
+    # CSS rotate(R) in screen-space (Y-down) maps (dx, dy) relative
+    # to the centre to (dx·cosR - dy·sinR, dx·sinR + dy·cosR), the
+    # same matrix that the rotated overlay <Box> applies in the
+    # editor — so the rendered polygon tracks the interactive rect.
+    rot_for_lines = float(getattr(zi, "rotation", 0) or 0)
+    if abs(rot_for_lines) > 0.01:
+        rad = math.radians(rot_for_lines)
+        cos_r, sin_r = math.cos(rad), math.sin(rad)
+        cx_src = x + w / 2.0
+        cy_src = y + h / 2.0
 
-    # Paste zoomed region
+        def _rotpt(px, py):
+            dx = px - cx_src
+            dy = py - cy_src
+            return (cx_src + dx * cos_r - dy * sin_r,
+                    cy_src + dx * sin_r + dy * cos_r)
+
+        src_corners = [
+            _rotpt(x, y),
+            _rotpt(x + w, y),
+            _rotpt(x + w, y + h),
+            _rotpt(x, y + h),
+        ]
+    else:
+        src_corners = None
+
+    # Paste zoomed region (no AA needed for the bitmap paste itself).
     tx = max(0, min(zi.target_x, iw - zw))
     ty = max(0, min(zi.target_y, ih - zh))
     img.paste(region, (tx, ty))
 
-    # Destination rectangle
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([tx, ty, tx + zw, ty + zh], outline=zi.rectangle_color, width=zi.rectangle_width)
-
-    # Connecting lines
-    _draw_connecting_lines(draw, (x, y, x + w, y + h), (tx, ty, tx + zw, ty + zh),
-                           zi.line_color, zi.line_width)
+    # All outline + connector drawing goes through _AAImage which
+    # uses cv2.LINE_AA to draw smooth straight lines at any angle
+    # — no supersampling, no Lanczos downsample, no blur.
+    # rectangle_style applies to BOTH the source and target rect
+    # outlines; line_style applies to the connecting lines.
+    rect_w = max(1, zi.rectangle_width)
+    line_w = max(1, zi.line_width)
+    rect_style = getattr(zi, "rectangle_style", "solid") or "solid"
+    line_style = getattr(zi, "line_style", "solid") or "solid"
+    aa = _AAImage(img)
+    if src_corners is not None:
+        aa.polygon_outline(src_corners, zi.rectangle_color, rect_w, rect_style)
+    else:
+        aa.rectangle((x, y, x + w, y + h), zi.rectangle_color, rect_w, rect_style)
+    aa.rectangle((tx, ty, tx + zw, ty + zh), zi.rectangle_color, rect_w, rect_style)
+    _draw_connecting_lines(
+        aa, (x, y, x + w, y + h), (tx, ty, tx + zw, ty + zh),
+        zi.line_color, line_w, src_corners=src_corners, style=line_style,
+    )
+    aa.finalize()
     return img
 
 
@@ -954,7 +1250,25 @@ def process_panel(image: Image.Image, panel: PanelInfo,
                   min_dims: Tuple[int, int],
                   images_dict: Dict[str, Image.Image],
                   skip_labels: bool = False,
-                  skip_symbols: bool = False) -> Image.Image:
+                  skip_symbols: bool = False,
+                  skip_annotations: bool = False) -> Image.Image:
+    """Process a panel image through the full pipeline.
+
+    skip_annotations  — when True, the scale-bar / line / area
+       overlays are NOT drawn onto this panel image. Used by
+       `_apply_adjacent_zoom_insets` to re-process a source panel
+       cleanly when cropping out the region that becomes the
+       adjacent-zoom target: we don't want the source's scale bar /
+       lines / areas baked into the zoomed adjacent view, since
+       annotations are conceptually overlays that live OUTSIDE the
+       zoom magnification.
+
+    Within this function the zoom inset is also drawn BEFORE the
+    annotation overlays (it used to be last) so that the inset's
+    internal crop sees a clean image. The result: a Standard or
+    Separate zoom inset never captures the source panel's
+    annotations either.
+    """
     img = image.copy()
     # Save original dimensions for font scaling — labels/scale bars/symbols
     # should maintain the same visual size regardless of crop
@@ -1112,33 +1426,44 @@ def process_panel(image: Image.Image, panel: PanelInfo,
     if panel.final_resize:
         img = img.resize((panel.final_width, panel.final_height), Image.LANCZOS)
 
-    # 8) Scale bar — extract micron_per_pixel for measurement calculations.
-    # In the full figure pipeline, scale bar rendering is done via matplotlib.
-    # When skip_labels is False (rendered preview mode), also draw via PIL.
+    # We still need micron_per_pixel for the annotation draw_lines /
+    # draw_areas calls below, regardless of the skip_* flags. Compute
+    # it here so the value survives the reorder.
     micron_per_pixel = 1.0
     if panel.add_scale_bar and panel.scale_bar:
         micron_per_pixel = panel.scale_bar.micron_per_pixel
-        if not skip_labels:  # rendered preview mode — draw scale bar via PIL
-            img = draw_scale_bar(img, panel.scale_bar, font_reference_width=orig_w)
 
-    # 9) Lines
-    if panel.lines:
+    # 8) Zoom inset — runs BEFORE annotations so the inset's internal
+    #    crop reads a CLEAN copy of the panel image (no scale bar /
+    #    lines / areas baked in). This is what stops the inset from
+    #    swallowing the annotations that happen to overlap its
+    #    source rectangle.
+    if panel.add_zoom_inset and panel.zoom_inset:
+        img = draw_zoom_inset(img, panel, images_dict)
+
+    # 9) Scale bar — drawn on top of the panel image AND the pasted
+    #    inset. In the full figure pipeline this still goes via
+    #    matplotlib; when skip_labels is False (rendered preview),
+    #    also draw via PIL. Suppressed entirely when skip_annotations
+    #    (the source panel for an adjacent zoom must be clean).
+    if (panel.add_scale_bar and panel.scale_bar
+            and not skip_labels and not skip_annotations):
+        img = draw_scale_bar(img, panel.scale_bar, font_reference_width=orig_w)
+
+    # 10) Lines
+    if panel.lines and not skip_annotations:
         img = draw_lines(img, panel.lines, micron_per_pixel)
 
-    # 10) Areas
-    if panel.areas:
+    # 11) Areas
+    if panel.areas and not skip_annotations:
         img = draw_areas(img, panel.areas, micron_per_pixel)
 
-    # 11) Labels
+    # 12) Labels
     if panel.labels and not skip_labels:
         img = draw_labels(img, panel.labels, font_reference_width=orig_w)
 
-    # 12) Symbols
+    # 13) Symbols
     if panel.symbols and not skip_symbols:
         img = draw_symbols(img, panel.symbols, reference_width=orig_w)
-
-    # 13) Zoom inset
-    if panel.add_zoom_inset and panel.zoom_inset:
-        img = draw_zoom_inset(img, panel, images_dict)
 
     return img.convert("RGB")

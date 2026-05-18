@@ -241,8 +241,12 @@ class ApiClient {
 
   // ── Save / Load project ────────────────────────────────
 
-  async saveProject(path: string): Promise<{ ok: boolean }> {
-    return apiJson("/api/project/save", "POST", JSON.stringify({ path }));
+  async saveProject(path: string, analysis?: import("./types").AnalysisPayload | null): Promise<{ ok: boolean }> {
+    return apiJson(
+      "/api/project/save",
+      "POST",
+      JSON.stringify({ path, analysis: analysis ?? null }),
+    );
   }
 
   async loadProject(path: string): Promise<ProjectLoadResponse> {
@@ -372,7 +376,7 @@ class ApiClient {
 
   // ── Measurements ────────────────────────────────────────
 
-  async getMeasurements(): Promise<{ measurements: Array<{ panel: string; name: string; type: string; value: string }> }> {
+  async getMeasurements(): Promise<{ measurements: Array<{ panel: string; name: string; type: string; value: string; numeric?: number; unit?: string }> }> {
     return apiJson("/api/measurements");
   }
 
@@ -383,8 +387,26 @@ class ApiClient {
     return apiJson(`/api/analysis/check-r${params}`);
   }
 
-  async runR(code: string, dataCsv: string, rscriptPath?: string): Promise<{ success: boolean; stdout: string; stderr: string; plots: string[] }> {
+  async runR(
+    code: string,
+    dataCsv: string,
+    rscriptPath?: string,
+  ): Promise<{
+    success: boolean;
+    stdout: string;
+    stderr: string;
+    plots: string[];
+    /** CSV-encoded data.frames the R script wrote out via mpfig_data(df, name).
+     *  Empty array when the script didn't call mpfig_data. */
+    tables: { name: string; csv: string }[];
+  }> {
     return apiJson("/api/analysis/run-r", "POST", JSON.stringify({ code, data_csv: dataCsv, rscript_path: rscriptPath || null }));
+  }
+
+  /** Run a raw R command (no data/plot boilerplate) — for the Analysis
+   *  dialog's mini R console, mainly install.packages("..."). */
+  async runRConsole(command: string, rscriptPath?: string): Promise<{ success: boolean; stdout: string; stderr: string }> {
+    return apiJson("/api/analysis/run-console", "POST", JSON.stringify({ command, rscript_path: rscriptPath || null }));
   }
 
   // ── Image Thumbnail ──────────────────────────────────────

@@ -21,12 +21,17 @@ def _rot(points: List[Tuple[float, float]], angle_deg: float) -> List[Tuple[floa
     return [(x * cos_a - y * sin_a, x * sin_a + y * cos_a) for x, y in points]
 
 
-def get_symbol_polys(shape: str, rotation: float = 0) -> dict:
+def get_symbol_polys(shape: str, rotation: float = 0, width: float = 1.0) -> dict:
     """
     Returns dict with:
       - 'fill': list of polygons (each = list of (x,y) in [-0.5, 0.5])
       - 'stroke': list of polylines
       - 'filled': True = solid fill, False = outline only
+
+    `width` is a cross-axis thickness multiplier used ONLY by the
+    direction-based symbols (Arrow, NarrowTriangle): it scales the shape
+    perpendicular to its pointing direction without changing its length.
+    All other shapes ignore it.
     """
     fill: PolyList = []
     stroke: PolyList = []
@@ -36,17 +41,36 @@ def get_symbol_polys(shape: str, rotation: float = 0) -> dict:
     # After rotation, the tip points in the rotation direction.
 
     if shape == "Arrow":
-        # Tip at origin, shaft extends backward
-        shaft: List[Tuple[float, float]] = [(0, 0), (-0.6, 0)]
-        head: List[Tuple[float, float]] = [(0, 0), (-0.22, -0.1), (-0.22, 0.1)]
-        stroke = [_rot(shaft, rotation)]
-        fill = [_rot(head, rotation)]
+        # Single filled polygon — a clean arrow with a sharp tip. Tip at
+        # origin, head + shaft extend backward (-x). Defining it as ONE
+        # filled polygon (rather than a thin STROKED shaft + a filled head)
+        # is what makes it render identically in the SVG edit-panel
+        # overlay, the matplotlib final figure, and the PIL path: a stroke
+        # width has no shared unit across those three (viewBox units vs
+        # matplotlib points vs pixels), so the old stroked shaft looked
+        # chunkier in the final preview than in the editor. The head is
+        # long and narrow (head_len >> head_hw) to give a pointed tip.
+        head_len = 0.38                        # head length (unaffected by width)
+        head_hw = 0.11 * width                 # head base half-width
+        shaft_len = 0.6                        # total length (unaffected by width)
+        shaft_hw = 0.03 * width                # shaft half-thickness
+        arrow: List[Tuple[float, float]] = [
+            (0.0, 0.0),               # tip
+            (-head_len, -head_hw),    # head back, upper
+            (-head_len, -shaft_hw),   # head -> shaft junction, upper
+            (-shaft_len, -shaft_hw),  # shaft tail, upper
+            (-shaft_len, shaft_hw),   # shaft tail, lower
+            (-head_len, shaft_hw),    # head -> shaft junction, lower
+            (-head_len, head_hw),     # head back, lower
+        ]
+        fill = [_rot(arrow, rotation)]
         filled = True
 
     elif shape == "NarrowTriangle":
         # Tip at origin pointing RIGHT (same direction as Arrow at rot=0)
-        # Body extends to the left
-        pts = [(0, 0), (-1.0, -0.12), (-1.0, 0.12)]
+        # Body extends to the left. `width` scales the base half-width.
+        hw = 0.12 * width
+        pts = [(0, 0), (-1.0, -hw), (-1.0, hw)]
         fill = [_rot(pts, rotation)]
         filled = True
 
@@ -108,12 +132,13 @@ def get_symbol_polys(shape: str, rotation: float = 0) -> dict:
 
 
 def symbol_to_pixels(shape: str, cx: float, cy: float, size: float,
-                     rotation: float = 0) -> dict:
+                     rotation: float = 0, width: float = 1.0) -> dict:
     """
     Convert normalized symbol to pixel coordinates.
     Returns same structure but with absolute pixel coordinates.
+    `width` is the Arrow / NarrowTriangle cross-axis thickness multiplier.
     """
-    data = get_symbol_polys(shape, rotation)
+    data = get_symbol_polys(shape, rotation, width)
     result = {"filled": data["filled"], "fill": [], "stroke": []}
     for poly in data["fill"]:
         result["fill"].append([(cx + x * size, cy + y * size) for x, y in poly])

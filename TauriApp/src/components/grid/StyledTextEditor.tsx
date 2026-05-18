@@ -28,6 +28,7 @@ import {
 } from "react";
 import type {
   CSSProperties,
+  FocusEvent as ReactFocusEvent,
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
 } from "react";
@@ -67,7 +68,7 @@ export interface StyledTextEditorProps {
   onBeforeAction?: () => void;
   onSelectionChange?: (sel: { start: number; end: number } | null) => void;
   onFocus?: () => void;
-  onBlur?: () => void;
+  onBlur?: (e: ReactFocusEvent<HTMLDivElement>) => void;
   onClick?: (e: ReactMouseEvent<HTMLDivElement>) => void;
   onKeyDown?: (e: ReactKeyboardEvent<HTMLDivElement>) => void;
   onContextMenu?: (e: ReactMouseEvent<HTMLDivElement>) => void;
@@ -137,6 +138,14 @@ function buildHtml(
     const lines = t.split("\n").map(escapeHtml);
     return lines.join("<br>");
   };
+  // NOTE: this produces a flat run of inline <span>s and <br>s — NO
+  // wrapper element. That only renders correctly because the
+  // contentEditable element is a normal-flow block (the StyledTextEditor
+  // component puts the `display:flex` centring on an OUTER wrapper, so
+  // the editable itself is a single flex *item*, not a flex container).
+  // If the editable were the flex container, every <span>/<br> here
+  // would be blockified into a separate flex item — breaking <br> line
+  // breaks and native selection across segments.
   if (!segs || segs.length === 0) {
     return renderPlain(text);
   }
@@ -437,29 +446,62 @@ export const StyledTextEditor = forwardRef<
   };
 
   return (
+    // OUTER wrapper = the centring container. The parent passes
+    // `display:flex; align-items/justify-content:center` (plus the box's
+    // background, border, padding, min-height, etc.) via `className` +
+    // `style`; all of that lives here. CRITICAL: the flex container must
+    // be this wrapper, NOT the contentEditable. A flex container
+    // blockifies every direct child, so if the editable were the flex
+    // container its styled-segment <span>s and <br> line breaks would
+    // each become an independent block-level flex item — which kills
+    // <br> line breaking and makes WebKit hand back element-level
+    // (whole-element) selection ranges instead of character ranges.
+    // With flex on this wrapper, the editable below is a single flex
+    // ITEM (an ordinary block) whose children flow as normal inline
+    // text + <br>.
     <div
-      ref={rootRef}
       className={className}
-      contentEditable
-      suppressContentEditableWarning
-      spellCheck={false}
-      style={{
-        // Element-level styles inherited by unstyled chars.
-        fontWeight: fontStyle.includes("Bold") ? 700 : 400,
-        fontStyle: fontStyle.includes("Italic") ? "italic" : "normal",
-        color: defaultColor,
-        outline: "none",
-        cursor: "text",
-        ...style,
+      style={style}
+      onMouseDown={(e) => {
+        // Keep the whole padded box clickable: a press that lands on the
+        // centring wrapper itself (the few px of padding around the
+        // shrink-wrapped editable) is redirected into the editor.
+        if (e.target === e.currentTarget) {
+          e.preventDefault();
+          rootRef.current?.focus();
+          onBeforeAction?.();
+        }
       }}
-      onInput={handleInput}
-      onPaste={handlePaste}
-      onMouseDown={onBeforeAction}
-      onFocus={onFocus}
-      onBlur={onBlur}
-      onClick={onClick}
-      onKeyDown={handleKeyDown}
-      onContextMenu={onContextMenu}
-    />
+    >
+      <div
+        ref={rootRef}
+        contentEditable
+        suppressContentEditableWarning
+        spellCheck={false}
+        style={{
+          // Element-level styles inherited by unstyled chars. Text-flow
+          // properties (white-space, word-break, line-height, font-size,
+          // text-align, writing-mode) are CSS-inherited from the wrapper,
+          // so they don't need to be repeated here.
+          fontWeight: fontStyle.includes("Bold") ? 700 : 400,
+          fontStyle: fontStyle.includes("Italic") ? "italic" : "normal",
+          color: defaultColor,
+          outline: "none",
+          cursor: "text",
+          // Let the editable shrink within the wrapper so long text wraps
+          // (via inherited word-break) instead of overflowing the box.
+          minWidth: 0,
+          maxWidth: "100%",
+        }}
+        onInput={handleInput}
+        onPaste={handlePaste}
+        onMouseDown={onBeforeAction}
+        onFocus={onFocus}
+        onBlur={onBlur}
+        onClick={onClick}
+        onKeyDown={handleKeyDown}
+        onContextMenu={onContextMenu}
+      />
+    </div>
   );
 });

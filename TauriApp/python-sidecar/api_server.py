@@ -246,6 +246,216 @@ def _get_video_info(video_path: str) -> dict:
     return info
 
 
+def _panel_zoom_insets(panel):
+    """Return the zoom-insets list for a panel, falling back to the
+    legacy singular `panel.zoom_inset` when the array is empty.
+    Returns [] if `add_zoom_inset` is False or no inset is set."""
+    if not getattr(panel, "add_zoom_inset", False):
+        return []
+    arr = list(getattr(panel, "zoom_insets", None) or [])
+    if arr:
+        return arr
+    legacy = getattr(panel, "zoom_inset", None)
+    if legacy is not None:
+        return [legacy]
+    return []
+
+
+def _apply_zoom_target_self_overlays(cfg, processed, rows, cols):
+    """Run the target panel's OWN overlay operations on the
+    synthesized image written by _apply_adjacent_zoom_insets.
+
+    Adjacent-zoom target panels have no `image_name`, so `process_panel`
+    is never called on them — which previously meant any nested zoom
+    inset (Standard / Separate), scale bar, line, or area annotation
+    configured on the target was silently dropped during rendering.
+    This pass replays the overlay portion of `process_panel` on each
+    synthesized target image so 'parent → adjacent → standard zoom'
+    chains actually display the nested zoom (and any other overlays
+    the user placed on the target via Edit Panel).
+
+    Adjacent-typed insets on the target itself are still handled by
+    `_apply_adjacent_zoom_insets`'s main pass — that's how
+    'parent → adjacent → adjacent' chains work — so we don't try to
+    draw them here. `_draw_one_zoom_inset` already no-ops on
+    Adjacent-typed entries.
+
+    Labels and symbols continue to be added later via matplotlib in
+    figure_builder._add_panel_labels / _add_panel_symbols, which
+    already work for zoom targets because they iterate cfg.panels
+    directly.
+    """
+    from image_processing import draw_zoom_inset, draw_scale_bar, draw_lines, draw_areas
+    for r in range(rows):
+        for c in range(cols):
+            panel = cfg.panels[r][c]
+            # Only act on cells that are SYNTHESISED zoom targets:
+            # no own image_name (or not loaded), but processed[r][c]
+            # has been populated by _apply_adjacent_zoom_insets.
+            if panel.image_name and panel.image_name in loaded_images:
+                continue
+            synth = processed[r][c]
+            if synth is None:
+                continue
+            # 1. Zoom inset overlays — runs FIRST so the nested inset's
+            #    internal crop reads a clean copy of the synthesised
+            #    image (parallels the new ordering in process_panel).
+            if getattr(panel, "add_zoom_inset", False):
+                try:
+                    synth = draw_zoom_inset(synth, panel, loaded_images)
+                except Exception as e:
+                    import sys; print(f"[zoom-target-overlay] draw_zoom_inset failed at ({r},{c}): {e}", file=sys.stderr)
+            # 2. Scale bar — SKIPPED here. The matplotlib pass
+            #    `_add_panel_scale_bars` runs over EVERY cell in the
+            #    grid (zoom targets included) and would draw the same
+            #    bar on top of our PIL one, producing the "ghosted"
+            #    double-render the user reported. Drawing only via
+            #    matplotlib keeps the bar crisp and matches how
+            #    image-bearing panels' bars are rendered.
+            mpp = panel.scale_bar.micron_per_pixel if getattr(panel, "scale_bar", None) else 1.0
+            # 3. Lines
+            if getattr(panel, "lines", None):
+                try:
+                    synth = draw_lines(synth, panel.lines, mpp)
+                except Exception as e:
+                    import sys; print(f"[zoom-target-overlay] draw_lines failed at ({r},{c}): {e}", file=sys.stderr)
+            # 4. Areas
+            if getattr(panel, "areas", None):
+                try:
+                    synth = draw_areas(synth, panel.areas, mpp)
+                except Exception as e:
+                    import sys; print(f"[zoom-target-overlay] draw_areas failed at ({r},{c}): {e}", file=sys.stderr)
+            processed[r][c] = synth
+
+
+def _apply_adjacent_zoom_insets(cfg, processed, rows, cols):
+    """Replace target panels in `processed[][]` with zoomed crops for
+    every Adjacent Panel zoom inset configured on any source panel.
+
+    Iterates panel.zoom_insets (with legacy fallback to [zoom_inset]).
+    Each Adjacent Panel inset's `side` field points the result at one
+    of (r-1, c) / (r+1, c) / (r, c-1) / (r, c+1). Out-of-bounds
+    targets are silently skipped. When two insets target the same
+    cell, the LATER one wins (last write).
+
+    Mutates processed[][] in place. Used by /api/preview,
+    /api/figure/save, and the video render worker so multi-figure
+    arrays land in their adjacent slots regardless of which path the
+    user invokes.
+    """
+    for r in range(rows):
+        for c in range(cols):
+            panel = cfg.panels[r][c]
+            for zi in _panel_zoom_insets(panel):
+                if zi is None or zi.inset_type != "Adjacent Panel":
+                    continue
+                ar, ac = r, c
+                side = zi.side or "Right"
+                if side == "Top": ar -= 1
+                elif side == "Bottom": ar += 1
+                elif side == "Left": ac -= 1
+                elif side == "Right": ac += 1
+                if not (0 <= ar < rows and 0 <= ac < cols):
+                    continue
+                ext_name = getattr(zi, "separate_image_name", "") or ""
+                if ext_name and ext_name not in ("", "select") and ext_name in loaded_images:
+                    ext_img = loaded_images[ext_name].convert("RGB")
+                    xi = getattr(zi, "x_inset", 0) or 0
+                    yi = getattr(zi, "y_inset", 0) or 0
+                    wi = getattr(zi, "width_inset", ext_img.size[0]) or ext_img.size[0]
+                    hi = getattr(zi, "height_inset", ext_img.size[1]) or ext_img.size[1]
+                    xi = max(0, min(xi, ext_img.size[0]-1))
+                    yi = max(0, min(yi, ext_img.size[1]-1))
+                    wi = max(1, min(wi, ext_img.size[0]-xi))
+                    hi = max(1, min(hi, ext_img.size[1]-yi))
+                    region = ext_img.crop((xi, yi, xi+wi, yi+hi))
+                    zw = max(1, int(wi * zi.zoom_factor))
+                    zh = max(1, int(hi * zi.zoom_factor))
+                    region = region.resize((zw, zh), Image.LANCZOS)
+                    processed[ar][ac] = region
+                else:
+                    p_src = cfg.panels[r][c]
+                    # Re-process the source panel WITHOUT the zoom
+                    # inset overlay so the cropped content is clean —
+                    # i.e. no rectangle-border artifacts smearing into
+                    # the adjacent-panel result, especially under
+                    # rotation where the rect border would otherwise
+                    # rotate into diagonal lines inside the crop.
+                    #
+                    # Video sources have their image_name in
+                    # `loaded_videos`, not `loaded_images`; use
+                    # `_get_panel_image` (which handles both) as the
+                    # gate so video panels can still feed the
+                    # adjacent zoom.
+                    p_src_img = _get_panel_image(p_src) if p_src.image_name else None
+                    if p_src_img is not None:
+                        clean_panel = _from_dict(PanelInfo, _to_dict(p_src))
+                        clean_panel.add_zoom_inset = False
+                        try:
+                            # skip_annotations=True keeps the source's
+                            # scale bar / lines / areas out of the
+                            # cropped region that becomes the adjacent
+                            # zoom — annotations are overlays, not
+                            # part of the image content we're zooming
+                            # into. The crop here corresponds to the
+                            # zoom rectangle on the source panel.
+                            main_img = process_panel(
+                                p_src_img,
+                                clean_panel, min_dims, loaded_images,
+                                skip_labels=True, skip_symbols=True,
+                                skip_annotations=True,
+                            )
+                        except Exception:
+                            main_img = processed[r][c]
+                    else:
+                        # For chained adjacent zooms (source itself is
+                        # an adjacent-zoom TARGET with no image_name),
+                        # fall back to whatever the previous iteration
+                        # already wrote into processed[r][c] — that's
+                        # the synthesised "primary" zoom image whose
+                        # content the secondary zoom is supposed to
+                        # crop from.
+                        main_img = processed[r][c]
+                    if main_img is None:
+                        continue
+                    miw, mih = main_img.size
+                    if p_src.crop_image and p_src.crop and len(p_src.crop) == 4:
+                        fw = p_src.crop[2] - p_src.crop[0]
+                        fh = p_src.crop[3] - p_src.crop[1]
+                    elif p_src.image_name and p_src.image_name in loaded_images:
+                        fw, fh = loaded_images[p_src.image_name].size
+                    else:
+                        fw, fh = miw, mih
+                    scx = miw / max(fw, 1)
+                    scy = mih / max(fh, 1)
+                    # Source rectangle in main_img coords. We keep the
+                    # full extent (no border-width inset needed because
+                    # we cropped from a clean source above).
+                    cx1 = max(0, int(zi.x * scx))
+                    cy1 = max(0, int(zi.y * scy))
+                    cx2 = min(miw, int((zi.x + zi.width) * scx))
+                    cy2 = min(mih, int((zi.y + zi.height) * scy))
+                    cx2 = max(cx1 + 1, cx2)
+                    cy2 = max(cy1 + 1, cy2)
+                    rot = float(getattr(zi, "rotation", 0) or 0)
+                    if abs(rot) > 0.01:
+                        # CSS rotate(+R) = CW; PIL Image.rotate(+R) =
+                        # CCW. Use +rot (= CCW in PIL) to un-rotate
+                        # the CW-tilted CSS rect so a plain crop at
+                        # the original (cx1, cy1, cx2, cy2) yields
+                        # axis-aligned content of a tilted source.
+                        ccx = (cx1 + cx2) / 2.0
+                        ccy = (cy1 + cy2) / 2.0
+                        rot_img = main_img.rotate(rot, center=(ccx, ccy), resample=Image.BICUBIC)
+                        region = rot_img.crop((cx1, cy1, cx2, cy2))
+                    else:
+                        region = main_img.crop((cx1, cy1, cx2, cy2))
+                    zw = max(1, int(zi.width * zi.zoom_factor * scx))
+                    zh = max(1, int(zi.height * zi.zoom_factor * scy))
+                    region = region.resize((zw, zh), Image.LANCZOS)
+                    processed[ar][ac] = region
+
+
 def _recalc_min_dims():
     global min_dims
     if loaded_images:
@@ -1328,23 +1538,128 @@ def get_panel_rendered_preview(r: int, c: int):
     if r >= cfg.rows or c >= cfg.cols:
         raise HTTPException(400, f"Panel [{r}][{c}] out of range")
     panel = cfg.panels[r][c]
-    if not panel.image_name or panel.image_name not in loaded_images:
-        return {"image": ""}
 
-    # Process base image (no labels/symbols/zoom — those are rendered via matplotlib/SVG)
-    # Temporarily disable zoom inset to prevent double rendering with SVG overlay
-    saved_zoom = panel.add_zoom_inset
-    panel.add_zoom_inset = False
-    processed = process_panel(
-        _get_panel_image(panel) or loaded_images[panel.image_name], panel, min_dims, loaded_images,
-        skip_labels=True, skip_symbols=True)
-    panel.add_zoom_inset = saved_zoom
+    # Adjacent-zoom target panels have no image_name of their own —
+    # their image content is synthesised from a SOURCE panel's zoom
+    # rectangle. The Edit Panel dialog needs to show that synthesised
+    # image so the user can place nested labels / scale bars /
+    # annotations / further zoom insets on it. Reuse the same
+    # _apply_adjacent_zoom_insets path that the full preview uses and
+    # pick out the cell we want.
+    if not panel.image_name or panel.image_name not in loaded_images:
+        # Build a sparse processed[][] grid: only fill cells that are
+        # SOURCES for an adjacent inset that targets (r, c), plus the
+        # target itself. The helper only mutates target cells, so
+        # the rest stay None.
+        rows, cols = cfg.rows, cfg.cols
+        processed = [[None for _ in range(cols)] for _ in range(rows)]
+        for sr in range(rows):
+            for sc in range(cols):
+                src = cfg.panels[sr][sc]
+                # Accept both static images (loaded_images) AND videos
+                # (loaded_videos). `_get_panel_image` handles both and
+                # returns None when the source has no usable image.
+                # Without this, video sources are silently dropped from
+                # the synthesis pass and their zoom targets show empty
+                # (or fall through to a blank synth).
+                if not (src.image_name and (src.image_name in loaded_images or src.image_name in loaded_videos)):
+                    continue
+                # Quick check — does this source point at (r, c)?
+                insets = []
+                if getattr(src, "add_zoom_inset", False):
+                    arr = list(getattr(src, "zoom_insets", None) or [])
+                    if arr:
+                        insets = arr
+                    elif getattr(src, "zoom_inset", None) is not None:
+                        insets = [src.zoom_inset]
+                aims_at_us = False
+                for zi in insets:
+                    if zi is None or getattr(zi, "inset_type", "") != "Adjacent Panel":
+                        continue
+                    side = getattr(zi, "side", "Right") or "Right"
+                    ar, ac = sr, sc
+                    if side == "Top": ar -= 1
+                    elif side == "Bottom": ar += 1
+                    elif side == "Left": ac -= 1
+                    elif side == "Right": ac += 1
+                    if ar == r and ac == c:
+                        aims_at_us = True
+                        break
+                if aims_at_us:
+                    # Process this source (with labels / symbols / zoom
+                    # inset suppressed — same as the full preview path).
+                    src_img = _get_panel_image(src)
+                    if src_img is None:
+                        # Defensive — already gated above, but skip
+                        # silently if the image (video frame extract)
+                        # failed for any reason rather than KeyError'ing
+                        # via loaded_images[empty/missing].
+                        continue
+                    saved_z = src.add_zoom_inset
+                    src.add_zoom_inset = False
+                    try:
+                        processed[sr][sc] = process_panel(
+                            src_img,
+                            src, min_dims, loaded_images,
+                            skip_labels=True, skip_symbols=True,
+                        )
+                    finally:
+                        src.add_zoom_inset = saved_z
+        # Fill the target slot with a placeholder so the helper's
+        # `processed[ar][ac] = region` assignment doesn't IndexError.
+        if processed[r][c] is None:
+            # Size doesn't matter — it gets replaced. Use a 1×1.
+            processed[r][c] = Image.new("RGB", (1, 1), "white")
+        _apply_adjacent_zoom_insets(cfg, processed, rows, cols)
+        _apply_zoom_target_self_overlays(cfg, processed, rows, cols)
+        synth = processed[r][c]
+        if synth is None or synth.size == (1, 1):
+            return {"image": ""}
+        # Fall through to the shared matplotlib rendering pass below.
+        # `processed` is now the synthesised PIL image; `panel` carries
+        # the target cell's stamped scale_bar / labels. Routing zoom
+        # targets through the same matplotlib pass as image-bearing
+        # cells means scalebars / labels / symbols render on them too,
+        # fixing the dialog-preview asymmetry where zoom targets
+        # previously showed the raw zoomed image without a scalebar.
+        processed = synth
+    else:
+        # Image-bearing panel: process the base image (no labels /
+        # symbols / zoom — those are rendered via matplotlib / SVG).
+        # Temporarily disable zoom inset to prevent double rendering
+        # with the SVG overlay.
+        saved_zoom = panel.add_zoom_inset
+        panel.add_zoom_inset = False
+        processed = process_panel(
+            _get_panel_image(panel) or loaded_images[panel.image_name], panel, min_dims, loaded_images,
+            skip_labels=True, skip_symbols=True)
+        panel.add_zoom_inset = saved_zoom
 
     iw, ih = processed.size
     # Match the figure builder's reference_inches (3.0) so that
     # text at N points occupies the same fraction of the panel as
     # in the final output.  DPI = pixels / inches.
     reference_inches = 3.0
+    # Minimum source width for the dialog preview. The synthesised
+    # image for an adjacent-zoom target is often smaller than an
+    # image-bearing panel's source (e.g. 300×300 source × 2× zoom =
+    # 600 wide vs 800+ for a real image), which makes
+    # `preview_dpi = iw / 3.0` correspondingly lower — and the font
+    # rendering visibly softer than the parent panel's. Upsample
+    # short sources so the dialog preview hits at least this width
+    # before matplotlib draws on top. We pass the pre-upsample size
+    # as pre_norm_sizes so the scalebar pass rescales bar length /
+    # bar height proportionally and the bar still represents the
+    # correct physical length on the higher-DPI canvas.
+    MIN_PREVIEW_W = 1000
+    pre_upscale_sizes = [[None for _ in range(cfg.cols)] for _ in range(cfg.rows)]
+    pre_upscale_sizes[r][c] = processed.size
+    if iw < MIN_PREVIEW_W:
+        scale_up = MIN_PREVIEW_W / iw
+        new_w = int(iw * scale_up)
+        new_h = int(ih * scale_up)
+        processed = processed.resize((new_w, new_h), Image.LANCZOS)
+        iw, ih = new_w, new_h
     preview_dpi = max(72, iw / reference_inches)
     fig_w = iw / preview_dpi   # = reference_inches = 3.0
     fig_h = ih / preview_dpi
@@ -1356,18 +1671,29 @@ def get_panel_rendered_preview(r: int, c: int):
     ax.set_ylim(ih, 0)
     ax.axis('off')
 
-    # Use the SAME scale bar rendering as the full figure
+    # Use the SAME scale bar rendering as the full figure. Pass
+    # pre_upscale_sizes so the bar/text scale with the upsample
+    # we may have applied above (otherwise a 200-px bar in a 600
+    # synth would become 200 px in a 1000-px upscale = visibly
+    # too short).
     axes_grid = np.array([[ax]])
     _add_panel_scale_bars(fig, axes_grid, cfg, 1, 1,
-                          [[processed]], panel_override=(r, c))
+                          [[processed]], panel_override=(r, c),
+                          pre_norm_sizes=pre_upscale_sizes)
 
     # Use the SAME label rendering as the full figure
     _add_panel_labels(fig, axes_grid, cfg, 1, 1,
                       [[processed]], panel_override=(r, c))
 
-    # Use the SAME symbol rendering as the full figure
-    # Pass original (uncropped) image for consistent size scaling
-    orig_img = _get_panel_image(panel) or loaded_images[panel.image_name]
+    # Use the SAME symbol rendering as the full figure.
+    # Adjacent-zoom target panels have no image_name (their content is
+    # synthesised), so fall back to the synthesised image for symbol
+    # size scaling — otherwise loaded_images[panel.image_name] would
+    # KeyError on the empty string and the dialog preview 500's.
+    if panel.image_name and panel.image_name in loaded_images:
+        orig_img = _get_panel_image(panel) or loaded_images[panel.image_name]
+    else:
+        orig_img = processed
     _add_panel_symbols(fig, axes_grid, cfg, 1, 1,
                        [[processed]], panel_override=(r, c),
                        original_images=[[orig_img]])
@@ -1535,8 +1861,17 @@ def magic_wand_select(r: int, c: int, body: MagicWandRequest):
 
 @app.get("/api/measurements")
 def get_measurements():
-    """Compute all line/area measurements across all panels."""
-    from models import compute_line_measurement, compute_area_measurement
+    """Compute all line/area measurements across all panels.
+
+    Each result carries the measurement BOTH as a display string (`value`,
+    which honours a user `measure_text` override) AND as separate
+    structured fields — `numeric` (the computed number) and `unit` (its
+    label, e.g. 'µm' / 'µm²'). The structured fields ensure the unit is
+    explicitly recorded for the Analysis section rather than only being
+    embedded inside the display string."""
+    from models import (compute_line_measurement, compute_area_measurement,
+                         compute_line_measurement_value,
+                         compute_area_measurement_value, unit_label)
     results = []
     for r in range(cfg.rows):
         for c in range(cfg.cols):
@@ -1555,16 +1890,23 @@ def get_measurements():
             for line in (panel.lines or []):
                 if line.show_measure and len(line.points) >= 2:
                     unit = getattr(line, 'measure_unit', 'um')
+                    numeric = compute_line_measurement_value(line.points, iw, ih, mpp, unit)
                     text = line.measure_text or compute_line_measurement(
                         line.points, iw, ih, mpp, unit)
-                    results.append({"panel": label, "name": line.name, "type": "line", "value": text})
+                    results.append({"panel": label, "name": line.name, "type": "line",
+                                    "value": text, "numeric": round(numeric, 4),
+                                    "unit": unit_label(unit, squared=False)})
             # Area measurements
             for area in (panel.areas or []):
                 if area.show_measure and len(area.points) >= 2:
                     unit = getattr(area, 'measure_unit', 'um')
+                    numeric = compute_area_measurement_value(
+                        area.points, area.shape, iw, ih, mpp, unit)
                     text = area.measure_text or compute_area_measurement(
                         area.points, area.shape, iw, ih, mpp, unit)
-                    results.append({"panel": label, "name": area.name, "type": "area", "value": text})
+                    results.append({"panel": label, "name": area.name, "type": "area",
+                                    "value": text, "numeric": round(numeric, 4),
+                                    "unit": unit_label(unit, squared=True)})
     return {"measurements": results}
 
 
@@ -1610,63 +1952,9 @@ def generate_preview():
             if processed[r][c] is None:
                 processed[r][c] = Image.new("RGB", (col_max_w[c], row_max_h[r]), "white")
 
-    # Adjacent Panel zoom insets
-    for r in range(rows):
-        for c in range(cols):
-            panel = cfg.panels[r][c]
-            if panel.add_zoom_inset and panel.zoom_inset and panel.zoom_inset.inset_type == "Adjacent Panel":
-                zi = panel.zoom_inset
-                ar, ac = r, c
-                if zi.side == "Top": ar -= 1
-                elif zi.side == "Bottom": ar += 1
-                elif zi.side == "Left": ac -= 1
-                elif zi.side == "Right": ac += 1
-                if 0 <= ar < rows and 0 <= ac < cols:
-                    ext_name = getattr(zi, 'separate_image_name', '') or ''
-                    if ext_name and ext_name not in ('', 'select') and ext_name in loaded_images:
-                        ext_img = loaded_images[ext_name].convert("RGB")
-                        xi = getattr(zi, 'x_inset', 0) or 0
-                        yi = getattr(zi, 'y_inset', 0) or 0
-                        wi = getattr(zi, 'width_inset', ext_img.size[0]) or ext_img.size[0]
-                        hi = getattr(zi, 'height_inset', ext_img.size[1]) or ext_img.size[1]
-                        xi = max(0, min(xi, ext_img.size[0]-1))
-                        yi = max(0, min(yi, ext_img.size[1]-1))
-                        wi = max(1, min(wi, ext_img.size[0]-xi))
-                        hi = max(1, min(hi, ext_img.size[1]-yi))
-                        region = ext_img.crop((xi, yi, xi+wi, yi+hi))
-                        zw = max(1, int(wi * zi.zoom_factor))
-                        zh = max(1, int(hi * zi.zoom_factor))
-                        region = region.resize((zw, zh), Image.LANCZOS)
-                        processed[ar][ac] = region
-                    else:
-                        main_img = processed[r][c]
-                        miw, mih = main_img.size
-                        p_src = cfg.panels[r][c]
-                        if p_src.crop_image and p_src.crop and len(p_src.crop) == 4:
-                            fw = p_src.crop[2] - p_src.crop[0]
-                            fh = p_src.crop[3] - p_src.crop[1]
-                        elif p_src.image_name and p_src.image_name in loaded_images:
-                            fw, fh = loaded_images[p_src.image_name].size
-                        else:
-                            fw, fh = miw, mih
-                        scx = miw / max(fw, 1)
-                        scy = mih / max(fh, 1)
-                        # Inset by rectangle border width so we crop only
-                        # pixels INSIDE the selection box, not the border
-                        bw = max(1, getattr(zi, 'rectangle_width', 2) or 2)
-                        bw_x = bw * scx
-                        bw_y = bw * scy
-                        cx1 = max(0, int(zi.x * scx + bw_x))
-                        cy1 = max(0, int(zi.y * scy + bw_y))
-                        cx2 = min(miw, int((zi.x + zi.width) * scx - bw_x))
-                        cy2 = min(mih, int((zi.y + zi.height) * scy - bw_y))
-                        cx2 = max(cx1 + 1, cx2)
-                        cy2 = max(cy1 + 1, cy2)
-                        region = main_img.crop((cx1, cy1, cx2, cy2))
-                        zw = max(1, int(zi.width * zi.zoom_factor * scx))
-                        zh = max(1, int(zi.height * zi.zoom_factor * scy))
-                        region = region.resize((zw, zh), Image.LANCZOS)
-                        processed[ar][ac] = region
+    # Adjacent Panel zoom insets — array-aware via _apply_adjacent_zoom_insets
+    _apply_adjacent_zoom_insets(cfg, processed, rows, cols)
+    _apply_zoom_target_self_overlays(cfg, processed, rows, cols)
 
     # Build full-res sizes for zoom inset line positioning
     full_res_sizes = {}
@@ -1737,60 +2025,8 @@ def save_figure(body: SaveFigureRequest):
                 processed[r][c] = Image.new("RGB", (col_max_w[c], row_max_h[r]), "white")
 
     # Adjacent Panel zoom insets (must match preview pipeline)
-    for r in range(rows):
-        for c in range(cols):
-            panel = cfg.panels[r][c]
-            if panel.add_zoom_inset and panel.zoom_inset and panel.zoom_inset.inset_type == "Adjacent Panel":
-                zi = panel.zoom_inset
-                ar, ac = r, c
-                if zi.side == "Top": ar -= 1
-                elif zi.side == "Bottom": ar += 1
-                elif zi.side == "Left": ac -= 1
-                elif zi.side == "Right": ac += 1
-                if 0 <= ar < rows and 0 <= ac < cols:
-                    ext_name = getattr(zi, 'separate_image_name', '') or ''
-                    if ext_name and ext_name not in ('', 'select') and ext_name in loaded_images:
-                        ext_img = loaded_images[ext_name].convert("RGB")
-                        xi = getattr(zi, 'x_inset', 0) or 0
-                        yi = getattr(zi, 'y_inset', 0) or 0
-                        wi = getattr(zi, 'width_inset', ext_img.size[0]) or ext_img.size[0]
-                        hi = getattr(zi, 'height_inset', ext_img.size[1]) or ext_img.size[1]
-                        xi = max(0, min(xi, ext_img.size[0]-1))
-                        yi = max(0, min(yi, ext_img.size[1]-1))
-                        wi = max(1, min(wi, ext_img.size[0]-xi))
-                        hi = max(1, min(hi, ext_img.size[1]-yi))
-                        region = ext_img.crop((xi, yi, xi+wi, yi+hi))
-                        zw = max(1, int(wi * zi.zoom_factor))
-                        zh = max(1, int(hi * zi.zoom_factor))
-                        region = region.resize((zw, zh), Image.LANCZOS)
-                        processed[ar][ac] = region
-                    else:
-                        main_img = processed[r][c]
-                        miw, mih = main_img.size
-                        p_src = cfg.panels[r][c]
-                        if p_src.crop_image and p_src.crop and len(p_src.crop) == 4:
-                            fw = p_src.crop[2] - p_src.crop[0]
-                            fh = p_src.crop[3] - p_src.crop[1]
-                        elif p_src.image_name and p_src.image_name in loaded_images:
-                            fw, fh = loaded_images[p_src.image_name].size
-                        else:
-                            fw, fh = miw, mih
-                        scx = miw / max(fw, 1)
-                        scy = mih / max(fh, 1)
-                        bw = max(1, getattr(zi, 'rectangle_width', 2) or 2)
-                        bw_x = bw * scx
-                        bw_y = bw * scy
-                        cx1 = max(0, int(zi.x * scx + bw_x))
-                        cy1 = max(0, int(zi.y * scy + bw_y))
-                        cx2 = min(miw, int((zi.x + zi.width) * scx - bw_x))
-                        cy2 = min(mih, int((zi.y + zi.height) * scy - bw_y))
-                        cx2 = max(cx1 + 1, cx2)
-                        cy2 = max(cy1 + 1, cy2)
-                        region = main_img.crop((cx1, cy1, cx2, cy2))
-                        zw = max(1, int(zi.width * zi.zoom_factor * scx))
-                        zh = max(1, int(zi.height * zi.zoom_factor * scy))
-                        region = region.resize((zw, zh), Image.LANCZOS)
-                        processed[ar][ac] = region
+    _apply_adjacent_zoom_insets(cfg, processed, rows, cols)
+    _apply_zoom_target_self_overlays(cfg, processed, rows, cols)
 
     full_res_sizes2 = {}
     for r in range(rows):
@@ -2069,62 +2305,11 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
                     if processed[r][c] is None:
                         processed[r][c] = _PIL.new("RGB", (col_max_w[c], row_max_h[r]), "white")
 
-            # Adjacent Panel zoom insets — mirror the save_figure pipeline so
-            # the target cell isn't left blank for each exported frame.
-            for r in range(rows):
-                for c in range(cols):
-                    panel = cfg.panels[r][c]
-                    if panel.add_zoom_inset and panel.zoom_inset and panel.zoom_inset.inset_type == "Adjacent Panel":
-                        zi = panel.zoom_inset
-                        ar, ac = r, c
-                        if zi.side == "Top": ar -= 1
-                        elif zi.side == "Bottom": ar += 1
-                        elif zi.side == "Left": ac -= 1
-                        elif zi.side == "Right": ac += 1
-                        if 0 <= ar < rows and 0 <= ac < cols:
-                            ext_name = getattr(zi, 'separate_image_name', '') or ''
-                            if ext_name and ext_name not in ('', 'select') and ext_name in loaded_images:
-                                ext_img = loaded_images[ext_name].convert("RGB")
-                                xi = getattr(zi, 'x_inset', 0) or 0
-                                yi = getattr(zi, 'y_inset', 0) or 0
-                                wi = getattr(zi, 'width_inset', ext_img.size[0]) or ext_img.size[0]
-                                hi = getattr(zi, 'height_inset', ext_img.size[1]) or ext_img.size[1]
-                                xi = max(0, min(xi, ext_img.size[0]-1))
-                                yi = max(0, min(yi, ext_img.size[1]-1))
-                                wi = max(1, min(wi, ext_img.size[0]-xi))
-                                hi = max(1, min(hi, ext_img.size[1]-yi))
-                                region = ext_img.crop((xi, yi, xi+wi, yi+hi))
-                                zw = max(1, int(wi * zi.zoom_factor))
-                                zh = max(1, int(hi * zi.zoom_factor))
-                                region = region.resize((zw, zh), Image.LANCZOS)
-                                processed[ar][ac] = region
-                            else:
-                                main_img = processed[r][c]
-                                miw, mih = main_img.size
-                                p_src = cfg.panels[r][c]
-                                if p_src.crop_image and p_src.crop and len(p_src.crop) == 4:
-                                    fw = p_src.crop[2] - p_src.crop[0]
-                                    fh = p_src.crop[3] - p_src.crop[1]
-                                elif p_src.image_name and p_src.image_name in loaded_images:
-                                    fw, fh = loaded_images[p_src.image_name].size
-                                else:
-                                    fw, fh = miw, mih
-                                scx = miw / max(fw, 1)
-                                scy = mih / max(fh, 1)
-                                bw = max(1, getattr(zi, 'rectangle_width', 2) or 2)
-                                bw_x = bw * scx
-                                bw_y = bw * scy
-                                cx1 = max(0, int(zi.x * scx + bw_x))
-                                cy1 = max(0, int(zi.y * scy + bw_y))
-                                cx2 = min(miw, int((zi.x + zi.width) * scx - bw_x))
-                                cy2 = min(mih, int((zi.y + zi.height) * scy - bw_y))
-                                cx2 = max(cx1 + 1, cx2)
-                                cy2 = max(cy1 + 1, cy2)
-                                region = main_img.crop((cx1, cy1, cx2, cy2))
-                                zw = max(1, int(zi.width * zi.zoom_factor * scx))
-                                zh = max(1, int(zi.height * zi.zoom_factor * scy))
-                                region = region.resize((zw, zh), Image.LANCZOS)
-                                processed[ar][ac] = region
+            # Adjacent Panel zoom insets — share the helper used by the
+            # /api/preview and /api/figure/save paths so video export
+            # honours every adjacent inset configured on every panel.
+            _apply_adjacent_zoom_insets(cfg, processed, rows, cols)
+            _apply_zoom_target_self_overlays(cfg, processed, rows, cols)
 
             full_res_sizes2: Dict[Tuple[int, int], Tuple[int, int]] = {}
             for r in range(rows):
@@ -2275,6 +2460,15 @@ def render_video_cancel(job_id: str):
 
 class ProjectSaveRequest(BaseModel):
     path: str
+    # Optional analysis payload. Shape:
+    #   {
+    #     "manifest": <dict — arbitrary JSON describing tabs, etc.>,
+    #     "plots":  { "<plot_id>": "<base64-png>", ... },
+    #     "tables": { "<table_id>": "<csv text>", ... },
+    #   }
+    # The frontend ships PNG plots as base64 — we decode them here before
+    # handing off to save_project().
+    analysis: Optional[dict] = None
 
 
 @app.post("/api/project/save")
@@ -2318,7 +2512,27 @@ def save_proj(body: ProjectSaveRequest):
         import sys
         print(f"[save_proj] disk_usage check failed: {e}", file=sys.stderr, flush=True)
 
-    save_project(cfg, img_bytes, path, custom_fonts or None)
+    # Convert the optional analysis payload from the wire format
+    # ({plot_id: base64_png}) into the bytes the model layer expects.
+    analysis_payload = None
+    if body.analysis:
+        plots_in = (body.analysis or {}).get("plots") or {}
+        plots_bytes: Dict[str, bytes] = {}
+        for pid, b64 in plots_in.items():
+            if not b64:
+                continue
+            try:
+                plots_bytes[pid] = base64.b64decode(b64)
+            except Exception as _e:
+                import sys
+                print(f"[save_proj] failed to decode plot {pid}: {_e}", file=sys.stderr, flush=True)
+        analysis_payload = {
+            "manifest": (body.analysis or {}).get("manifest"),
+            "plots": plots_bytes,
+            "tables": (body.analysis or {}).get("tables") or {},
+        }
+
+    save_project(cfg, img_bytes, path, custom_fonts or None, analysis_payload)
     # Verify file was written
     if not os.path.isfile(path) or os.path.getsize(path) == 0:
         try: os.unlink(path)
@@ -2339,7 +2553,7 @@ def load_proj(body: ProjectLoadRequest):
         path = os.path.join(os.path.expanduser("~"), "Documents", path)
     if not os.path.isfile(path):
         raise HTTPException(404, f"Project file not found: {path}")
-    loaded_cfg, img_bytes_dict, font_bytes_dict = load_project(path)
+    loaded_cfg, img_bytes_dict, font_bytes_dict, analysis = load_project(path)
     cfg = loaded_cfg
     cfg.ensure_grid()
     loaded_images.clear()
@@ -2359,10 +2573,31 @@ def load_proj(body: ProjectLoadRequest):
     custom_fonts = font_bytes_dict or {}
     _recalc_min_dims()
     thumbnails = {n: _thumb_b64(img) for n, img in loaded_images.items()}
+
+    # Re-encode any analysis plot bytes as base64 strings for transport to the
+    # frontend; tables travel as plain CSV text.
+    analysis_out = None
+    if analysis is not None:
+        plots_b64: Dict[str, str] = {}
+        for pid, raw in (analysis.get("plots") or {}).items():
+            if not raw:
+                continue
+            try:
+                plots_b64[pid] = base64.b64encode(raw).decode()
+            except Exception as _e:
+                import sys
+                print(f"[load_proj] failed to encode plot {pid}: {_e}", file=sys.stderr, flush=True)
+        analysis_out = {
+            "manifest": analysis.get("manifest"),
+            "plots": plots_b64,
+            "tables": analysis.get("tables") or {},
+        }
+
     return {
         "config": _cfg_json(),
         "image_names": list(loaded_images.keys()),
         "thumbnails": thumbnails,
+        "analysis": analysis_out,
     }
 
 
@@ -2564,7 +2799,7 @@ def _load_collage_mpf(path: str):
     hit = _collage_mpf_cache.get(path)
     if hit and hit.get("mtime") == mtime:
         return hit["cfg"], hit["images"]
-    loaded_cfg, img_bytes_dict, _font_bytes = load_project(path)
+    loaded_cfg, img_bytes_dict, _font_bytes, _analysis = load_project(path)
     loaded_cfg.ensure_grid()
     local_images: Dict[str, Image.Image] = {}
     for name, data in img_bytes_dict.items():
@@ -2914,7 +3149,7 @@ def run_r_code(body: RAnalysisRequest):
     """Run R code with provided data, return stdout/stderr and any generated plots."""
     rscript = _find_rscript(body.rscript_path)
     if not rscript:
-        return {"success": False, "stdout": "", "stderr": "R is not installed. Please install R from https://cran.r-project.org/ or specify the Rscript path.", "plots": []}
+        return {"success": False, "stdout": "", "stderr": "R is not installed. Please install R from https://cran.r-project.org/ or specify the Rscript path.", "plots": [], "tables": []}
 
     with tempfile.TemporaryDirectory(prefix="mpfig_r_") as tmpdir:
         data_path = os.path.join(tmpdir, "data.csv")
@@ -2923,9 +3158,17 @@ def run_r_code(body: RAnalysisRequest):
             f.write(csv_text)
 
         plot_dir = os.path.join(tmpdir, "plots")
-        os.makedirs(plot_dir)
-        script = '# Auto-install missing packages\n'
-        script += 'if (!requireNamespace("ggplot2", quietly=TRUE)) install.packages("ggplot2", repos="https://cloud.r-project.org", quiet=TRUE)\n\n'
+        os.makedirs(plot_dir, exist_ok=True)
+        table_dir = os.path.join(tmpdir, "tables")
+        os.makedirs(table_dir, exist_ok=True)
+        script = '# Auto-install missing packages used by the generated analysis\n'
+        script += '#   ggplot2  — plotting\n'
+        script += '#   ggprism  — GraphPad Prism-style theme + palettes, add_pvalue()\n'
+        script += '#   rstatix  — t-test / Wilcoxon / ANOVA / Kruskal-Wallis stats\n'
+        script += '#   dplyr    — the %>% pipe used by the stats block\n'
+        script += 'for (.pkg in c("ggplot2", "ggprism", "rstatix", "dplyr")) {\n'
+        script += '  if (!requireNamespace(.pkg, quietly=TRUE)) install.packages(.pkg, repos="https://cloud.r-project.org", quiet=TRUE)\n'
+        script += '}\n\n'
         script += f'# Auto-generated data loading\ndata <- read.csv("{data_path.replace(chr(92), "/")}")\n\n'
         script += f'# Set plot output directory\n.plot_dir <- "{plot_dir.replace(chr(92), "/")}"\n'
         script += '.plot_count <- 0\n'
@@ -2933,6 +3176,11 @@ def run_r_code(body: RAnalysisRequest):
         script += '  .plot_count <<- .plot_count + 1\n'
         script += '  if (is.null(filename)) filename <- paste0("plot_", .plot_count, ".png")\n'
         script += '  png(file.path(.plot_dir, filename), width=width, height=height, res=res)\n'
+        script += '}\n\n'
+        script += f'# Set table output directory\n.table_dir <- "{table_dir.replace(chr(92), "/")}"\n'
+        script += 'mpfig_data <- function(df, name = "table") {\n'
+        script += '  write.csv(df, file = file.path(.table_dir, paste0(name, ".csv")), row.names = FALSE)\n'
+        script += '  invisible(df)\n'
         script += '}\n\n'
         script += '# User code\n'
         script += body.code
@@ -2949,21 +3197,76 @@ def run_r_code(body: RAnalysisRequest):
                 cwd=tmpdir
             )
         except subprocess.TimeoutExpired:
-            return {"success": False, "stdout": "", "stderr": "R script timed out after 120 seconds (may be installing packages — try again).", "plots": []}
+            return {"success": False, "stdout": "", "stderr": "R script timed out after 120 seconds (may be installing packages — try again).", "plots": [], "tables": []}
         except Exception as e:
-            return {"success": False, "stdout": "", "stderr": str(e), "plots": []}
+            return {"success": False, "stdout": "", "stderr": str(e), "plots": [], "tables": []}
 
         plots_b64 = []
         for png_path in sorted(glob_mod.glob(os.path.join(plot_dir, "*.png"))):
             with open(png_path, "rb") as pf:
                 plots_b64.append(base64.b64encode(pf.read()).decode())
 
+        tables_out = []
+        for csv_path in sorted(glob_mod.glob(os.path.join(table_dir, "*.csv"))):
+            try:
+                with open(csv_path, "r", encoding="utf-8") as cf:
+                    tables_out.append({
+                        "name": os.path.splitext(os.path.basename(csv_path))[0],
+                        "csv": cf.read(),
+                    })
+            except Exception as _e:
+                import sys
+                print(f"[run-r] failed to read table {csv_path}: {_e}", file=sys.stderr, flush=True)
+
         return {
             "success": result.returncode == 0,
             "stdout": result.stdout,
             "stderr": result.stderr,
             "plots": plots_b64,
+            "tables": tables_out,
         }
+
+
+class RConsoleRequest(BaseModel):
+    command: str
+    rscript_path: Optional[str] = None
+
+
+@app.post("/api/analysis/run-console")
+def run_r_console(body: RConsoleRequest):
+    """Run a RAW R command — no data-loading / plot boilerplate.
+
+    Powers the Analysis dialog's small R console, whose main use is
+    ad-hoc package management, e.g.  install.packages("ggsignif").
+    Uses a long timeout because a CRAN install can be slow."""
+    rscript = _find_rscript(body.rscript_path)
+    if not rscript:
+        return {"success": False, "stdout": "",
+                "stderr": "R is not installed. Install R from https://cran.r-project.org/ "
+                          "or set the Rscript path."}
+    cmd = (body.command or "").strip()
+    if not cmd:
+        return {"success": False, "stdout": "", "stderr": "Empty command."}
+    with tempfile.TemporaryDirectory(prefix="mpfig_rc_") as tmpdir:
+        # Default the CRAN mirror so bare install.packages("x") works
+        # without an interactive mirror prompt.
+        script = ('options(repos = c(CRAN = "https://cloud.r-project.org"))\n'
+                  + cmd + "\n")
+        script_path = os.path.join(tmpdir, "console.R")
+        with open(script_path, "w") as f:
+            f.write(script)
+        try:
+            result = subprocess.run(
+                [rscript, script_path],
+                capture_output=True, text=True, timeout=600, cwd=tmpdir,
+            )
+            return {"success": result.returncode == 0,
+                    "stdout": result.stdout, "stderr": result.stderr}
+        except subprocess.TimeoutExpired:
+            return {"success": False, "stdout": "",
+                    "stderr": "Command timed out after 600 seconds."}
+        except Exception as e:
+            return {"success": False, "stdout": "", "stderr": str(e)}
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────

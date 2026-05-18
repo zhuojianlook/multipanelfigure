@@ -43,8 +43,10 @@ import {
   AccordionDetails,
 } from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import DeleteIcon from "@mui/icons-material/Delete";
 import AddIcon from "@mui/icons-material/Add";
+import SettingsIcon from "@mui/icons-material/Settings";
 import AutoFixHighIcon from "@mui/icons-material/AutoFixHigh";
 import FlipIcon from "@mui/icons-material/Flip";
 import RestartAltIcon from "@mui/icons-material/RestartAlt";
@@ -89,6 +91,58 @@ function TabPanel({ children, value, index }: { children: React.ReactNode; value
       sx={{ py: active ? 2 : 0, display: active ? "block" : "none" }}
     >
       {children}
+    </Box>
+  );
+}
+
+/** Collapsible section wrapper for the Annotations tab. A panel can
+ *  accumulate many symbols / lines / areas; folding away the types you
+ *  aren't currently editing keeps the tab short instead of letting it
+ *  grow into one long scroll. Header shows the live count and hosts the
+ *  "Add" action so it stays reachable even when the section is folded. */
+function AnnotationSection({ title, count, open, onToggle, onAdd, addLabel, children }: {
+  title: string;
+  count: number;
+  open: boolean;
+  onToggle: () => void;
+  onAdd: () => void;
+  addLabel: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Box sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, overflow: "hidden" }}>
+      <Box
+        onClick={onToggle}
+        sx={{
+          display: "flex", alignItems: "center", gap: 0.25, pl: 0.25, pr: 0.5, py: 0.25,
+          bgcolor: "action.hover", cursor: "pointer", userSelect: "none",
+          "&:hover": { bgcolor: "action.selected" },
+        }}
+      >
+        <IconButton size="small" sx={{ p: 0.25 }} disableRipple>
+          {open ? <ExpandLessIcon sx={{ fontSize: 16 }} /> : <ExpandMoreIcon sx={{ fontSize: 16 }} />}
+        </IconButton>
+        <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.7rem", flex: 1, textTransform: "uppercase", letterSpacing: 0.4 }}>
+          {title} ({count})
+        </Typography>
+        <Button
+          size="small"
+          startIcon={<AddIcon sx={{ fontSize: 14 }} />}
+          onClick={(e) => { e.stopPropagation(); onAdd(); }}
+          sx={{ fontSize: "0.65rem", py: 0, px: 0.75, minWidth: 0, "& .MuiButton-startIcon": { mr: 0.25 } }}
+        >
+          {addLabel}
+        </Button>
+      </Box>
+      {open && (
+        <Box sx={{ p: 0.75, display: "flex", flexDirection: "column", gap: 0.5 }}>
+          {count === 0 ? (
+            <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.68rem", fontStyle: "italic", px: 0.5, py: 0.25 }}>
+              None yet — use “{addLabel}” to add one.
+            </Typography>
+          ) : children}
+        </Box>
+      )}
     </Box>
   );
 }
@@ -178,6 +232,10 @@ function defaultSymbol(fontName?: string): SymbolSettings {
     color: "#FF0000",
     size: 30,
     rotation: -45,
+    width: 1,             // Arrow/NarrowTriangle cross-axis thickness multiplier
+    border_style: "solid",// outline-shape border line style
+    fill_color: "",       // outline-shape centre fill ("" = outline only)
+    fill_opacity: 100,    // outline-shape centre fill opacity (0-100 %)
     label_text: "",
     label_color: "#FFFFFF",
     label_offset_x: 0,
@@ -192,14 +250,20 @@ function defaultSymbol(fontName?: string): SymbolSettings {
   };
 }
 
+function makeInsetId(): string {
+  return `inset_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
 function defaultZoomInset(): ZoomInsetSettings {
   return {
     inset_type: "Standard Zoom",
     zoom_factor: 2.0,
-    rectangle_color: "#FFFFFF",
+    rectangle_color: "#808080",
     rectangle_width: 2,
-    line_color: "#FFFFFF",
-    line_width: 1,
+    line_color: "#808080",
+    line_width: 2,
+    rectangle_style: "solid",
+    line_style: "solid",
     x: 10,
     y: 10,
     width: 100,
@@ -215,11 +279,106 @@ function defaultZoomInset(): ZoomInsetSettings {
     y_inset: 0.0,
     width_inset: 1.0,
     height_inset: 1.0,
-    side: "right",
+    side: "Right",
     margin_offset: 5,
     scale_bar: null,
     zoom_label: null,
+    rotation: 0,
+    id: makeInsetId(),
+    // parent_inset_id left undefined — root insets have no parent.
   };
+}
+
+/** Build a ScaleBarSettings derived from a source bar with mpp
+ *  divided by `zoomFactor`. Used to cascade an inherited scale bar
+ *  through an inset (so a 10 µm bar on the parent shows as 10 µm on
+ *  the inset too, just at zoomed pixel scale). */
+function deriveInheritedScaleBar(source: ScaleBarSettings, zoomFactor: number): ScaleBarSettings {
+  const z = zoomFactor > 0 ? zoomFactor : 1;
+  return { ...source, micron_per_pixel: source.micron_per_pixel / z };
+}
+
+/** Walk up the parent_inset_id chain to compute the effective scale
+ *  bar of an inset. Returns the SOURCE scalebar (not divided by the
+ *  inset's own zoom_factor — callers do that themselves).
+ *
+ *   • If `zi` has parent_inset_id pointing to another inset in the
+ *     same array: recursively get the parent's effective scalebar
+ *     (already-scaled by the chain so far), then if parent's mode
+ *     is "Inherit" (show_scale_bar_in_zoom on Std/Sep), divide by
+ *     parent.zoom_factor. If parent is "Custom" (zi.scale_bar),
+ *     return parent.scale_bar verbatim (so the cascade continues
+ *     from the customised values).
+ *   • Else: return the root panel's scalebar if any.
+ *
+ *  Returns null when no scalebar is reachable up the chain. */
+function effectiveParentScaleBar(
+  zi: ZoomInsetSettings,
+  insets: ZoomInsetSettings[],
+  rootScaleBar: ScaleBarSettings | null,
+): ScaleBarSettings | null {
+  if (zi.parent_inset_id) {
+    const parent = insets.find((it) => it.id === zi.parent_inset_id);
+    if (parent) {
+      // Compute the parent inset's OWN effective scalebar — i.e.
+      // what physically lives on it after all inheritance.
+      const parentEffective = computeOwnEffectiveScaleBar(parent, insets, rootScaleBar);
+      return parentEffective;
+    }
+  }
+  return rootScaleBar;
+}
+
+/** Compute the scalebar that physically lives on `zi` after all
+ *  inheritance is resolved. For Standard/Separate this is either
+ *  derived from the parent chain (when show_scale_bar_in_zoom is
+ *  true) or `zi.scale_bar` (custom). For Adjacent insets the
+ *  scalebar is on the TARGET panel — callers must inspect that
+ *  directly; we return null here. */
+function computeOwnEffectiveScaleBar(
+  zi: ZoomInsetSettings,
+  insets: ZoomInsetSettings[],
+  rootScaleBar: ScaleBarSettings | null,
+): ScaleBarSettings | null {
+  if (zi.inset_type === "Adjacent Panel") {
+    // The scalebar lives on the target cell, not on the inset.
+    // We can't reach that from here — caller resolves it.
+    return null;
+  }
+  if (zi.show_scale_bar_in_zoom) {
+    const source = effectiveParentScaleBar(zi, insets, rootScaleBar);
+    if (!source) return null;
+    return deriveInheritedScaleBar(source, zi.zoom_factor);
+  }
+  return zi.scale_bar ?? null;
+}
+
+/* ================================================================
+   Zoom-inset line-style helpers
+   ================================================================ */
+// Map a zoom-inset line style → CSS border-style. CSS has no native
+// "dash-dot", so it's approximated as "dashed" in the editor preview;
+// the backend render shows dash-dot accurately.
+function ziStyleToCss(style: string | undefined): string {
+  switch (style) {
+    case "dashed": return "dashed";
+    case "dotted": return "dotted";
+    case "dash-dot": return "dashed";
+    default: return "solid";
+  }
+}
+
+// Map a zoom-inset line style → SVG strokeDasharray. `w` scales the
+// dash pattern with the stroke width so it reads consistently.
+// Returns undefined for "solid" (no dash array).
+function ziStyleToDash(style: string | undefined, w: number): string | undefined {
+  const u = Math.max(1, w);
+  switch (style) {
+    case "dashed": return `${u * 3} ${u * 2}`;
+    case "dotted": return `${u} ${u * 1.6}`;
+    case "dash-dot": return `${u * 3} ${u * 1.6} ${u} ${u * 1.6}`;
+    default: return undefined;
+  }
 }
 
 /* ================================================================
@@ -1610,7 +1769,11 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   // Tab offset: video OR z-stack panels have an extra tab at index 0
   const hasFrameTab = isVideoPanel || isZStackPanel;
   const tOff = hasFrameTab ? 1 : 0;
-  // Logical tab indices (adjusted for video offset)
+  // Logical tab indices. We keep these constant across all panel kinds
+  // (zoom target or not) so per-tab undo / overlay-tab checks stay
+  // valid; the Crop tab is simply not RENDERED for zoom targets, and
+  // explicit `value={...}` props on the remaining tabs keep their
+  // routing pinned to these indices.
   const TAB_CROP = 0 + tOff;
   const TAB_ADJ = 1 + tOff;
   const TAB_LABELS = 2 + tOff;
@@ -1618,6 +1781,65 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   const TAB_ANNOT = 4 + tOff;
   const TAB_ZOOM = 5 + tOff;
   const OVERLAY_TABS = [TAB_ADJ, TAB_LABELS, TAB_SCALE, TAB_ANNOT, TAB_ZOOM];
+
+  // ── Source-of-adjacent-zoom lookup ──────────────────────────
+  // Find the (r, c, inset) of whichever SOURCE panel has an
+  // Adjacent inset pointing at this cell. Used to derive the
+  // inherited scalebar when the user clicks "Enable Scale Bar"
+  // on a zoom target. Returns null when this cell isn't a target.
+  const findAdjacentZoomSource = (): { r: number; c: number; inset: ZoomInsetSettings } | null => {
+    if (!config) return null;
+    for (let r = 0; r < config.rows; r++) {
+      for (let c = 0; c < config.cols; c++) {
+        const p = config.panels[r]?.[c];
+        if (!p?.add_zoom_inset) continue;
+        const insets = (p.zoom_insets && p.zoom_insets.length > 0)
+          ? p.zoom_insets
+          : (p.zoom_inset ? [p.zoom_inset] : []);
+        for (const zi of insets) {
+          if ((zi as { inset_type?: string }).inset_type !== "Adjacent Panel") continue;
+          const side = (zi as { side?: string }).side || "Right";
+          let tr = r, tc = c;
+          if (side === "Top") tr--; else if (side === "Bottom") tr++;
+          else if (side === "Left") tc--; else if (side === "Right") tc++;
+          if (tr === row && tc === col) return { r, c, inset: zi as ZoomInsetSettings };
+        }
+      }
+    }
+    return null;
+  };
+
+  // ── Adjacent-zoom target detection ─────────────────────────
+  // A panel is an "adjacent-zoom target" when SOME OTHER panel in the
+  // grid has an Adjacent-Panel zoom inset pointing at this cell. Such
+  // panels have no image of their own — the renderer paints them with
+  // the zoomed source. We allow editing labels / scale bar / annotations
+  // / nested zooms on them, but NOT cropping (no source image to crop).
+  //
+  // This expands the older PanelCell-only check to also walk the new
+  // `zoom_insets[]` array, so panels with multiple adjacent insets all
+  // have their targets recognised.
+  const isZoomTarget = (() => {
+    if (!config) return false;
+    for (let r = 0; r < config.rows; r++) {
+      for (let c = 0; c < config.cols; c++) {
+        const p = config.panels[r]?.[c];
+        if (!p?.add_zoom_inset) continue;
+        const insets = (p.zoom_insets && p.zoom_insets.length > 0)
+          ? p.zoom_insets
+          : (p.zoom_inset ? [p.zoom_inset] : []);
+        for (const zi of insets) {
+          if ((zi as { inset_type?: string }).inset_type !== "Adjacent Panel") continue;
+          const side = (zi as { side?: string }).side || "Right";
+          let tr = r, tc = c;
+          if (side === "Top") tr--; else if (side === "Bottom") tr++;
+          else if (side === "Left") tc--; else if (side === "Right") tc++;
+          if (tr === row && tc === col) return true;
+        }
+      }
+    }
+    return false;
+  })();
 
   // ── Per-tab undo / redo ──────────────────────────────────────
   // Each tab has its own history stack; undo/redo only affects fields
@@ -1728,9 +1950,30 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   // raw window.alert() with the same MUI Dialog style used by the
   // toolbar's "New" confirmation, so the popup matches the app theme.
   const [syncSeekResult, setSyncSeekResult] = useState<{ title: string; message: string } | null>(null);
+  // Index of the zoom inset currently being edited via the existing
+  // (singular) zoom UI. The data model now supports panel.zoom_insets
+  // (an array); we keep panel.zoom_inset mirrored to
+  // zoom_insets[selectedInsetIdx] inside updateLocal so the existing
+  // editor controls light up the right entry.
+  const [selectedInsetIdx, setSelectedInsetIdx] = useState(0);
   const [selectedAnnotIdx, setSelectedAnnotIdx] = useState<{ type: "symbol" | "line" | "area"; idx: number } | null>(null);
+  // Per-type collapse state for the Annotations tab's three sections
+  // (Symbols / Lines / Areas), so the tab stays compact when a panel has
+  // many annotations of many types.
+  const [annotSectionsOpen, setAnnotSectionsOpen] = useState<{ symbol: boolean; line: boolean; area: boolean }>({ symbol: true, line: true, area: true });
   const [magicWandLoading, setMagicWandLoading] = useState(false);
   const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // When an annotation becomes active (e.g. clicked on the preview), make
+  // sure its section is expanded — otherwise its editing form would be
+  // hidden inside a folded section. Keyed on the selection only, so the
+  // user can still freely fold/unfold sections afterwards.
+  useEffect(() => {
+    if (selectedAnnotIdx) {
+      const t = selectedAnnotIdx.type;
+      setAnnotSectionsOpen((prev) => (prev[t] ? prev : { ...prev, [t]: true }));
+    }
+  }, [selectedAnnotIdx]);
 
   // Crop canvas state
   const [origImgSrc, setOrigImgSrc] = useState<string>("");
@@ -1751,7 +1994,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
 
   useEffect(() => {
     if (panel && open) {
-      const p = JSON.parse(JSON.stringify(panel)) as PanelInfo;
+      let p = JSON.parse(JSON.stringify(panel)) as PanelInfo;
       // Ensure new fields exist (for configs saved before these were added)
       if (p.rotation === undefined) p.rotation = 0;
       if (p.flip_horizontal === undefined) p.flip_horizontal = false;
@@ -1780,7 +2023,30 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       // Migrate old single input_black/input_white to per-channel
       if (pu.input_black !== undefined) { pu.input_black_r = pu.input_black; pu.input_black_g = pu.input_black; pu.input_black_b = pu.input_black; delete pu.input_black; }
       if (pu.input_white !== undefined) { pu.input_white_r = pu.input_white; pu.input_white_g = pu.input_white; pu.input_white_b = pu.input_white; delete pu.input_white; }
+      // Hydrate zoom_insets[] from the legacy singular zoom_inset for
+      // projects saved before the array existed. Without this the new
+      // array-aware backend renderer would see an empty list and fall
+      // back to the legacy path; mirroring up-front keeps everything
+      // on the array path.
+      if (p.add_zoom_inset && p.zoom_inset && (!p.zoom_insets || p.zoom_insets.length === 0)) {
+        p = { ...p, zoom_insets: [p.zoom_inset] };
+      }
+      // CRITICAL: the singular `zoom_inset` is the editor's working
+      // copy of `zoom_insets[selectedInsetIdx]`. On save it holds the
+      // LAST-edited inset, which may not be index 0. Since we reset
+      // selectedInsetIdx to 0 below, we must also point `zoom_inset`
+      // at `zoom_insets[0]` — otherwise the editor shows inset 0's
+      // chip but inset N's data, and the first edit mirrors inset N's
+      // data into arr[0], clobbering inset 0.
+      if (p.zoom_insets && p.zoom_insets.length > 0) {
+        // Shallow copy so the singular and the array slot aren't the
+        // same object reference (the mirror logic replaces the slot
+        // with a fresh object on the first edit anyway, but copying
+        // up-front avoids any transient aliasing surprises).
+        p = { ...p, zoom_inset: { ...p.zoom_insets[0] } };
+      }
       setLocal(p);
+      setSelectedInsetIdx(0);
       // Hydrate the video range / play-range fields from the model.
       // Defaults preserve old behaviour for legacy projects.
       setVideoFrame(p.frame ?? 0);
@@ -1800,8 +2066,12 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       };
       historyRef.current = fresh;
       setHistoryVersion((v) => v + 1);
-      // Restore last-used tab (don't reset to 0)
-      _setTabIdx(_lastTabIdx);
+      // Restore last-used tab (don't reset to 0). For adjacent-zoom
+      // target panels the Crop tab is hidden, so if the last-used tab
+      // was Crop we redirect to Adjustments — otherwise the user would
+      // land on a non-existent tab.
+      const restored = isZoomTarget && _lastTabIdx === TAB_CROP ? TAB_ADJ : _lastTabIdx;
+      _setTabIdx(restored);
       setPreviewB64("");
       const preset = ratioStrToPreset(p.aspect_ratio_str);
       setAspectPreset(preset);
@@ -2045,28 +2315,47 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     }, 300);
   }, [row, col]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Rendered preview: matplotlib-rendered single panel with labels + scale bar
+  // Rendered preview: matplotlib-rendered single panel with labels + scale bar.
+  // For adjacent-zoom target panels (no image_name) the backend synthesises
+  // the zoomed image from the source panel — so we still call through to it,
+  // gated on `cur.image_name || isZoomTarget` instead of just image_name.
+  //
+  // CRITICAL: zoom-target panels still need their panel state PATCHED to
+  // the backend before re-rendering — otherwise the matplotlib pass
+  // reads stale scale_bar / labels / etc. and the preview never reflects
+  // mid-drag updates. Without this fix the user observed the bar
+  // staying at its old position during drag and only updating when the
+  // mouse was released (because release triggers a render with state
+  // that happens to match by then). Now we always sync first.
   const refreshRenderedPreview = useCallback(() => {
     if (renderedPreviewTimerRef.current) clearTimeout(renderedPreviewTimerRef.current);
     renderedPreviewTimerRef.current = setTimeout(async () => {
       try {
         const cur = localRef.current;
-        if (!cur?.image_name) return;
-        // Sync panel state first
-        await api.patchPanelAndPreview(row, col, cur as unknown as Record<string, unknown>);
+        if (!cur?.image_name && !isZoomTarget) return;
+        if (cur?.image_name) {
+          // Image-bearing path: atomic patch+preview returns the base
+          // preview too, which we re-use for previewB64.
+          await api.patchPanelAndPreview(row, col, cur as unknown as Record<string, unknown>);
+        } else if (cur) {
+          // Zoom-target path: just sync the panel state. There's no
+          // base preview to fetch (the synthesised image comes from
+          // /api/panel-rendered-preview below).
+          await api.patchPanel(row, col, cur as unknown as Record<string, unknown>);
+        }
         const resp = await api.getPanelRenderedPreview(row, col);
         if (resp.image) setRenderedPreviewB64(resp.image);
       } catch { /* ignore */ }
     }, 200);
-  }, [row, col]);
+  }, [row, col, isZoomTarget]);
 
   // Refresh rendered preview when overlays change or tab switches to overlay tabs
   const overlayHash = `${local?.labels?.length || 0}-${local?.add_scale_bar || false}-${local?.scale_bar?.bar_length_microns || 0}-${local?.scale_bar?.font_size || 0}-${local?.symbols?.length || 0}`;
   useEffect(() => {
-    if (OVERLAY_TABS.includes(tabIdx) && local?.image_name) {
+    if (OVERLAY_TABS.includes(tabIdx) && (local?.image_name || isZoomTarget)) {
       refreshRenderedPreview();
     }
-  }, [tabIdx, refreshRenderedPreview, overlayHash]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tabIdx, refreshRenderedPreview, overlayHash, isZoomTarget]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Fetch external image thumbnail and dimensions when it changes
   useEffect(() => {
@@ -2109,53 +2398,79 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       if (!prev) return prev;
       let next = { ...prev, ...patch };
 
-      // When crop changes, transform line/area/symbol coordinates to maintain
-      // physical position on the original image (critical for measurement accuracy)
+      // When crop changes: zoom inset coordinates are stored in
+      // post-crop pixel space, so we deliberately do NOT transform
+      // them — the box stays where the user placed it numerically.
+      // We only intervene when the new crop would push the source
+      // rectangle (or target position) outside the new bounds, in
+      // which case we reset position to a sensible default rather
+      // than letting the box silently disappear off-image.
       if (patch.crop !== undefined || patch.crop_image !== undefined) {
         const oW = origFullW > 0 ? origFullW : 1000;
         const oH = origFullH > 0 ? origFullH : 1000;
-        const oldCrop = (prev.crop_image && prev.crop?.length === 4) ? prev.crop : [0, 0, oW, oH];
         const newCrop = (next.crop_image && next.crop?.length === 4) ? next.crop : [0, 0, oW, oH];
-        const oldCx = oldCrop[0], oldCy = oldCrop[1], oldCw = oldCrop[2] - oldCrop[0], oldCh = oldCrop[3] - oldCrop[1];
-        const newCx = newCrop[0], newCy = newCrop[1], newCw = newCrop[2] - newCrop[0], newCh = newCrop[3] - newCrop[1];
+        const newCw = newCrop[2] - newCrop[0];
+        const newCh = newCrop[3] - newCrop[1];
 
-        if (oldCw > 0 && oldCh > 0 && newCw > 0 && newCh > 0) {
-          // Annotations are stored in absolute pixel coords relative to the
-          // ORIGINAL image. They do NOT move when crop changes — they stay
-          // fixed to the pixels they were drawn on.
-          // Only zoom inset coordinates need transformation (they're in pixel coords).
-
-          const transformPt = (pctX: number, pctY: number): [number, number] => {
-            const origPx = pctX / 100 * oldCw + oldCx;
-            const origPy = pctY / 100 * oldCh + oldCy;
-            return [(origPx - newCx) / newCw * 100, (origPy - newCy) / newCh * 100];
+        if (newCw > 0 && newCh > 0) {
+          const resetIfOutOfBounds = (zi: ZoomInsetSettings): ZoomInsetSettings => {
+            const out = { ...zi };
+            const srcOutside = out.x < 0 || out.y < 0 || out.x + out.width > newCw || out.y + out.height > newCh;
+            if (srcOutside) {
+              // Reset source rect to a centred ~50% box, clamped to bounds.
+              const w = Math.max(20, Math.min(out.width, Math.floor(newCw * 0.5)));
+              const h = Math.max(20, Math.min(out.height, Math.floor(newCh * 0.5)));
+              out.x = Math.max(0, Math.floor((newCw - w) / 2));
+              out.y = Math.max(0, Math.floor((newCh - h) / 2));
+              out.width = w;
+              out.height = h;
+            }
+            // Target position: only reset if completely off-canvas.
+            const tx = out.target_x ?? 0;
+            const ty = out.target_y ?? 0;
+            if (tx < 0 || ty < 0 || tx > newCw || ty > newCh) {
+              out.target_x = Math.max(0, Math.min(newCw - 1, Math.floor(newCw * 0.6)));
+              out.target_y = Math.max(0, Math.min(newCh - 1, Math.floor(newCh * 0.05)));
+            }
+            return out;
           };
 
-          // Transform zoom inset source region (pixel coords → % → transform → % → pixel coords)
+          // Apply to legacy singular field and all entries in the array.
           if (next.zoom_inset && next.add_zoom_inset) {
-            const zi = { ...next.zoom_inset };
-            // Source region: convert pixel coords to old-crop-% then transform to new-crop-%
-            const srcXPct = zi.x / oldCw * 100;
-            const srcYPct = zi.y / oldCh * 100;
-            const srcWPct = zi.width / oldCw * 100;
-            const srcHPct = zi.height / oldCh * 100;
-            const [newSrcXPct, newSrcYPct] = transformPt(srcXPct, srcYPct);
-            const [newSrcEndXPct, newSrcEndYPct] = transformPt(srcXPct + srcWPct, srcYPct + srcHPct);
-            zi.x = Math.round(newSrcXPct / 100 * newCw);
-            zi.y = Math.round(newSrcYPct / 100 * newCh);
-            zi.width = Math.round((newSrcEndXPct - newSrcXPct) / 100 * newCw);
-            zi.height = Math.round((newSrcEndYPct - newSrcYPct) / 100 * newCh);
-            // Target position
-            const tgtXPct = zi.target_x / oldCw * 100;
-            const tgtYPct = zi.target_y / oldCh * 100;
-            const [newTgtXPct, newTgtYPct] = transformPt(tgtXPct, tgtYPct);
-            zi.target_x = Math.round(newTgtXPct / 100 * newCw);
-            zi.target_y = Math.round(newTgtYPct / 100 * newCh);
-            next = { ...next, zoom_inset: zi };
+            next = { ...next, zoom_inset: resetIfOutOfBounds(next.zoom_inset) };
+          }
+          if (next.zoom_insets && next.zoom_insets.length > 0) {
+            next = { ...next, zoom_insets: next.zoom_insets.map(resetIfOutOfBounds) };
           }
         }
       }
 
+      // Mirror panel.zoom_inset (legacy singular) into
+      // panel.zoom_insets[selectedInsetIdx] so the array stays the
+      // source of truth for backend rendering. The mirror only runs
+      // when the caller did NOT pass zoom_insets explicitly — if it
+      // did (e.g. addInset / removeCurrent), the caller has already
+      // computed the correct array and we must trust it. Otherwise
+      // a stale selectedInsetIdx (React state batching) would
+      // overwrite the wrong slot and clobber existing insets.
+      if (patch.zoom_inset !== undefined || patch.add_zoom_inset !== undefined || patch.zoom_insets !== undefined) {
+        if (patch.zoom_insets !== undefined) {
+          // Caller-supplied array wins. Still honour the toggle —
+          // disabling clears the array regardless.
+          if (next.add_zoom_inset === false) {
+            next = { ...next, zoom_insets: [] };
+          }
+        } else {
+          const arr = (next.zoom_insets ?? []).slice();
+          if (next.add_zoom_inset && next.zoom_inset) {
+            while (arr.length <= selectedInsetIdx) arr.push(next.zoom_inset);
+            arr[selectedInsetIdx] = next.zoom_inset;
+          } else if (!next.add_zoom_inset) {
+            arr.length = 0;
+          }
+          next = { ...next, zoom_insets: arr };
+        }
+      }
       localRef.current = next;
       return next;
     });
@@ -2407,14 +2722,18 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
               const isVid = VIDEO_EXTS.some(ext => imgName.toLowerCase().endsWith(ext));
               return (
                 <Tabs value={tabIdx} onChange={(_, v) => setTabIdx(v)} variant="scrollable" scrollButtons="auto">
-                  {isVid && <Tab label="Play & Seek" />}
-                  {!isVid && isZStackPanel && <Tab label="Z-Stack Slice" />}
-                  <Tab label="Crop/Resize" />
-                  <Tab label="Adjustments" />
-                  <Tab label="Labels" />
-                  <Tab label="Scale Bar" />
-                  <Tab label="Annotations" />
-                  <Tab label="Zoom Inset" />
+                  {isVid && <Tab label="Play & Seek" value={0} />}
+                  {!isVid && isZStackPanel && <Tab label="Z-Stack Slice" value={0} />}
+                  {/* Crop/Resize is omitted for adjacent-zoom target panels
+                      — they have no source image of their own. The other
+                      tabs use explicit `value` props so their routing
+                      stays pinned to TAB_ADJ … TAB_ZOOM regardless. */}
+                  {!isZoomTarget && <Tab label="Crop/Resize" value={TAB_CROP} />}
+                  <Tab label="Adjustments" value={TAB_ADJ} />
+                  <Tab label="Labels" value={TAB_LABELS} />
+                  <Tab label="Scale Bar" value={TAB_SCALE} />
+                  <Tab label="Annotations" value={TAB_ANNOT} />
+                  <Tab label="Zoom Inset" value={TAB_ZOOM} />
                 </Tabs>
               );
             })()}
@@ -3254,15 +3573,78 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   checked={local.add_scale_bar}
                   onChange={(e) => {
                     const enabled = e.target.checked;
+                    // ── Inherit-from-source default for zoom targets ──
+                    // Adjacent-zoom target panels have no inherent
+                    // pixels-per-micron of their own (their image is a
+                    // magnified crop of someone else's). When the user
+                    // enables a scale bar here, default the values to
+                    // INHERIT from the source panel × the zoom factor,
+                    // so the bar shows the correct physical length out
+                    // of the box. The user can still customise the
+                    // numbers manually afterwards.
+                    let nextSb = local.scale_bar;
+                    if (enabled && !local.scale_bar) {
+                      if (isZoomTarget) {
+                        const src = findAdjacentZoomSource();
+                        const srcPanel = src ? config?.panels[src.r]?.[src.c] : null;
+                        if (src && srcPanel?.add_scale_bar && srcPanel.scale_bar) {
+                          const zoom = src.inset.zoom_factor || 1;
+                          nextSb = {
+                            ...srcPanel.scale_bar,
+                            micron_per_pixel: srcPanel.scale_bar.micron_per_pixel / (zoom > 0 ? zoom : 1),
+                          };
+                        } else {
+                          nextSb = defaultScaleBar();
+                        }
+                      } else {
+                        nextSb = defaultScaleBar();
+                      }
+                    }
                     updateLocal({
                       add_scale_bar: enabled,
-                      scale_bar: enabled && !local.scale_bar ? defaultScaleBar() : local.scale_bar,
+                      scale_bar: nextSb,
                     });
                   }}
                 />
               }
               label="Enable Scale Bar"
             />
+            {isZoomTarget && local.add_scale_bar && (() => {
+              const src = findAdjacentZoomSource();
+              const srcPanel = src ? config?.panels[src.r]?.[src.c] : null;
+              if (!src || !srcPanel?.add_scale_bar || !srcPanel.scale_bar) return null;
+              const zoom = src.inset.zoom_factor || 1;
+              const inheritMpp = srcPanel.scale_bar.micron_per_pixel / (zoom > 0 ? zoom : 1);
+              const currentMpp = local.scale_bar?.micron_per_pixel ?? 0;
+              const isInherited = Math.abs(currentMpp - inheritMpp) < 1e-6;
+              return (
+                <Alert
+                  severity={isInherited ? "success" : "info"}
+                  action={
+                    !isInherited && (
+                      <Button
+                        size="small"
+                        onClick={() => {
+                          updateLocal({
+                            scale_bar: {
+                              ...srcPanel.scale_bar!,
+                              micron_per_pixel: inheritMpp,
+                            },
+                          });
+                        }}
+                      >
+                        Inherit
+                      </Button>
+                    )
+                  }
+                  sx={{ "& .MuiAlert-message": { fontSize: "0.7rem", py: 0.25 } }}
+                >
+                  {isInherited
+                    ? `Inherited from R${src.r + 1}C${src.c + 1} (${srcPanel.scale_bar.micron_per_pixel.toFixed(4)} µm/px ÷ ${zoom} = ${inheritMpp.toFixed(4)} µm/px).`
+                    : `This is an adjacent-zoom target of R${src.r + 1}C${src.c + 1}. Click "Inherit" to re-derive mpp from that panel × ${zoom}× zoom factor.`}
+                </Alert>
+              );
+            })()}
             {local.add_scale_bar && local.scale_bar && (() => {
               const sb = local.scale_bar!;
               const unitLabels: Record<string, string> = { km: "km", m: "m", cm: "cm", mm: "mm", um: "\u00B5m", nm: "nm", pm: "pm" };
@@ -3471,17 +3853,26 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 <Button size="small" sx={{ color: "#fff", fontSize: "0.6rem", minWidth: 0, p: 0.25 }} onClick={() => setSelectedAnnotIdx(null)}>Clear</Button>
               </Box>
             )}
+            <AnnotationSection
+              title="Symbols"
+              count={local.symbols.length}
+              open={annotSectionsOpen.symbol}
+              onToggle={() => setAnnotSectionsOpen((p) => ({ ...p, symbol: !p.symbol }))}
+              onAdd={addSymbol}
+              addLabel="Add"
+            >
             {local.symbols.map((sym, i) => {
               const isActive = selectedAnnotIdx?.type === "symbol" && selectedAnnotIdx.idx === i;
               return (
-              <Box key={i} onClick={() => setSelectedAnnotIdx({ type: "symbol", idx: i })} sx={{ border: "1px solid", borderColor: isActive ? "primary.main" : "divider", borderRadius: 1, p: 1.5, cursor: "pointer", "&:hover": { borderColor: "primary.light" }, opacity: selectedAnnotIdx && !isActive ? 0.6 : 1, transition: "opacity 0.15s" }}>
-                {/* Header row */}
-                <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.75rem", color: isActive ? "primary.main" : "text.primary" }}>
-                    {sym.name || `${sym.shape} Annotation ${i + 1}`} {isActive ? "(editing)" : "- click to edit"}
+              <Box key={i} onClick={() => setSelectedAnnotIdx({ type: "symbol", idx: i })} sx={{ border: "1px solid", borderColor: isActive ? "primary.main" : "divider", borderRadius: 1, p: isActive ? 1.5 : 0.75, cursor: "pointer", "&:hover": { borderColor: "primary.light" }, opacity: selectedAnnotIdx && !isActive ? 0.55 : 1, transition: "opacity 0.15s" }}>
+                {/* Header row — compact when collapsed, expands inline when active */}
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                  <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.72rem", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: isActive ? "primary.main" : "text.primary" }}>
+                    {sym.name || `Annotation ${i + 1}`}
+                    <Box component="span" sx={{ color: "text.disabled", fontWeight: 400, ml: 0.5 }}>· {sym.shape}{isActive ? " · editing" : ""}</Box>
                   </Typography>
                   <IconButton onClick={(e) => { e.stopPropagation(); removeSymbol(i); }} size="small" sx={{ p: 0.25 }}>
-                    <DeleteIcon sx={{ fontSize: 16 }} />
+                    <DeleteIcon sx={{ fontSize: 14 }} />
                   </IconButton>
                 </Box>
                 {/* Controls only shown when active */}
@@ -3517,10 +3908,65 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     type="color"
                     value={sym.color}
                     onChange={(e) => updateSymbol(i, { color: e.target.value })}
-                    title="Symbol color"
+                    title={["Triangle","Star","Rectangle","Ellipse","Cross"].includes(sym.shape) ? "Border / outline color" : "Symbol color"}
                     style={{ width: 28, height: 28, border: "none", padding: 0, cursor: "pointer", borderRadius: 4, marginLeft: 8, verticalAlign: "middle" }}
                   />
                 </Box>
+
+                {/* Width — Arrow / NarrowTriangle only. Scales the symbol's
+                    cross-axis thickness without changing its length. */}
+                {(sym.shape === "Arrow" || sym.shape === "NarrowTriangle") && (
+                  <>
+                    <Typography variant="caption" sx={{ fontWeight: 600, mt: 1.5, mb: 0.5, display: "block", fontSize: "0.7rem" }}>Width</Typography>
+                    <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                      <Typography variant="caption" sx={{ width: 32, flexShrink: 0 }}>Thick</Typography>
+                      <Slider size="small" value={sym.width ?? 1} min={0.25} max={4} step={0.25}
+                        onChange={(_, v) => updateSymbol(i, { width: v as number })} sx={{ flex: 1, mx: 1 }} />
+                      <TextField type="number" value={sym.width ?? 1}
+                        onChange={(e) => updateSymbol(i, { width: Math.max(0.1, Number(e.target.value) || 1) })}
+                        size="small" inputProps={{ min: 0.1, max: 8, step: 0.25 }}
+                        sx={{ width: 60, "& input": { fontSize: "0.8rem", px: 1, py: 0.75, textAlign: "center" } }} />
+                      <IconButton size="small" title="Reset width" onClick={() => updateSymbol(i, { width: 1 })} sx={{ p: 0.25, ml: 0.5 }}><RestartAltIcon sx={{ fontSize: 14 }} /></IconButton>
+                    </Box>
+                  </>
+                )}
+
+                {/* Border style + centre fill — outline shapes only.
+                    (Arrow / NarrowTriangle / Arrowhead are solid shapes;
+                    Cross is open so it has no centre fill.) */}
+                {["Triangle","Star","Rectangle","Ellipse","Cross"].includes(sym.shape) && (
+                  <>
+                    <Typography variant="caption" sx={{ fontWeight: 600, mt: 1.5, mb: 0.5, display: "block", fontSize: "0.7rem" }}>Border &amp; Fill</Typography>
+                    <ToggleButtonGroup value={sym.border_style || "solid"} exclusive size="small"
+                      onChange={(_, v) => { if (v) updateSymbol(i, { border_style: v }); }}
+                      sx={{ "& .MuiToggleButton-root": { px: 1, py: 0.25, fontSize: "0.65rem", textTransform: "none" } }}>
+                      <ToggleButton value="solid">Solid</ToggleButton>
+                      <ToggleButton value="dashed">Dashed</ToggleButton>
+                      <ToggleButton value="dotted">Dotted</ToggleButton>
+                    </ToggleButtonGroup>
+                    {sym.shape !== "Cross" && (
+                      <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", mt: 1 }}>
+                        <FormControlLabel sx={{ ml: 0, mr: 0.5 }}
+                          control={<Checkbox size="small" checked={!!sym.fill_color}
+                            onChange={(e) => updateSymbol(i, { fill_color: e.target.checked ? (sym.fill_color || sym.color || "#FF0000") : "" })} />}
+                          label={<Typography variant="caption" sx={{ fontSize: "0.72rem" }}>Centre fill</Typography>} />
+                        <input type="color" value={sym.fill_color || sym.color || "#FF0000"}
+                          disabled={!sym.fill_color}
+                          onChange={(e) => updateSymbol(i, { fill_color: e.target.value })}
+                          title="Centre fill color"
+                          style={{ width: 28, height: 28, border: "none", padding: 0, cursor: sym.fill_color ? "pointer" : "default", borderRadius: 4, opacity: sym.fill_color ? 1 : 0.4 }} />
+                      </Box>
+                    )}
+                    {sym.shape !== "Cross" && !!sym.fill_color && (
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
+                        <Typography variant="caption" sx={{ width: 48, flexShrink: 0, fontSize: "0.72rem" }}>Opacity</Typography>
+                        <Slider size="small" value={sym.fill_opacity ?? 100} min={0} max={100} step={5}
+                          onChange={(_, v) => updateSymbol(i, { fill_opacity: v as number })} sx={{ flex: 1, mx: 1 }} />
+                        <Typography variant="caption" sx={{ width: 36, textAlign: "right", fontSize: "0.72rem" }}>{Math.round(sym.fill_opacity ?? 100)}%</Typography>
+                      </Box>
+                    )}
+                  </>
+                )}
 
                 {/* Position */}
                 <Typography variant="caption" sx={{ fontWeight: 600, mt: 1.5, mb: 0.5, display: "block", fontSize: "0.7rem" }}>Position</Typography>
@@ -3606,19 +4052,44 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
               </Box>
               );
             })}
-            <Button startIcon={<AddIcon />} onClick={addSymbol} size="small" variant="outlined">Add Annotation</Button>
+            </AnnotationSection>
 
             {/* ---- Line Annotations ---- */}
-            <Typography variant="caption" sx={{ fontWeight: 600, mt: 2 }}>Lines</Typography>
-            <Divider />
+            <AnnotationSection
+              title="Lines"
+              count={(local.lines ?? []).length}
+              open={annotSectionsOpen.line}
+              onToggle={() => setAnnotSectionsOpen((p) => ({ ...p, line: !p.line }))}
+              onAdd={() => {
+                const lines = [...(local.lines ?? []), {
+                  name: `Line ${(local.lines ?? []).length + 1}`,
+                  points: [], color: "#FFFF00", width: 2, dash_style: "solid",
+                  line_type: "straight", is_curved: false, show_measure: false, measure_text: "",
+                  measure_unit: "um", measure_font_size: 12, measure_color: "#FFFF00",
+                  measure_font_name: config?.column_labels?.[0]?.font_name || "arial.ttf", measure_font_style: [],
+                  measure_styled_segments: [], measure_position_x: -1, measure_position_y: -1,
+                }];
+                updateLocal({ lines } as unknown as Partial<PanelInfo>);
+              }}
+              addLabel="Add"
+            >
             {(local.lines ?? []).map((line, i) => {
               const isLineActive = selectedAnnotIdx?.type === "line" && selectedAnnotIdx.idx === i;
               return (
-              <Box key={`line-${i}`} onClick={() => setSelectedAnnotIdx({ type: "line", idx: i })} sx={{ border: "2px solid", borderColor: isLineActive ? "primary.main" : "divider", borderRadius: 1, p: 1, mb: 0.5, cursor: "pointer", "&:hover": { borderColor: "primary.light" }, opacity: selectedAnnotIdx && !isLineActive ? 0.6 : 1, transition: "opacity 0.15s" }}>
+              <Box key={`line-${i}`} onClick={() => setSelectedAnnotIdx({ type: "line", idx: i })} sx={{ border: "1px solid", borderColor: isLineActive ? "primary.main" : "divider", borderRadius: 1, p: isLineActive ? 1 : 0.75, cursor: "pointer", "&:hover": { borderColor: "primary.light" }, opacity: selectedAnnotIdx && !isLineActive ? 0.55 : 1, transition: "opacity 0.15s" }}>
                 {!isLineActive ? (
-                  <Typography variant="caption" sx={{ fontWeight: 600, color: "text.primary" }}>
-                    {line.name || `Line ${i + 1}`} ({line.points?.length ?? 0} pts) - click to edit
-                  </Typography>
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                    <Box sx={{ width: 10, height: 10, flexShrink: 0, borderRadius: 0.5, bgcolor: line.color }} />
+                    <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.72rem", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "text.primary" }}>
+                      {line.name || `Line ${i + 1}`}
+                      <Box component="span" sx={{ color: "text.disabled", fontWeight: 400, ml: 0.5 }}>· {line.points?.length ?? 0} pts</Box>
+                    </Typography>
+                    <IconButton size="small" sx={{ p: 0.25 }} onClick={(e) => {
+                      e.stopPropagation();
+                      const lines = (local.lines ?? []).filter((_, idx) => idx !== i);
+                      updateLocal({ lines } as unknown as Partial<PanelInfo>);
+                    }}><DeleteIcon sx={{ fontSize: 14 }} /></IconButton>
+                  </Box>
                 ) : <>
                 <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 0.5 }}>
                   <TextField label="Name" value={line.name} onClick={(e) => e.stopPropagation()} onChange={(e) => {
@@ -3821,29 +4292,45 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
               </Box>
               );
             })}
-            <Button size="small" variant="outlined" onClick={() => {
-              const lines = [...(local.lines ?? []), {
-                name: `Line ${(local.lines ?? []).length + 1}`,
-                points: [], color: "#FFFF00", width: 2, dash_style: "solid",
-                line_type: "straight", is_curved: false, show_measure: false, measure_text: "",
-                measure_unit: "um", measure_font_size: 12, measure_color: "#FFFF00",
-                measure_font_name: config?.column_labels?.[0]?.font_name || "arial.ttf", measure_font_style: [],
-                measure_styled_segments: [], measure_position_x: -1, measure_position_y: -1,
-              }];
-              updateLocal({ lines } as unknown as Partial<PanelInfo>);
-            }}>Add Line</Button>
+            </AnnotationSection>
 
             {/* ---- Area Annotations ---- */}
-            <Typography variant="caption" sx={{ fontWeight: 600, mt: 2 }}>Areas</Typography>
-            <Divider />
+            <AnnotationSection
+              title="Areas"
+              count={(local.areas ?? []).length}
+              open={annotSectionsOpen.area}
+              onToggle={() => setAnnotSectionsOpen((p) => ({ ...p, area: !p.area }))}
+              onAdd={() => {
+                const areas = [...(local.areas ?? []), {
+                  name: `Area ${(local.areas ?? []).length + 1}`,
+                  shape: "Custom", points: [], color: "#FF000040", border_color: "#FF0000",
+                  border_width: 1, show_measure: true, measure_text: "",
+                  measure_unit: local.scale_bar?.unit || "um",
+                  measure_font_size: 12, measure_color: "#FF0000",
+                  measure_font_name: config?.column_labels?.[0]?.font_name || "arial.ttf",
+                  measure_styled_segments: [],
+                }];
+                updateLocal({ areas } as unknown as Partial<PanelInfo>);
+              }}
+              addLabel="Add"
+            >
             {(local.areas ?? []).map((area, i) => {
               const isAreaActive = selectedAnnotIdx?.type === "area" && selectedAnnotIdx.idx === i;
               return (
-              <Box key={`area-${i}`} onClick={() => setSelectedAnnotIdx({ type: "area", idx: i })} sx={{ border: "2px solid", borderColor: isAreaActive ? "primary.main" : "divider", borderRadius: 1, p: 1, mb: 0.5, cursor: "pointer", "&:hover": { borderColor: "primary.light" }, opacity: selectedAnnotIdx && !isAreaActive ? 0.6 : 1, transition: "opacity 0.15s" }}>
+              <Box key={`area-${i}`} onClick={() => setSelectedAnnotIdx({ type: "area", idx: i })} sx={{ border: "1px solid", borderColor: isAreaActive ? "primary.main" : "divider", borderRadius: 1, p: isAreaActive ? 1 : 0.75, cursor: "pointer", "&:hover": { borderColor: "primary.light" }, opacity: selectedAnnotIdx && !isAreaActive ? 0.55 : 1, transition: "opacity 0.15s" }}>
                 {!isAreaActive ? (
-                  <Typography variant="caption" sx={{ fontWeight: 600, color: "text.primary" }}>
-                    {area.name || `Area ${i + 1}`} ({area.shape}) - click to edit
-                  </Typography>
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                    <Box sx={{ width: 10, height: 10, flexShrink: 0, borderRadius: 0.5, bgcolor: area.border_color || area.color?.slice(0, 7) || "#FF0000" }} />
+                    <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.72rem", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "text.primary" }}>
+                      {area.name || `Area ${i + 1}`}
+                      <Box component="span" sx={{ color: "text.disabled", fontWeight: 400, ml: 0.5 }}>· {area.shape}</Box>
+                    </Typography>
+                    <IconButton size="small" sx={{ p: 0.25 }} onClick={(e) => {
+                      e.stopPropagation();
+                      const areas = (local.areas ?? []).filter((_, idx) => idx !== i);
+                      updateLocal({ areas } as unknown as Partial<PanelInfo>);
+                    }}><DeleteIcon sx={{ fontSize: 14 }} /></IconButton>
+                  </Box>
                 ) : <>
                 {/* Name + delete */}
                 <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -4099,18 +4586,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
               </Box>
               );
             })}
-            <Button size="small" variant="outlined" onClick={() => {
-              const areas = [...(local.areas ?? []), {
-                name: `Area ${(local.areas ?? []).length + 1}`,
-                shape: "Custom", points: [], color: "#FF000040", border_color: "#FF0000",
-                border_width: 1, show_measure: true, measure_text: "",
-                measure_unit: local.scale_bar?.unit || "um",
-                measure_font_size: 12, measure_color: "#FF0000",
-                measure_font_name: config?.column_labels?.[0]?.font_name || "arial.ttf",
-                measure_styled_segments: [],
-              }];
-              updateLocal({ areas } as unknown as Partial<PanelInfo>);
-            }}>Add Area</Button>
+            </AnnotationSection>
           </Box>
         </TabPanel>
 
@@ -4125,9 +4601,22 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   checked={local.add_zoom_inset}
                   onChange={(e) => {
                     const enabled = e.target.checked;
+                    let next = local.zoom_inset;
+                    if (enabled && !local.zoom_inset) {
+                      next = defaultZoomInset();
+                      // Cascade default: when the parent panel has a
+                      // scalebar, a freshly-enabled inset starts in
+                      // Inherit mode (show_scale_bar_in_zoom for
+                      // Standard/Separate; the Adjacent target's
+                      // scalebar is stamped on the Apply path when
+                      // the user picks the Adjacent type).
+                      if (local.add_scale_bar && local.scale_bar) {
+                        next = { ...next, show_scale_bar_in_zoom: true };
+                      }
+                    }
                     updateLocal({
                       add_zoom_inset: enabled,
-                      zoom_inset: enabled && !local.zoom_inset ? defaultZoomInset() : local.zoom_inset,
+                      zoom_inset: next,
                     });
                   }}
                 />
@@ -4170,16 +4659,270 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   </Typography>
                 </AccordionSummary>
                 <AccordionDetails sx={{ pt: 1, pb: 1.5, px: 1.5, display: "flex", flexDirection: "column", gap: 1.5 }}>
+
+                {/* Multi-inset switcher. Clicking a chip swaps the
+                    editor below to that inset (zoom_inset is mirrored
+                    to zoom_insets[selectedInsetIdx] inside updateLocal).
+                    "+" appends a new inset; the trash icon on the
+                    selected chip removes it. */}
+                {(() => {
+                  const insets = local.zoom_insets ?? [];
+                  const total = insets.length;
+                  const switchToInset = (idx: number) => {
+                    const target = insets[idx];
+                    if (!target) return;
+                    setSelectedInsetIdx(idx);
+                    // Pass the existing array along with the new singular
+                    // so updateLocal's mirror block — which reads the
+                    // pre-switch selectedInsetIdx — skips its overwrite.
+                    // Without this, the mirror clobbers arr[old idx] with
+                    // the target's data, leaving both array slots
+                    // identical and breaking chip-switching visibility.
+                    updateLocal({ zoom_inset: target, zoom_insets: insets } as Partial<PanelInfo>);
+                  };
+                  const addInset = () => {
+                    const fresh = defaultZoomInset();
+                    // Cascade rule: a new inset on a parent panel
+                    // that has a scalebar defaults to Inherit mode.
+                    // For Standard/Separate we just flip the
+                    // show_scale_bar_in_zoom flag. For Adjacent the
+                    // scalebar lives on the target cell — we stamp
+                    // that when the user picks the Adjacent type or
+                    // changes its target side (handled elsewhere).
+                    if (local.add_scale_bar && local.scale_bar) {
+                      fresh.show_scale_bar_in_zoom = true;
+                    }
+                    const arr = [...insets, fresh];
+                    setSelectedInsetIdx(arr.length - 1);
+                    updateLocal({
+                      zoom_inset: fresh,
+                      zoom_insets: arr,
+                      add_zoom_inset: true,
+                    } as Partial<PanelInfo>);
+                  };
+                  const removeCurrent = () => {
+                    if (total <= 1) return; // can't delete the last one — toggle disabled instead
+                    const arr = insets.filter((_, i) => i !== selectedInsetIdx);
+                    const newIdx = Math.min(selectedInsetIdx, arr.length - 1);
+                    setSelectedInsetIdx(newIdx);
+                    updateLocal({
+                      zoom_inset: arr[newIdx],
+                      zoom_insets: arr,
+                      add_zoom_inset: arr.length > 0,
+                    } as Partial<PanelInfo>);
+                  };
+                  // ── Spawn an Adjacent zoom whose source rectangle
+                  //    is the currently-selected Standard / Separate
+                  //    inset's TARGET region. Lets the user build a
+                  //    "parent → standard zoom → adjacent zoom" chain
+                  //    from a single click; they can then further
+                  //    refine the new adjacent target via its gear
+                  //    icon (Phase 1 unlock). The source rectangle is
+                  //    in PARENT image coordinates — so the new
+                  //    adjacent panel will show what's at those
+                  //    coordinates on the parent (which is also where
+                  //    the standard zoom's paste lives in the rendered
+                  //    figure). Note: this is NOT a recursive "zoom of
+                  //    zoom" — the adjacent crop reads from a clean
+                  //    parent image, not from the magnified content.
+                  //    True recursive nesting will arrive with a
+                  //    follow-up backend refactor.
+                  const spawnAdjacentFromCurrent = () => {
+                    const cur = insets[selectedInsetIdx];
+                    if (!cur) return;
+                    if (cur.inset_type !== "Standard Zoom" && cur.inset_type !== "Separate Image") return;
+                    // Spawn semantic: the new Adjacent inset reveals
+                    // the SAME source content as `cur` but magnified
+                    // further. We can't truly read pixels from the
+                    // standard zoom's pasted target (that requires
+                    // recursive rendering on the backend) — but
+                    // semantically "zoom of the zoom" means same
+                    // source rect at higher zoom factor, so we set
+                    // B.source = A.source and combine the zoom
+                    // factors (B_zoom = A_zoom × 2). The Adjacent
+                    // renderer then reads the parent image's clean
+                    // A-source region and scales by the combined
+                    // factor, producing a deeper magnification of
+                    // exactly the area A was already magnifying.
+                    const tw = Math.max(20, Math.round(cur.width || 50));
+                    const th = Math.max(20, Math.round(cur.height || 50));
+                    // Pick the first available side. Skip occupied / out-of-grid.
+                    const cfg = config!;
+                    const sides: ("Right" | "Left" | "Top" | "Bottom")[] = ["Right", "Bottom", "Left", "Top"];
+                    let pickedSide: string | null = null;
+                    for (const s of sides) {
+                      const dr = s === "Top" ? -1 : s === "Bottom" ? 1 : 0;
+                      const dc = s === "Left" ? -1 : s === "Right" ? 1 : 0;
+                      const tr = row + dr, tc = col + dc;
+                      if (tr < 0 || tr >= cfg.rows || tc < 0 || tc >= cfg.cols) continue;
+                      const tp = cfg.panels[tr]?.[tc];
+                      if (tp && tp.image_name) continue;
+                      pickedSide = s; break;
+                    }
+                    if (!pickedSide) {
+                      alert("No free neighbouring panel — clear one before spawning an adjacent zoom.");
+                      return;
+                    }
+                    // Ensure the spawn-source inset has an id so we
+                    // can record the parent relationship on the new
+                    // adjacent inset. Older insets (pre-id field)
+                    // get one stamped here.
+                    if (!cur.id) {
+                      const parentArr = insets.slice();
+                      const idx = selectedInsetIdx;
+                      parentArr[idx] = { ...cur, id: makeInsetId() };
+                      // Note: we keep iterating below using `cur` —
+                      // refresh the reference too.
+                      (cur as ZoomInsetSettings).id = parentArr[idx].id;
+                      // We'll commit the array AFTER computing adj
+                      // (we want the parent id on cur in the final
+                      // committed array as well).
+                    }
+                    const adj: ZoomInsetSettings = {
+                      ...defaultZoomInset(),
+                      inset_type: "Adjacent Panel",
+                      side: pickedSide,
+                      // B_zoom = A_zoom × 2 → deeper magnification
+                      // than A while reading the SAME source rect.
+                      zoom_factor: (cur.zoom_factor || 2) * 2,
+                      x: cur.x, y: cur.y,
+                      width: tw, height: th,
+                      rectangle_color: "#FF9800",
+                      line_color: "#FF9800",
+                      // Link to the spawn-source so the inherit
+                      // semantic walks the chain.
+                      parent_inset_id: cur.id,
+                    };
+                    // ── Cascade: stamp the target cell's scalebar
+                    // based on the parent inset's mode at spawn
+                    // time. (We compute effective values once; if
+                    // the user later changes the parent we don't
+                    // auto-update — they can re-pick Inherit on the
+                    // child to refresh.)
+                    const rootSB = (local.add_scale_bar && local.scale_bar) ? local.scale_bar : null;
+                    const parentEffective = computeOwnEffectiveScaleBar(cur, insets, rootSB);
+                    if (parentEffective) {
+                      const stamped = deriveInheritedScaleBar(parentEffective, adj.zoom_factor);
+                      useFigureStore.getState().updatePanel(
+                        row + (pickedSide === "Top" ? -1 : pickedSide === "Bottom" ? 1 : 0),
+                        col + (pickedSide === "Left" ? -1 : pickedSide === "Right" ? 1 : 0),
+                        { add_scale_bar: true, scale_bar: stamped } as Partial<PanelInfo>,
+                      );
+                    }
+                    // Commit the updated insets array. We rebuild
+                    // it so any cur.id-stamp from above is preserved.
+                    const arr = insets.slice();
+                    arr[selectedInsetIdx] = cur;
+                    arr.push(adj);
+                    setSelectedInsetIdx(arr.length - 1);
+                    updateLocal({
+                      zoom_inset: adj,
+                      zoom_insets: arr,
+                      add_zoom_inset: true,
+                    } as Partial<PanelInfo>);
+                  };
+                  const currentInset = insets[selectedInsetIdx];
+                  const canSpawn = !!currentInset && (currentInset.inset_type === "Standard Zoom" || currentInset.inset_type === "Separate Image");
+                  return (
+                    <Box sx={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 0.5, pb: 0.5, borderBottom: "1px dashed", borderColor: "divider" }}>
+                      <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mr: 0.5 }}>
+                        Insets:
+                      </Typography>
+                      {insets.map((it, i) => (
+                        <Button
+                          key={i}
+                          size="small"
+                          variant={i === selectedInsetIdx ? "contained" : "outlined"}
+                          onClick={() => switchToInset(i)}
+                          sx={{
+                            fontSize: "0.6rem",
+                            textTransform: "none",
+                            minWidth: 0,
+                            px: 0.75,
+                            py: 0,
+                            height: 22,
+                          }}
+                        >
+                          {i + 1}{it.inset_type === "Adjacent Panel" ? " ↗" : it.inset_type === "Separate Image" ? " ⎘" : ""}
+                        </Button>
+                      ))}
+                      <Tooltip title="Add another zoom inset">
+                        <IconButton size="small" onClick={addInset} sx={{ width: 22, height: 22 }}>
+                          <AddIcon sx={{ fontSize: 14 }} />
+                        </IconButton>
+                      </Tooltip>
+                      <Tooltip title={total <= 1 ? "Disable Zoom Inset above to remove the last one" : "Remove the currently-selected inset"}>
+                        <span>
+                          <IconButton
+                            size="small"
+                            disabled={total <= 1}
+                            onClick={removeCurrent}
+                            sx={{ width: 22, height: 22, color: total <= 1 ? "text.disabled" : "error.main" }}
+                          >
+                            <DeleteIcon sx={{ fontSize: 14 }} />
+                          </IconButton>
+                        </span>
+                      </Tooltip>
+                      <Tooltip placement="top" title={
+                        canSpawn
+                          ? "Spawn an Adjacent zoom whose source rect = this inset's target region. Lets you build a parent → standard zoom → adjacent panel chain. Refine the new adjacent target via its gear icon."
+                          : "Select a Standard or Separate inset above to spawn a chained adjacent zoom from it"
+                      }>
+                        <span>
+                          <IconButton
+                            size="small"
+                            disabled={!canSpawn}
+                            onClick={spawnAdjacentFromCurrent}
+                            sx={{ width: 22, height: 22, color: canSpawn ? "primary.main" : "text.disabled" }}
+                          >
+                            <SettingsIcon sx={{ fontSize: 14 }} />
+                          </IconButton>
+                        </span>
+                      </Tooltip>
+                    </Box>
+                  );
+                })()}
+
                 <FormControl size="small" fullWidth>
                   <InputLabel>Inset Type</InputLabel>
                   <Select
                     value={local.zoom_inset.inset_type}
                     label="Inset Type"
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      const newType = e.target.value;
+                      const zi = local.zoom_inset!;
                       updateLocal({
-                        zoom_inset: { ...local.zoom_inset!, inset_type: e.target.value },
-                      })
-                    }
+                        zoom_inset: { ...zi, inset_type: newType },
+                      });
+                      // Cascade default: when switching to "Adjacent Panel"
+                      // and the parent panel has a scalebar, auto-stamp the
+                      // target cell's scalebar with the inherited values
+                      // (mpp ÷ zoom_factor). The user can later switch the
+                      // Scale Bar (on inset) selector to None / Custom to
+                      // override. We only stamp when the target's
+                      // scale_bar is currently unset, so we never clobber
+                      // a manual customisation.
+                      if (newType === "Adjacent Panel" && local.add_scale_bar && local.scale_bar && config) {
+                        const side = zi.side || "Right";
+                        const dr = side === "Top" ? -1 : side === "Bottom" ? 1 : 0;
+                        const dc = side === "Left" ? -1 : side === "Right" ? 1 : 0;
+                        const tr = row + dr, tc = col + dc;
+                        if (tr >= 0 && tr < config.rows && tc >= 0 && tc < config.cols) {
+                          const target = config.panels[tr]?.[tc];
+                          if (target && !target.scale_bar) {
+                            const zoom = zi.zoom_factor || 1;
+                            const inherited: ScaleBarSettings = {
+                              ...local.scale_bar,
+                              micron_per_pixel: local.scale_bar.micron_per_pixel / (zoom > 0 ? zoom : 1),
+                            };
+                            useFigureStore.getState().updatePanel(tr, tc, {
+                              add_scale_bar: true,
+                              scale_bar: inherited,
+                            } as Partial<PanelInfo>);
+                          }
+                        }
+                      }
+                    }}
                   >
                     <MenuItem value="Standard Zoom">Standard Zoom</MenuItem>
                     <MenuItem value="Adjacent Panel">Adjacent Panel</MenuItem>
@@ -4206,6 +4949,39 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   />
                 </Box>
                 )}
+
+                {/* Source rectangle rotation. The rotation tilts the
+                    selection on the panel image; the rendered zoom
+                    output is always axis-aligned (the backend
+                    inverse-rotates around the rect centre before
+                    cropping), so the user sees an upright zoomed
+                    view of a tilted feature. */}
+                <Box sx={{ px: 2 }}>
+                  <Typography variant="caption" color="text.secondary">
+                    Source Rotation: {(local.zoom_inset.rotation ?? 0).toFixed(0)}°
+                  </Typography>
+                  <Slider
+                    value={local.zoom_inset.rotation ?? 0}
+                    min={-180}
+                    max={180}
+                    step={1}
+                    // Inner-only marks so the labels at the slider's
+                    // ends don't overflow the right-hand panel and
+                    // clip into the dialog edge. Showing the live
+                    // numeric above is enough for the boundary case.
+                    marks={[
+                      { value: -90, label: "-90" },
+                      { value: 0, label: "0" },
+                      { value: 90, label: "90" },
+                    ]}
+                    valueLabelDisplay="auto"
+                    onChange={(_, v) =>
+                      updateLocal({
+                        zoom_inset: { ...local.zoom_inset!, rotation: v as number },
+                      })
+                    }
+                  />
+                </Box>
 
                 {/* External image option */}
                 <FormControlLabel
@@ -4501,19 +5277,114 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   />
                 </Box>
 
+                {/* Independent line styles for the selection box outline
+                    and the connecting lines. */}
+                <Box sx={{ display: "flex", gap: 1 }}>
+                  <FormControl size="small" fullWidth>
+                    <InputLabel>Box style</InputLabel>
+                    <Select
+                      value={local.zoom_inset.rectangle_style || "solid"}
+                      label="Box style"
+                      onChange={(e) =>
+                        updateLocal({
+                          zoom_inset: { ...local.zoom_inset!, rectangle_style: e.target.value },
+                        })
+                      }
+                    >
+                      <MenuItem value="solid">Solid</MenuItem>
+                      <MenuItem value="dashed">Dashed</MenuItem>
+                      <MenuItem value="dotted">Dotted</MenuItem>
+                      <MenuItem value="dash-dot">Dash-dot</MenuItem>
+                    </Select>
+                  </FormControl>
+                  <FormControl size="small" fullWidth>
+                    <InputLabel>Line style</InputLabel>
+                    <Select
+                      value={local.zoom_inset.line_style || "solid"}
+                      label="Line style"
+                      onChange={(e) =>
+                        updateLocal({
+                          zoom_inset: { ...local.zoom_inset!, line_style: e.target.value },
+                        })
+                      }
+                    >
+                      <MenuItem value="solid">Solid</MenuItem>
+                      <MenuItem value="dashed">Dashed</MenuItem>
+                      <MenuItem value="dotted">Dotted</MenuItem>
+                      <MenuItem value="dash-dot">Dash-dot</MenuItem>
+                    </Select>
+                  </FormControl>
+                </Box>
+
                 {/* Adjacent Panel options */}
                 {local.zoom_inset.inset_type === "Adjacent Panel" && (
                   <>
+                    {(() => {
+                      // Top-level guard: are ANY of the four sides usable?
+                      // A side is usable when the neighbour cell is in the
+                      // grid AND empty (no image). If all four are blocked,
+                      // surface a prominent warning so the user knows
+                      // Adjacent Panel zoom can't render here — and what
+                      // to do about it. Per-side warnings (below) only
+                      // explain the CURRENTLY-selected side, which can
+                      // hide the bigger picture when nothing works.
+                      if (!config) return null;
+                      const sides = [
+                        { value: "Top", dr: -1, dc: 0 },
+                        { value: "Bottom", dr: 1, dc: 0 },
+                        { value: "Left", dr: 0, dc: -1 },
+                        { value: "Right", dr: 0, dc: 1 },
+                      ];
+                      const usable = sides.filter(s => {
+                        const tr = row + s.dr, tc = col + s.dc;
+                        const inBounds = tr >= 0 && tr < config.rows && tc >= 0 && tc < config.cols;
+                        if (!inBounds) return false;
+                        const tp = config.panels[tr]?.[tc];
+                        return !tp?.image_name;
+                      });
+                      if (usable.length === 0) {
+                        return (
+                          <Alert severity="warning" sx={{ "& .MuiAlert-message": { fontSize: "0.7rem", py: 0.25 } }}>
+                            <strong>No free adjacent panel.</strong> Every neighbour of R{row + 1}C{col + 1} is either outside the grid or already holds an image. Clear a neighbouring cell, or expand the grid (Sidebar → Rows / Columns), before using Adjacent Panel zoom.
+                          </Alert>
+                        );
+                      }
+                      return null;
+                    })()}
                     <FormControl size="small" fullWidth>
                       <InputLabel>Target Side</InputLabel>
                       <Select
                         value={local.zoom_inset.side}
                         label="Target Side"
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          const newSide = e.target.value;
+                          const zi = local.zoom_inset!;
                           updateLocal({
-                            zoom_inset: { ...local.zoom_inset!, side: e.target.value },
-                          })
-                        }
+                            zoom_inset: { ...zi, side: newSide },
+                          });
+                          // Same cascade-on-target-change as the Inset
+                          // Type select: stamp the NEW target's scalebar
+                          // with the inherited values if it has none yet.
+                          if (local.add_scale_bar && local.scale_bar && config) {
+                            const dr = newSide === "Top" ? -1 : newSide === "Bottom" ? 1 : 0;
+                            const dc = newSide === "Left" ? -1 : newSide === "Right" ? 1 : 0;
+                            const tr = row + dr, tc = col + dc;
+                            if (tr >= 0 && tr < config.rows && tc >= 0 && tc < config.cols) {
+                              const target = config.panels[tr]?.[tc];
+                              if (target && !target.scale_bar) {
+                                const zoom = zi.zoom_factor || 1;
+                                const inherited: ScaleBarSettings = {
+                                  ...local.scale_bar,
+                                  micron_per_pixel: local.scale_bar.micron_per_pixel / (zoom > 0 ? zoom : 1),
+                                };
+                                useFigureStore.getState().updatePanel(tr, tc, {
+                                  add_scale_bar: true,
+                                  scale_bar: inherited,
+                                } as Partial<PanelInfo>);
+                              }
+                            }
+                          }
+                        }}
                       >
                         {(() => {
                           const sides = [
@@ -4549,41 +5420,181 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       return null;
                     })()}
 
-                    {/* Zoom factor */}
-                    <Typography variant="caption" sx={{ mt: 1 }}>
-                      Zoom Factor: {local.zoom_inset.zoom_factor.toFixed(1)}x
-                    </Typography>
-                    <Slider
-                      value={local.zoom_inset.zoom_factor}
-                      min={1} max={10} step={0.5}
-                      marks={[{ value: 1, label: "1x" }, { value: 5, label: "5x" }, { value: 10, label: "10x" }]}
-                      onChange={(_, val) =>
-                        updateLocal({ zoom_inset: { ...local.zoom_inset!, zoom_factor: val as number } })
-                      }
-                      sx={{ mt: 0 }}
-                    />
-
-                    {/* Source area */}
-                    <Typography variant="caption" sx={{ fontWeight: 600, mt: 1 }}>Source Area</Typography>
-                    <Box sx={{ display: "flex", gap: 1 }}>
-                      <TextField label="X" type="number" onFocus={(e) => (e.target as HTMLInputElement).select()} value={local.zoom_inset.x} onChange={(e) =>
-                        updateLocal({ zoom_inset: { ...local.zoom_inset!, x: Number(e.target.value) } })
-                      } size="small" sx={{ flex: 1, "& input": { fontSize: "0.8rem", px: 1, py: 0.75 } }} />
-                      <TextField label="Y" type="number" onFocus={(e) => (e.target as HTMLInputElement).select()} value={local.zoom_inset.y} onChange={(e) =>
-                        updateLocal({ zoom_inset: { ...local.zoom_inset!, y: Number(e.target.value) } })
-                      } size="small" sx={{ flex: 1, "& input": { fontSize: "0.8rem", px: 1, py: 0.75 } }} />
-                      <TextField label="W" type="number" onFocus={(e) => (e.target as HTMLInputElement).select()} value={local.zoom_inset.width} onChange={(e) =>
-                        updateLocal({ zoom_inset: { ...local.zoom_inset!, width: Number(e.target.value) } })
-                      } size="small" sx={{ flex: 1, "& input": { fontSize: "0.8rem", px: 1, py: 0.75 } }} />
-                      <TextField label="H" type="number" onFocus={(e) => (e.target as HTMLInputElement).select()} value={local.zoom_inset.height} onChange={(e) =>
-                        updateLocal({ zoom_inset: { ...local.zoom_inset!, height: Number(e.target.value) } })
-                      } size="small" sx={{ flex: 1, "& input": { fontSize: "0.8rem", px: 1, py: 0.75 } }} />
-                    </Box>
-                    <Typography variant="caption" sx={{ color: "text.secondary", fontSize: "0.6rem", fontStyle: "italic" }}>
-                      Drag the source rectangle on the preview to reposition
-                    </Typography>
+                    {/* Zoom Factor and Source Area are shared with
+                        Standard Zoom and rendered above this branch
+                        unconditionally. They used to be duplicated
+                        here too, which made the Adjacent Panel UI
+                        look like it had its own (different) sliders
+                        and fields. Removed — only Adjacent-Panel-
+                        specific fields (Target Side) live in this
+                        block now. */}
                   </>
                 )}
+
+                {/* ── Scale Bar on the inset ─────────────────────────
+                    Three modes:
+                      • None    — no bar drawn inside the zoom.
+                      • Inherit — copy the source panel's scale bar and
+                                  divide its mpp by zoom_factor, so the
+                                  inset shows the same physical length
+                                  as the source (e.g. 10 µm) but at the
+                                  zoomed-in pixel scale.
+                      • Custom  — user-defined bar on the inset (or, for
+                                  Adjacent Panel, on the target cell —
+                                  refinable via Edit Panel on that cell).
+
+                    For Standard / Separate insets this writes to
+                    zi.show_scale_bar_in_zoom + zi.scale_bar, which the
+                    backend's _draw_standard_zoom / _draw_separate_zoom
+                    already render. For Adjacent Panel insets, the
+                    target cell carries its own scale_bar, so this
+                    block stamps THAT panel directly (Inherit derives
+                    from the source's mpp / zoom_factor). */}
+                {(() => {
+                  const zi = local.zoom_inset!;
+                  const isAdjacent = zi.inset_type === "Adjacent Panel";
+                  const zoomFactor = zi.zoom_factor || 1;
+
+                  // Where the inherited / stamped scale bar lives.
+                  // For Adjacent, that's the target cell; for Standard
+                  // / Separate, it's the inset itself (zi.scale_bar).
+                  const side = zi.side || "Right";
+                  const dr = side === "Top" ? -1 : side === "Bottom" ? 1 : 0;
+                  const dc = side === "Left" ? -1 : side === "Right" ? 1 : 0;
+                  const tr = row + dr, tc = col + dc;
+                  const targetInGrid =
+                    isAdjacent && tr >= 0 && tc >= 0 &&
+                    config && tr < config.rows && tc < config.cols;
+                  const targetPanel = targetInGrid ? config!.panels[tr]?.[tc] : null;
+
+                  // Chain-aware inherit source: if this inset has a
+                  // parent_inset_id, walk up to its effective scalebar
+                  // (which may itself be inherited or custom). Otherwise
+                  // fall back to the root panel's scalebar.
+                  const rootSB = (local.add_scale_bar && local.scale_bar) ? local.scale_bar : null;
+                  const parentEffective = effectiveParentScaleBar(zi, (local.zoom_insets ?? []), rootSB);
+                  const hasInheritSource = !!parentEffective;
+                  const inheritSourceMpp = parentEffective?.micron_per_pixel ?? 0;
+                  const inheritMpp = zoomFactor > 0 ? inheritSourceMpp / zoomFactor : inheritSourceMpp;
+
+                  // Recognise the current mode:
+                  let currentMode: "none" | "inherit" | "custom" = "none";
+                  if (isAdjacent) {
+                    if (targetPanel?.add_scale_bar && targetPanel.scale_bar) {
+                      const tMpp = targetPanel.scale_bar.micron_per_pixel ?? 0;
+                      // Within 1e-4 of the chain-inherited value = "inherit".
+                      if (hasInheritSource && Math.abs(tMpp - inheritMpp) < 1e-4) currentMode = "inherit";
+                      else currentMode = "custom";
+                    }
+                  } else {
+                    if (zi.show_scale_bar_in_zoom) currentMode = "inherit";
+                    else if (zi.scale_bar) currentMode = "custom";
+                  }
+
+                  // Default ScaleBarSettings for a fresh "Custom" stamp.
+                  // Borrows from the chain when available so the user
+                  // doesn't have to reconfigure everything.
+                  const defaultScaleBar = (): ScaleBarSettings => {
+                    if (parentEffective) {
+                      return { ...parentEffective, micron_per_pixel: inheritMpp };
+                    }
+                    return {
+                      micron_per_pixel: 1.0,
+                      bar_length_microns: 50,
+                      bar_position: [0.5, 0.95],
+                      bar_height: 4,
+                      bar_color: "#FFFFFF",
+                      label: "",
+                      font_size: 12,
+                      font_name: "arial.ttf",
+                      font_path: null,
+                      label_x_offset: 0,
+                      label_font_style: [],
+                      label_color: "#FFFFFF",
+                      position_preset: "Bottom-Right",
+                      position_x: 50,
+                      position_y: 90,
+                      edge_distance: 5.0,
+                      unit: "um",
+                      scale_name: "",
+                      styled_segments: [],
+                      draggable: false,
+                    };
+                  };
+
+                  const setMode = (mode: "none" | "inherit" | "custom") => {
+                    if (isAdjacent) {
+                      if (!targetPanel || !targetInGrid) return;
+                      let patch: Partial<PanelInfo>;
+                      if (mode === "none") {
+                        patch = { add_scale_bar: false, scale_bar: null };
+                      } else if (mode === "inherit") {
+                        if (!hasInheritSource || !parentEffective) return;
+                        patch = {
+                          add_scale_bar: true,
+                          scale_bar: { ...parentEffective, micron_per_pixel: inheritMpp },
+                        };
+                      } else {
+                        patch = { add_scale_bar: true, scale_bar: defaultScaleBar() };
+                      }
+                      useFigureStore.getState().updatePanel(tr, tc, patch);
+                    } else {
+                      // Standard / Separate — store on the inset itself.
+                      if (mode === "none") {
+                        updateLocal({ zoom_inset: { ...zi, show_scale_bar_in_zoom: false, scale_bar: null } });
+                      } else if (mode === "inherit") {
+                        updateLocal({ zoom_inset: { ...zi, show_scale_bar_in_zoom: true, scale_bar: null } });
+                      } else {
+                        updateLocal({ zoom_inset: { ...zi, show_scale_bar_in_zoom: false, scale_bar: defaultScaleBar() } });
+                      }
+                    }
+                  };
+
+                  const parentLabel = zi.parent_inset_id
+                    ? (() => {
+                        const insets2 = (local.zoom_insets ?? []);
+                        const pIdx = insets2.findIndex((it) => it.id === zi.parent_inset_id);
+                        return pIdx >= 0 ? `inset #${pIdx + 1}` : "parent inset";
+                      })()
+                    : "the panel";
+                  return (
+                    <>
+                      <Typography variant="caption" sx={{ fontWeight: 600, mt: 2 }}>Scale Bar (on inset)</Typography>
+                      <Divider />
+                      <FormControl size="small" fullWidth>
+                        <InputLabel>Scale bar</InputLabel>
+                        <Select
+                          value={currentMode}
+                          label="Scale bar"
+                          onChange={(e) => setMode(e.target.value as "none" | "inherit" | "custom")}
+                        >
+                          <MenuItem value="none">None</MenuItem>
+                          <MenuItem value="inherit" disabled={!hasInheritSource}>
+                            Inherit from {parentLabel} × zoom factor{!hasInheritSource ? ` (${parentLabel} has no scale bar)` : ""}
+                          </MenuItem>
+                          <MenuItem value="custom">Custom</MenuItem>
+                        </Select>
+                      </FormControl>
+                      {currentMode === "inherit" && (
+                        <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary" }}>
+                          {isAdjacent
+                            ? `Target panel scalebar mpp = ${parentLabel}'s mpp (${inheritSourceMpp.toFixed(4)}) ÷ ${zoomFactor} = ${inheritMpp.toFixed(4)} µm/px. Re-select "Inherit" after changing the zoom factor to refresh.`
+                            : `Inset draws ${parentLabel}'s scale bar at zoomed scale (mpp ÷ ${zoomFactor}).`}
+                        </Typography>
+                      )}
+                      {currentMode === "custom" && isAdjacent && (
+                        <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary" }}>
+                          A scale bar was stamped on the target cell. Refine it via the gear icon on that cell → Scale Bar tab.
+                        </Typography>
+                      )}
+                      {currentMode === "custom" && !isAdjacent && zi.scale_bar && (
+                        <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary" }}>
+                          Bar length {zi.scale_bar.bar_length_microns} µm · {zi.scale_bar.position_preset}. Edit details below if needed.
+                        </Typography>
+                      )}
+                    </>
+                  );
+                })()}
 
                 {/* Separate Image options */}
                 </AccordionDetails>
@@ -4595,7 +5606,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
 
           {/* -- Right: Live Preview with draggable labels ----------- */}
           <Box sx={{ flex: 1, display: "flex", alignItems: "flex-start", justifyContent: "center", p: 1, bgcolor: "action.hover", borderRadius: 2, border: "1px solid", borderColor: "divider", maxHeight: "70vh", overflow: "hidden" }}>
-            {previewB64 ? (
+            {/* Adjacent-zoom target panels have no `image_name` of
+                their own, so `previewB64` (which is fetched from the
+                base /api/panel-preview endpoint, gated on
+                local.image_name) stays empty. The rendered preview
+                IS fetched for them (see refreshRenderedPreview's
+                isZoomTarget gate), so accept either as the trigger
+                to render the preview wrapper — otherwise the user
+                sees "No image assigned" and can't place nested
+                insets / labels / annotations. */}
+            {(previewB64 || renderedPreviewB64) ? (
               <Box sx={{ display: "flex", alignItems: "center", justifyContent: "center", width: "100%", height: "100%" }}>
                 {/* Wrapper sized via CSS aspect-ratio to the rendered
                     preview's natural dimensions. Combined with width:100%
@@ -4609,7 +5629,18 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 <Box sx={{
                   position: "relative",
                   width: "100%",
-                  maxWidth: "100%",
+                  // Bound the wrapper to BOTH the parent width AND the
+                  // (max-height × aspect) width, so when max-height
+                  // kicks in width shrinks proportionally instead of
+                  // staying at 100% (which would make the wrapper a
+                  // different aspect than the image and letterbox the
+                  // image inside — overlays measured against the
+                  // wrapper would then no longer align with the image,
+                  // and a square source selection would appear as a
+                  // rectangle).
+                  maxWidth: previewNatW > 0 && previewNatH > 0
+                    ? `calc(68vh * ${previewNatW} / ${previewNatH})`
+                    : "100%",
                   maxHeight: "68vh",
                   aspectRatio: previewNatW > 0 && previewNatH > 0
                     ? `${previewNatW} / ${previewNatH}`
@@ -4623,7 +5654,13 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   // Annotations tab (4) uses base preview + SVG overlays for responsive drag.
                   // Crop tab uses base preview for crop handles.
                   // Zoom Inset tab (5) uses rendered preview to show all overlays.
-                  const useRendered = [TAB_ADJ, TAB_LABELS, TAB_SCALE, TAB_ZOOM].includes(tabIdx) && renderedPreviewB64;
+                  // Adjacent-zoom TARGET panels have no base preview at all
+                  // (no image_name), so fall back to renderedPreviewB64
+                  // for any tab when the base is empty — otherwise the
+                  // <img> would be sourced from a broken data URI.
+                  const useRendered =
+                    ([TAB_ADJ, TAB_LABELS, TAB_SCALE, TAB_ZOOM].includes(tabIdx) && renderedPreviewB64) ||
+                    (!previewB64 && !!renderedPreviewB64);
                   return (
                     <Box
                       component="img"
@@ -4739,8 +5776,11 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     </Box>
                   );
                 })}
-                {/* Scale bar CSS overlay: only on Crop tab when no rendered preview, hidden elsewhere */}
-                {tabIdx !== TAB_CROP && !([TAB_ADJ, TAB_LABELS, TAB_SCALE, TAB_ANNOT].includes(tabIdx) && renderedPreviewB64) && local.add_scale_bar && local.scale_bar && (() => {
+                {/* Scale bar CSS overlay: only on Crop tab when no rendered preview, hidden elsewhere.
+                    TAB_ZOOM is in the exclude list now too — the rendered
+                    preview on the Zoom Inset tab already shows the bar
+                    baked in, so the inline overlay would duplicate it. */}
+                {tabIdx !== TAB_CROP && !([TAB_ADJ, TAB_LABELS, TAB_SCALE, TAB_ANNOT, TAB_ZOOM].includes(tabIdx) && renderedPreviewB64) && local.add_scale_bar && local.scale_bar && (() => {
                   const isScaleBarTab = tabIdx === TAB_SCALE;
                   const sb = local.scale_bar!;
                   const edgePct = sb.edge_distance ?? 5;
@@ -4813,7 +5853,13 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       position: "absolute",
                       ...posStyle,
                       transform: transformStr,
-                      cursor: isScaleBarTab && (sb.position_preset ?? "Bottom-Right") === "Custom" ? "grab" : "default",
+                      // Always "grab" on the Scale Bar tab — dragging
+                      // auto-switches preset → Custom (see onMouseDown).
+                      // This makes inherited scalebars on zoom targets
+                      // (which copy the source's preset, often
+                      // Bottom-Right) draggable just like the parent
+                      // panel's bar.
+                      cursor: isScaleBarTab ? "grab" : "default",
                       pointerEvents: isScaleBarTab ? "auto" : "none",
                       userSelect: "none",
                       display: "flex",
@@ -4822,7 +5868,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       gap: 0.25,
                       zIndex: 5,
                     }}
-                    onMouseDown={(local.scale_bar.position_preset ?? "Bottom-Right") === "Custom" ? (e) => {
+                    onMouseDown={isScaleBarTab ? (e) => {
                       e.preventDefault();
                       e.stopPropagation();
                       const imgEl = (e.currentTarget.parentElement?.querySelector("img")) as HTMLImageElement | null;
@@ -4866,11 +5912,28 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     })()}
                   </Box>
                   ); })()}
-                {/* Scale bar drag hitbox — invisible, for dragging on Scale Bar tab with rendered preview */}
-                {tabIdx === TAB_SCALE && renderedPreviewB64 && local.add_scale_bar && local.scale_bar && (local.scale_bar.position_preset ?? "Bottom-Right") === "Custom" && (() => {
+                {/* Scale bar drag hitbox — invisible overlay that
+                    lets the user drag the bar on the Scale Bar tab
+                    when the matplotlib-rendered preview is showing.
+                    Now works regardless of preset: if the bar is at a
+                    preset position (Bottom-Right etc.), we compute
+                    its effective on-image position and place the
+                    hitbox there. The mousedown auto-switches the
+                    bar to "Custom" mode so the drag commits. */}
+                {tabIdx === TAB_SCALE && renderedPreviewB64 && local.add_scale_bar && local.scale_bar && (() => {
                   const sb = local.scale_bar!;
-                  const posX = sb.position_x ?? 50;
-                  const posY = sb.position_y ?? 90;
+                  const edgePct = sb.edge_distance ?? 5;
+                  // Compute the bar's effective on-image position
+                  // (matches the backend's preset math).
+                  let posX = sb.position_x ?? 50;
+                  let posY = sb.position_y ?? 90;
+                  const preset = sb.position_preset ?? "Bottom-Right";
+                  if (preset && preset !== "Custom") {
+                    if (preset === "Bottom-Right") { posX = 100 - edgePct; posY = 100 - edgePct; }
+                    else if (preset === "Bottom-Left") { posX = edgePct; posY = 100 - edgePct; }
+                    else if (preset === "Top-Right") { posX = 100 - edgePct; posY = edgePct; }
+                    else if (preset === "Top-Left") { posX = edgePct; posY = edgePct; }
+                  }
                   return (
                     <Box
                       sx={{
@@ -4878,8 +5941,8 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         left: `${posX}%`,
                         top: `${posY}%`,
                         transform: "translate(-50%, -50%)",
-                        width: "15%",
-                        height: "10%",
+                        width: "20%",
+                        height: "12%",
                         cursor: "grab",
                         zIndex: 10,
                       }}
@@ -4893,11 +5956,14 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                           const rect = imgEl.getBoundingClientRect();
                           const px = Math.max(0, Math.min(100, ((ev.clientX - rect.left) / rect.width) * 100));
                           const py = Math.max(0, Math.min(100, ((ev.clientY - rect.top) / rect.height) * 100));
+                          // Auto-switch to Custom on first drag movement
+                          // (no-op if already Custom).
                           updateLocal({ scale_bar: { ...local.scale_bar!, position_x: Math.round(px), position_y: Math.round(py), position_preset: "Custom", bar_position: [px / 100, py / 100] } });
                         };
                         const onUp = () => {
                           window.removeEventListener("mousemove", onMove);
                           window.removeEventListener("mouseup", onUp);
+                          setTimeout(() => refreshRenderedPreview(), 0);
                         };
                         window.addEventListener("mousemove", onMove);
                         window.addEventListener("mouseup", onUp);
@@ -5541,17 +6607,33 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       const rpx = Math.round(px * 10) / 10;
                       const rpy = Math.round(py * 10) / 10;
 
-                      // If there's an active area being edited, add points to it
-                      const activeAreaIdx = selectedAnnotIdx?.type === "area" ? selectedAnnotIdx.idx : -1;
-                      // Or find an area without enough points
-                      const areaIdx = activeAreaIdx >= 0 ? activeAreaIdx : (local.areas ?? []).findIndex(a => !a.points || a.points.length < 2);
-                      if (areaIdx >= 0) {
+                      // ── Routing rules ──────────────────────────────────
+                      // 1. EXPLICIT selection wins. If the user has clicked
+                      //    a Line / Area row in the right panel, the click
+                      //    on the preview goes to THAT annotation — even if
+                      //    other incomplete annotations exist. This fixes
+                      //    the bug where, with multiple lines and areas all
+                      //    added but unmarked, selecting "Line 1" still
+                      //    sent clicks into the first incomplete area
+                      //    (because the previous code only honored the
+                      //    selection for the "area" type, and otherwise
+                      //    fell into "find first incomplete area").
+                      // 2. If NO annotation is selected, fall back to
+                      //    implicit routing: pick up the first incomplete
+                      //    area, else add to the last line. This preserves
+                      //    the original "just hit Add + click" UX.
+                      const selType = selectedAnnotIdx?.type;
+                      const selIdx = selectedAnnotIdx?.idx ?? -1;
+
+                      // Helper: route a click into a specific area index,
+                      // honouring its shape (Magic / Custom / standard).
+                      const fillArea = (areaIdx: number) => {
                         const areas = [...(local.areas ?? [])];
                         const area = areas[areaIdx];
+                        if (!area) return;
                         const pts = [...(area.points ?? [])];
 
                         if (area.shape === "Magic") {
-                          // Magic wand: call backend to flood-fill select
                           const tolerance = (area as any).magic_tolerance ?? 30;
                           setMagicWandLoading(true);
                           (async () => {
@@ -5580,7 +6662,6 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         }
 
                         if (area.shape === "Custom") {
-                          // Custom polygon: keep adding points on each click
                           pts.push([rpx, rpy]);
                           areas[areaIdx] = { ...areas[areaIdx], points: pts };
                           setSelectedAnnotIdx({ type: "area", idx: areaIdx });
@@ -5600,22 +6681,43 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         areas[areaIdx] = { ...areas[areaIdx], points: pts };
                         setSelectedAnnotIdx({ type: "area", idx: areaIdx });
                         updateLocal({ areas } as unknown as Partial<PanelInfo>);
+                      };
+
+                      // Helper: route a click into a specific line index.
+                      const addLinePoint = (lineIdx: number) => {
+                        const lines = [...(local.lines ?? [])];
+                        const target = lines[lineIdx];
+                        if (!target) return;
+                        const pts = [...(target.points ?? [])];
+                        const lt = target.line_type || (target.is_curved ? "curved" : "straight");
+                        // Straight = 2-point max; curved / multijointed = unlimited.
+                        if (lt === "straight" && pts.length >= 2) return;
+                        pts.push([rpx, rpy]);
+                        lines[lineIdx] = { ...target, points: pts };
+                        updateLocal({ lines } as unknown as Partial<PanelInfo>);
+                      };
+
+                      // 1a. Area is explicitly selected → route there.
+                      if (selType === "area" && selIdx >= 0 && (local.areas ?? [])[selIdx]) {
+                        fillArea(selIdx);
+                        return;
+                      }
+                      // 1b. Line is explicitly selected → route there.
+                      //     (Previously: ignored — the handler walked off to
+                      //     "find incomplete area" or "last line" instead.)
+                      if (selType === "line" && selIdx >= 0 && (local.lines ?? [])[selIdx]) {
+                        addLinePoint(selIdx);
                         return;
                       }
 
-                      // Otherwise add point to last line
-                      const lines = [...(local.lines ?? [])];
-                      const lastIdx = lines.length - 1;
-                      if (lastIdx >= 0) {
-                        const lastLine = lines[lastIdx];
-                        const pts = [...(lastLine.points ?? [])];
-                        // Enforce 2-point max for straight lines only
-                        const lt = lastLine.line_type || (lastLine.is_curved ? "curved" : "straight");
-                        if (lt === "straight" && pts.length >= 2) return;
-                        pts.push([rpx, rpy]);
-                        lines[lastIdx] = { ...lines[lastIdx], points: pts };
-                        updateLocal({ lines } as unknown as Partial<PanelInfo>);
+                      // 2. No selection — implicit routing fallback.
+                      const incompleteAreaIdx = (local.areas ?? []).findIndex(a => !a.points || a.points.length < 2);
+                      if (incompleteAreaIdx >= 0) {
+                        fillArea(incompleteAreaIdx);
+                        return;
                       }
+                      const lines = local.lines ?? [];
+                      if (lines.length > 0) addLinePoint(lines.length - 1);
                     }}
                   />
                 )}
@@ -5639,27 +6741,43 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       const svgColor = sym.color;
                       const sw = Math.max(0.2, sz / 12);
 
-                      // Use shared symbol definitions (matches backend exactly)
+                      // Use shared symbol definitions (matches backend exactly).
+                      // `width` scales Arrow / NarrowTriangle cross-axis thickness.
                       const { fillPolys, strokePolys, filled } = symbolToSvgPoints(
-                        sym.shape, cx, cy, sz, sym.rotation || 0
+                        sym.shape, cx, cy, sz, sym.rotation || 0, sym.width ?? 1.0
                       );
                       // Stroke scales with symbol size (pixel units)
                       const thinSw = Math.max(vbW * 0.001, sz / 20);
+                      // Outline-shape styling: border line style + optional
+                      // translucent centre fill. Mirrors _add_panel_symbols.
+                      const borderStyle = sym.border_style || "solid";
+                      const dashArr = borderStyle === "dashed"
+                        ? `${thinSw * 3.5},${thinSw * 2.5}`
+                        : borderStyle === "dotted"
+                        ? `${thinSw},${thinSw * 2}`
+                        : undefined;
+                      const fillColor = sym.fill_color || "";
+                      const fillOpacity = Math.max(0, Math.min(1, (sym.fill_opacity ?? 100) / 100));
+                      const hasCentreFill = !filled && !!fillColor && fillOpacity > 0;
 
                       // Always show SVG shapes on Annotations tab (base preview is used, not rendered)
                       const shape = (
                         <g>
                           {fillPolys.map((pts, pi) => (
                             <polygon key={`f${pi}`} points={pts}
-                              fill={filled ? svgColor : "none"}
+                              fill={filled ? svgColor : (hasCentreFill ? fillColor : "none")}
+                              fillOpacity={filled ? 1 : (hasCentreFill ? fillOpacity : 1)}
                               stroke={svgColor}
                               strokeWidth={filled ? 0.15 : thinSw}
+                              strokeDasharray={filled ? undefined : dashArr}
                               strokeLinejoin="round"
+                              strokeLinecap={borderStyle === "dotted" ? "round" : undefined}
                             />
                           ))}
                           {strokePolys.map((pts, pi) => (
                             <polyline key={`s${pi}`} points={pts}
                               fill="none" stroke={svgColor} strokeWidth={thinSw}
+                              strokeDasharray={dashArr}
                               strokeLinecap="round"
                             />
                           ))}
@@ -5752,6 +6870,298 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     </Box>
                   </Box>
                 )}
+                {/* Read-only renderings for the OTHER insets (those not
+                    currently selected). Show the FULL inset — source
+                    rect, the live zoomed inset, and connector lines —
+                    so the user can preview every inset at once. The
+                    target rect uses the same canvas pipeline as the
+                    active inset so you see the same image content,
+                    just non-interactable. Adjacent Panel insets show
+                    the source rect plus the parallel lines to the
+                    panel edge (matching the active rendering). */}
+                {tabIdx === TAB_ZOOM && local.add_zoom_inset && (local.zoom_insets ?? []).map((other, otherIdx) => {
+                  if (otherIdx === selectedInsetIdx) return null;
+                  if (!["Standard Zoom", "Adjacent Panel"].includes(other.inset_type)) return null;
+                  const ziActualW = (local.crop_image && local.crop?.length === 4)
+                    ? (local.crop[2] - local.crop[0]) : (origFullW > 0 ? origFullW : 1000);
+                  const ziActualH = (local.crop_image && local.crop?.length === 4)
+                    ? (local.crop[3] - local.crop[1]) : (origFullH > 0 ? origFullH : 1000);
+                  // Display-to-source scale: render borders + connector
+                  // lines at the same SOURCE-pixel thickness as the main
+                  // preview so the user sees consistent proportions.
+                  const _ziPreviewElO = document.querySelector('[alt="Panel preview"]') as HTMLImageElement | null;
+                  const _ziImgWO = _ziPreviewElO?.clientWidth || 400;
+                  const dispScaleO = _ziImgWO / Math.max(1, ziActualW);
+                  const otherRectW = Math.max(1, Math.round((other.rectangle_width || 2) * dispScaleO));
+                  const otherLineW = Math.max(1, Math.round((other.line_width || 2) * dispScaleO));
+                  // Each non-selected inset shows its OWN configured
+                  // styles so the preview is accurate; non-interactivity
+                  // is conveyed by reduced opacity + missing handles.
+                  const otherRectCss = ziStyleToCss(other.rectangle_style);
+                  const otherLineDash = ziStyleToDash(other.line_style, otherLineW);
+                  const xPct = (other.x / ziActualW) * 100;
+                  const yPct = (other.y / ziActualH) * 100;
+                  const wPct = (other.width / ziActualW) * 100;
+                  const hPct = (other.height / ziActualH) * 100;
+
+                  // Common badge + source rect outline (used for both
+                  // Standard Zoom and Adjacent Panel modes).
+                  const sourceRectBox = (
+                    <Box
+                      sx={{
+                        position: "absolute",
+                        left: `${xPct}%`,
+                        top: `${yPct}%`,
+                        width: `${wPct}%`,
+                        height: `${hPct}%`,
+                        border: `${otherRectW}px ${otherRectCss} ${other.rectangle_color || "#ffffff"}`,
+                        borderBottomWidth: `${otherRectW * 2}px`,
+                        opacity: 0.7,
+                        pointerEvents: "none",
+                        zIndex: 6,
+                        transform: other.rotation ? `rotate(${other.rotation}deg)` : undefined,
+                        transformOrigin: "center center",
+                      }}
+                      title={`Inset ${otherIdx + 1} source (click chip to edit)`}
+                    >
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          position: "absolute",
+                          top: -16,
+                          left: 0,
+                          fontSize: "0.55rem",
+                          color: other.rectangle_color || "#ffffff",
+                          backgroundColor: "rgba(0,0,0,0.6)",
+                          px: 0.5,
+                          borderRadius: 0.5,
+                        }}
+                      >
+                        {otherIdx + 1}
+                      </Typography>
+                    </Box>
+                  );
+
+                  // ── Adjacent Panel: source rect + parallel lines to panel edge ──
+                  if (other.inset_type === "Adjacent Panel") {
+                    const side = other.side || "Right";
+                    const xPx = other.x, yPx = other.y, wPx = other.width, hPx = other.height;
+                    const rotDeg = other.rotation || 0;
+                    let scPx: number[][];
+                    if (Math.abs(rotDeg) > 0.01) {
+                      const rad = (rotDeg * Math.PI) / 180;
+                      const cR = Math.cos(rad), sR = Math.sin(rad);
+                      const cxPx = xPx + wPx / 2;
+                      const cyPx = yPx + hPx / 2;
+                      const rotPt = (px: number, py: number): number[] => {
+                        const dx = px - cxPx, dy = py - cyPx;
+                        return [cxPx + dx * cR - dy * sR, cyPx + dx * sR + dy * cR];
+                      };
+                      scPx = [
+                        rotPt(xPx, yPx), rotPt(xPx + wPx, yPx),
+                        rotPt(xPx + wPx, yPx + hPx), rotPt(xPx, yPx + hPx),
+                      ];
+                    } else {
+                      scPx = [
+                        [xPx, yPx], [xPx + wPx, yPx],
+                        [xPx + wPx, yPx + hPx], [xPx, yPx + hPx],
+                      ];
+                    }
+                    // Closest-corners by rotated screen position
+                    // (matches active Adjacent Panel block above).
+                    let orderIdx: number[];
+                    if (side === "Right") {
+                      orderIdx = [0, 1, 2, 3].sort((a, b) => scPx[b][0] - scPx[a][0]);
+                    } else if (side === "Left") {
+                      orderIdx = [0, 1, 2, 3].sort((a, b) => scPx[a][0] - scPx[b][0]);
+                    } else if (side === "Top") {
+                      orderIdx = [0, 1, 2, 3].sort((a, b) => scPx[a][1] - scPx[b][1]);
+                    } else {
+                      orderIdx = [0, 1, 2, 3].sort((a, b) => scPx[b][1] - scPx[a][1]);
+                    }
+                    const s1Px = scPx[orderIdx[0]];
+                    const s2Px = scPx[orderIdx[1]];
+                    const xToPctO = (v: number) => (v / Math.max(1, ziActualW)) * 100;
+                    const yToPctO = (v: number) => (v / Math.max(1, ziActualH)) * 100;
+                    const s1P: [number, number] = [xToPctO(s1Px[0]), yToPctO(s1Px[1])];
+                    const s2P: [number, number] = [xToPctO(s2Px[0]), yToPctO(s2Px[1])];
+                    let e1P: [number, number], e2P: [number, number];
+                    if (side === "Right") { e1P = [100, s1P[1]]; e2P = [100, s2P[1]]; }
+                    else if (side === "Left") { e1P = [0, s1P[1]]; e2P = [0, s2P[1]]; }
+                    else if (side === "Top") { e1P = [s1P[0], 0]; e2P = [s2P[0], 0]; }
+                    else { e1P = [s1P[0], 100]; e2P = [s2P[0], 100]; }
+                    return (
+                      <Box key={`other-inset-${otherIdx}`} sx={{ display: "contents" }}>
+                        {sourceRectBox}
+                        <svg style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 6, opacity: 0.55 }}>
+                          <line x1={`${s1P[0]}%`} y1={`${s1P[1]}%`} x2={`${e1P[0]}%`} y2={`${e1P[1]}%`} stroke={other.line_color || "#ffffff"} strokeWidth={otherLineW} strokeDasharray={otherLineDash} />
+                          <line x1={`${s2P[0]}%`} y1={`${s2P[1]}%`} x2={`${e2P[0]}%`} y2={`${e2P[1]}%`} stroke={other.line_color || "#ffffff"} strokeWidth={otherLineW} strokeDasharray={otherLineDash} />
+                        </svg>
+                      </Box>
+                    );
+                  }
+
+                  // ── Standard Zoom: source rect + live zoomed target + connectors ──
+                  const tgtXPct = ((other.target_x ?? 200) / ziActualW) * 100;
+                  const tgtYPct = ((other.target_y ?? 200) / ziActualH) * 100;
+                  const rotDeg = other.rotation || 0;
+                  const xPx = other.x, yPx = other.y, wPx = other.width, hPx = other.height;
+                  let scPx: number[][];
+                  if (Math.abs(rotDeg) > 0.01) {
+                    const rad = (rotDeg * Math.PI) / 180;
+                    const cR = Math.cos(rad), sR = Math.sin(rad);
+                    const cxPx = xPx + wPx / 2;
+                    const cyPx = yPx + hPx / 2;
+                    const rotPt = (px: number, py: number): number[] => {
+                      const dx = px - cxPx, dy = py - cyPx;
+                      return [cxPx + dx * cR - dy * sR, cyPx + dx * sR + dy * cR];
+                    };
+                    scPx = [
+                      rotPt(xPx, yPx),
+                      rotPt(xPx + wPx, yPx),
+                      rotPt(xPx + wPx, yPx + hPx),
+                      rotPt(xPx, yPx + hPx),
+                    ];
+                  } else {
+                    scPx = [
+                      [xPx, yPx], [xPx + wPx, yPx],
+                      [xPx + wPx, yPx + hPx], [xPx, yPx + hPx],
+                    ];
+                  }
+                  const tgtXPx = other.target_x ?? 0;
+                  const tgtYPx = other.target_y ?? 0;
+                  const tgtWPx = wPx * other.zoom_factor;
+                  const tgtHPx = hPx * other.zoom_factor;
+                  const dcPx = [
+                    [tgtXPx, tgtYPx], [tgtXPx + tgtWPx, tgtYPx],
+                    [tgtXPx + tgtWPx, tgtYPx + tgtHPx], [tgtXPx, tgtYPx + tgtHPx],
+                  ];
+                  const srcCx2 = scPx.reduce((s, c) => s + c[0], 0) / 4;
+                  const srcCy2 = scPx.reduce((s, c) => s + c[1], 0) / 4;
+                  const dstCx2 = tgtXPx + tgtWPx / 2;
+                  const dstCy2 = tgtYPx + tgtHPx / 2;
+                  // Closest-corners funnel (see Standard Zoom block above)
+                  const srcSorted = scPx.map((c, i) => ({
+                    i, d: Math.hypot(c[0] - dstCx2, c[1] - dstCy2),
+                  })).sort((a, b) => a.d - b.d);
+                  const dstSorted = dcPx.map((c, i) => ({
+                    i, d: Math.hypot(c[0] - srcCx2, c[1] - srcCy2),
+                  })).sort((a, b) => a.d - b.d);
+                  const s1Idx = srcSorted[0].i;
+                  const s2Idx = srcSorted[1].i;
+                  let d1Idx = dstSorted[0].i;
+                  let d2Idx = dstSorted[1].i;
+                  const ccw2 = (a: number[], b: number[], c: number[]) =>
+                    (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0]);
+                  const cross2 = (p1: number[], p2: number[], q1: number[], q2: number[]) =>
+                    ccw2(p1, q1, q2) !== ccw2(p2, q1, q2) &&
+                    ccw2(p1, p2, q1) !== ccw2(p1, p2, q2);
+                  if (cross2(scPx[s1Idx], dcPx[d1Idx], scPx[s2Idx], dcPx[d2Idx])) {
+                    [d1Idx, d2Idx] = [d2Idx, d1Idx];
+                  }
+                  const sT = [s1Idx, s2Idx];
+                  const dT = [d1Idx, d2Idx];
+                  const xToPct = (v: number) => (v / Math.max(1, ziActualW)) * 100;
+                  const yToPct = (v: number) => (v / Math.max(1, ziActualH)) * 100;
+                  const tgtWPct = wPct * other.zoom_factor;
+                  const tgtHPct = hPct * other.zoom_factor;
+                  return (
+                    <Box key={`other-inset-${otherIdx}`} sx={{ display: "contents" }}>
+                      {sourceRectBox}
+                      {/* Target rectangle with the live zoomed image
+                          drawn on a canvas — same pipeline as the
+                          active inset, so the read-only preview shows
+                          identical content. Slightly translucent +
+                          dashed border to mark it as non-interactable. */}
+                      <Box
+                        sx={{
+                          position: "absolute",
+                          left: `${tgtXPct}%`,
+                          top: `${tgtYPct}%`,
+                          width: `${tgtWPct}%`,
+                          height: `${tgtHPct}%`,
+                          border: `${otherRectW}px ${otherRectCss} ${other.rectangle_color || "#ffffff"}`,
+                          opacity: 0.7,
+                          pointerEvents: "none",
+                          zIndex: 6,
+                          overflow: "hidden",
+                          backgroundColor: "rgba(0,0,0,0.3)",
+                        }}
+                        title={`Inset ${otherIdx + 1} target (click chip to edit)`}
+                        ref={(el: HTMLDivElement | null) => {
+                          if (!el) return;
+                          const existingCanvas = el.querySelector("canvas");
+                          if (existingCanvas) existingCanvas.remove();
+                          const canvas = document.createElement("canvas");
+                          const tgtW = el.clientWidth;
+                          const tgtH = el.clientHeight;
+                          if (tgtW < 2 || tgtH < 2) return;
+                          canvas.width = tgtW;
+                          canvas.height = tgtH;
+                          canvas.style.width = "100%";
+                          canvas.style.height = "100%";
+                          canvas.style.pointerEvents = "none";
+                          const ctx = canvas.getContext("2d");
+                          if (!ctx) return;
+                          ctx.imageSmoothingEnabled = true;
+                          ctx.imageSmoothingQuality = "high";
+                          // Sample from the panel <img> sibling. Walk
+                          // up from this target Box → wrapper to find
+                          // the panel image (same logic as the active
+                          // inset's canvas ref).
+                          const wrapper = el.parentElement;
+                          const imgEl = wrapper?.querySelector("img") as HTMLImageElement | null;
+                          if (!imgEl || !imgEl.naturalWidth) {
+                            el.appendChild(canvas);
+                            return;
+                          }
+                          const srcCxImg = ((other.x + other.width / 2) / ziActualW) * imgEl.naturalWidth;
+                          const srcCyImg = ((other.y + other.height / 2) / ziActualH) * imgEl.naturalHeight;
+                          const srcWImg = (other.width / ziActualW) * imgEl.naturalWidth;
+                          const srcHImg = (other.height / ziActualH) * imgEl.naturalHeight;
+                          try {
+                            if (Math.abs(rotDeg) > 0.01) {
+                              const rotRad = (rotDeg * Math.PI) / 180;
+                              ctx.save();
+                              ctx.translate(tgtW / 2, tgtH / 2);
+                              ctx.scale(tgtW / Math.max(1, srcWImg), tgtH / Math.max(1, srcHImg));
+                              ctx.rotate(-rotRad);
+                              ctx.translate(-srcCxImg, -srcCyImg);
+                              ctx.drawImage(imgEl, 0, 0);
+                              ctx.restore();
+                            } else {
+                              const srcX = srcCxImg - srcWImg / 2;
+                              const srcY = srcCyImg - srcHImg / 2;
+                              ctx.drawImage(imgEl, srcX, srcY, srcWImg, srcHImg, 0, 0, tgtW, tgtH);
+                            }
+                          } catch {}
+                          el.appendChild(canvas);
+                        }}
+                      />
+                      {/* Connector lines */}
+                      <svg style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 6, opacity: 0.6 }}>
+                        <line
+                          x1={`${xToPct(scPx[sT[0]][0])}%`}
+                          y1={`${yToPct(scPx[sT[0]][1])}%`}
+                          x2={`${xToPct(dcPx[dT[0]][0])}%`}
+                          y2={`${yToPct(dcPx[dT[0]][1])}%`}
+                          stroke={other.line_color || "#ffffff"}
+                          strokeWidth={otherLineW}
+                          strokeDasharray={otherLineDash}
+                        />
+                        <line
+                          x1={`${xToPct(scPx[sT[1]][0])}%`}
+                          y1={`${yToPct(scPx[sT[1]][1])}%`}
+                          x2={`${xToPct(dcPx[dT[1]][0])}%`}
+                          y2={`${yToPct(dcPx[dT[1]][1])}%`}
+                          stroke={other.line_color || "#ffffff"}
+                          strokeWidth={otherLineW}
+                          strokeDasharray={otherLineDash}
+                        />
+                      </svg>
+                    </Box>
+                  );
+                })}
                 {/* Zoom inset overlay — draggable rectangle showing zoom area */}
                 {tabIdx === TAB_ZOOM && local.add_zoom_inset && local.zoom_inset && ["Standard Zoom", "Adjacent Panel"].includes(local.zoom_inset.inset_type) && (() => {
                   const zi = local.zoom_inset!;
@@ -5763,6 +7173,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     ? (local.crop[2] - local.crop[0]) : (origFullW > 0 ? origFullW : 1000);
                   const ziActualH = (local.crop_image && local.crop?.length === 4)
                     ? (local.crop[3] - local.crop[1]) : (origFullH > 0 ? origFullH : 1000);
+                  // Display-to-source scale: lets us render the rect
+                  // border and connector lines at the same SOURCE-pixel
+                  // thickness as the main preview, so the user sees the
+                  // same proportional line widths in both views.
+                  // Rounded to whole pixels so the browser renders a
+                  // crisp edge (fractional CSS border / SVG stroke
+                  // widths get sub-pixel-rendered and look blurry).
+                  const dispScale = ziImgW / Math.max(1, ziActualW);
+                  const rectW = Math.max(1, Math.round((zi.rectangle_width || 2) * dispScale));
+                  const lineWdisp = Math.max(1, Math.round((zi.line_width || 2) * dispScale));
                   // Convert pixel coords to percentage
                   const xPct = (zi.x / ziActualW) * 100;
                   const yPct = (zi.y / ziActualH) * 100;
@@ -5772,14 +7192,31 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   const tgtYPct = ((zi.target_y ?? 200) / ziActualH) * 100;
                   return (
                     <>
-                      {/* Source area rectangle — draggable + resizable like crop */}
+                      {/* Source area rectangle — draggable + resizable like crop.
+                          When zi.rotation is non-zero, the rectangle rotates
+                          around its centre — matching the backend's
+                          inverse-rotate-then-crop logic so what you see in
+                          the editor is what gets cropped. Drag handlers
+                          still operate in the un-rotated coordinate system
+                          (cursor x/y deltas map to the unrotated rect's
+                          axes via simple inverse rotation). */}
                       <Box
                         sx={{
                           position: "absolute",
                           left: `${xPct}%`, top: `${yPct}%`,
                           width: `${wPct}%`, height: `${hPct}%`,
-                          border: `2px solid ${zi.rectangle_color}`,
+                          // Border width matches `zi.rectangle_width` in
+                          // SOURCE pixels, scaled to the editor's display
+                          // size — so it visually matches the main preview.
+                          // Style follows `zi.rectangle_style`.
+                          border: `${rectW}px ${ziStyleToCss(zi.rectangle_style)} ${zi.rectangle_color}`,
+                          // Slightly heavier bottom edge as an orientation
+                          // cue under rotation (scaled with rectW so it
+                          // stays proportional at any image resolution).
+                          borderBottomWidth: `${rectW * 2}px`,
                           cursor: "grab", zIndex: 8,
+                          transform: zi.rotation ? `rotate(${zi.rotation}deg)` : undefined,
+                          transformOrigin: "center center",
                           "&:hover": { boxShadow: `0 0 8px ${zi.rectangle_color}` },
                         }}
                         onMouseDown={(e) => {
@@ -5798,6 +7235,27 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                           window.addEventListener("mousemove", onMove); window.addEventListener("mouseup", onUp);
                         }}
                       >
+                        {/* Bottom-edge marker: small "▼" badge anchored at
+                            the centre of the bottom edge, inside the rect.
+                            Helps disambiguate orientation under rotation. */}
+                        <Box
+                          sx={{
+                            position: "absolute",
+                            bottom: 2, left: "50%",
+                            transform: "translateX(-50%)",
+                            fontSize: "0.6rem",
+                            lineHeight: 1,
+                            color: zi.rectangle_color,
+                            backgroundColor: "rgba(0,0,0,0.55)",
+                            px: 0.4, borderRadius: 0.4,
+                            pointerEvents: "none",
+                            userSelect: "none",
+                            zIndex: 9,
+                          }}
+                          title="Bottom edge"
+                        >
+                          ▼
+                        </Box>
                         {/* Corner resize handles */}
                         {(["nw", "ne", "sw", "se"] as const).map((corner) => {
                           const isRight = corner.includes("e");
@@ -5818,27 +7276,52 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                               onMouseDown={(e) => {
                                 e.preventDefault(); e.stopPropagation();
                                 // DOM walk: corner handle → source-rect → wrapper.
-                                // The previous `closest("[style]")` matched the
-                                // first ancestor with an inline style attribute,
-                                // which is unpredictable since MUI's sx compiles
-                                // to emotion classes (not inline style). It often
-                                // landed on the dialog backdrop, whose
-                                // getBoundingClientRect bears no relation to the
-                                // panel image — so dx/dy scaled by the wrong rect
-                                // and the source rectangle "jumped" on tiny drags.
                                 const imgEl = e.currentTarget.parentElement?.parentElement?.querySelector("img") as HTMLImageElement | null;
                                 if (!imgEl) return;
                                 const startX = e.clientX, startY = e.clientY;
                                 const startZi = { ...zi };
+                                // Rotation-aware corner resize: keep the
+                                // OPPOSITE corner fixed in screen space and
+                                // make the dragged corner follow the mouse.
+                                // Without this, drag dx/dy applied directly
+                                // to width/height makes the visible corner
+                                // shoot off-axis on rotated rects (the user
+                                // sees "changing width changes height too").
+                                const cx0 = startZi.x + startZi.width / 2;
+                                const cy0 = startZi.y + startZi.height / 2;
+                                const rad = ((startZi.rotation || 0) * Math.PI) / 180;
+                                const cosR = Math.cos(rad), sinR = Math.sin(rad);
+                                // Opposite corner (un-rotated) — fixed during drag
+                                const oppLX = corner.includes("w") ? startZi.x + startZi.width : startZi.x;
+                                const oppLY = corner.includes("n") ? startZi.y + startZi.height : startZi.y;
+                                const oppSX = cx0 + (oppLX - cx0) * cosR - (oppLY - cy0) * sinR;
+                                const oppSY = cy0 + (oppLX - cx0) * sinR + (oppLY - cy0) * cosR;
+                                // Original dragged-corner screen position
+                                const dragLX = corner.includes("e") ? startZi.x + startZi.width : startZi.x;
+                                const dragLY = corner.includes("s") ? startZi.y + startZi.height : startZi.y;
+                                const dragSX0 = cx0 + (dragLX - cx0) * cosR - (dragLY - cy0) * sinR;
+                                const dragSY0 = cy0 + (dragLX - cx0) * sinR + (dragLY - cy0) * cosR;
                                 const onMove = (ev: MouseEvent) => {
                                   const rect = imgEl.getBoundingClientRect();
-                                  const dx = ((ev.clientX - startX) / rect.width) * ziActualW;
-                                  const dy = ((ev.clientY - startY) / rect.height) * ziActualH;
-                                  let newX = startZi.x, newY = startZi.y, newW = startZi.width, newH = startZi.height;
-                                  if (corner.includes("e")) { newW = Math.max(20, Math.round(startZi.width + dx)); }
-                                  if (corner.includes("w")) { newX = Math.max(0, Math.round(startZi.x + dx)); newW = Math.max(20, Math.round(startZi.width - dx)); }
-                                  if (corner.includes("s")) { newH = Math.max(20, Math.round(startZi.height + dy)); }
-                                  if (corner.includes("n")) { newY = Math.max(0, Math.round(startZi.y + dy)); newH = Math.max(20, Math.round(startZi.height - dy)); }
+                                  const dxScreen = ((ev.clientX - startX) / rect.width) * ziActualW;
+                                  const dyScreen = ((ev.clientY - startY) / rect.height) * ziActualH;
+                                  // New screen-space position of the dragged corner
+                                  const dragSXnew = dragSX0 + dxScreen;
+                                  const dragSYnew = dragSY0 + dyScreen;
+                                  // New centre = midpoint of fixed-opposite and new-dragged
+                                  const newCx = (oppSX + dragSXnew) / 2;
+                                  const newCy = (oppSY + dragSYnew) / 2;
+                                  // Screen-space half-diagonal from new centre to dragged corner
+                                  const hdSx = dragSXnew - newCx;
+                                  const hdSy = dragSYnew - newCy;
+                                  // Inverse rotation → un-rotated half-diagonal
+                                  // (= half-width, half-height with correct sign)
+                                  const hdLx = hdSx * cosR + hdSy * sinR;
+                                  const hdLy = -hdSx * sinR + hdSy * cosR;
+                                  const newW = Math.max(20, Math.round(Math.abs(hdLx) * 2));
+                                  const newH = Math.max(20, Math.round(Math.abs(hdLy) * 2));
+                                  const newX = Math.max(0, Math.round(newCx - newW / 2));
+                                  const newY = Math.max(0, Math.round(newCy - newH / 2));
                                   updateLocal({ zoom_inset: { ...zi, x: newX, y: newY, width: newW, height: newH } });
                                 };
                                 const onUp = () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); setTimeout(() => refreshPreview(), 0); };
@@ -5863,7 +7346,9 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                           position: "absolute",
                           left: `${tgtXPct}%`, top: `${tgtYPct}%`,
                           width: `${insetWPct}%`, height: `${insetHPct}%`,
-                          border: `2px solid ${zi.rectangle_color}`,
+                          // Border in source-pixel units (matches main
+                          // preview); style follows `zi.rectangle_style`.
+                          border: `${rectW}px ${ziStyleToCss(zi.rectangle_style)} ${zi.rectangle_color}`,
                           overflow: "hidden", cursor: "grab", zIndex: 7,
                           bgcolor: "rgba(0,0,0,0.3)",
                         }}
@@ -5902,14 +7387,41 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                             };
                             extImg.src = `data:image/png;base64,${extImageThumb}`;
                           } else {
-                            // Default: crop source region from preview image
+                            // Default: crop source region from preview image.
+                            // For zi.rotation != 0, the source rectangle is
+                            // rotated CSS-style (CW). Plain drawImage with
+                            // a srcX/Y/W/H argument samples ONLY axis-aligned
+                            // pixels — it can't sample rotated content. So
+                            // when rotation is non-zero we transform the
+                            // canvas instead, drawing the WHOLE image with
+                            // a coord system rotated/scaled so the rotated
+                            // source rect's pixels land axis-aligned in the
+                            // target canvas. ctx.rotate(-R) is the inverse
+                            // of CSS rotate(R) (canvas and CSS share the
+                            // Y-down convention; positive angle = CW).
                             const imgEl = el.parentElement?.querySelector("img") as HTMLImageElement | null;
                             if (!imgEl || !imgEl.naturalWidth) return;
-                            const srcX = (zi.x / ziActualW) * imgEl.naturalWidth;
-                            const srcY = (zi.y / ziActualH) * imgEl.naturalHeight;
+                            const srcCx = ((zi.x + zi.width / 2) / ziActualW) * imgEl.naturalWidth;
+                            const srcCy = ((zi.y + zi.height / 2) / ziActualH) * imgEl.naturalHeight;
                             const srcW = (zi.width / ziActualW) * imgEl.naturalWidth;
                             const srcH = (zi.height / ziActualH) * imgEl.naturalHeight;
-                            try { ctx.drawImage(imgEl, srcX, srcY, srcW, srcH, 0, 0, tgtW, tgtH); } catch {}
+                            const rot = zi.rotation || 0;
+                            try {
+                              if (Math.abs(rot) > 0.01) {
+                                const rotRad = (rot * Math.PI) / 180;
+                                ctx.save();
+                                ctx.translate(tgtW / 2, tgtH / 2);
+                                ctx.scale(tgtW / Math.max(1, srcW), tgtH / Math.max(1, srcH));
+                                ctx.rotate(-rotRad);
+                                ctx.translate(-srcCx, -srcCy);
+                                ctx.drawImage(imgEl, 0, 0);
+                                ctx.restore();
+                              } else {
+                                const srcX = srcCx - srcW / 2;
+                                const srcY = srcCy - srcH / 2;
+                                ctx.drawImage(imgEl, srcX, srcY, srcW, srcH, 0, 0, tgtW, tgtH);
+                              }
+                            } catch {}
                           }
                           el.appendChild(canvas);
                         }}
@@ -5961,83 +7473,204 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       })()}
                       {/* Connecting lines — funnel from source corners to inset corners (Standard Zoom only) */}
                       {zi.inset_type === "Standard Zoom" && (() => {
-                        // Source corners (TL, TR, BR, BL)
-                        const sc = [
-                          [xPct, yPct], [xPct + wPct, yPct],
-                          [xPct + wPct, yPct + hPct], [xPct, yPct + hPct]
-                        ];
-                        // Inset corners — use same sizing as the inset box
-                        const hasExtLine = zi.separate_image_name && zi.separate_image_name !== "select";
-                        const tgtW = wPct * zi.zoom_factor;
-                        const tgtH = hasExtLine && extImageDims.w > 0 && extImageDims.h > 0
-                          ? tgtW * ((zi.height_inset || extImageDims.h) / (zi.width_inset || extImageDims.w)) * (ziActualW / ziActualH)
-                          : hPct * zi.zoom_factor;
-                        const dc = [
-                          [tgtXPct, tgtYPct], [tgtXPct + tgtW, tgtYPct],
-                          [tgtXPct + tgtW, tgtYPct + tgtH], [tgtXPct, tgtYPct + tgtH]
-                        ];
-                        // Centers
-                        const srcCx = xPct + wPct / 2, srcCy = yPct + hPct / 2;
-                        const dstCx = tgtXPct + tgtW / 2, dstCy = tgtYPct + tgtH / 2;
-                        // Sort source corners by distance to inset center, take 2 closest
-                        const srcSorted = sc.map((c, i) => ({ c, i, d: Math.hypot(c[0] - dstCx, c[1] - dstCy) }))
-                          .sort((a, b) => a.d - b.d);
-                        const s1 = srcSorted[0].c, s2 = srcSorted[1].c;
-                        // Sort inset corners by distance to source center, take 2 closest
-                        const dstSorted = dc.map((c, i) => ({ c, i, d: Math.hypot(c[0] - srcCx, c[1] - srcCy) }))
-                          .sort((a, b) => a.d - b.d);
-                        const d1 = dstSorted[0].c, d2 = dstSorted[1].c;
-                        // Connect: try both pairings, pick the non-crossing one
-                        const ccw = (a: number[], b: number[], c: number[]) =>
-                          (c[1]-a[1])*(b[0]-a[0]) > (b[1]-a[1])*(c[0]-a[0]);
-                        const cross = (p1: number[], p2: number[], q1: number[], q2: number[]) =>
-                          ccw(p1,q1,q2) !== ccw(p2,q1,q2) && ccw(p1,p2,q1) !== ccw(p1,p2,q2);
-                        let l1s = s1, l1e = d1, l2s = s2, l2e = d2;
-                        if (cross(l1s, l1e, l2s, l2e)) {
-                          // Swap destination pairing
-                          l1e = d2; l2e = d1;
+                        // ── Coordinates: zi pixel space, NOT % ───────────
+                        // CSS rotates around the rect's centre in PIXEL
+                        // space. If the wrapper isn't square, rotating in
+                        // % space (where x and y axes have different
+                        // pixel-per-percent scales) produces visibly
+                        // wrong corner positions — that's why the lines
+                        // didn't meet the box. Compute everything in zi
+                        // pixel coords (ziActualW × ziActualH), then
+                        // convert to % only when emitting the SVG.
+                        const rotDeg = zi.rotation || 0;
+                        const xPx = zi.x;
+                        const yPx = zi.y;
+                        const wPx = zi.width;
+                        const hPx = zi.height;
+                        let scPx: number[][];
+                        if (Math.abs(rotDeg) > 0.01) {
+                          const rad = (rotDeg * Math.PI) / 180;
+                          const cR = Math.cos(rad);
+                          const sR = Math.sin(rad);
+                          const cxPx = xPx + wPx / 2;
+                          const cyPx = yPx + hPx / 2;
+                          const rot = (px: number, py: number): number[] => {
+                            const dx = px - cxPx;
+                            const dy = py - cyPx;
+                            return [cxPx + dx * cR - dy * sR, cyPx + dx * sR + dy * cR];
+                          };
+                          scPx = [
+                            rot(xPx, yPx),
+                            rot(xPx + wPx, yPx),
+                            rot(xPx + wPx, yPx + hPx),
+                            rot(xPx, yPx + hPx),
+                          ];
+                        } else {
+                          scPx = [
+                            [xPx, yPx], [xPx + wPx, yPx],
+                            [xPx + wPx, yPx + hPx], [xPx, yPx + hPx]
+                          ];
                         }
+                        // Destination box in zi pixel space — match the
+                        // visible inset overlay (which is sized to wPx ·
+                        // zoom and hPx · zoom for non-external; for
+                        // external, height follows the inset image's
+                        // aspect ratio).
+                        const hasExtLine = zi.separate_image_name && zi.separate_image_name !== "select";
+                        const tgtXPx = zi.target_x ?? 0;
+                        const tgtYPx = zi.target_y ?? 0;
+                        const tgtWPx = wPx * zi.zoom_factor;
+                        const tgtHPx = hasExtLine && extImageDims.w > 0 && extImageDims.h > 0
+                          ? tgtWPx * ((zi.height_inset || extImageDims.h) / (zi.width_inset || extImageDims.w))
+                          : hPx * zi.zoom_factor;
+                        const dcPx = [
+                          [tgtXPx, tgtYPx], [tgtXPx + tgtWPx, tgtYPx],
+                          [tgtXPx + tgtWPx, tgtYPx + tgtHPx], [tgtXPx, tgtYPx + tgtHPx]
+                        ];
+                        // Aliases so the rest of the algorithm reads the
+                        // same. Algorithm runs in pixel space, then we
+                        // convert each line endpoint to % at emit time.
+                        const sc = scPx;
+                        const dc = dcPx;
+                        const srcCx = sc.reduce((s, c) => s + c[0], 0) / sc.length;
+                        const srcCy = sc.reduce((s, c) => s + c[1], 0) / sc.length;
+                        const dstCx = tgtXPx + tgtWPx / 2, dstCy = tgtYPx + tgtHPx / 2;
+                        // ── Closest-corners funnel ─────────────────────────
+                        // Pick the two source corners closest to the
+                        // destination centroid and the two destination
+                        // corners closest to the source centroid — so
+                        // the line endpoints sit on the edges of each
+                        // rect that FACE the other rect. Then choose
+                        // the non-crossing pairing of (s1↔d1, s2↔d2)
+                        // vs. (s1↔d2, s2↔d1). This avoids the silhouette-
+                        // tangent's diagonal corner picks that could
+                        // route a line through the rect's interior.
+                        const srcSorted = sc.map((c, i) => ({
+                          i, d: Math.hypot(c[0] - dstCx, c[1] - dstCy),
+                        })).sort((a, b) => a.d - b.d);
+                        const dstSorted = dc.map((c, i) => ({
+                          i, d: Math.hypot(c[0] - srcCx, c[1] - srcCy),
+                        })).sort((a, b) => a.d - b.d);
+                        const s1 = sc[srcSorted[0].i];
+                        const s2 = sc[srcSorted[1].i];
+                        let d1 = dc[dstSorted[0].i];
+                        let d2 = dc[dstSorted[1].i];
+                        const ccw = (a: number[], b: number[], c: number[]) =>
+                          (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0]);
+                        const cross = (p1: number[], p2: number[], q1: number[], q2: number[]) =>
+                          ccw(p1, q1, q2) !== ccw(p2, q1, q2) &&
+                          ccw(p1, p2, q1) !== ccw(p1, p2, q2);
+                        if (cross(s1, d1, s2, d2)) {
+                          [d1, d2] = [d2, d1];
+                        }
+                        const l1s = s1, l1e = d1;
+                        const l2s = s2, l2e = d2;
+                        // Convert pixel-space endpoints to % of the
+                        // wrapper for SVG positioning. ziActualW maps the
+                        // x axis, ziActualH maps the y axis — the same
+                        // basis used for the source-rect overlay's CSS
+                        // left/top/width/height, so the line ends land
+                        // exactly on the rotated rect's visible corners.
+                        const xToPct = (v: number) => (v / Math.max(1, ziActualW)) * 100;
+                        const yToPct = (v: number) => (v / Math.max(1, ziActualH)) * 100;
                         return (
                           <svg style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 6 }}>
-                            <line x1={`${l1s[0]}%`} y1={`${l1s[1]}%`} x2={`${l1e[0]}%`} y2={`${l1e[1]}%`} stroke={zi.line_color} strokeWidth={zi.line_width} opacity={0.6} />
-                            <line x1={`${l2s[0]}%`} y1={`${l2s[1]}%`} x2={`${l2e[0]}%`} y2={`${l2e[1]}%`} stroke={zi.line_color} strokeWidth={zi.line_width} opacity={0.6} />
+                            <line x1={`${xToPct(l1s[0])}%`} y1={`${yToPct(l1s[1])}%`} x2={`${xToPct(l1e[0])}%`} y2={`${yToPct(l1e[1])}%`} stroke={zi.line_color} strokeWidth={lineWdisp} strokeDasharray={ziStyleToDash(zi.line_style, lineWdisp)} opacity={0.6} />
+                            <line x1={`${xToPct(l2s[0])}%`} y1={`${yToPct(l2s[1])}%`} x2={`${xToPct(l2e[0])}%`} y2={`${yToPct(l2e[1])}%`} stroke={zi.line_color} strokeWidth={lineWdisp} strokeDasharray={ziStyleToDash(zi.line_style, lineWdisp)} opacity={0.6} />
                           </svg>
                         );
                       })()}
                     </>
                   );
                 })()}
-                {/* Adjacent Panel: connecting lines from source to panel edge + label */}
+                {/* Adjacent Panel: connecting lines from source to panel edge + label.
+                    With rotation: take the source rect's silhouette
+                    tangent corners (the extremes perpendicular to the
+                    "side" direction) and draw lines from them to the
+                    panel edge. Same pixel-space approach as Standard
+                    Zoom so the lines meet the visible rotated rect. */}
                 {tabIdx === TAB_ZOOM && local.add_zoom_inset && local.zoom_inset?.inset_type === "Adjacent Panel" && (() => {
                   const zi = local.zoom_inset!;
                   const adjActW = (local.crop_image && local.crop?.length === 4) ? (local.crop[2] - local.crop[0]) : (origFullW > 0 ? origFullW : 1000);
                   const adjActH = (local.crop_image && local.crop?.length === 4) ? (local.crop[3] - local.crop[1]) : (origFullH > 0 ? origFullH : 1000);
-                  const sxP = (zi.x / adjActW) * 100;
-                  const syP = (zi.y / adjActH) * 100;
-                  const swP = (zi.width / adjActW) * 100;
-                  const shP = (zi.height / adjActH) * 100;
-                  // Explicit corner matching — source edge corners to panel edge
+                  // Display-to-source scale so SVG strokeWidth matches
+                  // the main preview's source-pixel line thickness.
+                  const _adjPreviewEl = document.querySelector('[alt="Panel preview"]') as HTMLImageElement | null;
+                  const _adjImgW = _adjPreviewEl?.clientWidth || 400;
+                  const adjDispScale = _adjImgW / Math.max(1, adjActW);
+                  const lineWdisp = Math.max(1, Math.round((zi.line_width || 2) * adjDispScale));
                   const side = zi.side || "Right";
-                  let s1: [number, number], s2: [number, number];
-                  let e1: [number, number], e2: [number, number];
-                  if (side === "Right") {
-                    s1 = [sxP + swP, syP]; s2 = [sxP + swP, syP + shP];
-                    e1 = [100, syP]; e2 = [100, syP + shP];
-                  } else if (side === "Left") {
-                    s1 = [sxP, syP]; s2 = [sxP, syP + shP];
-                    e1 = [0, syP]; e2 = [0, syP + shP];
-                  } else if (side === "Top") {
-                    s1 = [sxP, syP]; s2 = [sxP + swP, syP];
-                    e1 = [sxP, 0]; e2 = [sxP + swP, 0];
+                  // Compute the 4 source corners in zi pixel space
+                  // (matches CSS rotation around the rect centre).
+                  const xPx = zi.x, yPx = zi.y, wPx = zi.width, hPx = zi.height;
+                  const rotDeg = zi.rotation || 0;
+                  let scPx: number[][];
+                  if (Math.abs(rotDeg) > 0.01) {
+                    const rad = (rotDeg * Math.PI) / 180;
+                    const cR = Math.cos(rad), sR = Math.sin(rad);
+                    const cxPx = xPx + wPx / 2;
+                    const cyPx = yPx + hPx / 2;
+                    const rotPt = (px: number, py: number): number[] => {
+                      const dx = px - cxPx, dy = py - cyPx;
+                      return [cxPx + dx * cR - dy * sR, cyPx + dx * sR + dy * cR];
+                    };
+                    scPx = [
+                      rotPt(xPx, yPx),
+                      rotPt(xPx + wPx, yPx),
+                      rotPt(xPx + wPx, yPx + hPx),
+                      rotPt(xPx, yPx + hPx),
+                    ];
                   } else {
-                    s1 = [sxP, syP + shP]; s2 = [sxP + swP, syP + shP];
-                    e1 = [sxP, 100]; e2 = [sxP + swP, 100];
+                    scPx = [
+                      [xPx, yPx], [xPx + wPx, yPx],
+                      [xPx + wPx, yPx + hPx], [xPx, yPx + hPx],
+                    ];
+                  }
+                  // Pick the two source corners CLOSEST (by rotated
+                  // screen position) to the adjacent panel direction
+                  // — min/max x for Right/Left, min/max y for
+                  // Top/Bottom. Closest-corners adapts naturally to
+                  // rotation: at e.g. 90° CW the original top-edge
+                  // corners are now the rightmost, and the algorithm
+                  // picks those.
+                  let orderIdx: number[];
+                  if (side === "Right") {
+                    orderIdx = [0, 1, 2, 3].sort((a, b) => scPx[b][0] - scPx[a][0]);
+                  } else if (side === "Left") {
+                    orderIdx = [0, 1, 2, 3].sort((a, b) => scPx[a][0] - scPx[b][0]);
+                  } else if (side === "Top") {
+                    orderIdx = [0, 1, 2, 3].sort((a, b) => scPx[a][1] - scPx[b][1]);
+                  } else {
+                    orderIdx = [0, 1, 2, 3].sort((a, b) => scPx[b][1] - scPx[a][1]);
+                  }
+                  const s1Px = scPx[orderIdx[0]];
+                  const s2Px = scPx[orderIdx[1]];
+                  // Endpoints: extend each tangent corner to the matching
+                  // panel edge along the "side" axis.
+                  const xToPct = (v: number) => (v / Math.max(1, adjActW)) * 100;
+                  const yToPct = (v: number) => (v / Math.max(1, adjActH)) * 100;
+                  let e1Pct: [number, number], e2Pct: [number, number];
+                  let s1Pct: [number, number], s2Pct: [number, number];
+                  s1Pct = [xToPct(s1Px[0]), yToPct(s1Px[1])];
+                  s2Pct = [xToPct(s2Px[0]), yToPct(s2Px[1])];
+                  if (side === "Right") {
+                    e1Pct = [100, s1Pct[1]];
+                    e2Pct = [100, s2Pct[1]];
+                  } else if (side === "Left") {
+                    e1Pct = [0, s1Pct[1]];
+                    e2Pct = [0, s2Pct[1]];
+                  } else if (side === "Top") {
+                    e1Pct = [s1Pct[0], 0];
+                    e2Pct = [s2Pct[0], 0];
+                  } else {
+                    e1Pct = [s1Pct[0], 100];
+                    e2Pct = [s2Pct[0], 100];
                   }
                   return (
                     <>
                       <svg style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 6 }}>
-                        <line x1={`${s1[0]}%`} y1={`${s1[1]}%`} x2={`${e1[0]}%`} y2={`${e1[1]}%`} stroke={zi.line_color} strokeWidth={zi.line_width} opacity={0.6} />
-                        <line x1={`${s2[0]}%`} y1={`${s2[1]}%`} x2={`${e2[0]}%`} y2={`${e2[1]}%`} stroke={zi.line_color} strokeWidth={zi.line_width} opacity={0.6} />
+                        <line x1={`${s1Pct[0]}%`} y1={`${s1Pct[1]}%`} x2={`${e1Pct[0]}%`} y2={`${e1Pct[1]}%`} stroke={zi.line_color} strokeWidth={lineWdisp} strokeDasharray={ziStyleToDash(zi.line_style, lineWdisp)} opacity={0.6} />
+                        <line x1={`${s2Pct[0]}%`} y1={`${s2Pct[1]}%`} x2={`${e2Pct[0]}%`} y2={`${e2Pct[1]}%`} stroke={zi.line_color} strokeWidth={lineWdisp} strokeDasharray={ziStyleToDash(zi.line_style, lineWdisp)} opacity={0.6} />
                       </svg>
                       <Typography variant="caption" sx={{ position: "absolute", bottom: 8, right: 8, bgcolor: "rgba(0,0,0,0.7)", color: "#fff", px: 1, py: 0.25, borderRadius: 1, fontSize: "0.6rem", zIndex: 8 }}>
                         Zoomed region → {side} panel
