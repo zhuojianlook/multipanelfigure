@@ -2396,6 +2396,58 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     }
   }, [tabIdx, refreshRenderedPreview, overlayHash, isZoomTarget]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Live cascade of inherited scale bar to adjacent-zoom target panels ──
+  // Whenever the source panel's outgoing Adjacent inset changes
+  // (rect resize, drag, rotation, zoom_factor adjustment), re-derive
+  // the TARGET panel's scale bar using the selection-size ratio so
+  // the user sees the bar shrink / grow as they resize the rect.
+  // Cascades through chains too — if the target itself has an
+  // outgoing inset, its target's bar gets re-derived next time the
+  // user opens that cell. We don't reach into other panels' bars
+  // via React state, so the chain re-derivation happens lazily.
+  const cascadeHash = (() => {
+    if (!local || !local.add_zoom_inset) return "";
+    const insets = (local.zoom_insets && local.zoom_insets.length > 0)
+      ? local.zoom_insets
+      : (local.zoom_inset ? [local.zoom_inset] : []);
+    return insets
+      .filter((zi) => zi && zi.inset_type === "Adjacent Panel")
+      .map((zi) => `${zi.side}|${zi.x}|${zi.y}|${zi.width}|${zi.height}|${zi.zoom_factor}|${zi.rotation || 0}`)
+      .join(";");
+  })();
+  useEffect(() => {
+    if (!open || !local || !config || !local.add_scale_bar || !local.scale_bar) return;
+    const insets = (local.zoom_insets && local.zoom_insets.length > 0)
+      ? local.zoom_insets
+      : (local.zoom_inset ? [local.zoom_inset] : []);
+    for (const zi of insets) {
+      if (!zi || zi.inset_type !== "Adjacent Panel") continue;
+      let tr = row, tc = col;
+      const side = zi.side || "Right";
+      if (side === "Top") tr--; else if (side === "Bottom") tr++;
+      else if (side === "Left") tc--; else if (side === "Right") tc++;
+      if (tr < 0 || tr >= config.rows || tc < 0 || tc >= config.cols) continue;
+      const targetPanel = config.panels[tr]?.[tc];
+      if (!targetPanel || !targetPanel.add_scale_bar) continue;
+      const ratio = computeInheritRatio(local, zi);
+      const newMpp = local.scale_bar.micron_per_pixel * ratio;
+      const newBar = local.scale_bar.bar_length_microns * ratio;
+      const curMpp = targetPanel.scale_bar?.micron_per_pixel ?? 0;
+      const curBar = targetPanel.scale_bar?.bar_length_microns ?? 0;
+      // Skip if already at the inherited values (within float-noise
+      // tolerance) — avoids an infinite update loop and pointless
+      // re-renders when nothing changed.
+      if (Math.abs(curMpp - newMpp) < 1e-9 && Math.abs(curBar - newBar) < 1e-6) continue;
+      updatePanel(tr, tc, {
+        scale_bar: {
+          ...(targetPanel.scale_bar ?? local.scale_bar),
+          micron_per_pixel: newMpp,
+          bar_length_microns: newBar,
+        },
+      } as Partial<PanelInfo>);
+    }
+  }, [open, row, col, cascadeHash, local?.scale_bar?.micron_per_pixel, local?.scale_bar?.bar_length_microns, local?.add_scale_bar]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Fetch external image thumbnail and dimensions when it changes
   useEffect(() => {
     const extName = local?.zoom_inset?.separate_image_name;
