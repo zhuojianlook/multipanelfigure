@@ -5895,11 +5895,15 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     </Box>
                   );
                 })}
-                {/* Scale bar CSS overlay: only on Crop tab when no rendered preview, hidden elsewhere.
-                    TAB_ZOOM is in the exclude list now too — the rendered
-                    preview on the Zoom Inset tab already shows the bar
-                    baked in, so the inline overlay would duplicate it. */}
-                {tabIdx !== TAB_CROP && !([TAB_ADJ, TAB_LABELS, TAB_SCALE, TAB_ANNOT, TAB_ZOOM].includes(tabIdx) && renderedPreviewB64) && local.add_scale_bar && local.scale_bar && (() => {
+                {/* Inline scale-bar overlay: shown ONLY on overlay tabs
+                    where the user expects bar interaction (Adjustments,
+                    Labels, Scale Bar, Annotations, Zoom Inset) and only
+                    when the matplotlib-rendered preview hasn't loaded
+                    yet (otherwise the rendered PNG already has the bar
+                    baked in). Excluded from Crop, Play & Seek, and
+                    Z-Stack tabs — those tabs serve other purposes and
+                    don't need the inline bar. */}
+                {OVERLAY_TABS.includes(tabIdx) && !renderedPreviewB64 && local.add_scale_bar && local.scale_bar && (() => {
                   const isScaleBarTab = tabIdx === TAB_SCALE;
                   const sb = local.scale_bar!;
                   const edgePct = sb.edge_distance ?? 5;
