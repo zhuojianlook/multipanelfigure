@@ -200,6 +200,12 @@ interface CodeTab {
   statTest: string;
   code: string;
   plots: AnalysisPlot[];    // PNGs + dest tracking from this tab's last Run
+  /** Which interpreter the primary Run button dispatches for this
+   *  tab. Defaults to "r" (the historical default) so existing
+   *  tabs / saved projects keep working. Pipeline-seeded tabs
+   *  (Python starter, MATLAB starter) carry "python" or "matlab"
+   *  so Run does the right thing without an extra selector click. */
+  engine?: "r" | "python" | "matlab";
 }
 
 function makeTabId(): string {
@@ -1122,6 +1128,7 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
             statTest: "none",
             code: PYTHON_STARTER_CODE,
             plots: [],
+            engine: "python",
           };
           setTabs([starter]);
           setActiveTabId(id);
@@ -1258,6 +1265,15 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
 
   const handleRun = async () => {
     if (!activeTab) return;
+    // Dispatch based on the tab's engine so the primary Run button
+    // does the right thing regardless of whether the tab is R,
+    // Python, or MATLAB. The secondary "Run Python/MATLAB" button
+    // remains as a way to FORCE-run with a specific engine — handy
+    // when the user wants to sanity-check the same code under
+    // both, or override a tab's stored engine.
+    const eng = activeTab.engine || "r";
+    if (eng === "python") { await handleRunPython(); return; }
+    if (eng === "matlab") { await handleRunMatlab(); return; }
     setRunning(true);
     // Clear the active tab's plots + any of its keys in the selection.
     // Re-running produces fresh images so we drop tracking for the
@@ -1366,6 +1382,7 @@ ggplot(data, aes(x = ${stringCol}, y = ${yCol})) +
         statTest: "none",
         code,
         plots: [],
+        engine: "r",
       };
       return [...prev, tab];
     });
@@ -1386,6 +1403,18 @@ ggplot(data, aes(x = ${stringCol}, y = ${yCol})) +
     },
     [],
   );
+
+  // When the user switches tabs, sync the engine selector to the
+  // tab's stored engine (if it has a python / matlab one). R tabs
+  // leave the selector at its last value so flipping between an R
+  // and a Python tab doesn't lose the Python/MATLAB choice.
+  useEffect(() => {
+    if (!activeTab) return;
+    const eng = activeTab.engine;
+    if (eng === "python" || eng === "matlab") {
+      setPipelineEngine(eng);
+    }
+  }, [activeTabId, activeTab?.engine]);
 
   // Whenever the user toggles the preset OR (for haze) picks a new
   // reference, replace the active tab's code IF it still matches
@@ -2200,16 +2229,38 @@ ggplot(data, aes(x = ${stringCol}, y = ${yCol})) +
             {rInstalled && rVersion && (
               <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>{rVersion}</Typography>
             )}
-            <Button
-              size="small"
-              variant="contained"
-              startIcon={running ? <CircularProgress size={12} /> : <PlayArrowIcon sx={{ fontSize: 14 }} />}
-              disabled={running || runningPy || !rInstalled || !activeTab}
-              onClick={handleRun}
-              sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25 }}
-            >
-              {running ? "Running..." : "Run"}
-            </Button>
+            {(() => {
+              // Re-label / re-disable the primary Run button based on
+              // the active tab's engine so a user clicking it on a
+              // Python tab actually runs Python (not R, which would
+              // explode with "unexpected symbol in 'import numpy'").
+              const eng = activeTab?.engine || "r";
+              const isRTab = eng === "r";
+              const isPyTab = eng === "python";
+              const isMatTab = eng === "matlab";
+              const busy = running || runningPy || runningMatlab;
+              const disabled = busy || !activeTab
+                || (isRTab && !rInstalled)
+                || (isPyTab && insetSources.length === 0)
+                || (isMatTab && (insetSources.length === 0 || !matlabInfo.installed));
+              const label = busy
+                ? "Running…"
+                : isPyTab ? `Run Python${insetSources.length ? ` (${insetSources.length})` : ""}`
+                : isMatTab ? `Run MATLAB${insetSources.length ? ` (${insetSources.length})` : ""}`
+                : "Run R";
+              return (
+                <Button
+                  size="small"
+                  variant="contained"
+                  startIcon={busy ? <CircularProgress size={12} /> : <PlayArrowIcon sx={{ fontSize: 14 }} />}
+                  disabled={disabled}
+                  onClick={handleRun}
+                  sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25 }}
+                >
+                  {label}
+                </Button>
+              );
+            })()}
             {/* Engine selector + dispatch for pipeline runs against
                 the flagged zoom insets. Python is always available;
                 MATLAB requires a host install of Octave or MATLAB. */}
@@ -2219,16 +2270,23 @@ ggplot(data, aes(x = ${stringCol}, y = ${yCol})) +
               onChange={(e) => {
                 const next = e.target.value as "python" | "matlab";
                 setPipelineEngine(next);
-                // Auto-swap the editor's starter when the user is still
-                // on a default snippet AND it doesn't match the new
-                // engine. Preserves any custom edits — only stock
-                // PYTHON_STARTER_CODE / MATLAB_STARTER_CODE get swapped.
+                // Also update the ACTIVE tab's engine so the primary
+                // Run button dispatches the chosen interpreter
+                // automatically — without this the tab stays at its
+                // original engine and the primary Run still does the
+                // wrong thing. R-engine tabs aren't reachable from
+                // this selector (which only offers python / matlab),
+                // so we always overwrite.
                 if (activeTab) {
+                  updateActiveTab({ engine: next });
+                  // Auto-swap the editor's starter when the user is
+                  // still on a default snippet that doesn't match
+                  // the new engine. Custom edits are preserved.
                   const cur = activeTab.code || "";
                   if (next === "matlab" && cur.trim() === PYTHON_STARTER_CODE.trim()) {
-                    updateActiveTab({ code: MATLAB_STARTER_CODE });
+                    updateActiveTab({ code: MATLAB_STARTER_CODE, engine: next });
                   } else if (next === "python" && cur.trim() === MATLAB_STARTER_CODE.trim()) {
-                    updateActiveTab({ code: PYTHON_STARTER_CODE });
+                    updateActiveTab({ code: PYTHON_STARTER_CODE, engine: next });
                   }
                 }
               }}
