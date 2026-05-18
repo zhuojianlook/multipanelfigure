@@ -338,7 +338,84 @@ const nodeTypes = {
   r: ProcessNode,
 };
 
-// ── Starter snippets ─────────────────────────────────────────
+// ── Per-engine code preset registries ───────────────────────
+// Each engine ships a small library of ready-to-run snippets the
+// user can pick from a dropdown on the node card. The user can
+// also save their own (stored in localStorage under a per-engine
+// key) — see loadUserPresets / saveUserPresets below.
+
+interface CodePreset { name: string; code: string; }
+
+const PY_HAZE = `# HAZE ANALYSIS — compares grayscale mean of each image input
+# against the FIRST input (the "reference"). Output:
+# delta_vs_reference + ratio_to_reference per source. Wire into
+# an R Plot node downstream for visualisation.
+
+import numpy as np
+imgs = {k: v for k, v in inputs.items() if isinstance(v, dict) and "image" in v}
+if not imgs:
+    raise SystemExit("No image inputs — connect at least one inset → reference + sample(s).")
+ref_key = next(iter(imgs))
+ref_mean = float(imgs[ref_key]["image"].mean(axis=2).mean())
+rows = []
+for key, src in imgs.items():
+    g = float(src["image"].mean(axis=2).mean())
+    rows.append({"source": src.get("label", key),
+                 "is_reference": (key == ref_key),
+                 "mean_gray": g,
+                 "delta_vs_reference": g - ref_mean,
+                 "ratio_to_reference": g / ref_mean if ref_mean else float("nan")})
+mpfig_data(rows, name="haze_analysis")
+`;
+
+const PY_CHANNELS = `# CHANNEL STATISTICS — per-source R/G/B means and stdevs.
+
+import numpy as np
+rows = []
+for key, src in inputs.items():
+    if not (isinstance(src, dict) and "image" in src): continue
+    img = src["image"]
+    rows.append({
+        "source": src.get("label", key),
+        "R_mean": float(img[..., 0].mean()), "R_std": float(img[..., 0].std()),
+        "G_mean": float(img[..., 1].mean()), "G_std": float(img[..., 1].std()),
+        "B_mean": float(img[..., 2].mean()), "B_std": float(img[..., 2].std()),
+    })
+mpfig_data(rows, name="channel_stats")
+`;
+
+const PY_HISTOGRAM = `# INTENSITY HISTOGRAM — bins luminance pixel counts per source.
+# Output: long-format CSV ready for ggplot facet_wrap(~ source).
+
+import numpy as np
+rows = []
+N_BINS = 32
+edges = np.linspace(0, 255, N_BINS + 1)
+centers = 0.5 * (edges[:-1] + edges[1:])
+for key, src in inputs.items():
+    if not (isinstance(src, dict) and "image" in src): continue
+    lum = src["image"].mean(axis=2).ravel()
+    h, _ = np.histogram(lum, bins=edges)
+    for c, n in zip(centers, h):
+        rows.append({"source": src.get("label", key),
+                     "bin_center": float(c), "count": int(n)})
+mpfig_data(rows, name="intensity_histogram")
+`;
+
+const PY_THRESHOLD = `# THRESHOLD MASK — saves a thresholded copy of each image to
+# the images-output bucket. Drop the resulting PNG into a
+# Separate-Image inset on the main figure.
+
+import numpy as np
+THRESHOLD = 128
+for key, src in inputs.items():
+    if not (isinstance(src, dict) and "image" in src): continue
+    img = src["image"]
+    lum = img.mean(axis=2)
+    out = img.copy()
+    out[lum <= THRESHOLD] = 0
+    mpfig_image(out, name=f"{src.get('label', key)}_thresholded")
+`;
 
 const PY_DEFAULT = `# Python node — extracts data from upstream images / tables.
 # Plots are R-only; mpfig_plot() is intentionally a no-op here.
@@ -354,6 +431,82 @@ for key, src in inputs.items():
                      "std_gray": float(gray.std())})
 
 mpfig_data(rows, name="stats")
+`;
+
+const PYTHON_PRESETS: CodePreset[] = [
+  { name: "Custom (starter)", code: PY_DEFAULT },
+  { name: "Haze analysis", code: PY_HAZE },
+  { name: "Channel statistics (R/G/B)", code: PY_CHANNELS },
+  { name: "Intensity histogram", code: PY_HISTOGRAM },
+  { name: "Threshold mask", code: PY_THRESHOLD },
+];
+
+const ML_DEFAULT = `% MATLAB / Octave node — extracts data from upstream inputs.
+% Plots are R-only.
+
+keys   = fieldnames(inputs);
+labels = cell(numel(keys), 1);
+means  = zeros(numel(keys), 1);
+stds   = zeros(numel(keys), 1);
+for k = 1:numel(keys)
+  src = inputs.(keys{k});
+  if isfield(src, 'image')
+    g = mean(double(src.image), 3);
+    labels{k} = src.label;
+    means(k)  = mean(g(:));
+    stds(k)   = std(g(:));
+  end
+end
+mpfig_data(struct('source', {labels}, 'mean_gray', means, 'std_gray', stds), 'stats');
+`;
+
+const ML_HAZE = `% HAZE ANALYSIS — compares each image input's grayscale mean
+% against the FIRST input (the reference). Output: per-source
+% delta_vs_reference and ratio_to_reference; pipe to R for plot.
+
+keys = fieldnames(inputs);
+mask = false(numel(keys), 1);
+for k = 1:numel(keys); mask(k) = isfield(inputs.(keys{k}), 'image'); end
+keys = keys(mask);
+if isempty(keys); error('No image inputs.'); end
+ref_mean = mean(mean(mean(double(inputs.(keys{1}).image), 3)));
+sources = cell(numel(keys), 1);
+mean_g  = zeros(numel(keys), 1);
+delta   = zeros(numel(keys), 1);
+ratio   = zeros(numel(keys), 1);
+is_ref  = false(numel(keys), 1);
+for k = 1:numel(keys)
+  src = inputs.(keys{k});
+  m = mean(mean(mean(double(src.image), 3)));
+  sources{k} = src.label;
+  mean_g(k)  = m;
+  delta(k)   = m - ref_mean;
+  ratio(k)   = m / ref_mean;
+  is_ref(k)  = (k == 1);
+end
+mpfig_data(struct('source', {sources}, 'is_reference', is_ref, ...
+  'mean_gray', mean_g, 'delta_vs_reference', delta, ...
+  'ratio_to_reference', ratio), 'haze_analysis');
+`;
+
+const ML_CHANNELS = `% CHANNEL STATISTICS — R/G/B means/stdevs per source.
+
+keys = fieldnames(inputs);
+n = numel(keys);
+labels = cell(n, 1); R = zeros(n,1); G = zeros(n,1); B = zeros(n,1);
+Rs = zeros(n,1); Gs = zeros(n,1); Bs = zeros(n,1);
+for k = 1:n
+  src = inputs.(keys{k});
+  if ~isfield(src, 'image'); continue; end
+  img = double(src.image);
+  labels{k} = src.label;
+  R(k)  = mean(mean(img(:,:,1))); Rs(k) = std(reshape(img(:,:,1),[],1));
+  G(k)  = mean(mean(img(:,:,2))); Gs(k) = std(reshape(img(:,:,2),[],1));
+  B(k)  = mean(mean(img(:,:,3))); Bs(k) = std(reshape(img(:,:,3),[],1));
+end
+mpfig_data(struct('source', {labels}, ...
+  'R_mean', R, 'R_std', Rs, 'G_mean', G, 'G_std', Gs, 'B_mean', B, 'B_std', Bs), ...
+  'channel_stats');
 `;
 
 const ML_DEFAULT = `% MATLAB / Octave node — extracts data from upstream inputs.
@@ -375,6 +528,80 @@ end
 mpfig_data(struct('source', {labels}, 'mean_gray', means, 'std_gray', stds), 'stats');
 `;
 
+const MATLAB_PRESETS: CodePreset[] = [
+  { name: "Custom (starter)", code: ML_DEFAULT },
+  { name: "Haze analysis", code: ML_HAZE },
+  { name: "Channel statistics (R/G/B)", code: ML_CHANNELS },
+];
+
+const R_BAR = `# BAR CHART (mean + SE).  `+`Plots the first numeric column of
+# the first upstream table grouped by its first string column.
+
+library(ggplot2); library(ggprism)
+data <- inputs[[1]]
+ycol <- names(data)[sapply(data, is.numeric)][1]
+xcol <- names(data)[!sapply(data, is.numeric)][1]
+mpfig_plot("bar.png")
+ggplot(data, aes(x = .data[[xcol]], y = .data[[ycol]], fill = .data[[xcol]])) +
+  stat_summary(fun = mean, geom = "col", width = 0.7) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2) +
+  theme_prism() + theme(legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(x = NULL)
+`;
+
+const R_BOX = `# BOX PLOT.
+library(ggplot2); library(ggprism)
+data <- inputs[[1]]
+ycol <- names(data)[sapply(data, is.numeric)][1]
+xcol <- names(data)[!sapply(data, is.numeric)][1]
+mpfig_plot("box.png")
+ggplot(data, aes(x = .data[[xcol]], y = .data[[ycol]], fill = .data[[xcol]])) +
+  geom_boxplot(width = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.12, alpha = 0.55) +
+  theme_prism() + theme(legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(x = NULL)
+`;
+
+const R_VIOLIN = `# VIOLIN PLOT.
+library(ggplot2); library(ggprism)
+data <- inputs[[1]]
+ycol <- names(data)[sapply(data, is.numeric)][1]
+xcol <- names(data)[!sapply(data, is.numeric)][1]
+mpfig_plot("violin.png")
+ggplot(data, aes(x = .data[[xcol]], y = .data[[ycol]], fill = .data[[xcol]])) +
+  geom_violin(trim = FALSE, alpha = 0.85) +
+  geom_boxplot(width = 0.12, fill = "white", outlier.shape = NA, alpha = 0.7) +
+  theme_prism() + theme(legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(x = NULL)
+`;
+
+const R_SCATTER = `# SCATTER (+ linear fit) — needs two numeric columns.
+library(ggplot2); library(ggprism)
+data <- inputs[[1]]
+ncols <- names(data)[sapply(data, is.numeric)]
+if (length(ncols) < 2) stop("Need at least two numeric columns")
+mpfig_plot("scatter.png")
+ggplot(data, aes(x = .data[[ncols[1]]], y = .data[[ncols[2]]])) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE) +
+  theme_prism()
+`;
+
+const R_HEATMAP = `# HEATMAP — pivot the first table into a matrix, plot tile fills.
+library(ggplot2); library(ggprism)
+data <- inputs[[1]]
+ycol <- names(data)[sapply(data, is.numeric)][1]
+xcol <- names(data)[!sapply(data, is.numeric)][1]
+mpfig_plot("heatmap.png")
+ggplot(data, aes(x = .data[[xcol]], y = .data[[xcol]], fill = .data[[ycol]])) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  theme_prism() + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+`;
+
 const R_DEFAULT = `# R node — receives upstream tables as data frames in \`inputs\`.
 # Plot with ggplot/ggprism, then save via mpfig_plot().
 
@@ -391,6 +618,84 @@ ggplot(data, aes(x = source, y = mean_gray)) +
   theme(legend.position = "none", axis.text.x = element_text(angle = 30, hjust = 1)) +
   labs(x = NULL, y = "mean_gray")
 `;
+
+const R_PRESETS: CodePreset[] = [
+  { name: "Custom (starter)", code: R_DEFAULT },
+  { name: "Bar chart (mean + SE)", code: R_BAR },
+  { name: "Box plot", code: R_BOX },
+  { name: "Violin plot", code: R_VIOLIN },
+  { name: "Scatter (+ linear fit)", code: R_SCATTER },
+  { name: "Heatmap", code: R_HEATMAP },
+];
+
+const BUILTIN_PRESETS: Record<EngineKind, CodePreset[]> = {
+  python: PYTHON_PRESETS,
+  matlab: MATLAB_PRESETS,
+  r: R_PRESETS,
+};
+
+// ── User-saved code presets (localStorage) ──────────────────
+const USER_PRESET_KEY: Record<EngineKind, string> = {
+  python: "mpfig.user_presets.python",
+  matlab: "mpfig.user_presets.matlab",
+  r: "mpfig.user_presets.r",
+};
+
+function loadUserPresets(engine: EngineKind): CodePreset[] {
+  try {
+    const raw = localStorage.getItem(USER_PRESET_KEY[engine]);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr.filter((x) => x?.name && x?.code) : [];
+  } catch { return []; }
+}
+function saveUserPresets(engine: EngineKind, presets: CodePreset[]) {
+  try { localStorage.setItem(USER_PRESET_KEY[engine], JSON.stringify(presets)); } catch { /* ignore */ }
+}
+
+// ── Saved workflows (localStorage) ───────────────────────────
+const WORKFLOW_KEY = "mpfig.saved_workflows";
+
+interface SavedWorkflow {
+  id: string;
+  name: string;
+  nodes: Node<NodeData>[];
+  edges: Edge[];
+  createdAt: number;
+}
+
+function loadSavedWorkflows(): SavedWorkflow[] {
+  try {
+    const raw = localStorage.getItem(WORKFLOW_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr.filter((x) => x?.id && x?.name && Array.isArray(x.nodes) && Array.isArray(x.edges)) : [];
+  } catch { return []; }
+}
+function saveSavedWorkflows(workflows: SavedWorkflow[]) {
+  try { localStorage.setItem(WORKFLOW_KEY, JSON.stringify(workflows)); } catch { /* ignore */ }
+}
+
+// ── Workflow tabs (in-session) ──────────────────────────────
+// Each tab is an independent graph (nodes + edges). The user can
+// add multiple to run the same analysis on different image sets.
+interface WorkflowTab {
+  id: string;
+  name: string;
+  nodes: Node<NodeData>[];
+  edges: Edge[];
+}
+
+function newSourceNode(sources: InsetSource[]): Node<NodeData> {
+  return {
+    id: "source",
+    type: "source",
+    position: { x: 30, y: 30 },
+    data: { label: "Source", kind: "source", sources, status: "ok" } as NodeData,
+    draggable: true,
+    deletable: false,
+  };
+}
 
 // ── Main component ───────────────────────────────────────────
 
@@ -421,18 +726,50 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // Inset sources from the backend (image ports for the source node).
   const [insetSources, setInsetSources] = useState<InsetSource[]>([]);
   const [matlabKind, setMatlabKind] = useState<string>("");
-  // Graph state.
-  const [nodes, setNodes] = useState<Node<NodeData>[]>(() => [
-    {
-      id: "source",
-      type: "source",
-      position: { x: 30, y: 30 },
-      data: { label: "Source", kind: "source", sources: [], status: "ok" } as NodeData,
-      draggable: true,
-      deletable: false,
-    },
-  ]);
-  const [edges, setEdges] = useState<Edge[]>([]);
+
+  // ── Layer-2 canvases: multiple workflow tabs ────────────────
+  // Each tab is an independent graph. The user creates new tabs
+  // to run the same analysis topology on a different image set,
+  // or loads a previously-saved workflow from localStorage.
+  const [workflowTabs, setWorkflowTabs] = useState<WorkflowTab[]>(() => [{
+    id: newId("wf"),
+    name: "Workflow 1",
+    nodes: [newSourceNode([])],
+    edges: [],
+  }]);
+  const [activeWfId, setActiveWfId] = useState<string>(() => "");
+  const activeWf = useMemo(() => workflowTabs.find((w) => w.id === activeWfId) || workflowTabs[0], [workflowTabs, activeWfId]);
+  // Reactive references to the active tab's nodes / edges so the
+  // existing handlers below (which were written against a single
+  // {nodes, edges} pair) stay correct.
+  const nodes = activeWf.nodes;
+  const edges = activeWf.edges;
+  const setNodes = useCallback((updater: (n: Node<NodeData>[]) => Node<NodeData>[]) => {
+    setWorkflowTabs((tabs) => tabs.map((t) => t.id === activeWf.id ? { ...t, nodes: updater(t.nodes) } : t));
+  }, [activeWf.id]);
+  const setEdges = useCallback((updater: (e: Edge[]) => Edge[]) => {
+    setWorkflowTabs((tabs) => tabs.map((t) => t.id === activeWf.id ? { ...t, edges: updater(t.edges) } : t));
+  }, [activeWf.id]);
+
+  useEffect(() => {
+    // Initial active id wire-up — first render sets it to the
+    // first tab so memoisation lands cleanly.
+    if (!activeWfId && workflowTabs.length > 0) setActiveWfId(workflowTabs[0].id);
+  }, [activeWfId, workflowTabs]);
+
+  // Saved workflow library (localStorage).
+  const [savedWorkflows, setSavedWorkflows] = useState<SavedWorkflow[]>(() => loadSavedWorkflows());
+
+  // React Flow instance captured via onInit — lets us project
+  // viewport coordinates so new nodes land in the visible area
+  // rather than at hard-coded x=350 (off-screen when the user
+  // has panned far away).
+  type RFInstance = {
+    getViewport: () => { x: number; y: number; zoom: number };
+    screenToFlowPosition: (p: { x: number; y: number }) => { x: number; y: number };
+  };
+  const rfRef = useRef<RFInstance | null>(null);
+
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [runningGraph, setRunningGraph] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(true);
@@ -448,10 +785,15 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     if (!open) return;
     api.listInsetAnalysisSources()
       .then((r) => {
-        setInsetSources(r.sources || []);
-        setNodes((cur) => cur.map((n) =>
-          n.id === "source" ? { ...n, data: { ...n.data, sources: r.sources || [] } } : n
-        ));
+        const list = r.sources || [];
+        setInsetSources(list);
+        // Push the latest source list into the Source node of EVERY
+        // workflow tab so the user's saved tabs stay in sync with
+        // the figure's current inset-flag selections.
+        setWorkflowTabs((tabs) => tabs.map((t) => ({
+          ...t,
+          nodes: t.nodes.map((n) => n.id === "source" ? { ...n, data: { ...n.data, sources: list } } : n),
+        })));
       })
       .catch(() => setInsetSources([]));
     api.checkMatlab().then((m) => setMatlabKind(m.kind || "")).catch(() => setMatlabKind(""));
@@ -461,10 +803,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
 
   const onNodesChange = useCallback((changes: NodeChange<Node<NodeData>>[]) => {
     setNodes((nds) => applyNodeChanges(changes, nds));
-  }, []);
+  }, [setNodes]);
   const onEdgesChange = useCallback((changes: EdgeChange[]) => {
     setEdges((eds) => applyEdgeChanges(changes, eds));
-  }, []);
+  }, [setEdges]);
 
   /** Validate an edge before adding: input and output kinds must
    *  match. Source-image → image-in; source-table → table-in. */
@@ -499,15 +841,38 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
 
   // ── Add a new node ─────────────────────────────────────────
 
-  const addProcessNode = useCallback((engine: EngineKind) => {
+  const addProcessNode = useCallback((engine: EngineKind, presetIdx: number = 0) => {
     const id = newId(engine);
-    const defaultCode = engine === "python" ? PY_DEFAULT : engine === "matlab" ? ML_DEFAULT : R_DEFAULT;
+    const defaultCode = BUILTIN_PRESETS[engine][presetIdx]?.code
+      ?? (engine === "python" ? PY_DEFAULT : engine === "matlab" ? ML_DEFAULT : R_DEFAULT);
+    // Place the new node inside the CURRENTLY VISIBLE viewport so
+    // the user always sees it, regardless of pan/zoom. Without
+    // this fallback to hardcoded screen coords the node was
+    // routinely off-screen on a panned canvas.
+    let pos = { x: 350, y: 120 };
+    const inst = rfRef.current;
+    if (inst) {
+      try {
+        // Pick a point roughly 1/3 across the visible viewport so
+        // the node has room for outgoing edges. The container's
+        // bounding rect is the viewport's screen extent.
+        const container = document.querySelector(".react-flow") as HTMLElement | null;
+        if (container) {
+          const rect = container.getBoundingClientRect();
+          const screen = {
+            x: rect.left + rect.width * 0.35 + Math.random() * 60,
+            y: rect.top + rect.height * 0.30 + Math.random() * 60,
+          };
+          pos = inst.screenToFlowPosition(screen);
+        }
+      } catch { /* fall back to default pos */ }
+    }
     setNodes((cur) => [
       ...cur,
       {
         id,
         type: engine,
-        position: { x: 350 + Math.random() * 100, y: 120 + Math.random() * 200 },
+        position: pos,
         data: {
           label: engine === "python" ? "Python" : engine === "matlab" ? "MATLAB" : "R Plot",
           kind: engine,
@@ -519,14 +884,91 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       },
     ]);
     setSelectedNodeId(id);
-  }, []);
+  }, [setNodes]);
 
   const removeNode = useCallback((nodeId: string) => {
     if (nodeId === "source") return;
     setNodes((cur) => cur.filter((n) => n.id !== nodeId));
     setEdges((eds) => eds.filter((e) => e.source !== nodeId && e.target !== nodeId));
     if (selectedNodeId === nodeId) setSelectedNodeId(null);
-  }, [selectedNodeId]);
+  }, [selectedNodeId, setNodes, setEdges]);
+
+  // ── Layer-2 workflow tab management ─────────────────────────
+
+  const addWorkflowTab = useCallback(() => {
+    const id = newId("wf");
+    const idx = workflowTabs.length + 1;
+    setWorkflowTabs((tabs) => [...tabs, {
+      id, name: `Workflow ${idx}`,
+      nodes: [newSourceNode(insetSources)], edges: [],
+    }]);
+    setActiveWfId(id);
+    setSelectedNodeId(null);
+  }, [workflowTabs.length, insetSources]);
+
+  const removeWorkflowTab = useCallback((id: string) => {
+    setWorkflowTabs((tabs) => {
+      if (tabs.length <= 1) return tabs;  // keep at least one
+      const idx = tabs.findIndex((t) => t.id === id);
+      const next = tabs.filter((t) => t.id !== id);
+      if (id === activeWfId) {
+        setActiveWfId(next[Math.max(0, idx - 1)]?.id || next[0]?.id || "");
+      }
+      return next;
+    });
+  }, [activeWfId]);
+
+  const renameWorkflowTab = useCallback((id: string, name: string) => {
+    setWorkflowTabs((tabs) => tabs.map((t) => t.id === id ? { ...t, name } : t));
+  }, []);
+
+  /** Save the active workflow into localStorage so the user can
+   *  reload it later as a starting point for a different image set. */
+  const saveCurrentWorkflow = useCallback(() => {
+    const name = window.prompt("Save workflow as:", activeWf.name);
+    if (!name) return;
+    // Strip output payloads / status — saved workflows are
+    // templates, not run results.
+    const sanitizedNodes = activeWf.nodes.map((n) => ({
+      ...n,
+      data: { ...n.data, outputs: [], status: "idle" as const, error: undefined },
+    }));
+    const wf: SavedWorkflow = {
+      id: newId("saved"), name, createdAt: Date.now(),
+      nodes: sanitizedNodes, edges: activeWf.edges,
+    };
+    setSavedWorkflows((cur) => {
+      const next = [...cur, wf];
+      saveSavedWorkflows(next);
+      return next;
+    });
+  }, [activeWf]);
+
+  /** Load a saved workflow as a NEW tab so the user can run it
+   *  against the current insets without overwriting their work. */
+  const loadSavedWorkflow = useCallback((id: string) => {
+    const wf = savedWorkflows.find((w) => w.id === id);
+    if (!wf) return;
+    const newWfId = newId("wf");
+    // Replace the saved source node's `sources` with the LIVE
+    // current insets so newly-flagged regions are reachable.
+    const refreshedNodes = wf.nodes.map((n) =>
+      n.id === "source" ? { ...n, data: { ...n.data, sources: insetSources } } : n
+    );
+    setWorkflowTabs((tabs) => [...tabs, {
+      id: newWfId, name: wf.name, nodes: refreshedNodes, edges: wf.edges,
+    }]);
+    setActiveWfId(newWfId);
+    setSelectedNodeId(null);
+  }, [savedWorkflows, insetSources]);
+
+  const deleteSavedWorkflow = useCallback((id: string) => {
+    setSavedWorkflows((cur) => {
+      const next = cur.filter((w) => w.id !== id);
+      saveSavedWorkflows(next);
+      return next;
+    });
+  }, []);
 
   // ── Topological execution ──────────────────────────────────
 
@@ -773,7 +1215,84 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // ── Render ─────────────────────────────────────────────────
 
   return (
-    <Box sx={{ position: "relative", flex: 1, display: "flex", minHeight: 0 }}>
+    <Box sx={{ position: "relative", flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+      {/* ── Layer-2: workflow tabs + saved-library dropdown ──────
+          Each tab is an independent graph (one canvas). The user
+          can run the same analysis on a different image set by
+          adding a new tab, or load a saved template from the
+          dropdown. Tabs persist for the session; saved workflows
+          persist in localStorage across app restarts. */}
+      <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, px: 1, py: 0.25, borderBottom: "1px solid", borderColor: "divider", bgcolor: "background.paper", flexShrink: 0 }}>
+        <Tabs
+          value={activeWf.id}
+          onChange={(_, v) => { setActiveWfId(v); setSelectedNodeId(null); }}
+          variant="scrollable"
+          scrollButtons="auto"
+          sx={{ minHeight: 28, "& .MuiTab-root": { minHeight: 28, fontSize: "0.7rem", py: 0, px: 1, textTransform: "none" } }}
+        >
+          {workflowTabs.map((t) => (
+            <Tab key={t.id} value={t.id} label={
+              <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                <span>{t.name}</span>
+                {workflowTabs.length > 1 && (
+                  <Box
+                    component="span"
+                    onClick={(e) => { e.stopPropagation(); removeWorkflowTab(t.id); }}
+                    sx={{ fontSize: "0.7rem", cursor: "pointer", color: "text.disabled", "&:hover": { color: "error.main" } }}
+                  >×</Box>
+                )}
+              </Box>
+            } />
+          ))}
+        </Tabs>
+        <IconButton size="small" onClick={addWorkflowTab} title="Add a new workflow tab">
+          <AddIcon sx={{ fontSize: 16 }} />
+        </IconButton>
+        <Button
+          size="small"
+          onClick={() => {
+            const newName = window.prompt("Rename this workflow:", activeWf.name);
+            if (newName && newName !== activeWf.name) renameWorkflowTab(activeWf.id, newName);
+          }}
+          sx={{ fontSize: "0.6rem", textTransform: "none", py: 0.25, minWidth: 0 }}
+        >
+          ✎ Rename
+        </Button>
+        <Box sx={{ flex: 1 }} />
+        <Button
+          size="small"
+          variant="outlined"
+          onClick={saveCurrentWorkflow}
+          sx={{ fontSize: "0.6rem", textTransform: "none", py: 0.25 }}
+        >
+          💾 Save workflow
+        </Button>
+        <Select
+          size="small"
+          displayEmpty
+          value=""
+          renderValue={() => `📂 Load saved (${savedWorkflows.length})`}
+          onChange={(e) => loadSavedWorkflow(String(e.target.value))}
+          disabled={savedWorkflows.length === 0}
+          sx={{ fontSize: "0.6rem", height: 26, minWidth: 150, "& .MuiSelect-select": { py: 0.25, px: 1 } }}
+        >
+          {savedWorkflows.length === 0 ? (
+            <MenuItem value="" disabled sx={{ fontSize: "0.7rem" }}>(no saved workflows)</MenuItem>
+          ) : savedWorkflows.map((wf) => (
+            <MenuItem key={wf.id} value={wf.id} sx={{ fontSize: "0.7rem", display: "flex", justifyContent: "space-between" }}>
+              <span style={{ flex: 1 }}>{wf.name}</span>
+              <Box
+                component="span"
+                onClick={(e) => { e.stopPropagation(); if (window.confirm(`Delete saved workflow '${wf.name}'?`)) deleteSavedWorkflow(wf.id); }}
+                sx={{ fontSize: "0.85rem", color: "text.disabled", ml: 1, "&:hover": { color: "error.main" } }}
+              >🗑</Box>
+            </MenuItem>
+          ))}
+        </Select>
+      </Box>
+
+      {/* Canvas + side panel + drawer (flex row below the tabs) */}
+      <Box sx={{ flex: 1, display: "flex", minHeight: 0, position: "relative" }}>
       {/* Left: graph canvas */}
       <Box sx={{ flex: 1, position: "relative", minWidth: 0, minHeight: 0 }}>
         <ReactFlow
@@ -786,6 +1305,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           nodeTypes={nodeTypes}
           onNodeClick={(_, n) => setSelectedNodeId(n.id)}
           onPaneClick={() => setSelectedNodeId(null)}
+          onInit={(inst) => { rfRef.current = inst as unknown as RFInstance; }}
           fitView
           deleteKeyCode={["Backspace", "Delete"]}
         >
@@ -831,11 +1351,15 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       </Box>
 
       {/* Right: selected-node detail panel */}
-      {selectedNode && selectedNode.id !== "source" && (
+      {selectedNode && selectedNode.id !== "source" && (() => {
+        const engine = selectedNode.data.kind as EngineKind;
+        const builtin = BUILTIN_PRESETS[engine] || [];
+        const userPresets = loadUserPresets(engine);
+        return (
         <Box sx={{ width: 460, borderLeft: "1px solid", borderColor: "divider", display: "flex", flexDirection: "column", minWidth: 0, bgcolor: "background.paper" }}>
           <Box sx={{ display: "flex", alignItems: "center", gap: 1, p: 1, borderBottom: "1px solid", borderColor: "divider" }}>
             <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.75rem" }}>
-              {KIND_ICON[selectedNode.data.kind as EngineKind]} {selectedNode.data.label}
+              {KIND_ICON[engine]} {selectedNode.data.label}
             </Typography>
             <Box sx={{ flex: 1 }} />
             <Button size="small" variant="outlined"
@@ -851,6 +1375,74 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
             <IconButton size="small" onClick={() => removeNode(selectedNode.id)} title="Remove node">
               <DeleteOutlineIcon sx={{ fontSize: 14 }} />
             </IconButton>
+          </Box>
+          {/* Layer-1 preset selector — built-in snippets + user-
+              saved presets stored per-engine in localStorage. */}
+          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, px: 1, py: 0.5, borderBottom: "1px solid", borderColor: "divider", flexWrap: "wrap" }}>
+            <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary" }}>Preset:</Typography>
+            <Select
+              size="small"
+              value=""
+              displayEmpty
+              renderValue={() => "Load preset…"}
+              onChange={(e) => {
+                const val = String(e.target.value);
+                let preset: CodePreset | undefined;
+                if (val.startsWith("b:")) preset = builtin[parseInt(val.slice(2), 10)];
+                else if (val.startsWith("u:")) preset = userPresets[parseInt(val.slice(2), 10)];
+                if (preset) {
+                  setNodes((cur) => cur.map((n) => n.id === selectedNode.id
+                    ? { ...n, data: { ...n.data, code: preset!.code, status: "idle" as const } } : n));
+                }
+              }}
+              sx={{ fontSize: "0.65rem", height: 26, minWidth: 180, "& .MuiSelect-select": { py: 0.4, px: 1 } }}
+            >
+              <MenuItem value="" disabled sx={{ fontSize: "0.7rem", fontWeight: 700 }}>Built-in</MenuItem>
+              {builtin.map((p, i) => (
+                <MenuItem key={`b${i}`} value={`b:${i}`} sx={{ fontSize: "0.7rem", pl: 2 }}>{p.name}</MenuItem>
+              ))}
+              {userPresets.length > 0 && (
+                <MenuItem value="" disabled sx={{ fontSize: "0.7rem", fontWeight: 700, mt: 0.5 }}>Saved</MenuItem>
+              )}
+              {userPresets.map((p, i) => (
+                <MenuItem key={`u${i}`} value={`u:${i}`} sx={{ fontSize: "0.7rem", pl: 2 }}>★ {p.name}</MenuItem>
+              ))}
+            </Select>
+            <Button size="small"
+              onClick={() => {
+                const name = window.prompt("Save current code as preset (name):");
+                if (!name) return;
+                const code = selectedNode.data.code || "";
+                const next = [...userPresets.filter((p) => p.name !== name), { name, code }];
+                saveUserPresets(engine, next);
+                setSelectedNodeId(selectedNode.id);  // force re-render
+              }}
+              sx={{ fontSize: "0.6rem", textTransform: "none", py: 0.25, minWidth: 0 }}
+            >
+              💾 Save
+            </Button>
+            {userPresets.length > 0 && (
+              <Tooltip title="Delete a saved preset">
+                <Select
+                  size="small"
+                  value=""
+                  displayEmpty
+                  renderValue={() => "🗑"}
+                  onChange={(e) => {
+                    const name = String(e.target.value);
+                    if (!name) return;
+                    if (!window.confirm(`Delete preset '${name}'?`)) return;
+                    saveUserPresets(engine, userPresets.filter((p) => p.name !== name));
+                    setSelectedNodeId(selectedNode.id);
+                  }}
+                  sx={{ fontSize: "0.6rem", height: 22, minWidth: 0, "& .MuiSelect-select": { py: 0.1, px: 0.5 } }}
+                >
+                  {userPresets.map((p) => (
+                    <MenuItem key={p.name} value={p.name} sx={{ fontSize: "0.7rem" }}>{p.name}</MenuItem>
+                  ))}
+                </Select>
+              </Tooltip>
+            )}
           </Box>
           <Box sx={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
             <Box sx={{ flex: 1, minHeight: 200, "& .cm-editor": { height: "100%" }, "& .cm-scroller": { overflow: "auto", fontFamily: "monospace" } }}>
@@ -895,7 +1487,8 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
             )}
           </Box>
         </Box>
-      )}
+        );
+      })()}
 
       {/* Bottom drawer: aggregated outputs */}
       <Drawer
@@ -977,6 +1570,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           </Button>
         </Tooltip>
       )}
+      </Box>{/* end canvas + side-panel row */}
     </Box>
   );
 }
