@@ -1787,6 +1787,41 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   // Adjacent inset pointing at this cell. Used to derive the
   // inherited scalebar when the user clicks "Enable Scale Bar"
   // on a zoom target. Returns null when this cell isn't a target.
+  /** The source panel's coordinate-canvas width that its outgoing zoom
+   *  inset coords are stored in. Mirrors the Edit Panel dialog's
+   *  `ziActualW` fallback:
+   *    • Cropped image source → crop width
+   *    • Zoom-target source (no image_name) → 1000-px default canvas
+   *    • Uncropped image source → cached origFullW or 1000 fallback
+   *  Used by the smart scale-bar inheritance to compute a selection-
+   *  size-aware mpp instead of using the raw zoom_factor field. */
+  const getSourceCoordWidth = (srcPanel: PanelInfo | null | undefined): number => {
+    if (!srcPanel) return 1000;
+    if (srcPanel.crop_image && srcPanel.crop && srcPanel.crop.length === 4) {
+      return Math.max(1, srcPanel.crop[2] - srcPanel.crop[0]);
+    }
+    if (!srcPanel.image_name) return 1000;  // zoom-target source
+    // Image-bearing without crop — we don't have the natural width
+    // cached in the store. Fall back to the dialog default of 1000.
+    // Worst case: ratio is off by the actual natural-w / 1000 factor;
+    // the user can still hit Inherit again after Apply or tune
+    // manually. (Most real panels use crop to define their source,
+    // so this branch is rare in practice.)
+    return 1000;
+  };
+
+  /** Selection-size ratio used to scale inherited scale-bar values
+   *  from a source panel down to an adjacent-zoom target's natural
+   *  view. = zi.width / source_coord_width. Smaller selection ⇒
+   *  smaller ratio ⇒ smaller mpp + smaller bar length. Works for
+   *  rotated selections too because zi.width / zi.height are the
+   *  un-rotated extent dimensions the backend actually crops. */
+  const computeInheritRatio = (srcPanel: PanelInfo | null | undefined, zi: ZoomInsetSettings): number => {
+    const w = Math.max(1, zi.width || 1);
+    const srcW = getSourceCoordWidth(srcPanel);
+    return w / srcW;
+  };
+
   const findAdjacentZoomSource = (): { r: number; c: number; inset: ZoomInsetSettings } | null => {
     if (!config) return null;
     for (let r = 0; r < config.rows; r++) {
@@ -3577,25 +3612,30 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   checked={local.add_scale_bar}
                   onChange={(e) => {
                     const enabled = e.target.checked;
-                    // ── Inherit-from-source default for zoom targets ──
-                    // Adjacent-zoom target panels have no inherent
-                    // pixels-per-micron of their own (their image is a
-                    // magnified crop of someone else's). When the user
-                    // enables a scale bar here, default the values to
-                    // INHERIT from the source panel × the zoom factor,
-                    // so the bar shows the correct physical length out
-                    // of the box. The user can still customise the
-                    // numbers manually afterwards.
+                    // ── Smart inherit-from-source default for zoom targets ──
+                    // The inset shows the selection region magnified.
+                    // Each inset pixel covers SELECTION_RATIO × source_mpp
+                    // physical units (ratio = zi.width / source_coord_w),
+                    // and a sensible scale bar represents the same fraction
+                    // of the panel as the source's bar. So scale BOTH the
+                    // mpp AND the bar length (in µm) by the selection
+                    // ratio. Example: a 100 µm bar at 1 µm/px in the
+                    // parent, with the user selecting ~1/10 of the parent
+                    // width → 10 µm bar at 0.1 µm/px in the primary inset.
                     let nextSb = local.scale_bar;
                     if (enabled && !local.scale_bar) {
                       if (isZoomTarget) {
                         const src = findAdjacentZoomSource();
                         const srcPanel = src ? config?.panels[src.r]?.[src.c] : null;
                         if (src && srcPanel?.add_scale_bar && srcPanel.scale_bar) {
-                          const zoom = src.inset.zoom_factor || 1;
+                          const ratio = computeInheritRatio(srcPanel, src.inset);
                           nextSb = {
                             ...srcPanel.scale_bar,
-                            micron_per_pixel: srcPanel.scale_bar.micron_per_pixel / (zoom > 0 ? zoom : 1),
+                            micron_per_pixel: srcPanel.scale_bar.micron_per_pixel * ratio,
+                            bar_length_microns: Math.max(
+                              1e-6,
+                              srcPanel.scale_bar.bar_length_microns * ratio,
+                            ),
                           };
                         } else {
                           nextSb = defaultScaleBar();
@@ -3617,10 +3657,21 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
               const src = findAdjacentZoomSource();
               const srcPanel = src ? config?.panels[src.r]?.[src.c] : null;
               if (!src || !srcPanel?.add_scale_bar || !srcPanel.scale_bar) return null;
-              const zoom = src.inset.zoom_factor || 1;
-              const inheritMpp = srcPanel.scale_bar.micron_per_pixel / (zoom > 0 ? zoom : 1);
+              // Smart inheritance: scale BOTH mpp and bar length by
+              // the selection ratio (selection_width / source_coord_w).
+              // Yields a bar that holds the same visual fraction of
+              // the inset as the source's bar does of the source —
+              // and the µm/px reflects how much physical extent each
+              // inset pixel covers given the selection size.
+              const ratio = computeInheritRatio(srcPanel, src.inset);
+              const inheritMpp = srcPanel.scale_bar.micron_per_pixel * ratio;
+              const inheritBar = srcPanel.scale_bar.bar_length_microns * ratio;
               const currentMpp = local.scale_bar?.micron_per_pixel ?? 0;
-              const isInherited = Math.abs(currentMpp - inheritMpp) < 1e-6;
+              const currentBar = local.scale_bar?.bar_length_microns ?? 0;
+              const isInherited =
+                Math.abs(currentMpp - inheritMpp) < 1e-6 &&
+                Math.abs(currentBar - inheritBar) < 1e-3;
+              const pctStr = `${(ratio * 100).toFixed(1)}%`;
               return (
                 <Alert
                   severity={isInherited ? "success" : "info"}
@@ -3633,6 +3684,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                             scale_bar: {
                               ...srcPanel.scale_bar!,
                               micron_per_pixel: inheritMpp,
+                              bar_length_microns: inheritBar,
                             },
                           });
                         }}
@@ -3644,8 +3696,8 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   sx={{ "& .MuiAlert-message": { fontSize: "0.7rem", py: 0.25 } }}
                 >
                   {isInherited
-                    ? `Inherited from R${src.r + 1}C${src.c + 1} (${srcPanel.scale_bar.micron_per_pixel.toFixed(4)} µm/px ÷ ${zoom} = ${inheritMpp.toFixed(4)} µm/px).`
-                    : `This is an adjacent-zoom target of R${src.r + 1}C${src.c + 1}. Click "Inherit" to re-derive mpp from that panel × ${zoom}× zoom factor.`}
+                    ? `Inherited from R${src.r + 1}C${src.c + 1}: selection is ${pctStr} of source → bar ${inheritBar.toPrecision(3)} µm at ${inheritMpp.toPrecision(3)} µm/px.`
+                    : `This is an adjacent-zoom target of R${src.r + 1}C${src.c + 1}. Click "Inherit" — selection is ${pctStr} of source, so bar will scale to ${inheritBar.toPrecision(3)} µm at ${inheritMpp.toPrecision(3)} µm/px.`}
                 </Alert>
               );
             })()}
