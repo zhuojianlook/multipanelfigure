@@ -461,8 +461,30 @@ def _apply_adjacent_zoom_insets(cfg, processed, rows, cols):
                         fh = p_src.crop[3] - p_src.crop[1]
                     elif p_src.image_name and p_src.image_name in loaded_images:
                         fw, fh = loaded_images[p_src.image_name].size
+                    elif p_src.image_name and p_src.image_name in loaded_videos:
+                        # Video source — its image_name lives in
+                        # loaded_videos, NOT loaded_images. Use the
+                        # video frame's natural size as the source
+                        # coord system (matches the dialog's
+                        # origFullW/H from getImageInfo, which returns
+                        # the video's frame size).
+                        vid_img = _get_panel_image(p_src)
+                        fw, fh = vid_img.size if vid_img is not None else (miw, mih)
                     else:
-                        fw, fh = miw, mih
+                        # Source is a synthesised zoom TARGET (no
+                        # image_name of its own — chained adjacent
+                        # zoom). The Edit Panel dialog has no
+                        # origFullW for such panels, so its
+                        # `ziActualW` falls back to the hardcoded
+                        # 1000-px default canvas (see EditPanelDialog
+                        # `const ziActualW = ... origFullW > 0 ? origFullW : 1000`).
+                        # Inset coords are therefore in 1000-px
+                        # space, not in main_img's natural pixels.
+                        # Using main_img.size as fw, fh would treat
+                        # 294-in-1000-space as 294 pixels of a 200-
+                        # px image, sending the crop off the edge
+                        # and producing a black secondary zoom.
+                        fw, fh = 1000, 1000
                     scx = miw / max(fw, 1)
                     scy = mih / max(fh, 1)
                     # Source rectangle in main_img coords. We keep the
