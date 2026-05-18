@@ -338,25 +338,59 @@ def _apply_adjacent_zoom_insets(cfg, processed, rows, cols):
     targets are silently skipped. When two insets target the same
     cell, the LATER one wins (last write).
 
+    Multi-pass cascade: chains like A → B → C where A is at (0,1),
+    B at (0,0), C at (1,0) would have failed in single-pass row-major
+    order because B's adjacent inset reads `processed[B]` which is
+    still empty when we visit B before A. So we keep re-running the
+    loop until no new cells get written, with a safety cap at
+    rows*cols passes (any real chain is much shorter).
+
     Mutates processed[][] in place. Used by /api/preview,
     /api/figure/save, and the video render worker so multi-figure
     arrays land in their adjacent slots regardless of which path the
     user invokes.
     """
-    for r in range(rows):
-        for c in range(cols):
-            panel = cfg.panels[r][c]
-            for zi in _panel_zoom_insets(panel):
-                if zi is None or zi.inset_type != "Adjacent Panel":
+    # A cell is "ready" to act as a SOURCE when either it has an
+    # image_name in loaded_images / loaded_videos, OR an earlier
+    # pass already wrote a synthesised image into it. Without
+    # this gate, a chained inset whose parent hasn't run yet would
+    # crop stale / blank pixels from `processed[r][c]`.
+    ready = [[False] * cols for _ in range(rows)]
+    for rr in range(rows):
+        for cc in range(cols):
+            p = cfg.panels[rr][cc]
+            nm = getattr(p, "image_name", "") or ""
+            if nm and (nm in loaded_images or nm in loaded_videos):
+                ready[rr][cc] = True
+
+    # Insets we've already executed (by id-of-zi object) so we
+    # don't re-fire the same one across passes — that'd produce
+    # zoom-of-zoom-of-zoom drift on the same target.
+    fired: set = set()
+    max_passes = max(2, rows * cols)
+    for _pass in range(max_passes):
+        wrote_something = False
+        for r in range(rows):
+            for c in range(cols):
+                panel = cfg.panels[r][c]
+                # The source cell must be ready before we can read
+                # pixels from it. Chained children wait their turn.
+                if not ready[r][c]:
                     continue
-                ar, ac = r, c
-                side = zi.side or "Right"
-                if side == "Top": ar -= 1
-                elif side == "Bottom": ar += 1
-                elif side == "Left": ac -= 1
-                elif side == "Right": ac += 1
-                if not (0 <= ar < rows and 0 <= ac < cols):
-                    continue
+                for zi in _panel_zoom_insets(panel):
+                    if zi is None or zi.inset_type != "Adjacent Panel":
+                        continue
+                    if id(zi) in fired:
+                        continue
+                    ar, ac = r, c
+                    side = zi.side or "Right"
+                    if side == "Top": ar -= 1
+                    elif side == "Bottom": ar += 1
+                    elif side == "Left": ac -= 1
+                    elif side == "Right": ac += 1
+                    if not (0 <= ar < rows and 0 <= ac < cols):
+                        fired.add(id(zi))
+                        continue
                 ext_name = getattr(zi, "separate_image_name", "") or ""
                 if ext_name and ext_name not in ("", "select") and ext_name in loaded_images:
                     ext_img = loaded_images[ext_name].convert("RGB")
@@ -373,6 +407,9 @@ def _apply_adjacent_zoom_insets(cfg, processed, rows, cols):
                     zh = max(1, int(hi * zi.zoom_factor))
                     region = region.resize((zw, zh), Image.LANCZOS)
                     processed[ar][ac] = region
+                    ready[ar][ac] = True
+                    wrote_something = True
+                    fired.add(id(zi))
                 else:
                     p_src = cfg.panels[r][c]
                     # Re-process the source panel WITHOUT the zoom
@@ -454,6 +491,11 @@ def _apply_adjacent_zoom_insets(cfg, processed, rows, cols):
                     zh = max(1, int(zi.height * zi.zoom_factor * scy))
                     region = region.resize((zw, zh), Image.LANCZOS)
                     processed[ar][ac] = region
+                    ready[ar][ac] = True
+                    wrote_something = True
+                    fired.add(id(zi))
+        if not wrote_something:
+            break
 
 
 def _recalc_min_dims():
@@ -1547,64 +1589,41 @@ def get_panel_rendered_preview(r: int, c: int):
     # _apply_adjacent_zoom_insets path that the full preview uses and
     # pick out the cell we want.
     if not panel.image_name or panel.image_name not in loaded_images:
-        # Build a sparse processed[][] grid: only fill cells that are
-        # SOURCES for an adjacent inset that targets (r, c), plus the
-        # target itself. The helper only mutates target cells, so
-        # the rest stay None.
+        # Build a processed[][] grid by seeding EVERY image-bearing
+        # cell (including videos). Without this, multi-hop chains
+        # like A → B → C would fail when the dialog opens for C —
+        # the previous "only-direct-sources" seeding would skip A
+        # because A doesn't directly target C. The cascade pass in
+        # `_apply_adjacent_zoom_insets` now propagates through chains
+        # of any length, so seeding all roots is sufficient.
         rows, cols = cfg.rows, cfg.cols
         processed = [[None for _ in range(cols)] for _ in range(rows)]
         for sr in range(rows):
             for sc in range(cols):
                 src = cfg.panels[sr][sc]
                 # Accept both static images (loaded_images) AND videos
-                # (loaded_videos). `_get_panel_image` handles both and
-                # returns None when the source has no usable image.
-                # Without this, video sources are silently dropped from
-                # the synthesis pass and their zoom targets show empty
-                # (or fall through to a blank synth).
+                # (loaded_videos). `_get_panel_image` handles both.
                 if not (src.image_name and (src.image_name in loaded_images or src.image_name in loaded_videos)):
                     continue
-                # Quick check — does this source point at (r, c)?
-                insets = []
-                if getattr(src, "add_zoom_inset", False):
-                    arr = list(getattr(src, "zoom_insets", None) or [])
-                    if arr:
-                        insets = arr
-                    elif getattr(src, "zoom_inset", None) is not None:
-                        insets = [src.zoom_inset]
-                aims_at_us = False
-                for zi in insets:
-                    if zi is None or getattr(zi, "inset_type", "") != "Adjacent Panel":
-                        continue
-                    side = getattr(zi, "side", "Right") or "Right"
-                    ar, ac = sr, sc
-                    if side == "Top": ar -= 1
-                    elif side == "Bottom": ar += 1
-                    elif side == "Left": ac -= 1
-                    elif side == "Right": ac += 1
-                    if ar == r and ac == c:
-                        aims_at_us = True
-                        break
-                if aims_at_us:
-                    # Process this source (with labels / symbols / zoom
-                    # inset suppressed — same as the full preview path).
-                    src_img = _get_panel_image(src)
-                    if src_img is None:
-                        # Defensive — already gated above, but skip
-                        # silently if the image (video frame extract)
-                        # failed for any reason rather than KeyError'ing
-                        # via loaded_images[empty/missing].
-                        continue
-                    saved_z = src.add_zoom_inset
-                    src.add_zoom_inset = False
-                    try:
-                        processed[sr][sc] = process_panel(
-                            src_img,
-                            src, min_dims, loaded_images,
-                            skip_labels=True, skip_symbols=True,
-                        )
-                    finally:
-                        src.add_zoom_inset = saved_z
+                src_img = _get_panel_image(src)
+                if src_img is None:
+                    continue
+                # Suppress own zoom-inset overlay; it would land
+                # *on* the source panel's image, not on the
+                # adjacent target, and is also wasted work for the
+                # dialog preview of a different cell.
+                saved_z = src.add_zoom_inset
+                src.add_zoom_inset = False
+                try:
+                    processed[sr][sc] = process_panel(
+                        src_img,
+                        src, min_dims, loaded_images,
+                        skip_labels=True, skip_symbols=True,
+                    )
+                except Exception:
+                    pass
+                finally:
+                    src.add_zoom_inset = saved_z
         # Fill the target slot with a placeholder so the helper's
         # `processed[ar][ac] = region` assignment doesn't IndexError.
         if processed[r][c] is None:
@@ -1921,13 +1940,18 @@ def generate_preview():
 
     # First pass: process panels WITHOUT labels/symbols/scale bar — those are
     # rendered via matplotlib AFTER normalize for immutable font sizing
+    #
+    # Accept both static images (loaded_images) AND videos (loaded_videos);
+    # `_get_panel_image` handles both. The previous gate of
+    # `panel.image_name in loaded_images` silently dropped video panels and
+    # they showed as blank placeholders in the preview.
     processed = []
     for r in range(rows):
         row_imgs = []
         for c in range(cols):
             panel = cfg.panels[r][c]
-            if panel.image_name and panel.image_name in loaded_images:
-                src_img = _get_panel_image(panel) or loaded_images[panel.image_name]
+            src_img = _get_panel_image(panel) if panel.image_name else None
+            if src_img is not None:
                 img = process_panel(
                     src_img, panel,
                     min_dims, loaded_images, skip_labels=True, skip_symbols=True)
@@ -1961,8 +1985,8 @@ def generate_preview():
     for r in range(rows):
         for c in range(cols):
             panel = cfg.panels[r][c]
-            if panel.image_name and panel.image_name in loaded_images:
-                orig_img = _get_panel_image(panel) or loaded_images[panel.image_name]
+            orig_img = _get_panel_image(panel) if panel.image_name else None
+            if orig_img is not None:
                 if panel.crop_image and panel.crop and len(panel.crop) == 4:
                     full_res_sizes[(r, c)] = (panel.crop[2] - panel.crop[0], panel.crop[3] - panel.crop[1])
                 else:
@@ -1998,15 +2022,18 @@ def save_figure(body: SaveFigureRequest):
     cfg.background = body.background
     # Generate
     rows, cols = cfg.rows, cfg.cols
-    # First pass: process all panels that have images
+    # First pass: process all panels that have images (or videos —
+    # `_get_panel_image` handles both, the previous gate of
+    # `image_name in loaded_images` silently dropped video panels).
     processed = []
     for r in range(rows):
         row_imgs = []
         for c in range(cols):
             panel = cfg.panels[r][c]
-            if panel.image_name and panel.image_name in loaded_images:
+            src_img = _get_panel_image(panel) if panel.image_name else None
+            if src_img is not None:
                 row_imgs.append(process_panel(
-                    _get_panel_image(panel) or loaded_images[panel.image_name], panel,
+                    src_img, panel,
                     min_dims, loaded_images, skip_labels=True, skip_symbols=True))
             else:
                 row_imgs.append(None)
@@ -2032,8 +2059,8 @@ def save_figure(body: SaveFigureRequest):
     for r in range(rows):
         for c in range(cols):
             panel = cfg.panels[r][c]
-            if panel.image_name and panel.image_name in loaded_images:
-                orig_img = _get_panel_image(panel) or loaded_images[panel.image_name]
+            orig_img = _get_panel_image(panel) if panel.image_name else None
+            if orig_img is not None:
                 if panel.crop_image and panel.crop and len(panel.crop) == 4:
                     full_res_sizes2[(r, c)] = (panel.crop[2] - panel.crop[0], panel.crop[3] - panel.crop[1])
                 else:

@@ -4799,10 +4799,20 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     // the user later changes the parent we don't
                     // auto-update — they can re-pick Inherit on the
                     // child to refresh.)
+                    //
+                    // IMPORTANT: `adj.zoom_factor` is the COMBINED
+                    // magnification relative to the ROOT panel
+                    // (cur.zoom_factor × 2), because the backend
+                    // reads from the parent's clean source rect, NOT
+                    // from cur's already-magnified pixels. To compute
+                    // the inherited mpp on adj we therefore divide
+                    // root.mpp by adj.zoom_factor — divinding the
+                    // already-shrunk parentEffective.mpp would
+                    // double-count cur.zoom_factor and yield a bar
+                    // that's too long by a factor of cur.zoom_factor.
                     const rootSB = (local.add_scale_bar && local.scale_bar) ? local.scale_bar : null;
-                    const parentEffective = computeOwnEffectiveScaleBar(cur, insets, rootSB);
-                    if (parentEffective) {
-                      const stamped = deriveInheritedScaleBar(parentEffective, adj.zoom_factor);
+                    if (rootSB) {
+                      const stamped = deriveInheritedScaleBar(rootSB, adj.zoom_factor);
                       useFigureStore.getState().updatePanel(
                         row + (pickedSide === "Top" ? -1 : pickedSide === "Bottom" ? 1 : 0),
                         col + (pickedSide === "Left" ? -1 : pickedSide === "Right" ? 1 : 0),

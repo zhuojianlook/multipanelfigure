@@ -818,18 +818,13 @@ function BuilderSidebar() {
             type="checkbox"
             checked={config.normalize_widths ?? false}
             onChange={(e) => {
-              // When the user FIRST enables normalize, default the
-              // mode to "height" — Match-height is the common case
-              // for grids of microscopy panels (each row should share
-              // the same on-screen height regardless of source aspect
-              // ratio). Preserve whatever was last picked on
-              // re-enables. Width-only mode is still selectable
-              // explicitly via the dropdown below.
+              // When the user FIRST enables normalize (mode is
+              // unset), default to "height" — Match-height is the
+              // common case for grids of microscopy panels. Once
+              // they pick a mode explicitly, preserve that choice
+              // across toggles.
               const enabled = e.target.checked;
-              const nextMode =
-                enabled && (!config.normalize_mode || config.normalize_mode === "width")
-                  ? "height"
-                  : (config.normalize_mode ?? "height");
+              const nextMode = config.normalize_mode ?? "height";
               const updated = { ...config, normalize_widths: enabled, normalize_mode: nextMode };
               setConfig(updated);
               api.updateConfig(updated).catch(console.error);
