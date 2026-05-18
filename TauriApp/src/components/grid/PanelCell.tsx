@@ -4,7 +4,7 @@
    Right-click context menu for copy/paste panel settings.
    ────────────────────────────────────────────────────────── */
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   Box,
   Typography,
@@ -111,22 +111,46 @@ export function PanelCell({ row, col, imageName }: Props) {
     setCtxMenu(null);
   };
 
-  // Check if this panel is a zoom inset target (protected from drops)
-  const isZoomTarget = (() => {
-    const cfg = useFigureStore.getState().config;
-    if (!cfg) return false;
-    for (let r = 0; r < cfg.rows; r++) {
-      for (let c = 0; c < cfg.cols; c++) {
-        const p = cfg.panels[r]?.[c];
-        if (!p?.add_zoom_inset || !p.zoom_inset || p.zoom_inset.inset_type !== "Adjacent Panel") continue;
-        const side = p.zoom_inset.side || "Right";
-        let tr = r, tc = c;
-        if (side === "Top") tr--; else if (side === "Bottom") tr++; else if (side === "Left") tc--; else if (side === "Right") tc++;
-        if (tr === row && tc === col) return true;
+  // Check if this panel is a zoom inset target (protected from drops).
+  // Returns a hash of the source inset's geometry so an upstream effect
+  // can re-fetch the synthesised thumbnail whenever the source rect or
+  // its zoom_factor / side changes.
+  const zoomTargetInfo: { isTarget: boolean; sourceHash: string } = (() => {
+    if (!config) return { isTarget: false, sourceHash: "" };
+    for (let r = 0; r < config.rows; r++) {
+      for (let c = 0; c < config.cols; c++) {
+        const p = config.panels[r]?.[c];
+        if (!p?.add_zoom_inset) continue;
+        const insets = (p.zoom_insets && p.zoom_insets.length > 0)
+          ? p.zoom_insets
+          : (p.zoom_inset ? [p.zoom_inset] : []);
+        for (const zi of insets) {
+          if (!zi || zi.inset_type !== "Adjacent Panel") continue;
+          const side = zi.side || "Right";
+          let tr = r, tc = c;
+          if (side === "Top") tr--; else if (side === "Bottom") tr++;
+          else if (side === "Left") tc--; else if (side === "Right") tc++;
+          if (tr === row && tc === col) {
+            // Found a source pointing here — record geometry so we can
+            // refetch the synthesised thumbnail when it changes.
+            const h = `${r}|${c}|${zi.x}|${zi.y}|${zi.width}|${zi.height}|${zi.zoom_factor}|${zi.rotation || 0}`;
+            return { isTarget: true, sourceHash: h };
+          }
+        }
       }
     }
-    return false;
+    return { isTarget: false, sourceHash: "" };
   })();
+  const isZoomTarget = zoomTargetInfo.isTarget;
+
+  // Auto-refetch the synthesised thumbnail for adjacent-zoom target
+  // cells whenever the source's inset geometry changes, so the panel
+  // planner shows live updates as the user drags the source rect.
+  useEffect(() => {
+    if (!isZoomTarget) return;
+    const refreshPanelThumbnail = useFigureStore.getState().refreshPanelThumbnail;
+    refreshPanelThumbnail(row, col).catch(() => { /* ignore */ });
+  }, [isZoomTarget, zoomTargetInfo.sourceHash, row, col]);
 
   // Centralized drop handler — extracted so we can use it on a transparent overlay too
   const handleDrop = (e: React.DragEvent) => {
@@ -286,6 +310,19 @@ export function PanelCell({ row, col, imageName }: Props) {
             src={`data:image/png;base64,${processedThumb || img.thumbnailB64}`}
             alt={img.name}
             sx={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", borderRadius: 0.5 }}
+            draggable={false}
+          />
+        ) : isZoomTarget && processedThumb ? (
+          // Adjacent-zoom target \u2014 show the cascade-synthesised preview
+          // the backend produces (now that /api/panel-preview handles
+          // image-less target cells). Lets the user see what content
+          // will appear here in the figure preview, instead of just a
+          // lock icon.
+          <Box
+            component="img"
+            src={`data:image/png;base64,${processedThumb}`}
+            alt={`Zoom target R${row + 1}C${col + 1}`}
+            sx={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", borderRadius: 0.5, opacity: 0.92 }}
             draggable={false}
           />
         ) : (

@@ -5909,7 +5909,22 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   const sbPrevEl = document.querySelector('[alt="Panel preview"]') as HTMLImageElement | null;
                   const sbDispW = sbPrevEl?.clientWidth || 400;
                   const sbDispH = sbPrevEl?.clientHeight || 400;
-                  const sbActW = origFullW > 0 ? origFullW : 1000;
+                  // The bar's "source coord width" — what matplotlib
+                  // treats as 1 unit of bar_length_px. That's the
+                  // PROCESSED image's natural pixel width (post-crop /
+                  // post-normalize, whatever the dialog preview shows).
+                  // We get it directly from the displayed image's
+                  // naturalWidth (cached as previewNatW). Falling back
+                  // to crop_w / origFullW / 1000 only when the preview
+                  // hasn't loaded yet — without these fallbacks the
+                  // inline bar showed at a wrong offset on cropped
+                  // image-bearing panels (assumed full pre-crop width)
+                  // and on zoom-target panels (defaulted to 1000).
+                  const sbActW = previewNatW > 0
+                    ? previewNatW
+                    : (local.crop_image && local.crop && local.crop.length === 4)
+                      ? Math.max(1, local.crop[2] - local.crop[0])
+                      : (origFullW > 0 ? origFullW : 1000);
                   const sbScale = sbDispW / sbActW;
                   // For presets, override with calculated positions that keep bar inside
                   if (sb.position_preset === "Bottom-Right") {
