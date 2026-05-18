@@ -309,7 +309,12 @@ export function PanelCell({ row, col, imageName }: Props) {
             component="img"
             src={`data:image/png;base64,${processedThumb || img.thumbnailB64}`}
             alt={img.name}
-            sx={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", borderRadius: 0.5 }}
+            // width:100% + objectFit:contain SCALES UP small thumbs to
+            // fill the cell while keeping their aspect. (maxWidth/maxHeight
+            // alone only shrunk oversize images and left tiny synth
+            // thumbnails \u2014 e.g. a 40\u00d740 secondary zoom \u2014 looking like
+            // small icons in the middle of a large empty cell.)
+            sx={{ width: "100%", height: "100%", objectFit: "contain", borderRadius: 0.5 }}
             draggable={false}
           />
         ) : isZoomTarget && processedThumb ? (
@@ -317,12 +322,13 @@ export function PanelCell({ row, col, imageName }: Props) {
           // the backend produces (now that /api/panel-preview handles
           // image-less target cells). Lets the user see what content
           // will appear here in the figure preview, instead of just a
-          // lock icon.
+          // lock icon. Scaled to fill the cell so a tiny 40\u00d740 secondary
+          // zoom isn't lost in the middle of a large empty box.
           <Box
             component="img"
             src={`data:image/png;base64,${processedThumb}`}
             alt={`Zoom target R${row + 1}C${col + 1}`}
-            sx={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", borderRadius: 0.5, opacity: 0.92 }}
+            sx={{ width: "100%", height: "100%", objectFit: "contain", borderRadius: 0.5, opacity: 0.92, imageRendering: "pixelated" }}
             draggable={false}
           />
         ) : (

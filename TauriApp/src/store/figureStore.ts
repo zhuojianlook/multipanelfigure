@@ -623,6 +623,11 @@ export const useFigureStore = create<FigureState>()(
       // Track which OTHER cells got their labels mutated so we know
       // which to push back to the backend below.
       const touchedAdjacent: Array<{ r: number; c: number }> = [];
+      // Track which other cells had their scale bar values cascaded
+      // (live inheritance through adjacent-zoom chains). They need
+      // their backend state pushed AND their PanelGrid thumbnails
+      // refreshed.
+      const cascadedScaleBar: Array<{ r: number; c: number }> = [];
 
       set((s) => {
         if (s.config && s.config.panels[row] && s.config.panels[row][col]) {
@@ -649,6 +654,65 @@ export const useFigureStore = create<FigureState>()(
             }
           }
         }
+
+        // ── Live scale-bar cascade through adjacent-zoom chains ──
+        // Whenever any panel's scale_bar OR outgoing adjacent inset
+        // geometry changes, re-derive every downstream target's bar
+        // values using the selection-size ratio formula. Walks the
+        // chain depth-first so secondary/tertiary insets update too,
+        // not just the immediate primary target.
+        if (s.config) {
+          const cfg = s.config;
+          // Source-coord width for an inset's source panel.
+          const srcCoordW = (sp: { crop_image?: boolean; crop?: number[]; image_name?: string }): number => {
+            if (sp.crop_image && sp.crop && sp.crop.length === 4) {
+              return Math.max(1, sp.crop[2] - sp.crop[0]);
+            }
+            if (!sp.image_name) return 1000;  // zoom-target source
+            return 1000;  // uncropped image-bearing source (rare)
+          };
+          type PInfo = { add_zoom_inset?: boolean; zoom_inset?: unknown; zoom_insets?: unknown[]; add_scale_bar?: boolean; scale_bar?: { micron_per_pixel: number; bar_length_microns: number } | null; image_name?: string };
+          const cascadeFrom = (sr: number, sc: number, visited: Set<string>) => {
+            const key = `${sr},${sc}`;
+            if (visited.has(key)) return;  // cycle guard
+            visited.add(key);
+            const sp = cfg.panels[sr]?.[sc] as PInfo | undefined;
+            if (!sp || !sp.add_zoom_inset || !sp.add_scale_bar || !sp.scale_bar) return;
+            const arr = (sp.zoom_insets && (sp.zoom_insets as unknown[]).length > 0)
+              ? (sp.zoom_insets as Array<Record<string, unknown>>)
+              : (sp.zoom_inset ? [sp.zoom_inset as Record<string, unknown>] : []);
+            for (const zi of arr) {
+              if (!zi || zi.inset_type !== "Adjacent Panel") continue;
+              const side = (zi.side as string | undefined) || "Right";
+              let tr = sr, tc = sc;
+              if (side === "Top") tr--; else if (side === "Bottom") tr++;
+              else if (side === "Left") tc--; else if (side === "Right") tc++;
+              if (tr < 0 || tr >= cfg.rows || tc < 0 || tc >= cfg.cols) continue;
+              const tp = cfg.panels[tr]?.[tc] as PInfo | undefined;
+              if (!tp || !tp.add_scale_bar) continue;
+              const w = Math.max(1, Number(zi.width) || 1);
+              const ratio = w / srcCoordW(sp);
+              const newMpp = sp.scale_bar.micron_per_pixel * ratio;
+              const newBar = sp.scale_bar.bar_length_microns * ratio;
+              const curMpp = tp.scale_bar?.micron_per_pixel ?? 0;
+              const curBar = tp.scale_bar?.bar_length_microns ?? 0;
+              if (Math.abs(curMpp - newMpp) > 1e-9 || Math.abs(curBar - newBar) > 1e-6) {
+                tp.scale_bar = {
+                  ...(tp.scale_bar ?? sp.scale_bar),
+                  micron_per_pixel: newMpp,
+                  bar_length_microns: newBar,
+                };
+                cascadedScaleBar.push({ r: tr, c: tc });
+              }
+              // Recurse into the target — its own outgoing insets
+              // (if any) need to refresh too.
+              cascadeFrom(tr, tc, visited);
+            }
+          };
+          // Start cascade from THIS panel — it's the one whose state
+          // just changed. Recursion fans out through the chain.
+          cascadeFrom(row, col, new Set());
+        }
       });
 
       const panel = get().config?.panels[row]?.[col];
@@ -661,6 +725,16 @@ export const useFigureStore = create<FigureState>()(
       // touched (newly-promoted zoom targets). Fire in parallel; their
       // thumbnails get refreshed when the patch resolves.
       for (const { r: rr, c: cc } of touchedAdjacent) {
+        const p2 = get().config?.panels[rr]?.[cc];
+        if (p2) {
+          api.patchPanel(rr, cc, p2 as unknown as Record<string, unknown>)
+            .then(() => get().refreshPanelThumbnail(rr, cc))
+            .catch(console.error);
+        }
+      }
+      // Push the cascaded scale-bar updates and refresh their
+      // thumbnails so the panel planner shows live updates.
+      for (const { r: rr, c: cc } of cascadedScaleBar) {
         const p2 = get().config?.panels[rr]?.[cc];
         if (p2) {
           api.patchPanel(rr, cc, p2 as unknown as Record<string, unknown>)
