@@ -1276,19 +1276,20 @@ def _add_panel_scale_bars(fig, axes, cfg, rows: int, cols: int,
 
             # Detect adjacent-zoom target panels — they have no image
             # of their own; the image is a synthesised crop from a
-            # source. For these the bar's PHYSICAL THICKNESS and TEXT
-            # SIZE should look the same as the source's, so we skip
-            # the normalize-scale-factor amplification on those two
-            # axes (the bar LENGTH still scales — that's what carries
-            # the inherited physical-length semantic).
+            # source. For these the bar's PHYSICAL THICKNESS should
+            # look the same as the source's, so we skip the
+            # normalize-scale-factor amplification on bar_height (the
+            # bar LENGTH still scales — that's what carries the
+            # inherited physical-length semantic).
             is_zoom_target = not (panel.image_name and panel.image_name.strip())
 
             # If image was normalized (scaled up), scale bar dimensions too.
             # When `panel_override` is set, `pre_norm_sizes` is interpreted
-            # the same way — the dialog preview endpoint upscales small
-            # synthesised images (zoom targets) to give matplotlib enough
-            # pixels for crisp text, and passes pre-norm sizes so the bar
-            # rescales to match.
+            # the same way — for image-bearing dialog previews the endpoint
+            # upscales small images for crisp matplotlib text; for zoom-
+            # target dialog previews the endpoint deliberately does NOT
+            # upscale (see /api/panel-rendered-preview), keeping nsf=1
+            # so the bar's visual fraction matches the full-figure render.
             if pre_norm_sizes:
                 pre_row = pre_norm_sizes[r] if r < len(pre_norm_sizes) else None
                 pre = pre_row[c] if pre_row and c < len(pre_row) else None
@@ -1297,12 +1298,6 @@ def _add_panel_scale_bars(fig, axes, cfg, rows: int, cols: int,
                     bar_length_px = int(bar_length_px * nsf)
                     if not is_zoom_target:
                         bar_height = int(bar_height * nsf)
-                    # else: keep bar_height at its stored value so
-                    # the visual thickness matches the source panel's.
-                    # (Font size stays at the stored point value — at
-                    # the higher DPI introduced by normalize / upscale,
-                    # matplotlib rasterises crisper text naturally; no
-                    # divide-by-nsf compensation needed.)
 
             # Position relative to image content area (not padding)
             edge_frac = sb.edge_distance / 100.0

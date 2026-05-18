@@ -1768,7 +1768,13 @@ def get_panel_rendered_preview(r: int, c: int):
     MIN_PREVIEW_W = 1000
     pre_upscale_sizes = [[None for _ in range(cfg.cols)] for _ in range(cfg.rows)]
     pre_upscale_sizes[r][c] = processed.size
-    if iw < MIN_PREVIEW_W:
+    # Upscale image-bearing panels for crispness. Zoom-target panels
+    # skip the upscale: the full-figure render has no analogous
+    # upscale, so keeping nsf=1 here means the bar's visual fraction
+    # matches the figure preview's. (Pairs with the bar_height
+    # is_zoom_target skip in _add_panel_scale_bars.)
+    _is_dlg_ztarget = not (panel.image_name and panel.image_name in loaded_images)
+    if iw < MIN_PREVIEW_W and not _is_dlg_ztarget:
         scale_up = MIN_PREVIEW_W / iw
         new_w = int(iw * scale_up)
         new_h = int(ih * scale_up)
