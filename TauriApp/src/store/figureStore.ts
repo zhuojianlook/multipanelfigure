@@ -15,6 +15,7 @@ import type {
   ImageGroup,
 } from "../api/types";
 import { api, checkHealth, lastHealthError } from "../api/client";
+import { niceScaleBarUm } from "../utils/scaleBarRounding";
 
 // ── Loaded image metadata kept client-side ───────────────
 
@@ -693,7 +694,10 @@ export const useFigureStore = create<FigureState>()(
               const w = Math.max(1, Number(zi.width) || 1);
               const ratio = w / srcCoordW(sp);
               const newMpp = sp.scale_bar.micron_per_pixel * ratio;
-              const newBar = sp.scale_bar.bar_length_microns * ratio;
+              // Snap the bar length to a "nice" value (multiples of 5
+              // when ≥5, integers / 0.1 increments below) so the
+              // cascaded values are easy to read in a figure caption.
+              const newBar = niceScaleBarUm(sp.scale_bar.bar_length_microns * ratio);
               const curMpp = tp.scale_bar?.micron_per_pixel ?? 0;
               const curBar = tp.scale_bar?.bar_length_microns ?? 0;
               if (Math.abs(curMpp - newMpp) > 1e-9 || Math.abs(curBar - newBar) > 1e-6) {

@@ -61,6 +61,7 @@ import RedoIcon from "@mui/icons-material/Redo";
 import { VolumeViewerDialog } from "./VolumeViewer";
 import { useFigureStore } from "../../store/figureStore";
 import { api } from "../../api/client";
+import { niceScaleBarUm } from "../../utils/scaleBarRounding";
 import type {
   PanelInfo,
   LabelSettings,
@@ -2437,12 +2438,13 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       // Skip if already at the inherited values (within float-noise
       // tolerance) — avoids an infinite update loop and pointless
       // re-renders when nothing changed.
-      if (Math.abs(curMpp - newMpp) < 1e-9 && Math.abs(curBar - newBar) < 1e-6) continue;
+      const niceBar = niceScaleBarUm(newBar);
+      if (Math.abs(curMpp - newMpp) < 1e-9 && Math.abs(curBar - niceBar) < 1e-6) continue;
       updatePanel(tr, tc, {
         scale_bar: {
           ...(targetPanel.scale_bar ?? local.scale_bar),
           micron_per_pixel: newMpp,
-          bar_length_microns: newBar,
+          bar_length_microns: niceBar,
         },
       } as Partial<PanelInfo>);
     }
@@ -3684,8 +3686,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                           nextSb = {
                             ...srcPanel.scale_bar,
                             micron_per_pixel: srcPanel.scale_bar.micron_per_pixel * ratio,
-                            bar_length_microns: Math.max(
-                              1e-6,
+                            bar_length_microns: niceScaleBarUm(
                               srcPanel.scale_bar.bar_length_microns * ratio,
                             ),
                           };
@@ -3717,7 +3718,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
               // inset pixel covers given the selection size.
               const ratio = computeInheritRatio(srcPanel, src.inset);
               const inheritMpp = srcPanel.scale_bar.micron_per_pixel * ratio;
-              const inheritBar = srcPanel.scale_bar.bar_length_microns * ratio;
+              const inheritBar = niceScaleBarUm(srcPanel.scale_bar.bar_length_microns * ratio);
               const currentMpp = local.scale_bar?.micron_per_pixel ?? 0;
               const currentBar = local.scale_bar?.bar_length_microns ?? 0;
               const isInherited =
