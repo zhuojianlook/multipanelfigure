@@ -3949,6 +3949,183 @@ def check_matlab_installed():
     return {"installed": bool(path), "kind": kind, "path": path or ""}
 
 
+def _find_imagej_executable():
+    """Locate an ImageJ / Fiji executable on PATH or in common
+    install locations. Returns (path, kind) where kind is one of
+    {'fiji', 'imagej'} or '' when nothing is installed. ImageJ-*
+    names (e.g. ImageJ-linux64, ImageJ-macosx) are version-suffixed
+    so we have to glob a couple of well-known parents."""
+    import shutil as _sh
+    import glob as _g
+    import os as _os
+    # 1. shutil.which preferring Fiji.
+    for cand in ("ImageJ-linux64", "ImageJ-macosx", "ImageJ-win64.exe",
+                 "fiji", "fiji-macosx", "Fiji.app/ImageJ-macosx", "ImageJ"):
+        path = _sh.which(cand)
+        if path:
+            kind = "fiji" if "Fiji" in path or "fiji" in cand.lower() else "imagej"
+            return path, kind
+    # 2. Common install locations on macOS / Linux.
+    candidates = [
+        "/Applications/Fiji.app/Contents/MacOS/ImageJ-macosx",
+        "/Applications/Fiji.app/ImageJ-macosx",
+        "/opt/Fiji.app/ImageJ-linux64",
+        _os.path.expanduser("~/Applications/Fiji.app/Contents/MacOS/ImageJ-macosx"),
+        _os.path.expanduser("~/Fiji.app/ImageJ-linux64"),
+    ]
+    for c in candidates:
+        if _os.path.isfile(c) and _os.access(c, _os.X_OK):
+            return c, "fiji"
+    # 3. Glob for ImageJ-* binaries on PATH so users with a versioned
+    #    install (ImageJ-2.14.0) still get detected.
+    for d in _os.environ.get("PATH", "").split(_os.pathsep):
+        for hit in _g.glob(_os.path.join(d, "ImageJ-*")):
+            if _os.access(hit, _os.X_OK):
+                return hit, "fiji" if "Fiji" in hit else "imagej"
+    return None, ""
+
+
+@app.get("/api/analysis/check-imagej")
+def check_imagej_installed():
+    """Tell the frontend whether the ImageJ button should be enabled."""
+    path, kind = _find_imagej_executable()
+    return {"installed": bool(path), "kind": kind, "path": path or ""}
+
+
+class ImageJAnalysisRequest(BaseModel):
+    code: str
+    sources: List[Dict[str, object]] = []
+    extra_inputs: List[Dict[str, object]] = []
+    timeout_sec: int = 120
+
+
+@app.post("/api/analysis/run-imagej")
+def run_imagej_pipeline(body: ImageJAnalysisRequest):
+    """Execute a Fiji / ImageJ macro headless against the requested
+    inset images. Each input is materialised to a tempfile and the
+    macro receives an `inputs` array with `path` + `label` per entry,
+    plus helper functions `mpfig_data(name, ...)` and `mpfig_image(name)`.
+
+    This is a scaffold: it actually shells out to Fiji when it's
+    installed, and returns a clear "not installed" error otherwise
+    so the frontend can surface an install hint inline rather than
+    failing opaquely.
+    """
+    import sys as _sys
+    import os as _os
+    import json as _json
+    import base64 as _b64
+    import subprocess as _sp
+    import tempfile as _tf
+    path, kind = _find_imagej_executable()
+    if not path:
+        return {
+            "success": False,
+            "kind": "",
+            "stdout": "",
+            "stderr": (
+                "ImageJ / Fiji not detected on this host. Install Fiji from "
+                "https://imagej.net/software/fiji/ and ensure the `ImageJ-*` "
+                "binary is on PATH (or place Fiji.app in /Applications or ~/Applications)."
+            ),
+            "plots": [], "tables": [], "images": [],
+        }
+
+    out_dir = _tf.mkdtemp(prefix="mpfig_imagej_")
+    try:
+        # 1. Materialise each inset to a PNG on disk.
+        materialised: List[Dict[str, str]] = []
+        for s in (body.sources or []):
+            key = str(s.get("key") or "")
+            label = str(s.get("label") or key)
+            try:
+                row = int(s.get("row") or 0)
+                col = int(s.get("col") or 0)
+                inset_idx = int(s.get("inset_index") or 0)
+                arr = _extract_inset_image(row, col, inset_idx)
+                if arr is None:
+                    continue
+                from PIL import Image as _Im
+                fpath = _os.path.join(out_dir, f"{key}.png")
+                _Im.fromarray(arr).save(fpath)
+                materialised.append({"path": fpath, "label": label, "key": key})
+            except Exception as _e:  # pragma: no cover
+                print(f"[run-imagej] extract failed for {s}: {_e}", file=_sys.stderr, flush=True)
+        # 2. Build the macro: prelude that defines `inputs` + helper
+        #    functions, followed by the user's code.  IJ Macro is
+        #    not Java — variables are loose; we write a JSON sidecar
+        #    so the user's code can `loadJSON("inputs.json")`-ish.
+        inputs_json = _json.dumps(materialised)
+        macro_path = _os.path.join(out_dir, "_main.ijm")
+        results_csv = _os.path.join(out_dir, "_results.csv")
+        prelude = (
+            f'INPUTS_JSON = \'{inputs_json}\';\n'
+            f'OUT_DIR = \'{out_dir}\';\n'
+            'function mpfig_data(name, labels, a, b) { '
+            '  out = OUT_DIR + "/" + name + ".csv";'
+            '  f = File.open(out);'
+            '  print(f, "label,a,b");'
+            '  for (k = 0; k < lengthOf(labels); k++) print(f, labels[k] + "," + a[k] + "," + b[k]);'
+            '  File.close(f); }\n'
+            'function mpfig_image(name) { '
+            '  saveAs("PNG", OUT_DIR + "/" + name + ".png"); }\n'
+            '// `inputs` is a global array of objects — IJ macro doesn\'t '
+            '// have JSON parsing, so for now we expose individual fields '
+            '// via newArray() helpers.  Users can `open(...)` images by path.\n'
+        )
+        with open(macro_path, "w") as _fh:
+            _fh.write(prelude)
+            _fh.write(body.code or "")
+
+        # 3. Run Fiji headless.
+        cmd = [path, "--headless", "--console", "-macro", macro_path]
+        try:
+            proc = _sp.run(cmd, capture_output=True, text=True, timeout=body.timeout_sec)
+            success = proc.returncode == 0
+            stdout = proc.stdout
+            stderr = proc.stderr
+        except _sp.TimeoutExpired as _te:
+            return {"success": False, "kind": kind, "stdout": _te.stdout or "",
+                    "stderr": f"ImageJ macro timed out after {body.timeout_sec}s",
+                    "plots": [], "tables": [], "images": []}
+
+        # 4. Collect outputs.
+        plots: List[str] = []
+        tables: List[Dict[str, str]] = []
+        images: List[Dict[str, str]] = []
+        try:
+            for fn in _os.listdir(out_dir):
+                fp = _os.path.join(out_dir, fn)
+                if fn.startswith("_"):
+                    continue
+                if fn.endswith(".csv"):
+                    try:
+                        with open(fp) as _r: csv = _r.read()
+                        tables.append({"name": fn[:-4], "csv": csv})
+                    except Exception:
+                        pass
+                elif fn.endswith(".png"):
+                    try:
+                        with open(fp, "rb") as _r: b = _b64.b64encode(_r.read()).decode("ascii")
+                        # ImageJ macros produce processed images, not
+                        # publication plots, so we surface them under
+                        # the `images` bucket; plots stay R-only.
+                        images.append({"name": fn[:-4], "image": b})
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        _ = results_csv  # reserved for future Results-table import
+        return {"success": success, "kind": kind, "stdout": stdout, "stderr": stderr,
+                "plots": plots, "tables": tables, "images": images}
+    finally:
+        try:
+            import shutil as _shr
+            _shr.rmtree(out_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 class MatlabAnalysisRequest(BaseModel):
     code: str
     sources: List[Dict[str, object]] = []

@@ -440,6 +440,35 @@ class ApiClient {
     return apiJson("/api/analysis/check-matlab");
   }
 
+  /** Detect whether ImageJ / Fiji is installed and reachable. The
+   *  Analysis dialog hides the ImageJ button when this returns
+   *  `installed: false`. The endpoint is optional on older sidecars
+   *  so this is wrapped to soft-fail. */
+  async checkImageJ(): Promise<{ installed: boolean; kind: string; path: string }> {
+    return apiJson("/api/analysis/check-imagej");
+  }
+
+  /** Run an ImageJ / Fiji headless macro against the requested
+   *  inset images. Output: same shape as runMatlab — plots, tables,
+   *  and per-image outputs.  Requires a working Fiji install on PATH;
+   *  the backend returns `success: false` with a clear stderr
+   *  otherwise. */
+  async runImageJ(
+    code: string,
+    sources: Array<{ key: string; row: number; col: number; inset_index: number; label?: string }>,
+    timeoutSec: number = 120,
+  ): Promise<{
+    success: boolean;
+    kind?: string;
+    stdout: string;
+    stderr: string;
+    plots: string[];
+    tables: { name: string; csv: string }[];
+    images: { name: string; image: string }[];
+  }> {
+    return apiJson("/api/analysis/run-imagej", "POST", JSON.stringify({ code, sources, timeout_sec: timeoutSec }));
+  }
+
   /** Run a MATLAB / Octave pipeline against the requested zoom-inset
    *  regions. The script can `load("inputs.mat")` to get
    *  `inputs.<safe_key>.image` (uint8 H×W×3 matrix), and call

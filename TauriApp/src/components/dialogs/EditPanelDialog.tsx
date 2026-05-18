@@ -456,16 +456,23 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
   latestRectRef.current = cropRect;
 
   // When the tab becomes active, re-measure container width (it was 0
-  // while display:none'd). The rAF-based redraw below handles repainting.
+  // while display:none'd). Burst-measure for the first second so we
+  // defeat MUI Dialog enter-transitions and any other case where the
+  // initial clientWidth read happens before final layout — the
+  // ResizeObserver below doesn't fire for transform-driven container
+  // animations, which is what caused the crop overlay to silently
+  // render at the 256 fallback width on initial dialog open.
   useEffect(() => {
     if (!active) return;
     const el = containerRef.current;
-    if (el) {
+    if (!el) return;
+    const measure = () => {
       const w = Math.floor(el.clientWidth);
-      if (w > 0) {
-        setCanvasW((cur) => (Math.abs(w - cur) >= 1 ? w : cur));
-      }
-    }
+      if (w > 0) setCanvasW((cur) => (Math.abs(w - cur) >= 1 ? w : cur));
+    };
+    measure();
+    const timers = [16, 50, 120, 250, 500, 1000].map((ms) => setTimeout(measure, ms));
+    return () => timers.forEach(clearTimeout);
   }, [active]);
 
   // Measure container width so canvas always fits.
@@ -571,12 +578,23 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
 
   // Final safety net — on initial mount and whenever props change such
   // that the canvas would need repainting, schedule a cascade of draws
-  // over the first few seconds. Covers any remaining race where the
-  // browser hadn't laid out / decoded the image when earlier draws fired.
+  // over the first few seconds. Also re-measure the container width
+  // because the dialog enter-transition may have completed only after
+  // the initial measurement landed. Covers any remaining race where
+  // the browser hadn't laid out / decoded the image when earlier
+  // draws fired.
   useEffect(() => {
     const timers: ReturnType<typeof setTimeout>[] = [];
+    const measureAndDraw = () => {
+      const el = containerRef.current;
+      if (el) {
+        const w = Math.floor(el.clientWidth);
+        if (w > 0) setCanvasW((cur) => (Math.abs(w - cur) >= 1 ? w : cur));
+      }
+      drawRef.current();
+    };
     for (const ms of [16, 50, 150, 400, 800, 1500, 3000]) {
-      timers.push(setTimeout(() => drawRef.current(), ms));
+      timers.push(setTimeout(measureAndDraw, ms));
     }
     return () => timers.forEach(clearTimeout);
   }, [imageSrc]);
@@ -593,8 +611,17 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    canvas.width = canvasW;
-    canvas.height = canvasH;
+    // Only reset canvas pixel buffer when dimensions actually change.
+    // Assigning canvas.width / canvas.height clears every pixel —
+    // doing it on every redraw (the 250 ms watchdog tick, the
+    // [16,50,150,400,…] ms cascade) caused a visible flicker on first
+    // dialog open. With this guard the watchdog ticks become idempotent
+    // (drawImage paints over the previous frame in the same JS turn,
+    // no intermediate clear is visible).
+    if (canvas.width !== canvasW || canvas.height !== canvasH) {
+      canvas.width = canvasW;
+      canvas.height = canvasH;
+    }
 
     // Draw rotated + flipped image: translate to center, rotate, flip, draw centered
     const displayW = imgNatW * scale;
