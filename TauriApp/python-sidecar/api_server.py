@@ -391,131 +391,131 @@ def _apply_adjacent_zoom_insets(cfg, processed, rows, cols):
                     if not (0 <= ar < rows and 0 <= ac < cols):
                         fired.add(id(zi))
                         continue
-                ext_name = getattr(zi, "separate_image_name", "") or ""
-                if ext_name and ext_name not in ("", "select") and ext_name in loaded_images:
-                    ext_img = loaded_images[ext_name].convert("RGB")
-                    xi = getattr(zi, "x_inset", 0) or 0
-                    yi = getattr(zi, "y_inset", 0) or 0
-                    wi = getattr(zi, "width_inset", ext_img.size[0]) or ext_img.size[0]
-                    hi = getattr(zi, "height_inset", ext_img.size[1]) or ext_img.size[1]
-                    xi = max(0, min(xi, ext_img.size[0]-1))
-                    yi = max(0, min(yi, ext_img.size[1]-1))
-                    wi = max(1, min(wi, ext_img.size[0]-xi))
-                    hi = max(1, min(hi, ext_img.size[1]-yi))
-                    region = ext_img.crop((xi, yi, xi+wi, yi+hi))
-                    zw = max(1, int(wi * zi.zoom_factor))
-                    zh = max(1, int(hi * zi.zoom_factor))
-                    region = region.resize((zw, zh), Image.LANCZOS)
-                    processed[ar][ac] = region
-                    ready[ar][ac] = True
-                    wrote_something = True
-                    fired.add(id(zi))
-                else:
-                    p_src = cfg.panels[r][c]
-                    # Re-process the source panel WITHOUT the zoom
-                    # inset overlay so the cropped content is clean —
-                    # i.e. no rectangle-border artifacts smearing into
-                    # the adjacent-panel result, especially under
-                    # rotation where the rect border would otherwise
-                    # rotate into diagonal lines inside the crop.
-                    #
-                    # Video sources have their image_name in
-                    # `loaded_videos`, not `loaded_images`; use
-                    # `_get_panel_image` (which handles both) as the
-                    # gate so video panels can still feed the
-                    # adjacent zoom.
-                    p_src_img = _get_panel_image(p_src) if p_src.image_name else None
-                    if p_src_img is not None:
-                        clean_panel = _from_dict(PanelInfo, _to_dict(p_src))
-                        clean_panel.add_zoom_inset = False
-                        try:
-                            # skip_annotations=True keeps the source's
-                            # scale bar / lines / areas out of the
-                            # cropped region that becomes the adjacent
-                            # zoom — annotations are overlays, not
-                            # part of the image content we're zooming
-                            # into. The crop here corresponds to the
-                            # zoom rectangle on the source panel.
-                            main_img = process_panel(
-                                p_src_img,
-                                clean_panel, min_dims, loaded_images,
-                                skip_labels=True, skip_symbols=True,
-                                skip_annotations=True,
-                            )
-                        except Exception:
+                    ext_name = getattr(zi, "separate_image_name", "") or ""
+                    if ext_name and ext_name not in ("", "select") and ext_name in loaded_images:
+                        ext_img = loaded_images[ext_name].convert("RGB")
+                        xi = getattr(zi, "x_inset", 0) or 0
+                        yi = getattr(zi, "y_inset", 0) or 0
+                        wi = getattr(zi, "width_inset", ext_img.size[0]) or ext_img.size[0]
+                        hi = getattr(zi, "height_inset", ext_img.size[1]) or ext_img.size[1]
+                        xi = max(0, min(xi, ext_img.size[0]-1))
+                        yi = max(0, min(yi, ext_img.size[1]-1))
+                        wi = max(1, min(wi, ext_img.size[0]-xi))
+                        hi = max(1, min(hi, ext_img.size[1]-yi))
+                        region = ext_img.crop((xi, yi, xi+wi, yi+hi))
+                        zw = max(1, int(wi * zi.zoom_factor))
+                        zh = max(1, int(hi * zi.zoom_factor))
+                        region = region.resize((zw, zh), Image.LANCZOS)
+                        processed[ar][ac] = region
+                        ready[ar][ac] = True
+                        wrote_something = True
+                        fired.add(id(zi))
+                    else:
+                        p_src = cfg.panels[r][c]
+                        # Re-process the source panel WITHOUT the zoom
+                        # inset overlay so the cropped content is clean —
+                        # i.e. no rectangle-border artifacts smearing into
+                        # the adjacent-panel result, especially under
+                        # rotation where the rect border would otherwise
+                        # rotate into diagonal lines inside the crop.
+                        #
+                        # Video sources have their image_name in
+                        # `loaded_videos`, not `loaded_images`; use
+                        # `_get_panel_image` (which handles both) as the
+                        # gate so video panels can still feed the
+                        # adjacent zoom.
+                        p_src_img = _get_panel_image(p_src) if p_src.image_name else None
+                        if p_src_img is not None:
+                            clean_panel = _from_dict(PanelInfo, _to_dict(p_src))
+                            clean_panel.add_zoom_inset = False
+                            try:
+                                # skip_annotations=True keeps the source's
+                                # scale bar / lines / areas out of the
+                                # cropped region that becomes the adjacent
+                                # zoom — annotations are overlays, not
+                                # part of the image content we're zooming
+                                # into. The crop here corresponds to the
+                                # zoom rectangle on the source panel.
+                                main_img = process_panel(
+                                    p_src_img,
+                                    clean_panel, min_dims, loaded_images,
+                                    skip_labels=True, skip_symbols=True,
+                                    skip_annotations=True,
+                                )
+                            except Exception:
+                                main_img = processed[r][c]
+                        else:
+                            # For chained adjacent zooms (source itself is
+                            # an adjacent-zoom TARGET with no image_name),
+                            # fall back to whatever the previous iteration
+                            # already wrote into processed[r][c] — that's
+                            # the synthesised "primary" zoom image whose
+                            # content the secondary zoom is supposed to
+                            # crop from.
                             main_img = processed[r][c]
-                    else:
-                        # For chained adjacent zooms (source itself is
-                        # an adjacent-zoom TARGET with no image_name),
-                        # fall back to whatever the previous iteration
-                        # already wrote into processed[r][c] — that's
-                        # the synthesised "primary" zoom image whose
-                        # content the secondary zoom is supposed to
-                        # crop from.
-                        main_img = processed[r][c]
-                    if main_img is None:
-                        continue
-                    miw, mih = main_img.size
-                    if p_src.crop_image and p_src.crop and len(p_src.crop) == 4:
-                        fw = p_src.crop[2] - p_src.crop[0]
-                        fh = p_src.crop[3] - p_src.crop[1]
-                    elif p_src.image_name and p_src.image_name in loaded_images:
-                        fw, fh = loaded_images[p_src.image_name].size
-                    elif p_src.image_name and p_src.image_name in loaded_videos:
-                        # Video source — its image_name lives in
-                        # loaded_videos, NOT loaded_images. Use the
-                        # video frame's natural size as the source
-                        # coord system (matches the dialog's
-                        # origFullW/H from getImageInfo, which returns
-                        # the video's frame size).
-                        vid_img = _get_panel_image(p_src)
-                        fw, fh = vid_img.size if vid_img is not None else (miw, mih)
-                    else:
-                        # Source is a synthesised zoom TARGET (no
-                        # image_name of its own — chained adjacent
-                        # zoom). The Edit Panel dialog has no
-                        # origFullW for such panels, so its
-                        # `ziActualW` falls back to the hardcoded
-                        # 1000-px default canvas (see EditPanelDialog
-                        # `const ziActualW = ... origFullW > 0 ? origFullW : 1000`).
-                        # Inset coords are therefore in 1000-px
-                        # space, not in main_img's natural pixels.
-                        # Using main_img.size as fw, fh would treat
-                        # 294-in-1000-space as 294 pixels of a 200-
-                        # px image, sending the crop off the edge
-                        # and producing a black secondary zoom.
-                        fw, fh = 1000, 1000
-                    scx = miw / max(fw, 1)
-                    scy = mih / max(fh, 1)
-                    # Source rectangle in main_img coords. We keep the
-                    # full extent (no border-width inset needed because
-                    # we cropped from a clean source above).
-                    cx1 = max(0, int(zi.x * scx))
-                    cy1 = max(0, int(zi.y * scy))
-                    cx2 = min(miw, int((zi.x + zi.width) * scx))
-                    cy2 = min(mih, int((zi.y + zi.height) * scy))
-                    cx2 = max(cx1 + 1, cx2)
-                    cy2 = max(cy1 + 1, cy2)
-                    rot = float(getattr(zi, "rotation", 0) or 0)
-                    if abs(rot) > 0.01:
-                        # CSS rotate(+R) = CW; PIL Image.rotate(+R) =
-                        # CCW. Use +rot (= CCW in PIL) to un-rotate
-                        # the CW-tilted CSS rect so a plain crop at
-                        # the original (cx1, cy1, cx2, cy2) yields
-                        # axis-aligned content of a tilted source.
-                        ccx = (cx1 + cx2) / 2.0
-                        ccy = (cy1 + cy2) / 2.0
-                        rot_img = main_img.rotate(rot, center=(ccx, ccy), resample=Image.BICUBIC)
-                        region = rot_img.crop((cx1, cy1, cx2, cy2))
-                    else:
-                        region = main_img.crop((cx1, cy1, cx2, cy2))
-                    zw = max(1, int(zi.width * zi.zoom_factor * scx))
-                    zh = max(1, int(zi.height * zi.zoom_factor * scy))
-                    region = region.resize((zw, zh), Image.LANCZOS)
-                    processed[ar][ac] = region
-                    ready[ar][ac] = True
-                    wrote_something = True
-                    fired.add(id(zi))
+                        if main_img is None:
+                            continue
+                        miw, mih = main_img.size
+                        if p_src.crop_image and p_src.crop and len(p_src.crop) == 4:
+                            fw = p_src.crop[2] - p_src.crop[0]
+                            fh = p_src.crop[3] - p_src.crop[1]
+                        elif p_src.image_name and p_src.image_name in loaded_images:
+                            fw, fh = loaded_images[p_src.image_name].size
+                        elif p_src.image_name and p_src.image_name in loaded_videos:
+                            # Video source — its image_name lives in
+                            # loaded_videos, NOT loaded_images. Use the
+                            # video frame's natural size as the source
+                            # coord system (matches the dialog's
+                            # origFullW/H from getImageInfo, which returns
+                            # the video's frame size).
+                            vid_img = _get_panel_image(p_src)
+                            fw, fh = vid_img.size if vid_img is not None else (miw, mih)
+                        else:
+                            # Source is a synthesised zoom TARGET (no
+                            # image_name of its own — chained adjacent
+                            # zoom). The Edit Panel dialog has no
+                            # origFullW for such panels, so its
+                            # `ziActualW` falls back to the hardcoded
+                            # 1000-px default canvas (see EditPanelDialog
+                            # `const ziActualW = ... origFullW > 0 ? origFullW : 1000`).
+                            # Inset coords are therefore in 1000-px
+                            # space, not in main_img's natural pixels.
+                            # Using main_img.size as fw, fh would treat
+                            # 294-in-1000-space as 294 pixels of a 200-
+                            # px image, sending the crop off the edge
+                            # and producing a black secondary zoom.
+                            fw, fh = 1000, 1000
+                        scx = miw / max(fw, 1)
+                        scy = mih / max(fh, 1)
+                        # Source rectangle in main_img coords. We keep the
+                        # full extent (no border-width inset needed because
+                        # we cropped from a clean source above).
+                        cx1 = max(0, int(zi.x * scx))
+                        cy1 = max(0, int(zi.y * scy))
+                        cx2 = min(miw, int((zi.x + zi.width) * scx))
+                        cy2 = min(mih, int((zi.y + zi.height) * scy))
+                        cx2 = max(cx1 + 1, cx2)
+                        cy2 = max(cy1 + 1, cy2)
+                        rot = float(getattr(zi, "rotation", 0) or 0)
+                        if abs(rot) > 0.01:
+                            # CSS rotate(+R) = CW; PIL Image.rotate(+R) =
+                            # CCW. Use +rot (= CCW in PIL) to un-rotate
+                            # the CW-tilted CSS rect so a plain crop at
+                            # the original (cx1, cy1, cx2, cy2) yields
+                            # axis-aligned content of a tilted source.
+                            ccx = (cx1 + cx2) / 2.0
+                            ccy = (cy1 + cy2) / 2.0
+                            rot_img = main_img.rotate(rot, center=(ccx, ccy), resample=Image.BICUBIC)
+                            region = rot_img.crop((cx1, cy1, cx2, cy2))
+                        else:
+                            region = main_img.crop((cx1, cy1, cx2, cy2))
+                        zw = max(1, int(zi.width * zi.zoom_factor * scx))
+                        zh = max(1, int(zi.height * zi.zoom_factor * scy))
+                        region = region.resize((zw, zh), Image.LANCZOS)
+                        processed[ar][ac] = region
+                        ready[ar][ac] = True
+                        wrote_something = True
+                        fired.add(id(zi))
         if not wrote_something:
             break
 
@@ -1526,23 +1526,66 @@ def get_histogram(r: int, c: int):
 
 @app.get("/api/panel-preview/{r}/{c}")
 def get_panel_preview(r: int, c: int):
-    """Get a processed preview of a single panel with current settings applied."""
+    """Get a processed preview of a single panel with current settings applied.
+
+    Handles three cases:
+      • Image-bearing panel (static image in loaded_images, or video in
+        loaded_videos): process_panel on the source frame.
+      • Adjacent-zoom TARGET panel (no image_name): synthesise from the
+        source panel via the same _apply_adjacent_zoom_insets path the
+        full preview uses, so the Edit dialog has a base image to show
+        on its first open.
+      • Empty cell: return empty image (frontend shows placeholder).
+    """
     if r >= cfg.rows or c >= cfg.cols:
         raise HTTPException(400, f"Panel [{r}][{c}] out of range")
     panel = cfg.panels[r][c]
-    if not panel.image_name or panel.image_name not in loaded_images:
+    # Try the regular image / video path first.
+    src_img = _get_panel_image(panel) if panel.image_name else None
+    if src_img is not None:
+        # For edit dialog preview: skip ALL overlays (labels, symbols,
+        # scale bar, lines, areas, zoom inset) — they're rendered as
+        # interactive UI overlays in the frontend.
+        panel_copy = _from_dict(PanelInfo, _to_dict(panel))
+        panel_copy.add_zoom_inset = False
+        panel_copy.add_scale_bar = False
+        panel_copy.labels = []
+        panel_copy.symbols = []
+        panel_copy.lines = []
+        panel_copy.areas = []
+        processed = process_panel(src_img, panel_copy, min_dims, loaded_images, skip_labels=True, skip_symbols=True)
+    elif not panel.image_name:
+        # Adjacent-zoom target: synthesise via the cascade path so the
+        # dialog can show what's actually in this cell. Without this,
+        # the dialog opens with a blank base preview and the user
+        # can't see what they're editing until they switch to an
+        # overlay tab that triggers the rendered-preview fetch.
+        rows, cols = cfg.rows, cfg.cols
+        processed_grid = [[None for _ in range(cols)] for _ in range(rows)]
+        # Seed every image-bearing cell.
+        for sr in range(rows):
+            for sc in range(cols):
+                sp = cfg.panels[sr][sc]
+                sp_img = _get_panel_image(sp) if sp.image_name else None
+                if sp_img is None:
+                    continue
+                saved_z = sp.add_zoom_inset
+                sp.add_zoom_inset = False
+                try:
+                    processed_grid[sr][sc] = process_panel(sp_img, sp, min_dims, loaded_images, skip_labels=True, skip_symbols=True)
+                except Exception:
+                    pass
+                finally:
+                    sp.add_zoom_inset = saved_z
+        if processed_grid[r][c] is None:
+            processed_grid[r][c] = Image.new("RGB", (1, 1), "white")
+        _apply_adjacent_zoom_insets(cfg, processed_grid, rows, cols)
+        synth = processed_grid[r][c]
+        if synth is None or synth.size == (1, 1):
+            return {"image": ""}
+        processed = synth
+    else:
         return {"image": ""}
-    # For edit dialog preview: skip ALL overlays (labels, symbols, scale bar, lines,
-    # areas, zoom inset) — they are rendered as interactive UI overlays in the frontend.
-    # This gives a clean base image for the user to work with.
-    panel_copy = _from_dict(PanelInfo, _to_dict(panel))
-    panel_copy.add_zoom_inset = False
-    panel_copy.add_scale_bar = False
-    panel_copy.labels = []
-    panel_copy.symbols = []
-    panel_copy.lines = []
-    panel_copy.areas = []
-    processed = process_panel(_get_panel_image(panel) or loaded_images[panel.image_name], panel_copy, min_dims, loaded_images, skip_labels=True, skip_symbols=True)
     proc_w, proc_h = processed.size  # full processed dimensions before thumbnail
     processed.thumbnail((1200, 1200), Image.LANCZOS)
     buf = io.BytesIO()
@@ -1558,23 +1601,53 @@ class PanelPatchAndPreview(BaseModel):
 @app.post("/api/panel-patch-preview/{r}/{c}")
 def patch_panel_and_preview(r: int, c: int, body: PanelPatchAndPreview):
     """Atomically patch a panel AND return its processed preview in one call.
-    Eliminates race conditions from separate PATCH + GET requests."""
+    Eliminates race conditions from separate PATCH + GET requests.
+
+    Handles image, video, and adjacent-zoom-target panels (latter via
+    cascade synthesis so the dialog has a base image to draw on).
+    """
     if r >= cfg.rows or c >= cfg.cols:
         raise HTTPException(400, f"Panel [{r}][{c}] out of range")
     # 1. Patch
     cfg.panels[r][c] = _from_dict(PanelInfo, body.panel)
     panel = cfg.panels[r][c]
     # 2. Generate preview — skip ALL overlays (rendered as interactive UI overlays)
-    if not panel.image_name or panel.image_name not in loaded_images:
+    src_img = _get_panel_image(panel) if panel.image_name else None
+    if src_img is not None:
+        panel_copy = _from_dict(PanelInfo, _to_dict(panel))
+        panel_copy.add_zoom_inset = False
+        panel_copy.add_scale_bar = False
+        panel_copy.labels = []
+        panel_copy.symbols = []
+        panel_copy.lines = []
+        panel_copy.areas = []
+        processed = process_panel(src_img, panel_copy, min_dims, loaded_images, skip_labels=True, skip_symbols=True)
+    elif not panel.image_name:
+        rows, cols = cfg.rows, cfg.cols
+        processed_grid = [[None for _ in range(cols)] for _ in range(rows)]
+        for sr in range(rows):
+            for sc in range(cols):
+                sp = cfg.panels[sr][sc]
+                sp_img = _get_panel_image(sp) if sp.image_name else None
+                if sp_img is None:
+                    continue
+                saved_z = sp.add_zoom_inset
+                sp.add_zoom_inset = False
+                try:
+                    processed_grid[sr][sc] = process_panel(sp_img, sp, min_dims, loaded_images, skip_labels=True, skip_symbols=True)
+                except Exception:
+                    pass
+                finally:
+                    sp.add_zoom_inset = saved_z
+        if processed_grid[r][c] is None:
+            processed_grid[r][c] = Image.new("RGB", (1, 1), "white")
+        _apply_adjacent_zoom_insets(cfg, processed_grid, rows, cols)
+        synth = processed_grid[r][c]
+        if synth is None or synth.size == (1, 1):
+            return {"panel": _to_dict(panel), "image": ""}
+        processed = synth
+    else:
         return {"panel": _to_dict(panel), "image": ""}
-    panel_copy = _from_dict(PanelInfo, _to_dict(panel))
-    panel_copy.add_zoom_inset = False
-    panel_copy.add_scale_bar = False
-    panel_copy.labels = []
-    panel_copy.symbols = []
-    panel_copy.lines = []
-    panel_copy.areas = []
-    processed = process_panel(_get_panel_image(panel) or loaded_images[panel.image_name], panel_copy, min_dims, loaded_images, skip_labels=True, skip_symbols=True)
     proc_w, proc_h = processed.size
     processed.thumbnail((1200, 1200), Image.LANCZOS)
     buf = io.BytesIO()

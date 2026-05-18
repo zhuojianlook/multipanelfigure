@@ -2107,10 +2107,14 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     return () => window.removeEventListener("keydown", onKey);
   }, [open, doUndo, doRedo]);
 
-  // Fetch preview image on open — use panel from store (not local which may not be set yet)
+  // Fetch preview image on open — use panel from store (not local which may not be set yet).
+  // Also fires for adjacent-zoom TARGET panels (no image_name): the backend
+  // now synthesises the cascade-produced image and returns it, so the dialog
+  // has a base preview to show immediately instead of staying blank until
+  // the user switches to an overlay tab.
   const panelImageName = panel?.image_name ?? "";
   useEffect(() => {
-    if (open && panelImageName) {
+    if (open && (panelImageName || isZoomTarget)) {
       // Small delay to ensure the dialog has rendered
       const t = setTimeout(() => {
         api.getPanelPreview(row, col).then((resp) => {
@@ -2119,7 +2123,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       }, 100);
       return () => clearTimeout(t);
     }
-  }, [open, row, col, panelImageName]);
+  }, [open, row, col, panelImageName, isZoomTarget]);
 
   // Load original image for the crop canvas (thumbnail) + fetch original dimensions.
   // Runs on every dialog-open transition. When the dialog is closed we
