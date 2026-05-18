@@ -328,7 +328,7 @@ def _apply_zoom_target_self_overlays(cfg, processed, rows, cols):
             processed[r][c] = synth
 
 
-def _apply_adjacent_zoom_insets(cfg, processed, rows, cols):
+def _apply_adjacent_zoom_insets(cfg, processed, rows, cols, image_override=None):
     """Replace target panels in `processed[][]` with zoomed crops for
     every Adjacent Panel zoom inset configured on any source panel.
 
@@ -349,6 +349,13 @@ def _apply_adjacent_zoom_insets(cfg, processed, rows, cols):
     /api/figure/save, and the video render worker so multi-figure
     arrays land in their adjacent slots regardless of which path the
     user invokes.
+
+    image_override: optional Dict[(r, c), PIL.Image] that overrides
+    `_get_panel_image()` when reading the source panel's frame. Used
+    by the video render worker to feed the CURRENT frame_idx's frame
+    into the cascade — without this, video-source insets always
+    sampled the panel's static `frame` field and zoom targets stayed
+    frozen while the source animated.
     """
     # A cell is "ready" to act as a SOURCE when either it has an
     # image_name in loaded_images / loaded_videos, OR an earlier
@@ -424,7 +431,16 @@ def _apply_adjacent_zoom_insets(cfg, processed, rows, cols):
                         # `_get_panel_image` (which handles both) as the
                         # gate so video panels can still feed the
                         # adjacent zoom.
-                        p_src_img = _get_panel_image(p_src) if p_src.image_name else None
+                        #
+                        # When `image_override` carries an entry for
+                        # this source cell (video render worker), use
+                        # THAT frame so insets animate frame-by-frame
+                        # instead of sampling the panel's static
+                        # `frame` field repeatedly.
+                        if image_override and (r, c) in image_override:
+                            p_src_img = image_override[(r, c)]
+                        else:
+                            p_src_img = _get_panel_image(p_src) if p_src.image_name else None
                         if p_src_img is not None:
                             clean_panel = _from_dict(PanelInfo, _to_dict(p_src))
                             clean_panel.add_zoom_inset = False
@@ -2474,7 +2490,13 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
             # Adjacent Panel zoom insets — share the helper used by the
             # /api/preview and /api/figure/save paths so video export
             # honours every adjacent inset configured on every panel.
-            _apply_adjacent_zoom_insets(cfg, processed, rows, cols)
+            # Pass `panel_images` (the per-output-frame frames we
+            # extracted for range-video panels) as the cascade source
+            # override, so insets animate frame-by-frame instead of
+            # repeatedly sampling the static `frame` field of each
+            # source panel.
+            _apply_adjacent_zoom_insets(cfg, processed, rows, cols,
+                                        image_override=panel_images)
             _apply_zoom_target_self_overlays(cfg, processed, rows, cols)
 
             full_res_sizes2: Dict[Tuple[int, int], Tuple[int, int]] = {}
