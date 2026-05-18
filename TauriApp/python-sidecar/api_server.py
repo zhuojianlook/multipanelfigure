@@ -1750,39 +1750,61 @@ def get_panel_rendered_preview(r: int, c: int):
         panel.add_zoom_inset = saved_zoom
 
     iw, ih = processed.size
-    # Match the figure builder's reference_inches (3.0) so that
-    # text at N points occupies the same fraction of the panel as
-    # in the final output.  DPI = pixels / inches.
+    # Match the figure builder's reference_inches (3.0) so text /
+    # bar sizes scale proportionally.
     reference_inches = 3.0
-    # Minimum source width for the dialog preview. The synthesised
-    # image for an adjacent-zoom target is often smaller than an
-    # image-bearing panel's source (e.g. 300×300 source × 2× zoom =
-    # 600 wide vs 800+ for a real image), which makes
-    # `preview_dpi = iw / 3.0` correspondingly lower — and the font
-    # rendering visibly softer than the parent panel's. Upsample
-    # short sources so the dialog preview hits at least this width
-    # before matplotlib draws on top. We pass the pre-upsample size
-    # as pre_norm_sizes so the scalebar pass rescales bar length /
-    # bar height proportionally and the bar still represents the
-    # correct physical length on the higher-DPI canvas.
-    MIN_PREVIEW_W = 1000
-    pre_upscale_sizes = [[None for _ in range(cfg.cols)] for _ in range(cfg.rows)]
-    pre_upscale_sizes[r][c] = processed.size
-    # Upscale image-bearing panels for crispness. Zoom-target panels
-    # skip the upscale: the full-figure render has no analogous
-    # upscale, so keeping nsf=1 here means the bar's visual fraction
-    # matches the figure preview's. (Pairs with the bar_height
-    # is_zoom_target skip in _add_panel_scale_bars.)
-    _is_dlg_ztarget = not (panel.image_name and panel.image_name in loaded_images)
-    if iw < MIN_PREVIEW_W and not _is_dlg_ztarget:
-        scale_up = MIN_PREVIEW_W / iw
-        new_w = int(iw * scale_up)
-        new_h = int(ih * scale_up)
-        processed = processed.resize((new_w, new_h), Image.LANCZOS)
-        iw, ih = new_w, new_h
-    preview_dpi = max(72, iw / reference_inches)
-    fig_w = iw / preview_dpi   # = reference_inches = 3.0
-    fig_h = ih / preview_dpi
+    # Match the 1×1 axes grid that we pass to matplotlib below (paired
+    # with panel_override). _add_panel_scale_bars iterates r=0..rows,
+    # c=0..cols and reads pre_norm_sizes[r][c] — using the override
+    # `(r, c)` here would mis-index a 1×1 grid. So we store the
+    # pre-resize size at [0][0].
+    pre_upscale_sizes = [[None]]
+    pre_upscale_sizes[0][0] = processed.size
+    # Mirror the FIGURE's effective render size: when normalize_widths
+    # is on, the figure stretches each panel to the grid-wide max
+    # width / height. We do the same here so the matplotlib bar
+    # position, length and thickness ALL match between dialog and
+    # figure. Crispness is then added by PIL-upscaling the FINAL
+    # OUTPUT bytes (below) — not by matplotlib upscaling, which
+    # would change `iw` and shift bar_height's visual fraction.
+    fig_target_w, fig_target_h = iw, ih
+    if getattr(cfg, "normalize_widths", False):
+        norm_mode = getattr(cfg, "normalize_mode", "width") or "width"
+        max_w, max_h = 1, 1
+        for sr in range(cfg.rows):
+            for sc in range(cfg.cols):
+                sp = cfg.panels[sr][sc]
+                if not (sp.image_name and (sp.image_name in loaded_images or sp.image_name in loaded_videos)):
+                    continue
+                src_img = _get_panel_image(sp)
+                if src_img is None:
+                    continue
+                try:
+                    pp = process_panel(src_img, sp, min_dims, loaded_images, skip_labels=True, skip_symbols=True)
+                    if pp.size[0] > max_w: max_w = pp.size[0]
+                    if pp.size[1] > max_h: max_h = pp.size[1]
+                except Exception:
+                    pass
+        if norm_mode == "width" and max_w > iw:
+            fig_target_w = max_w
+            fig_target_h = int(ih * max_w / max(iw, 1))
+        elif norm_mode == "height" and max_h > ih:
+            fig_target_h = max_h
+            fig_target_w = int(iw * max_h / max(ih, 1))
+    if fig_target_w != iw or fig_target_h != ih:
+        processed = processed.resize((fig_target_w, fig_target_h), Image.LANCZOS)
+        iw, ih = fig_target_w, fig_target_h
+    # Fix fig_w to the reference inches; preview_dpi controls output
+    # crispness independently from the data range. matplotlib stretches
+    # the imshow data to fill fig_w × fig_h, so the bar's position /
+    # length / thickness — which live in DATA coords — stay tied to
+    # `iw / ih` (the figure-equivalent size) regardless of dpi. We
+    # bump dpi up to MIN_PREVIEW_DPI so text and bar rasterise crisply
+    # in the dialog even when the underlying synth was small.
+    fig_w = reference_inches
+    fig_h = reference_inches * ih / max(iw, 1)
+    MIN_PREVIEW_DPI = 400  # ~1200 px output at 3-inch fig — crisp text/bar
+    preview_dpi = max(MIN_PREVIEW_DPI, iw / reference_inches)
 
     fig = plt.figure(figsize=(fig_w, fig_h), dpi=preview_dpi)
     ax = fig.add_axes([0, 0, 1, 1])
