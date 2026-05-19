@@ -61,6 +61,12 @@ class ScaleBarSettings:
     styled_segments: List[StyledSegment] = field(default_factory=list)  # for label text customization
     draggable: bool = False                # True for custom placement
     label_color: str = "#FFFFFF"
+    # Where to place the bar's text relative to the bar itself:
+    #   "auto"  — pick automatically based on bar's vertical position
+    #             (bar in bottom half → label above, otherwise → below)
+    #   "above" — always render the label above the bar
+    #   "below" — always render the label below the bar
+    label_position: str = "auto"
 
 
 # ---------------------------------------------------------------------------

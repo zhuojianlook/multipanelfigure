@@ -31,6 +31,7 @@ import { useFigureStore, type LoadedImage } from "../../store/figureStore";
 import { EditPanelDialog } from "../dialogs/EditPanelDialog";
 import { getSelectedImageName, clearSelectedImage, useSelectedImage } from "../image-strip/ImageStrip";
 import type { PanelInfo } from "../../api/types";
+import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 
 // Global clipboard for panel settings (excludes zoom_inset per spec 3.1.7)
 let copiedPanelSettings: Partial<PanelInfo> | null = null;
@@ -45,6 +46,7 @@ export function PanelCell({ row, col, imageName }: Props) {
   const loadedImages = useFigureStore((s) => s.loadedImages);
   const panelThumbnails = useFigureStore((s) => s.panelThumbnails);
   const setPanelImage = useFigureStore((s) => s.setPanelImage);
+  const clearPanel = useFigureStore((s) => s.clearPanel);
   const updatePanel = useFigureStore((s) => s.updatePanel);
   const config = useFigureStore((s) => s.config);
   const swapPanels = useFigureStore((s) => s.swapPanels);
@@ -152,30 +154,45 @@ export function PanelCell({ row, col, imageName }: Props) {
     refreshPanelThumbnail(row, col).catch(() => { /* ignore */ });
   }, [isZoomTarget, zoomTargetInfo.sourceHash, row, col]);
 
-  // Centralized drop handler — extracted so we can use it on a transparent overlay too
-  const handleDrop = (e: React.DragEvent) => {
+  // Centralized drop handler — extracted so we can use it on a transparent overlay too.
+  // Async because the confirm/alert dialogs are MUI components (Promise-based) rather
+  // than native blocking popups; we capture all DataTransfer payloads up-front so they
+  // survive the await (the React.DragEvent is reused & its dataTransfer reset by
+  // subsequent dispatches).
+  const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setDragOver(false);
+    // Snapshot drag payloads before any await — `e.dataTransfer` is
+    // wiped once we yield to the event loop.
+    const imgName = e.dataTransfer.getData("application/x-image-name");
+    const panelSrcRaw = e.dataTransfer.getData("application/x-panel-source");
+    const drawerSrc = e.dataTransfer.getData("application/x-drawer-index");
     if (isZoomTarget) {
-      alert("This panel is reserved for a zoom inset. Disable the zoom inset first.");
+      await alertDialog({
+        title: "Panel reserved",
+        body: "This panel is reserved for a zoom inset. Disable the zoom inset first.",
+      });
       return;
     }
-    const imgName = e.dataTransfer.getData("application/x-image-name");
     if (imgName) {
       if (imageName) {
-        if (!window.confirm(`Replace image in R${row + 1}C${col + 1}? Current settings will be lost.`)) return;
+        const ok = await confirmDialog({
+          title: "Replace image",
+          body: `Replace image in R${row + 1}C${col + 1}? Current settings will be lost.`,
+          confirmLabel: "Replace",
+          destructive: true,
+        });
+        if (!ok) return;
       }
       setPanelImage(row, col, imgName);
       return;
     }
-    const panelSrc = e.dataTransfer.getData("application/x-panel-source");
-    if (panelSrc) {
-      const src = JSON.parse(panelSrc) as { row: number; col: number };
+    if (panelSrcRaw) {
+      const src = JSON.parse(panelSrcRaw) as { row: number; col: number };
       swapPanels(src.row, src.col, row, col);
       return;
     }
-    const drawerSrc = e.dataTransfer.getData("application/x-drawer-index");
     if (drawerSrc) {
       const drawerIdx = Number(drawerSrc);
       const movePanelFromDrawer = useFigureStore.getState().movePanelFromDrawer;
@@ -215,12 +232,18 @@ export function PanelCell({ row, col, imageName }: Props) {
           e.dataTransfer.setDragImage(thumbEl, thumbEl.offsetWidth / 2, thumbEl.offsetHeight / 2);
         }
       }}
-      onClick={() => {
-        // Click-to-assign: if an image is selected in the filmstrip, assign it here
+      onClick={async () => {
+        // Click-to-assign: if an image is selected in the filmstrip, assign it here.
         const selImg = getSelectedImageName();
         if (selImg) {
           if (imageName && imageName !== selImg) {
-            if (!window.confirm(`Replace image in R${row + 1}C${col + 1}? Current settings will be lost.`)) return;
+            const ok = await confirmDialog({
+              title: "Replace image",
+              body: `Replace image in R${row + 1}C${col + 1}? Current settings will be lost.`,
+              confirmLabel: "Replace",
+              destructive: true,
+            });
+            if (!ok) return;
           }
           setPanelImage(row, col, selImg);
           clearSelectedImage();
@@ -280,12 +303,18 @@ export function PanelCell({ row, col, imageName }: Props) {
 
       {/* Thumbnail area — also handles click-to-assign */}
       <Box
-        onClick={() => {
+        onClick={async () => {
           if (isZoomTarget) return;
           const selImg = getSelectedImageName();
           if (selImg) {
             if (imageName && imageName !== selImg) {
-              if (!window.confirm(`Replace image in R${row + 1}C${col + 1}? Current settings will be lost.`)) return;
+              const ok = await confirmDialog({
+                title: "Replace image",
+                body: `Replace image in R${row + 1}C${col + 1}? Current settings will be lost.`,
+                confirmLabel: "Replace",
+                destructive: true,
+              });
+              if (!ok) return;
             }
             setPanelImage(row, col, selImg);
             clearSelectedImage();
@@ -349,12 +378,21 @@ export function PanelCell({ row, col, imageName }: Props) {
       <div>
       <Select
         value={imageName}
-        onChange={(e) => {
+        onChange={async (e) => {
           if (isZoomTarget) return;
-          if (!e.target.value && imageName) {
-            if (!window.confirm(`Remove image from R${row + 1}C${col + 1}? All settings will be lost.`)) return;
+          // Capture the target value before any await — MUI's
+          // SelectChangeEvent reuses the underlying object.
+          const nextVal = e.target.value;
+          if (!nextVal && imageName) {
+            const ok = await confirmDialog({
+              title: "Remove image",
+              body: `Remove image from R${row + 1}C${col + 1}? All settings will be lost.`,
+              confirmLabel: "Remove",
+              destructive: true,
+            });
+            if (!ok) return;
           }
-          setPanelImage(row, col, e.target.value);
+          setPanelImage(row, col, nextVal);
         }}
         disabled={isZoomTarget}
         displayEmpty
@@ -432,7 +470,10 @@ export function PanelCell({ row, col, imageName }: Props) {
             variant="contained"
             color="error"
             onClick={() => {
-              setPanelImage(row, col, "");
+              // Use clearPanel (not setPanelImage(row,col,"")) so the
+              // wipe truly resets crops, insets, labels, annotations
+              // and per-channel state — not just the image_name.
+              clearPanel(row, col);
               setClearConfirmOpen(false);
             }}
           >

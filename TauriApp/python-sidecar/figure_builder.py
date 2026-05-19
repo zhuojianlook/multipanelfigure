@@ -126,7 +126,10 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
         # position differently than styled ones at the same cx/cy
         # (user-visible: styled 2-line row headers drifted up relative
         # to plain siblings in the same tier).
-        txt = fig.text(x, adj_y, full_text, ha=ha, va=va, fontproperties=adj_fp,
+        # Symbol-font remap (no-op for normal Unicode fonts).  Also
+        # selects the symbol charmap on the cached FT2Font instance.
+        full_text_to_draw = _remap_text_for_font(full_text, adj_fp)
+        txt = fig.text(x, adj_y, full_text_to_draw, ha=ha, va=va, fontproperties=adj_fp,
                        color=color, rotation=rotation,
                        rotation_mode='anchor',
                        multialignment=ha if ha in ("left", "center", "right") else "center")
@@ -198,16 +201,19 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
         'changing color shifts characters slightly')."""
         if not txt:
             return 0.0
+        # Symbol-font remap so the measurement uses the codepoints
+        # that actually exist in the font's selected charmap.
+        txt_for_measure = _remap_text_for_font(txt, seg_fp)
         if _renderer is not None:
             try:
                 w_px, _h, _d = _renderer.get_text_width_height_descent(
-                    txt, seg_fp, ismath=False)
+                    txt_for_measure, seg_fp, ismath=False)
                 return float(w_px) / _dpi
             except Exception:
                 pass
             # Fallback: figure.text() + bbox — less accurate but better
             # than the constant-char-width estimate below.
-            t = fig.text(0, 0, txt, fontproperties=seg_fp, color="none")
+            t = fig.text(0, 0, txt_for_measure, fontproperties=seg_fp, color="none")
             try:
                 bb = t.get_window_extent(_renderer)
                 return bb.width / _dpi
@@ -226,8 +232,14 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
         seg_styles = seg.get('font_style') or []
         seg_size = seg.get('font_size') or fp.get_size()
         seg_font = seg.get('font_name')
+        # IMPORTANT: only inherit the base font_path when the seg
+        # doesn't override font_name.  _font_props prefers font_path
+        # over font_name when both are present — passing the base
+        # label's path along with a different seg font_name would
+        # cause the wrong font to load (e.g. user picks Wingdings
+        # for a SEGMENT but the label's base is Arial → renders Arial).
         seg_fp = _font_props(
-            fp._fname if hasattr(fp, '_fname') else None,
+            None if seg_font else (fp._fname if hasattr(fp, '_fname') else None),
             seg_font or (fp.get_name() if hasattr(fp, 'get_name') else "arial.ttf"),
             seg_size,
             seg_styles if seg_styles else (list(fp.get_style()) if hasattr(fp, 'get_style') else []),
@@ -453,7 +465,8 @@ def _draw_colored_text(fig, x, y, segments, fp, ha="center", va="bottom",
                 draw_x = cur_x + (-sin_r * sign * offset_in) / max(0.001, fig_w_in)
                 draw_y = cur_y + (cos_r * sign * offset_in) / max(0.001, fig_h_in)
 
-            txt_artist = fig.text(draw_x, draw_y, part_text, ha='left', va='baseline',
+            part_text_to_draw = _remap_text_for_font(part_text, draw_fp)
+            txt_artist = fig.text(draw_x, draw_y, part_text_to_draw, ha='left', va='baseline',
                      fontproperties=draw_fp, color=color,
                      rotation=rot_deg, rotation_mode='anchor')
 
@@ -587,6 +600,114 @@ def _resolve_font_path(font_name: str) -> Optional[str]:
     return None
 
 
+# ── Symbol-font (Microsoft Symbol encoding) handling ─────────────
+# Fonts like Wingdings / Webdings / Symbol ship with a cmap subtable
+# (platform 3, encoding 0) that maps glyphs into the PUA range
+# U+F020..U+F0FF instead of the standard Unicode (3, 1) subtable
+# at U+0020..U+00FF.  matplotlib loads these fonts but its default
+# FT_Select_Charmap(FT_ENCODING_UNICODE) call fails (no Unicode
+# subtable to select), leaving the charmap "undefined" and every
+# glyph lookup returning .notdef → user-visible tofu boxes for
+# ASCII text in Wingdings.
+#
+# The fix has TWO halves; both are required.  Either one alone
+# produces tofu:
+#   (a) Call `font.set_charmap(i)` to explicitly select the (3, 0)
+#       Microsoft Symbol charmap on the FT2Font instance matplotlib
+#       caches via font_manager.get_font().  This makes the symbol
+#       subtable the authoritative glyph map for subsequent reads.
+#   (b) Remap every ASCII character in the rendered text from
+#       0x20..0x7F to 0xF020..0xF0FF (the PUA block) so the lookups
+#       hit the (3, 0) subtable's keyspace.
+
+_symbol_font_cache: Dict[str, bool] = {}
+_symbol_charmap_idx_cache: Dict[str, int] = {}
+
+def _is_symbol_font(font_path: Optional[str]) -> bool:
+    """Return True when `font_path` is a TTF/OTF whose only
+    Microsoft-platform cmap subtable is the legacy Symbol (3, 0)
+    encoding — i.e. no Unicode (3, 1) or (3, 10) UCS-4 subtable.
+    For matplotlib to render glyphs from these fonts we need to
+    select the Symbol charmap AND remap text codepoints to PUA."""
+    if not font_path:
+        return False
+    cached = _symbol_font_cache.get(font_path)
+    if cached is not None:
+        return cached
+    try:
+        from fontTools.ttLib import TTFont
+        f = TTFont(font_path, lazy=True)
+        cmap = f.get("cmap")
+        if cmap is None:
+            _symbol_font_cache[font_path] = False
+            return False
+        has_unicode = any(t.platformID == 3 and t.platEncID in (1, 10) for t in cmap.tables)
+        has_symbol = any(t.platformID == 3 and t.platEncID == 0 for t in cmap.tables)
+        result = bool(has_symbol and not has_unicode)
+        _symbol_font_cache[font_path] = result
+        return result
+    except Exception:
+        _symbol_font_cache[font_path] = False
+        return False
+
+
+def _prepare_symbol_font_for_matplotlib(font_path: str) -> None:
+    """Select the Microsoft Symbol (3, 0) charmap on the matplotlib-
+    cached FT2Font for `font_path`.  Must be called before every
+    matplotlib text-render that uses this symbol font; the charmap
+    selection sticks on the cached FT2Font instance but matplotlib
+    can clear/reset it between renders so we re-apply defensively.
+
+    Walks each charmap looking for one that contains PUA codepoint
+    U+F041 ("A" in Wingdings' (3, 0) subtable) and selects it.  This
+    is more robust than hard-coding `set_charmap(1)` because the
+    subtable order varies by font / OS."""
+    try:
+        from matplotlib.font_manager import get_font
+        font = get_font(font_path)
+        cached_idx = _symbol_charmap_idx_cache.get(font_path)
+        if cached_idx is not None:
+            font.set_charmap(cached_idx)
+            return
+        # Find the symbol charmap by probing each for the well-known
+        # PUA codepoint U+F041 (Wingdings 'A' / equivalent in other
+        # symbol fonts). If no charmap has it, we just leave the font
+        # alone — rendering will still be tofu but no worse than
+        # before.
+        for i in range(font.num_charmaps):
+            try:
+                font.set_charmap(i)
+                # get_charmap() returns {codepoint: glyph_index}
+                m = font.get_charmap()
+                if 0xF041 in m or 0xF020 in m:
+                    _symbol_charmap_idx_cache[font_path] = i
+                    return
+            except Exception:
+                continue
+        # No symbol charmap found — clear so we don't retry every
+        # call (other lookups may have side effects).
+        _symbol_charmap_idx_cache[font_path] = 0
+    except Exception:
+        pass
+
+
+def _remap_text_for_font(text: str, fp: FontProperties) -> str:
+    """If `fp` points at a symbol-encoded font, ALSO ensure the
+    underlying FT2Font has the Symbol charmap selected, AND return
+    the text with ASCII codepoints shifted to the PUA U+F000 block.
+    Both steps are required for matplotlib to render correctly —
+    see the module-level note above."""
+    if not text:
+        return text
+    fp_path = getattr(fp, "_fname", None) or (fp.get_file() if hasattr(fp, "get_file") else None)
+    if not _is_symbol_font(fp_path):
+        return text
+    # Make the cached FT2Font use the symbol charmap before matplotlib
+    # picks it up for the next render.
+    _prepare_symbol_font_for_matplotlib(fp_path)
+    return "".join(chr(ord(c) + 0xF000) if 0x20 <= ord(c) <= 0x7F else c for c in text)
+
+
 def _font_props(font_path: Optional[str], font_name: str, size: int,
                 styles: List[str] = None) -> FontProperties:
     styles = styles or []
@@ -631,6 +752,13 @@ def _font_props(font_path: Optional[str], font_name: str, size: int,
     fp._extra_styles = [s for s in styles if s in ("Underline", "Strikethrough", "Superscript", "Subscript")]
     fp._want_bold = want_bold
     fp._want_italic = want_italic
+    # Stash the resolved file path so _remap_text_for_font can
+    # detect symbol-encoded fonts (Wingdings / Webdings / Symbol)
+    # without having to re-resolve through font_manager.  Matplotlib
+    # may rewrite get_file() to a different path under font_manager's
+    # lookup, but our _fname attribute is the original truth.
+    if resolved:
+        fp._fname = resolved
     return fp
 
 
@@ -1236,7 +1364,8 @@ def _add_panel_symbols(fig, axes, cfg, rows: int, cols: int,
                     else:
                         lx = cx + sz * 0.5
                         ly = cy - sz * 0.25
-                    ax.text(lx, ly, sym.label_text, color=sym.label_color,
+                    ax.text(lx, ly, _remap_text_for_font(sym.label_text, fp),
+                            color=sym.label_color,
                             fontproperties=fp, clip_on=False)
 
 
@@ -1337,18 +1466,51 @@ def _add_panel_scale_bars(fig, axes, cfg, rows: int, cols: int,
                 # Clean display: remove trailing zeros
                 label_text = f"{bar_in_unit:g} {unit_display}"
 
+            # When the user applied font / size / colour via the
+            # StyledTextField hovermenu (which writes to styled_segments
+            # rather than mutating the base font_size / font_name /
+            # label_color on the ScaleBarSettings), the matplotlib path
+            # historically rendered only the base props and the
+            # hovermenu changes were invisible.  Promote any UNIFORM
+            # override (where every segment agrees on a value) into
+            # the effective base props so the most common case
+            # (Cmd+A then change) just works.  Mixed-size segments
+            # still fall back to the original base values.
+            sb_segs = getattr(sb, 'styled_segments', None) or []
+
+            def _uniform_seg(attr):
+                if not sb_segs:
+                    return None
+                vals = [getattr(s, attr, None) for s in sb_segs]
+                if not vals or any(v is None for v in vals):
+                    return None
+                first = vals[0]
+                return first if all(v == first for v in vals) else None
+
+            eff_font_name = _uniform_seg('font_name') or getattr(sb, 'font_name', 'arial.ttf')
+            eff_font_size = _uniform_seg('font_size') or sb.font_size
+            eff_color     = _uniform_seg('color')      or getattr(sb, 'label_color', sb.bar_color) or sb.bar_color
+            eff_styles    = _uniform_seg('font_style') or getattr(sb, 'label_font_style', [])
+
             # Render text using matplotlib fonts (same quality as column/row labels).
             fp = _font_props(
                 getattr(sb, 'font_path', None),
-                getattr(sb, 'font_name', 'arial.ttf'),
-                sb.font_size,
-                getattr(sb, 'label_font_style', [])
+                eff_font_name,
+                eff_font_size,
+                eff_styles
             )
-            label_color = getattr(sb, 'label_color', sb.bar_color) or sb.bar_color
+            label_color = eff_color
 
-            # Place label above or below bar depending on position
-            # If bar is in the bottom half, put label above to avoid clipping
-            is_bottom = by > ih * 0.5
+            # Decide label position:
+            #   sb.label_position == "above" / "below" — explicit
+            #   sb.label_position == "auto" (default) — by bar y position
+            label_pos_mode = getattr(sb, 'label_position', 'auto') or 'auto'
+            if label_pos_mode == 'above':
+                is_bottom = True
+            elif label_pos_mode == 'below':
+                is_bottom = False
+            else:
+                is_bottom = by > ih * 0.5
             if is_bottom:
                 text_y = by - 2
                 text_va = 'bottom'
@@ -1358,7 +1520,7 @@ def _add_panel_scale_bars(fig, axes, cfg, rows: int, cols: int,
 
             ax.text(bx + bar_length_px / 2 + sb.label_x_offset,
                     text_y,
-                    label_text,
+                    _remap_text_for_font(label_text, fp),
                     color=label_color,
                     fontproperties=fp,
                     ha='center', va=text_va,

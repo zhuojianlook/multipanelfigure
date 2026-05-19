@@ -152,6 +152,209 @@ loaded_zstacks: Dict[str, str] = {}    # name → temp file path for multi-frame
 zstack_frames: Dict[str, int] = {}     # name → selected frame number
 zstack_counts: Dict[str, int] = {}     # name → total frame count
 
+# ── Multichannel TIFF / channel groups ────────────────────────────────────
+#
+# When a TIFF carries more than one channel (axes that include "C" with
+# size > 1, e.g. "CYX", "ZCYX", "TZCYX"), we treat it as a *channel
+# group*: each channel becomes its own greyscale plane that the user
+# tints with an arbitrary colour. The composite (sum of tinted channels,
+# clipped to [0,1] per RGB component) is what panels actually display
+# via `loaded_images[name]` — so the rest of the render pipeline doesn't
+# need to know that the source was multichannel.
+#
+# Per-channel state lives in `channel_groups[name]`. Mutating any field
+# via `/api/zstack/{name}/channels` recomputes the composite and writes
+# it back into `loaded_images[name]`, so existing panel-render code
+# "just works" with per-channel tint changes.
+#
+# Defaults are picked to be biology-friendly: red, green, blue, magenta,
+# cyan, yellow, then white for any extras. Each channel also gets its
+# own black/white levels (0–255) so the user can window each channel
+# independently — important for fluorescence where each fluorophore has
+# a different dynamic range.
+class _ChannelGroup:
+    __slots__ = ("axes", "arr", "num_channels", "num_z",
+                 "current_z", "tints", "enabled",
+                 "black_levels", "white_levels", "max_vals")
+
+    def __init__(self, axes: str, arr: "np.ndarray"):
+        self.axes = axes
+        self.arr = arr            # full N-D array, dtype as-loaded
+        self.num_channels = 0
+        self.num_z = 1
+        self.current_z = 0
+        self.tints: List[str] = []
+        self.enabled: List[bool] = []
+        self.black_levels: List[int] = []   # 0-255
+        self.white_levels: List[int] = []   # 0-255
+        self.max_vals: List[float] = []     # native max per channel (for level mapping)
+
+channel_groups: Dict[str, _ChannelGroup] = {}
+
+# Default per-channel tints — cycled for groups with > 7 channels.
+_DEFAULT_CHANNEL_TINTS = [
+    "#ff0000",  # red
+    "#00ff00",  # green
+    "#0066ff",  # blue
+    "#ff00ff",  # magenta
+    "#00ffff",  # cyan
+    "#ffff00",  # yellow
+    "#ffffff",  # white
+]
+
+
+def _detect_multichannel_tiff(tiff_path: str):
+    """Read a TIFF with tifffile and return (axes, arr) if it has > 1
+    channel, else None. Robust to single-page and pyramidal TIFFs."""
+    try:
+        import tifffile
+    except ImportError:
+        return None
+    try:
+        with tifffile.TiffFile(tiff_path) as tf:
+            if not tf.series:
+                return None
+            s = tf.series[0]
+            axes = (s.axes or "").upper()
+            shape = s.shape
+            # Find C axis
+            if "C" in axes:
+                ci = axes.index("C")
+                if ci < len(shape) and shape[ci] > 1:
+                    arr = s.asarray()
+                    return axes, arr
+            # Some TIFFs carry channel data in "S" (sample/photometric)
+            # — e.g. RGB stored as 3 samples per pixel. We don't treat
+            # standard RGB TIFFs as channel groups (PIL handles them).
+            return None
+    except Exception as e:
+        import sys
+        print(f"[multichannel-detect] {tiff_path}: {e}", file=sys.stderr, flush=True)
+        return None
+
+
+def _init_channel_group(name: str, axes: str, arr: "np.ndarray") -> _ChannelGroup:
+    """Build initial channel group state with sane defaults."""
+    g = _ChannelGroup(axes, arr)
+
+    # Collapse any T axis to first (we don't expose time-as-channels yet).
+    a = arr
+    ax = axes
+    while "T" in ax:
+        i = ax.index("T")
+        a = np.take(a, 0, axis=i)
+        ax = ax[:i] + ax[i+1:]
+
+    # Locate Z and C axes in the (possibly T-collapsed) array.
+    g.num_z = a.shape[ax.index("Z")] if "Z" in ax else 1
+    g.num_channels = a.shape[ax.index("C")] if "C" in ax else 1
+
+    # Cache the T-collapsed view to avoid re-doing the squeeze on every
+    # composite call.
+    g.arr = a
+    g.axes = ax
+
+    g.tints    = [_DEFAULT_CHANNEL_TINTS[c % len(_DEFAULT_CHANNEL_TINTS)] for c in range(g.num_channels)]
+    g.enabled  = [True] * g.num_channels
+    g.black_levels = [0]   * g.num_channels
+    g.white_levels = [255] * g.num_channels
+
+    # Compute per-channel max for normalization (important for 16-bit /
+    # float data — a 16-bit channel with peak 4000 would otherwise
+    # render near-black if we naively assumed uint8).
+    g.max_vals = []
+    for c in range(g.num_channels):
+        ch = _extract_channel_plane(g, c, 0)  # take z=0 sample for max scan
+        try:
+            mx = float(ch.max()) if ch.size else 1.0
+        except Exception:
+            mx = 1.0
+        # If the array has multiple Z slices, also sample a few more so the
+        # max reflects the brightest slice (cheap heuristic — full scan
+        # of every Z would be slow for big stacks).
+        if g.num_z > 1:
+            sample_zs = [g.num_z // 2, g.num_z - 1]
+            for z in sample_zs:
+                try:
+                    mx = max(mx, float(_extract_channel_plane(g, c, z).max()))
+                except Exception:
+                    pass
+        g.max_vals.append(mx if mx > 0 else 1.0)
+
+    channel_groups[name] = g
+    return g
+
+
+def _extract_channel_plane(g: _ChannelGroup, c: int, z: int) -> "np.ndarray":
+    """Return the (H, W) plane for channel c at z-slice z."""
+    a = g.arr
+    ax = g.axes
+    # Collapse Z
+    if "Z" in ax:
+        zi = ax.index("Z")
+        z = max(0, min(z, a.shape[zi] - 1))
+        a = np.take(a, z, axis=zi)
+        ax = ax[:zi] + ax[zi+1:]
+    # Collapse C
+    if "C" in ax:
+        ci = ax.index("C")
+        c = max(0, min(c, a.shape[ci] - 1))
+        a = np.take(a, c, axis=ci)
+        ax = ax[:ci] + ax[ci+1:]
+    # Should be (Y, X) now
+    if a.ndim == 3:
+        # Trailing sample axis (e.g. RGBA) — collapse to luminance-ish.
+        a = a.mean(axis=-1)
+    return a
+
+
+def _composite_channel_group(name: str) -> Image.Image:
+    """Re-render the composite RGB image for the channel group's current
+    z-slice using each channel's tint colour + black/white levels."""
+    g = channel_groups[name]
+    z = g.current_z
+    H = W = None
+    out = None
+
+    for c in range(g.num_channels):
+        if c < len(g.enabled) and not g.enabled[c]:
+            continue
+        ch = _extract_channel_plane(g, c, z).astype(np.float32)
+        if H is None:
+            H, W = ch.shape
+            out = np.zeros((H, W, 3), dtype=np.float32)
+        # Normalize to 0..1 against this channel's native max so 16-bit
+        # data spans the full dynamic range.
+        denom = max(g.max_vals[c], 1.0)
+        norm = ch / denom
+        # Apply black/white window: bl→0, wl→1 (both as 0..255 fractions
+        # of the normalized range, matching the UI's levels semantics).
+        bl = g.black_levels[c] / 255.0 if c < len(g.black_levels) else 0.0
+        wl = g.white_levels[c] / 255.0 if c < len(g.white_levels) else 1.0
+        if wl > bl:
+            norm = np.clip((norm - bl) / (wl - bl), 0.0, 1.0)
+        else:
+            norm = np.zeros_like(norm)
+        # Tint
+        hex_ = g.tints[c] if c < len(g.tints) else "#ffffff"
+        try:
+            r = int(hex_[1:3], 16) / 255.0
+            gn = int(hex_[3:5], 16) / 255.0
+            b = int(hex_[5:7], 16) / 255.0
+        except (ValueError, IndexError):
+            r = gn = b = 1.0
+        out[..., 0] += norm * r
+        out[..., 1] += norm * gn
+        out[..., 2] += norm * b
+
+    if out is None:
+        # All channels disabled — return black at first channel's plane size.
+        ch0 = _extract_channel_plane(g, 0, z)
+        out = np.zeros((*ch0.shape, 3), dtype=np.float32)
+
+    out = np.clip(out, 0.0, 1.0)
+    return Image.fromarray((out * 255).astype(np.uint8), "RGB")
+
 def _is_video(filename: str) -> bool:
     return Path(filename).suffix.lower() in VIDEO_EXTENSIONS
 
@@ -738,23 +941,42 @@ async def upload_images(files: List[UploadFile] = File(...)):
                 loaded_images[f.filename] = img
                 names.append(f.filename)
             elif _is_tiff(f.filename):
-                # Check if it's a multi-frame TIFF (z-stack)
-                img_obj = Image.open(io.BytesIO(data))
-                n_frames = getattr(img_obj, "n_frames", 1)
-                if n_frames > 1:
-                    # Save to temp file for seeking (io.BytesIO doesn't persist)
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(f.filename).suffix)
-                    tmp.write(data)
-                    tmp.close()
-                    loaded_zstacks[f.filename] = tmp.name
-                    zstack_frames[f.filename] = 0
-                    zstack_counts[f.filename] = n_frames
-                    img = _extract_tiff_frame(tmp.name, 0)
+                # Save to temp file first so tifffile / PIL can both
+                # read it (and so multi-frame seeks work for z-stacks).
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(f.filename).suffix)
+                tmp.write(data)
+                tmp.close()
+
+                # First check: is this a multichannel TIFF? If yes,
+                # build a channel group and use the composite as the
+                # initial image. Multichannel z-stacks (ZCYX, etc.)
+                # also register a zstack mapping so the existing
+                # frame-seek UI can drive `current_z`.
+                multi = _detect_multichannel_tiff(tmp.name)
+                if multi is not None:
+                    axes, arr = multi
+                    g = _init_channel_group(f.filename, axes, arr)
+                    img = _composite_channel_group(f.filename)
                     loaded_images[f.filename] = img
+                    if g.num_z > 1:
+                        loaded_zstacks[f.filename] = tmp.name
+                        zstack_frames[f.filename] = 0
+                        zstack_counts[f.filename] = g.num_z
+                    names.append(f.filename)
                 else:
-                    img = img_obj.convert("RGB")
-                    loaded_images[f.filename] = img
-                names.append(f.filename)
+                    # Single-channel: fall back to the legacy PIL path.
+                    img_obj = Image.open(tmp.name)
+                    n_frames = getattr(img_obj, "n_frames", 1)
+                    if n_frames > 1:
+                        loaded_zstacks[f.filename] = tmp.name
+                        zstack_frames[f.filename] = 0
+                        zstack_counts[f.filename] = n_frames
+                        img = _extract_tiff_frame(tmp.name, 0)
+                        loaded_images[f.filename] = img
+                    else:
+                        img = img_obj.convert("RGB")
+                        loaded_images[f.filename] = img
+                    names.append(f.filename)
             else:
                 img = Image.open(io.BytesIO(data)).convert("RGB")
                 loaded_images[f.filename] = img
@@ -809,13 +1031,31 @@ def list_videos():
 def get_zstack_info(name: str):
     if name not in loaded_zstacks:
         raise HTTPException(404, f"Z-stack '{name}' not found")
+    # If this is a channel group, the frame_count is num_z (the user
+    # advances Z, not the flat TIFF page index).
+    if name in channel_groups:
+        g = channel_groups[name]
+        sample = _extract_channel_plane(g, 0, g.current_z)
+        return {
+            "frame_count": g.num_z,
+            "width": int(sample.shape[1]),
+            "height": int(sample.shape[0]),
+            "multichannel": True,
+            "num_channels": g.num_channels,
+        }
     return _get_zstack_info(loaded_zstacks[name])
 
 @app.get("/api/zstack/{name}/frame/{frame_num}")
 def get_zstack_frame(name: str, frame_num: int, row: Optional[int] = None, col: Optional[int] = None):
-    if name not in loaded_zstacks:
+    if name not in loaded_zstacks and name not in channel_groups:
         raise HTTPException(404, f"Z-stack '{name}' not found")
-    img = _extract_tiff_frame(loaded_zstacks[name], frame_num)
+    if name in channel_groups:
+        # Multichannel: advance the group's current_z and re-composite.
+        g = channel_groups[name]
+        g.current_z = max(0, min(int(frame_num), g.num_z - 1))
+        img = _composite_channel_group(name)
+    else:
+        img = _extract_tiff_frame(loaded_zstacks[name], frame_num)
 
     # If row/col provided, update that specific panel's image assignment
     # so different panels can show different frames of the same z-stack
@@ -826,8 +1066,11 @@ def get_zstack_frame(name: str, frame_num: int, row: Optional[int] = None, col: 
         # Also update the panel's image_name to use the panel-specific key
         if row < cfg.rows and col < cfg.cols:
             cfg.panels[row][col].image_name = panel_key
-        # Register as a virtual z-stack so info lookups work
-        loaded_zstacks[panel_key] = loaded_zstacks[name]
+        # Register as a virtual z-stack so info lookups work. Channel
+        # groups don't always have an underlying tiff path (when they're
+        # purely in-memory composite outputs), so guard the lookup.
+        if name in loaded_zstacks:
+            loaded_zstacks[panel_key] = loaded_zstacks[name]
         zstack_counts[panel_key] = zstack_counts.get(name, 1)
     else:
         loaded_images[name] = img
@@ -848,6 +1091,109 @@ def get_zstack_frame(name: str, frame_num: int, row: Optional[int] = None, col: 
 @app.get("/api/zstack/list")
 def list_zstacks():
     return {"zstacks": list(loaded_zstacks.keys())}
+
+
+# ── Multichannel TIFF Endpoints ───────────────────────────────────────────
+
+@app.get("/api/zstack/{name}/channels/info")
+def get_channel_info(name: str):
+    """Return per-channel state for a multichannel TIFF/z-stack.
+    Returns 404 with `is_multichannel: false` for single-channel images,
+    so the frontend can probe any image to discover whether the channel
+    UI should be shown."""
+    if name not in channel_groups:
+        return {"is_multichannel": False}
+    g = channel_groups[name]
+    return {
+        "is_multichannel": True,
+        "axes": g.axes,
+        "num_channels": g.num_channels,
+        "num_z": g.num_z,
+        "current_z": g.current_z,
+        "tints": list(g.tints),
+        "enabled": list(g.enabled),
+        "black_levels": list(g.black_levels),
+        "white_levels": list(g.white_levels),
+    }
+
+
+class ChannelUpdateRequest(BaseModel):
+    # All optional — only provided fields are applied.
+    tints: Optional[List[str]] = None
+    enabled: Optional[List[bool]] = None
+    black_levels: Optional[List[int]] = None
+    white_levels: Optional[List[int]] = None
+    current_z: Optional[int] = None
+    # When provided, also reassign panel.image_name = panel_key (mirrors
+    # the per-panel pattern used by the frame endpoint, so two panels can
+    # show the same multichannel TIFF with different tints).
+    row: Optional[int] = None
+    col: Optional[int] = None
+
+
+@app.patch("/api/zstack/{name}/channels")
+def update_channels(name: str, body: ChannelUpdateRequest):
+    """Update channel-group state (tints, enabled, levels, z-slice) and
+    recompose. Returns the new composite as a base64 PNG preview."""
+    if name not in channel_groups:
+        raise HTTPException(404, f"'{name}' is not a multichannel image")
+    g = channel_groups[name]
+
+    if body.tints is not None:
+        # Length-guard: pad/truncate to num_channels.
+        ts = list(body.tints)[:g.num_channels]
+        while len(ts) < g.num_channels:
+            ts.append("#ffffff")
+        g.tints = ts
+    if body.enabled is not None:
+        es = list(body.enabled)[:g.num_channels]
+        while len(es) < g.num_channels:
+            es.append(True)
+        g.enabled = es
+    if body.black_levels is not None:
+        bs = [max(0, min(255, int(v))) for v in body.black_levels][:g.num_channels]
+        while len(bs) < g.num_channels:
+            bs.append(0)
+        g.black_levels = bs
+    if body.white_levels is not None:
+        ws = [max(0, min(255, int(v))) for v in body.white_levels][:g.num_channels]
+        while len(ws) < g.num_channels:
+            ws.append(255)
+        g.white_levels = ws
+    if body.current_z is not None:
+        g.current_z = max(0, min(int(body.current_z), g.num_z - 1))
+
+    img = _composite_channel_group(name)
+
+    # Per-panel override (mirrors /frame): give this panel its own image_name
+    # so changing channel tints on one panel doesn't bleed into another that
+    # shares the source.
+    if body.row is not None and body.col is not None:
+        panel_key = f"__chgrp_{name}_r{body.row}c{body.col}"
+        loaded_images[panel_key] = img
+        if body.row < cfg.rows and body.col < cfg.cols:
+            cfg.panels[body.row][body.col].image_name = panel_key
+    else:
+        loaded_images[name] = img
+
+    _recalc_min_dims()
+    preview = img.copy()
+    max_dim = 1200
+    if max(preview.size) > max_dim:
+        ratio = max_dim / max(preview.size)
+        preview = preview.resize((int(preview.size[0] * ratio), int(preview.size[1] * ratio)), Image.LANCZOS)
+    buf = io.BytesIO()
+    preview.save(buf, format="PNG")
+    return {
+        "thumbnail": base64.b64encode(buf.getvalue()).decode("ascii"),
+        "width": img.size[0],
+        "height": img.size[1],
+        "current_z": g.current_z,
+        "tints": list(g.tints),
+        "enabled": list(g.enabled),
+        "black_levels": list(g.black_levels),
+        "white_levels": list(g.white_levels),
+    }
 
 
 class ZStackProjectRequest(BaseModel):
@@ -2824,6 +3170,119 @@ def _load_persistent_fonts():
 
 # Load persistent fonts on startup
 _load_persistent_fonts()
+
+
+@app.get("/api/fonts/file-b64/{name}")
+def get_font_file_b64(name: str):
+    """Same as /api/fonts/file/{name} but returns a JSON payload with
+    a base64 string instead of raw bytes.  Used by the Tauri WebView
+    where direct binary URLs (for @font-face src=url(...)) are blocked
+    by the CSP — the frontend fetches this JSON via the api-proxy and
+    constructs an in-memory Blob URL to register the font.
+    """
+    import sys
+    safe = os.path.basename(name)
+    if not safe or safe.startswith("."):
+        raise HTTPException(404, "font not found")
+    blob: bytes | None = custom_fonts.get(safe)
+    if blob is None:
+        cand = _CUSTOM_FONTS_DIR / safe
+        if cand.is_file():
+            try:
+                blob = cand.read_bytes()
+            except Exception:
+                pass
+    if blob is None:
+        try:
+            registry = find_fonts()
+            sys_path = registry.get(safe)
+            if not sys_path:
+                try:
+                    from matplotlib import font_manager as _fm
+                    for ttf in (_fm.findSystemFonts(fontext="ttf")
+                                + _fm.findSystemFonts(fontext="otf")):
+                        if os.path.basename(ttf) == safe:
+                            sys_path = ttf
+                            break
+                except Exception:
+                    pass
+            if sys_path and os.path.isfile(sys_path):
+                with open(sys_path, "rb") as _fh:
+                    blob = _fh.read()
+        except Exception as _e:
+            print(f"[fonts] system lookup for {safe} failed: {_e}", file=sys.stderr, flush=True)
+    if blob is None:
+        raise HTTPException(404, f"font '{safe}' not found on this host")
+    return {
+        "name": safe,
+        "b64": base64.b64encode(blob).decode("ascii"),
+        "mime": "font/ttf" if safe.lower().endswith(".ttf") else (
+                "font/otf" if safe.lower().endswith(".otf") else "application/octet-stream"),
+    }
+
+
+@app.get("/api/fonts/file/{name}")
+def get_font_file(name: str):
+    """Serve raw font bytes by filename — used by the frontend's
+    @font-face loader so per-character styling in the CSS overlay
+    can use the same font the backend matplotlib / PIL renderer
+    uses.  Without this the CSS would fall back to system fonts
+    by name string (e.g. "ArialNarrowItalic.ttf" → no match → the
+    overlay used sans-serif instead of the actual font).
+
+    Looks up the font in three places, in order:
+      1. The in-memory `custom_fonts` dict (uploaded fonts +
+         project-bundled fonts loaded by load_project).
+      2. The persistent custom fonts dir (~/.multipanelfigure/fonts).
+      3. The system font index from find_fonts() / matplotlib's
+         font_manager — both return absolute paths.
+    """
+    from fastapi import Response
+    import sys
+    # Sanitise — strip any path components so callers can't request
+    # arbitrary files.  Only the basename is honoured.
+    safe = os.path.basename(name)
+    if not safe or safe.startswith("."):
+        raise HTTPException(404, "font not found")
+    # 1) In-memory cache.
+    blob = custom_fonts.get(safe)
+    if blob is None:
+        # 2) Persistent custom fonts dir.
+        cand = _CUSTOM_FONTS_DIR / safe
+        if cand.is_file():
+            try:
+                blob = cand.read_bytes()
+            except Exception as _e:
+                print(f"[fonts] read {cand} failed: {_e}", file=sys.stderr, flush=True)
+    if blob is None:
+        # 3) System font registry — find_fonts + matplotlib's font_manager.
+        try:
+            registry = find_fonts()
+            sys_path = registry.get(safe)
+            if not sys_path:
+                try:
+                    from matplotlib import font_manager as _fm
+                    for ttf in (_fm.findSystemFonts(fontext="ttf")
+                                + _fm.findSystemFonts(fontext="otf")):
+                        if os.path.basename(ttf) == safe:
+                            sys_path = ttf
+                            break
+                except Exception:
+                    pass
+            if sys_path and os.path.isfile(sys_path):
+                with open(sys_path, "rb") as _fh:
+                    blob = _fh.read()
+        except Exception as _e:
+            print(f"[fonts] system lookup for {safe} failed: {_e}", file=sys.stderr, flush=True)
+    if blob is None:
+        raise HTTPException(404, f"font '{safe}' not found on this host")
+    # Browsers don't strictly require a precise MIME for @font-face but
+    # font/ttf is the canonical hint.
+    media = "font/ttf" if safe.lower().endswith(".ttf") else (
+            "font/otf" if safe.lower().endswith(".otf") else "application/octet-stream")
+    return Response(content=blob, media_type=media, headers={
+        "Cache-Control": "public, max-age=86400",
+    })
 
 
 @app.post("/api/fonts/upload")

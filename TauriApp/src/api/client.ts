@@ -301,6 +301,20 @@ class ApiClient {
     return apiJson<{ fonts: Record<string, string> }>("/api/fonts");
   }
 
+  /** Fetch a single font's bytes as base64.  Used by the @font-face
+   *  loader so the CSS overlay can render labels with the same fonts
+   *  the backend uses.  Returns null if the font isn't installed on
+   *  this host (404). */
+  async getFontFileB64(name: string): Promise<{ name: string; b64: string; mime: string } | null> {
+    try {
+      return await apiJson<{ name: string; b64: string; mime: string }>(
+        `/api/fonts/file-b64/${encodeURIComponent(name)}`,
+      );
+    } catch {
+      return null;
+    }
+  }
+
   async uploadFonts(files: File[]): Promise<{ names: string[]; total: number }> {
     const invoke = await getInvoke();
     if (invoke) {
@@ -542,6 +556,41 @@ class ApiClient {
 
   async listZStacks(): Promise<{ zstacks: string[] }> {
     return apiJson("/api/zstack/list");
+  }
+
+  // ── Multichannel TIFF (channel groups) ───────────────────
+  //
+  // Returns `{ is_multichannel: false }` for ordinary single-channel
+  // images, so callers can probe any image name and conditionally
+  // render the channel-tint UI.
+  async getChannelInfo(name: string): Promise<{
+    is_multichannel: boolean;
+    axes?: string;
+    num_channels?: number;
+    num_z?: number;
+    current_z?: number;
+    tints?: string[];
+    enabled?: boolean[];
+    black_levels?: number[];
+    white_levels?: number[];
+  }> {
+    return apiJson(`/api/zstack/${encodeURIComponent(name)}/channels/info`);
+  }
+
+  // Update per-channel tints / enabled / levels / current_z. Any subset
+  // of fields may be provided; only present fields are applied. Returns
+  // the new composite thumbnail + the post-update state for state sync.
+  async updateChannels(name: string, body: {
+    tints?: string[]; enabled?: boolean[];
+    black_levels?: number[]; white_levels?: number[];
+    current_z?: number;
+    row?: number; col?: number;
+  }): Promise<{
+    thumbnail: string; width: number; height: number;
+    current_z: number; tints: string[]; enabled: boolean[];
+    black_levels: number[]; white_levels: number[];
+  }> {
+    return apiJson(`/api/zstack/${encodeURIComponent(name)}/channels`, "PATCH", JSON.stringify(body));
   }
 
   async projectZStack(name: string, startFrame: number, endFrame: number, method: string): Promise<{ method: string; start_frame: number; end_frame: number; width: number; height: number; thumbnail: string }> {

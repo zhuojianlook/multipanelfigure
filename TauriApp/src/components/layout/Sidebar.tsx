@@ -32,6 +32,8 @@ import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
 import { api } from "../../api/client";
 import { AnalysisDialog } from "../dialogs/AnalysisDialog";
+import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
+import { detectGlobalFont, describeDetectedFont } from "../../utils/detectGlobalFont";
 
 /* ── tiny reusable pieces ─────────────────────────────── */
 
@@ -127,7 +129,10 @@ function CollageSidebar() {
 
   const applyNow = async () => {
     if (figureItemCount === 0) {
-      window.alert("No figure items in the collage to re-render. Add a figure with a saved .mpf path first.");
+      await alertDialog({
+        title: "Nothing to re-render",
+        body: "No figure items in the collage to re-render. Add a figure with a saved .mpf path first.",
+      });
       return;
     }
     setApplyBusy(true);
@@ -168,17 +173,19 @@ function CollageSidebar() {
     } finally {
       setApplyBusy(false);
     }
-    window.alert(
-      `Re-rendered ${succeeded} figure${succeeded === 1 ? "" : "s"} at ${pendingPt} pt header size` +
-      (failed > 0 ? ` (${failed} failed — check console; the .mpf may have been moved or the path is wrong).` : "."),
-    );
+    void alertDialog({
+      title: failed > 0 ? "Re-render finished with errors" : "Re-render complete",
+      body: `Re-rendered ${succeeded} figure${succeeded === 1 ? "" : "s"} at ${pendingPt} pt header size`
+        + (failed > 0 ? ` (${failed} failed — check console; the .mpf may have been moved or the path is wrong).` : "."),
+    });
   };
 
   const clearOverride = () => {
     setGlobalHeaderPt(null);
-    window.alert(
-      "Global header size cleared. Existing collage items keep their last rendered preview — re-add or update individual figures to revert to their saved header sizes.",
-    );
+    void alertDialog({
+      title: "Override cleared",
+      body: "Global header size cleared. Existing collage items keep their last rendered preview — re-add or update individual figures to revert to their saved header sizes.",
+    });
   };
 
   return (
@@ -475,7 +482,13 @@ function BuilderSidebar() {
           size="small"
           variant="text"
           onClick={async () => {
-            if (!window.confirm("Replace all scale-bar presets with the bundled microscope defaults? Custom entries will be lost.")) return;
+            const ok = await confirmDialog({
+              title: "Restore default scale bars",
+              body: "Replace all scale-bar presets with the bundled microscope defaults? Custom entries will be lost.",
+              confirmLabel: "Restore defaults",
+              destructive: true,
+            });
+            if (!ok) return;
             try {
               const entries = await api.restoreDefaultResolutions();
               if (config) setConfig({ ...config, resolution_entries: entries });
@@ -612,18 +625,35 @@ function BuilderSidebar() {
             id="global-font-select"
             defaultValue={(() => {
               if (fonts.length === 0) return "";
+              // Proper detection: walk every label / header / panel
+              // and tally the most common (font_name, font_style)
+              // pair.  Fixes the "Arial Narrow Italic shows as just
+              // arial" bug — the old code just returned
+              // column_labels[0].font_name verbatim.
+              const detected = detectGlobalFont(config);
+              if (detected && fonts.includes(detected.font_name)) {
+                return detected.font_name;
+              }
+              // Existing first-column-label fallback (kept for the
+              // brand-new-figure case where no labels carry font
+              // data yet).
               const existing = config?.column_labels?.[0]?.font_name;
               if (existing && fonts.includes(existing)) return existing;
-              // Case-insensitive Arial match (Windows "arial.ttf",
-              // macOS "Arial.ttf", Linux variants — the installed
-              // filename varies by OS).
               const arial = fonts.find((f) =>
                 /^arial\b/i.test(f.replace(/\.(ttf|otf|ttc)$/i, "")),
               );
               if (arial) return arial;
               return fonts[0] || "";
             })()}
-            key={fonts.length > 0 ? `loaded-${fonts.length}` : "empty"}
+            // Key includes a fingerprint of the detected font so the
+            // <select> re-mounts (picks up a new defaultValue) when
+            // headers/labels are re-fonted.  Without this, the
+            // <select>'s defaultValue is locked at first mount.
+            key={(() => {
+              const d = detectGlobalFont(config);
+              const fp = d ? `${d.font_name}|${(d.font_style || []).join(",")}` : "none";
+              return `${fonts.length > 0 ? "loaded" : "empty"}-${fonts.length}-${fp}`;
+            })()}
             style={{
               fontSize: "0.65rem",
               flex: 1,
@@ -694,6 +724,28 @@ function BuilderSidebar() {
             Apply
           </Button>
           </Box>
+          {/* Inline summary of what the detector actually found.  Surfaces
+              the font_style (bold / italic) which the <select> alone can't
+              represent — fixes the user complaint that "Arial Narrow Italic"
+              looked like just "Arial" in the picker. */}
+          {(() => {
+            const d = detectGlobalFont(config);
+            if (!d) return null;
+            const ambiguous = d.total > 0 && d.count < Math.max(2, d.total * 0.5);
+            return (
+              <Typography variant="caption" sx={{
+                fontSize: "0.55rem",
+                color: ambiguous ? "warning.light" : "text.secondary",
+                mt: 0.25,
+                display: "block",
+                fontStyle: d.font_style.some((s) => /italic/i.test(s)) ? "italic" : "normal",
+                fontWeight: d.font_style.some((s) => /bold/i.test(s)) ? 700 : 400,
+              }}>
+                Detected: {describeDetectedFont(d)} ({d.count}/{d.total})
+                {ambiguous && " — mixed; pick one to unify"}
+              </Typography>
+            );
+          })()}
         </Box>
 
         {/* Global header font size — applies one size across every header

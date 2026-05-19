@@ -61,6 +61,13 @@ interface FigureState {
 
   setPanelImage: (row: number, col: number, imageName: string) => void;
   updatePanel: (row: number, col: number, patch: Partial<PanelInfo>) => void;
+  /** Wipe a panel back to defaults — image, crop, insets, labels,
+   *  area/line/symbol annotations, scale bar, brightness/contrast,
+   *  rotation/flip.  "Clear Panel" in the context menu calls this.
+   *  Distinct from `setPanelImage(row, col, "")` which previously
+   *  only cleared the image_name (leaving stale crops + insets that
+   *  re-appeared when a new image was assigned). */
+  clearPanel: (row: number, col: number) => void;
   refreshPanelThumbnail: (row: number, col: number) => Promise<void>;
 
   // `opts.skipSync` updates the store config only — no debounced
@@ -475,6 +482,20 @@ export const useFigureStore = create<FigureState>()(
         set((s) => {
           s.fonts = fontNames;
         });
+        // Lazy-import + fire-and-forget the @font-face registration so
+        // the CSS overlay (e.g. the per-character segment renderer in
+        // EditPanelDialog and the headers/labels overlay) can use the
+        // SAME font bytes the backend resolves.  Without this, fonts
+        // like "ArialNarrowItalic.ttf" fall back to sans-serif in the
+        // browser because the OS-level family name doesn't match the
+        // backend's filename-based lookup.
+        try {
+          const { loadCustomFonts } = await import("../utils/loadCustomFonts");
+          loadCustomFonts(fontNames);
+        } catch {
+          // The @font-face loader is best-effort — the existing
+          // sans-serif fallback handles missing fonts gracefully.
+        }
       } catch {
         // fonts will stay empty
       }
@@ -603,6 +624,62 @@ export const useFigureStore = create<FigureState>()(
           delete s.panelThumbnails[`${row}-${col}`];
           s.configDirty = true;
         }
+      });
+      const panel = get().config?.panels[row]?.[col];
+      if (panel) {
+        api.patchPanel(row, col, panel as unknown as Record<string, unknown>).catch(console.error);
+      }
+      get().requestPreview();
+    },
+
+    clearPanel: (row, col) => {
+      // Truly clear a panel — wipe image name AND every per-panel
+      // override (crop, insets, labels, annotations, scale bar,
+      // brightness/contrast, rotation/flip).  Without this, calling
+      // setPanelImage(row, col, "") would silently retain crops,
+      // insets and per-channel processing, so the cell visually
+      // looked empty but would reappear "haunted" when the user
+      // assigned a new image.
+      set((s) => {
+        if (!s.config) return;
+        const panel = s.config.panels[row]?.[col];
+        if (!panel) return;
+        // Use Object.assign so the panel object identity is preserved
+        // (some downstream listeners key off identity).  Reset every
+        // field with a sensible default — mirrors the empty-panel
+        // shape the backend creates for fresh grid cells.
+        Object.assign(panel, {
+          image_name: "",
+          crop_image: false,
+          crop: null,
+          aspect_ratio_str: "",
+          crop_offset_x: 0,
+          crop_offset_y: 0,
+          final_resize: false,
+          brightness: 1.0,
+          contrast: 1.0,
+          hue: 0,
+          saturation: 1.0,
+          gamma: 1.0,
+          rotation: 0,
+          flip_horizontal: false,
+          flip_vertical: false,
+          labels: [],
+          scale_bar: null,
+          add_scale_bar: false,
+          symbols: [],
+          lines: [],
+          areas: [],
+          // Both legacy + new zoom-inset shapes.
+          zoom_inset: null,
+          add_zoom_inset: false,
+          zoom_insets: [],
+          // Analysis flag — clearing a panel removes it from the
+          // Analysis library too.
+          include_in_analysis: false,
+        });
+        delete s.panelThumbnails[`${row}-${col}`];
+        s.configDirty = true;
       });
       const panel = get().config?.panels[row]?.[col];
       if (panel) {

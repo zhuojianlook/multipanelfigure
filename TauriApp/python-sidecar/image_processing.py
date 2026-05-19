@@ -98,6 +98,54 @@ def parse_colored_text(text: str, default_color: str = "#000000"):
 
 
 # -- Drawing helpers ---------------------------------------------------------
+
+# Cache: font path → True/False is-symbol-encoded.  Symbol fonts
+# (Wingdings, Webdings, Symbol) have only a (3, 0) Microsoft Symbol
+# cmap subtable — no (3, 1) Unicode — so PIL's default font load
+# can't find glyphs at ASCII codepoints and renders tofu boxes.
+# Pass `encoding="symb"` to ImageFont.truetype on these fonts so
+# freetype selects the symbol charmap.
+_pil_symbol_font_cache: Dict[str, bool] = {}
+
+def _is_symbol_font_pil(font_path: str) -> bool:
+    """Detect symbol-encoded fonts.  Same logic as figure_builder's
+    `_is_symbol_font`; duplicated here to avoid a cross-module import
+    cycle (figure_builder imports from image_processing).
+    """
+    if not font_path:
+        return False
+    cached = _pil_symbol_font_cache.get(font_path)
+    if cached is not None:
+        return cached
+    try:
+        from fontTools.ttLib import TTFont
+        f = TTFont(font_path, lazy=True)
+        cmap = f.get("cmap")
+        if cmap is None:
+            _pil_symbol_font_cache[font_path] = False
+            return False
+        has_unicode = any(t.platformID == 3 and t.platEncID in (1, 10) for t in cmap.tables)
+        has_symbol = any(t.platformID == 3 and t.platEncID == 0 for t in cmap.tables)
+        result = bool(has_symbol and not has_unicode)
+        _pil_symbol_font_cache[font_path] = result
+        return result
+    except Exception:
+        _pil_symbol_font_cache[font_path] = False
+        return False
+
+
+def _truetype_with_symbol_fallback(path: str, size: int) -> ImageFont.FreeTypeFont:
+    """ImageFont.truetype wrapper that picks `encoding="symb"` for
+    symbol-encoded fonts so Wingdings/Webdings/Symbol render their
+    actual glyphs (otherwise PIL produces tofu boxes for ASCII)."""
+    try:
+        if _is_symbol_font_pil(path):
+            return ImageFont.truetype(path, size, encoding="symb")
+    except Exception:
+        pass
+    return ImageFont.truetype(path, size)
+
+
 def _load_font(font_path: Optional[str], size: int, font_name: Optional[str] = None,
                font_style: Optional[List[str]] = None) -> ImageFont.FreeTypeFont:
     """Load a font with optional bold/italic variant resolution."""
@@ -159,7 +207,7 @@ def _load_font(font_path: Optional[str], size: int, font_name: Optional[str] = N
                     candidate = os.path.join(d, f"{win_name}{ext}")
                     if os.path.isfile(candidate):
                         try:
-                            return ImageFont.truetype(candidate, size)
+                            return _truetype_with_symbol_fallback(candidate, size)
                         except Exception:
                             pass
 
@@ -170,7 +218,7 @@ def _load_font(font_path: Optional[str], size: int, font_name: Optional[str] = N
                     candidate = os.path.join(d, variant_name)
                     if os.path.isfile(candidate):
                         try:
-                            return ImageFont.truetype(candidate, size)
+                            return _truetype_with_symbol_fallback(candidate, size)
                         except Exception:
                             pass
                 # Also try without space
@@ -179,14 +227,14 @@ def _load_font(font_path: Optional[str], size: int, font_name: Optional[str] = N
                     candidate = os.path.join(d, variant_name2)
                     if os.path.isfile(candidate):
                         try:
-                            return ImageFont.truetype(candidate, size)
+                            return _truetype_with_symbol_fallback(candidate, size)
                         except Exception:
                             pass
 
     # Try exact path
     if font_path and os.path.isfile(font_path):
         try:
-            return ImageFont.truetype(font_path, size)
+            return _truetype_with_symbol_fallback(font_path, size)
         except Exception:
             pass
     # Try font by name in system locations (exact match first)
@@ -195,7 +243,7 @@ def _load_font(font_path: Optional[str], size: int, font_name: Optional[str] = N
             candidate = os.path.join(d, effective_name)
             if os.path.isfile(candidate):
                 try:
-                    return ImageFont.truetype(candidate, size)
+                    return _truetype_with_symbol_fallback(candidate, size)
                 except Exception:
                     # Fallback: read via BytesIO to bypass Windows virtual folder issues
                     try:
@@ -214,7 +262,7 @@ def _load_font(font_path: Optional[str], size: int, font_name: Optional[str] = N
                         candidate = os.path.join(d, fn)
                         if os.path.isfile(candidate):
                             try:
-                                return ImageFont.truetype(candidate, size)
+                                return _truetype_with_symbol_fallback(candidate, size)
                             except Exception:
                                 try:
                                     with open(candidate, "rb") as f:
@@ -245,10 +293,158 @@ def _load_font(font_path: Optional[str], size: int, font_name: Optional[str] = N
     for fallback in fallbacks:
         if os.path.isfile(fallback):
             try:
-                return ImageFont.truetype(fallback, size)
+                return _truetype_with_symbol_fallback(fallback, size)
             except Exception:
                 pass
     return ImageFont.load_default()
+
+
+def _draw_styled_pil_text(
+    draw: ImageDraw.ImageDraw,
+    xy: Tuple[int, int],
+    segments: List,
+    base_font_name: Optional[str],
+    base_font_path: Optional[str],
+    base_size_px: int,
+    base_color: str,
+    base_style: Optional[List[str]] = None,
+    base_size_pt: Optional[int] = None,
+) -> int:
+    """Render a sequence of StyledSegment objects via PIL.
+
+    Each segment can override font_name, font_size (POINTS, scaled to
+    match base_size_px), font_style, and color.  Supports Bold / Italic
+    (via _load_font's variant resolution), Underline / Strikethrough
+    (drawn as line primitives after the text), and Superscript /
+    Subscript (baseline shift + smaller font).
+
+    `base_size_px` is the RENDERED pixel size for the BASE font.
+    `base_size_pt` is the SOURCE POINT size — callers pass this so
+    the helper can compute the proper pt-to-px scale factor and
+    correctly resize per-segment overrides (which are stored as
+    points, like the base).  When omitted, we fall back to treating
+    `base_size_px` as already in points (1:1 ratio) — a heuristic
+    that produced WRONG size renders for overrides because the
+    scale factor collapsed to 1.
+
+    Returns the final x cursor position so the caller can stitch
+    with additional drawing.
+    """
+    x, y = xy
+    cursor_x = x
+    if not segments:
+        return cursor_x
+
+    # pt → px scale.  When base_size_pt is provided, use the proper
+    # ratio (e.g. a 20pt label rendered at 60px → 3× per-pt).  When
+    # it isn't, fall back to 1:1 which preserves the legacy behaviour
+    # for callers that haven't yet passed the new arg.
+    pt_to_px = (base_size_px / base_size_pt) if base_size_pt and base_size_pt > 0 else 1.0
+
+    for seg in segments:
+        text_chunk = getattr(seg, "text", "") or ""
+        if not text_chunk:
+            continue
+        seg_style = list(getattr(seg, "font_style", None) or base_style or [])
+        is_sup = "Superscript" in seg_style
+        is_sub = "Subscript" in seg_style
+        is_underline = "Underline" in seg_style
+        is_strike = "Strikethrough" in seg_style
+
+        # Per-segment size — segments store points; scale to px using
+        # the (correct) pt → px ratio derived from the base.
+        seg_size_pt = getattr(seg, "font_size", None)
+        if seg_size_pt:
+            seg_size_px = max(8, int(round(seg_size_pt * pt_to_px)))
+        else:
+            seg_size_px = base_size_px
+        if is_sup or is_sub:
+            seg_size_px = max(8, int(seg_size_px * 0.7))
+
+        seg_font_name = getattr(seg, "font_name", None) or base_font_name
+        seg_color = getattr(seg, "color", None) or base_color
+
+        font = _load_font(base_font_path, seg_size_px,
+                          font_name=seg_font_name, font_style=seg_style)
+
+        # Vertical offset for sub/sup — shift relative to the baseline.
+        seg_y = y
+        if is_sup:
+            seg_y = y - int(base_size_px * 0.35)
+        elif is_sub:
+            seg_y = y + int(base_size_px * 0.35)
+
+        draw.text((cursor_x, seg_y), text_chunk, fill=seg_color, font=font)
+
+        try:
+            text_w = font.getlength(text_chunk)
+        except Exception:
+            text_w = len(text_chunk) * seg_size_px * 0.6
+
+        if is_underline or is_strike:
+            try:
+                bbox = draw.textbbox((cursor_x, seg_y), text_chunk, font=font)
+                if is_underline:
+                    line_y = bbox[3] - max(1, seg_size_px // 16)
+                    draw.line((bbox[0], line_y, bbox[2], line_y),
+                              fill=seg_color, width=max(1, seg_size_px // 16))
+                if is_strike:
+                    line_y = (bbox[1] + bbox[3]) // 2
+                    draw.line((bbox[0], line_y, bbox[2], line_y),
+                              fill=seg_color, width=max(1, seg_size_px // 18))
+            except Exception:
+                pass
+
+        cursor_x += int(round(text_w))
+    return cursor_x
+
+
+def _measure_styled_pil_text(
+    segments: List,
+    base_font_name: Optional[str],
+    base_font_path: Optional[str],
+    base_size_px: int,
+    base_style: Optional[List[str]] = None,
+    base_size_pt: Optional[int] = None,
+) -> int:
+    """Return the total horizontal pixel width that
+    `_draw_styled_pil_text` would consume for the given segments.
+    Mirrors the same per-segment size resolution, so pass the same
+    `base_size_pt` you'd pass to the renderer for matching results."""
+    total = 0
+    if not segments:
+        return total
+    pt_to_px = (base_size_px / base_size_pt) if base_size_pt and base_size_pt > 0 else 1.0
+
+    # Use a dummy 1x1 image to construct a Draw + measure fonts.
+    dummy = Image.new("RGB", (1, 1))
+    draw = ImageDraw.Draw(dummy)
+    for seg in segments:
+        text_chunk = getattr(seg, "text", "") or ""
+        if not text_chunk:
+            continue
+        seg_style = list(getattr(seg, "font_style", None) or base_style or [])
+        is_sup = "Superscript" in seg_style
+        is_sub = "Subscript" in seg_style
+        seg_size_pt = getattr(seg, "font_size", None)
+        if seg_size_pt:
+            seg_size_px = max(8, int(round(seg_size_pt * pt_to_px)))
+        else:
+            seg_size_px = base_size_px
+        if is_sup or is_sub:
+            seg_size_px = max(8, int(seg_size_px * 0.7))
+        seg_font_name = getattr(seg, "font_name", None) or base_font_name
+        font = _load_font(base_font_path, seg_size_px,
+                          font_name=seg_font_name, font_style=seg_style)
+        try:
+            total += int(round(font.getlength(text_chunk)))
+        except Exception:
+            try:
+                bbox = draw.textbbox((0, 0), text_chunk, font=font)
+                total += bbox[2] - bbox[0]
+            except Exception:
+                total += int(len(text_chunk) * seg_size_px * 0.6)
+    return total
 
 
 def _format_measurement(value: float, unit_label: str) -> str:
@@ -307,10 +503,17 @@ def draw_scale_bar(image: Image.Image, sb: ScaleBarSettings,
         um_per_unit = UNIT_TO_MICRONS.get(unit, 1.0)
         bar_in_unit = sb.bar_length_microns / um_per_unit
         label_text = f"{bar_in_unit:g} {unit_display}"
-    # Place label above bar if near bottom, below if near top
-    is_bottom = y > ih * 0.5
+    # Decide whether the label sits above or below the bar.
+    #   sb.label_position == "above" / "below" — explicit override
+    #   sb.label_position == "auto" (default)  — pick by bar y position
+    label_pos = getattr(sb, 'label_position', 'auto') or 'auto'
+    if label_pos == 'above':
+        is_bottom = True
+    elif label_pos == 'below':
+        is_bottom = False
+    else:
+        is_bottom = y > ih * 0.5
     if is_bottom:
-        text_y = y - 4
         # Get text height for positioning above bar
         try:
             bbox = font.getbbox(label_text)
@@ -320,13 +523,48 @@ def draw_scale_bar(image: Image.Image, sb: ScaleBarSettings,
         text_y = y - text_h - 2
     else:
         text_y = y + sb.bar_height + 4
-    # Center text on bar
-    try:
-        text_w = font.getlength(label_text)
-    except Exception:
-        text_w = len(label_text) * scaled_font_size * 0.6
-    text_x = x + bar_length_px / 2 - text_w / 2 + sb.label_x_offset
-    draw.text((int(text_x), int(text_y)), label_text, fill=label_color, font=font)
+    # Center text on bar.  If styled_segments is populated (per-char
+    # styling from the StyledTextField editor), use the segment-aware
+    # PIL renderer; otherwise fall back to the legacy plain draw.text.
+    # IMPORTANT: ScaleBarSettings exposes its label font as
+    # `font_name` / `font_path` (NOT `label_font_name` / `label_font_path`
+    # like Symbol / Line / Area).  Historical naming wart — the segment
+    # renderer was previously reading the wrong attribute and rendered
+    # nothing for styled scale-bar labels.
+    sb_segments = getattr(sb, 'styled_segments', None) or []
+    if sb_segments:
+        sb_base_font_name = getattr(sb, 'font_name', None)
+        sb_base_font_path = getattr(sb, 'font_path', None)
+        sb_base_style = getattr(sb, 'label_font_style', None)
+        # Pass base_size_pt so per-segment font_size overrides scale
+        # correctly.  Without it, the helper assumed 1:1 pt:px and
+        # segment sizes came out too small.
+        text_w = _measure_styled_pil_text(
+            sb_segments,
+            base_font_name=sb_base_font_name,
+            base_font_path=sb_base_font_path,
+            base_size_px=scaled_font_size,
+            base_size_pt=sb.font_size,
+            base_style=sb_base_style,
+        )
+        text_x = x + bar_length_px / 2 - text_w / 2 + sb.label_x_offset
+        _draw_styled_pil_text(
+            draw, (int(text_x), int(text_y)),
+            sb_segments,
+            base_font_name=sb_base_font_name,
+            base_font_path=sb_base_font_path,
+            base_size_px=scaled_font_size,
+            base_size_pt=sb.font_size,
+            base_color=label_color,
+            base_style=sb_base_style,
+        )
+    else:
+        try:
+            text_w = font.getlength(label_text)
+        except Exception:
+            text_w = len(label_text) * scaled_font_size * 0.6
+        text_x = x + bar_length_px / 2 - text_w / 2 + sb.label_x_offset
+        draw.text((int(text_x), int(text_y)), label_text, fill=label_color, font=font)
     return img
 
 
@@ -345,6 +583,27 @@ def draw_labels(image: Image.Image, labels: List[LabelSettings],
         font = _load_font(font_ref, font_size)
         px = int(lbl.position_x / 100.0 * w)
         py = int(lbl.position_y / 100.0 * h)
+
+        lbl_segments = getattr(lbl, 'styled_segments', None) or []
+        if lbl_segments and lbl.rotation == 0:
+            # Per-character styled rendering — Bold/Italic/Underline/
+            # Strikethrough/Sub/Sup/font-name/font-size/color per run.
+            # The rotated path falls back to the legacy plain renderer
+            # below; rotating styled runs would require compositing each
+            # segment into a transparent layer first, which we can add
+            # later if users need rotated styled labels.
+            _draw_styled_pil_text(
+                draw, (px, py),
+                lbl_segments,
+                base_font_name=lbl.font_name,
+                base_font_path=lbl.font_path,
+                base_size_px=font_size,
+                base_size_pt=lbl.font_size,
+                base_color=lbl.default_color,
+                base_style=getattr(lbl, 'font_style', None),
+            )
+            continue
+
         segments = parse_colored_text(lbl.text, lbl.default_color)
         x_cursor = px
         for color, text_chunk in segments:
@@ -435,7 +694,6 @@ def draw_symbols(image: Image.Image, symbols: List[SymbolSettings],
         # Label
         if sym.label_text:
             label_font_px = max(10, int(sym.label_font_size * scale))
-            font = _load_font(getattr(sym, 'label_font_path', None), label_font_px)
             label_color = getattr(sym, 'label_color', '#FFFFFF')
             # Use absolute position if set, otherwise auto (near symbol)
             lpos_x = getattr(sym, 'label_position_x', -1)
@@ -446,7 +704,20 @@ def draw_symbols(image: Image.Image, symbols: List[SymbolSettings],
             else:
                 lx = cx + sz // 2
                 ly = cy - sz // 4
-            draw.text((lx, ly), sym.label_text, fill=label_color, font=font)
+            sym_segments = getattr(sym, 'label_styled_segments', None) or []
+            if sym_segments:
+                _draw_styled_pil_text(
+                    draw, (lx, ly), sym_segments,
+                    base_font_name=getattr(sym, 'label_font_name', None),
+                    base_font_path=getattr(sym, 'label_font_path', None),
+                    base_size_px=label_font_px,
+                    base_size_pt=getattr(sym, 'label_font_size', None),
+                    base_color=label_color,
+                    base_style=getattr(sym, 'label_font_style', None),
+                )
+            else:
+                font = _load_font(getattr(sym, 'label_font_path', None), label_font_px)
+                draw.text((lx, ly), sym.label_text, fill=label_color, font=font)
     return img
 
 
@@ -533,7 +804,19 @@ def draw_lines(image: Image.Image, lines: List[LineAnnotation],
             else:
                 tx = int(mx) + int(5 * font_scale)
                 ty = int(my) - int(15 * font_scale)
-            draw.text((tx, ty), text, fill=line.measure_color, font=font)
+            line_segments = getattr(line, 'measure_styled_segments', None) or []
+            if line_segments:
+                _draw_styled_pil_text(
+                    draw, (tx, ty), line_segments,
+                    base_font_name=line_font_name,
+                    base_font_path=getattr(line, 'measure_font_path', None),
+                    base_size_px=scaled_font_size,
+                    base_size_pt=getattr(line, 'measure_font_size', None),
+                    base_color=line.measure_color,
+                    base_style=line_font_style,
+                )
+            else:
+                draw.text((tx, ty), text, fill=line.measure_color, font=font)
 
     return img
 
@@ -673,13 +956,45 @@ def draw_areas(image: Image.Image, areas: List[AreaAnnotation],
                 cy = area.points[0][1] / 100 * ih
             else:
                 cx, cy = iw / 2, ih / 2
-            try:
-                bbox = font.getbbox(text)
-                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                cx -= tw / 2; cy -= th / 2
-            except Exception:
-                pass
-            draw.text((int(cx), int(cy)), text, fill=area.measure_color, font=font)
+            area_segments = getattr(area, 'measure_styled_segments', None) or []
+            if area_segments:
+                # Centre the styled text by measuring its total width
+                # via the same per-segment font resolution the renderer
+                # uses, so segments with mixed font sizes line up.
+                tw = _measure_styled_pil_text(
+                    area_segments,
+                    base_font_name=area_font_name,
+                    base_font_path=getattr(area, 'measure_font_path', None),
+                    base_size_px=scaled_font_size,
+                    base_size_pt=getattr(area, 'measure_font_size', None),
+                    base_style=area_font_style,
+                )
+                cx -= tw / 2
+                # Vertical centring uses the base font's bbox height —
+                # close enough for mixed-size runs (matches the legacy
+                # behaviour which used the base font's ascent).
+                try:
+                    th = font.getbbox("Ay")[3] - font.getbbox("Ay")[1]
+                    cy -= th / 2
+                except Exception:
+                    pass
+                _draw_styled_pil_text(
+                    draw, (int(cx), int(cy)), area_segments,
+                    base_font_name=area_font_name,
+                    base_font_path=getattr(area, 'measure_font_path', None),
+                    base_size_px=scaled_font_size,
+                    base_size_pt=getattr(area, 'measure_font_size', None),
+                    base_color=area.measure_color,
+                    base_style=area_font_style,
+                )
+            else:
+                try:
+                    bbox = font.getbbox(text)
+                    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                    cx -= tw / 2; cy -= th / 2
+                except Exception:
+                    pass
+                draw.text((int(cx), int(cy)), text, fill=area.measure_color, font=font)
 
     return img.convert("RGB")
 
@@ -1396,8 +1711,33 @@ def process_panel(image: Image.Image, panel: PanelInfo,
             "magenta": lambda v: np.stack([v, np.zeros_like(v), v], axis=-1),
             "yellow": lambda v: np.stack([v, v, np.zeros_like(v)], axis=-1),
         }
+
+        # Custom tint: any #rrggbb or #rgb is treated as a linear black→tint
+        # ramp modulated by intensity.  Allows fully user-assignable colour
+        # for volume/zstack channels without restricting to a fixed palette.
+        def _parse_hex_tint(s: str):
+            s = s.strip()
+            if not s.startswith("#"):
+                return None
+            hex_ = s[1:]
+            if len(hex_) == 3:
+                hex_ = "".join(c + c for c in hex_)
+            if len(hex_) != 6:
+                return None
+            try:
+                return (int(hex_[0:2], 16) / 255.0,
+                        int(hex_[2:4], 16) / 255.0,
+                        int(hex_[4:6], 16) / 255.0)
+            except ValueError:
+                return None
+
         try:
-            if pseudocolor in SIMPLE_CMAPS:
+            tint_rgb = _parse_hex_tint(pseudocolor)
+            if tint_rgb is not None:
+                tr, tg, tb = tint_rgb
+                rgb = np.stack([arr * tr, arr * tg, arr * tb], axis=-1)
+                img = Image.fromarray((np.clip(rgb, 0, 1) * 255).astype(np.uint8), "RGB")
+            elif pseudocolor in SIMPLE_CMAPS:
                 rgb = SIMPLE_CMAPS[pseudocolor](arr)
                 img = Image.fromarray((np.clip(rgb, 0, 1) * 255).astype(np.uint8), "RGB")
             else:

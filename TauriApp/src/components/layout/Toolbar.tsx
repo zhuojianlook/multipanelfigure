@@ -175,6 +175,7 @@ async function fetchChangelog(): Promise<ChangelogEntry[]> {
 }
 import { useFigureStore } from "../../store/figureStore";
 import { SaveFigureDialog } from "../dialogs/SaveFigureDialog";
+import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 
 /* ── SaveCollageButton ───────────────────────────────────────
    Renders the collage canvas to PNG client-side (compositing
@@ -190,7 +191,10 @@ function SaveCollageButton() {
 
   const handleSave = async () => {
     if (items.length === 0) {
-      window.alert("No items in the collage to save. Add a figure or image first.");
+      await alertDialog({
+        title: "Empty collage",
+        body: "No items in the collage to save. Add a figure or image first.",
+      });
       return;
     }
     // Compose items onto an offscreen canvas at full virtual resolution.
@@ -202,7 +206,10 @@ function SaveCollageButton() {
     canvas.height = canvasH;
     const ctx = canvas.getContext("2d");
     if (!ctx) {
-      window.alert("Could not initialise a 2D canvas context.");
+      await alertDialog({
+        title: "Canvas error",
+        body: "Could not initialise a 2D canvas context.",
+      });
       return;
     }
     ctx.fillStyle = background;
@@ -238,7 +245,7 @@ function SaveCollageButton() {
       });
       if (!path) return;
       await invoke("save_base64_to_path", { path, dataB64: b64 });
-      window.alert(`Collage saved to ${path}`);
+      await alertDialog({ title: "Collage saved", body: `Collage saved to ${path}` });
       return;
     } catch {
       /* Not running inside Tauri — fall back to browser download. */
@@ -322,7 +329,10 @@ function CollageWorkspaceControls() {
       projectPath = await ensureProjectSaved();
     } catch (e) {
       console.error("[collage] save before add failed:", e);
-      window.alert("Could not save the project. Add to Collage cancelled.");
+      await alertDialog({
+        title: "Save failed",
+        body: "Could not save the project. Add to Collage cancelled.",
+      });
       return;
     }
     if (!projectPath) return; // user cancelled the save dialog
@@ -335,7 +345,10 @@ function CollageWorkspaceControls() {
     try {
       const resp = await api.getPreview();
       if (!resp?.image) {
-        window.alert("Preview is empty — add some images to your panels first.");
+        await alertDialog({
+          title: "Empty preview",
+          body: "Preview is empty — add some images to your panels first.",
+        });
         return;
       }
       const naturalW = resp.width || 0;
@@ -343,11 +356,13 @@ function CollageWorkspaceControls() {
       const aspect = naturalH > 0 ? naturalW / naturalH : 1;
 
       if (existing) {
-        const ok = window.confirm(
-          `"${existing.name}" (${projectPath}) is already in the collage.\n\n` +
-          "Update it with the latest rendered preview? (Position and size " +
-          "stay where you put them.)",
-        );
+        const ok = await confirmDialog({
+          title: "Already in collage",
+          body: `"${existing.name}" (${projectPath}) is already in the collage.\n\n`
+            + "Update it with the latest rendered preview? (Position and size "
+            + "stay where you put them.)",
+          confirmLabel: "Update",
+        });
         if (!ok) return;
         // Refresh the item in place. Keep x/y/w/h; update the source
         // image bytes + natural dims so future resizes use the new
@@ -380,7 +395,10 @@ function CollageWorkspaceControls() {
       setMode("collage");
     } catch (e) {
       console.error("Add to collage failed:", e);
-      window.alert("Failed to capture the figure preview. Check the console.");
+      await alertDialog({
+        title: "Add to collage failed",
+        body: "Failed to capture the figure preview. Check the console.",
+      });
     }
   };
 
@@ -394,21 +412,25 @@ function CollageWorkspaceControls() {
     }
     const selected = useCollageStore.getState().items.find((i) => i.id === selectedId);
     if (selected && selected.kind === "figure" && selected.projectPath) {
-      const ok = window.confirm(
-        `Open "${selected.name}" in the Multi-Panel Builder?\n\n` +
-        `This will load ${selected.projectPath} into the builder, replacing ` +
-        "your current builder state.",
-      );
+      const ok = await confirmDialog({
+        title: "Open in builder",
+        body: `Open "${selected.name}" in the Multi-Panel Builder?\n\n`
+          + `This will load ${selected.projectPath} into the builder, replacing `
+          + "your current builder state.",
+        confirmLabel: "Open",
+        destructive: true,
+      });
       if (!ok) return;
       try {
         await loadProject(selected.projectPath);
       } catch (e) {
         console.error("[collage] load project failed:", e);
-        window.alert(
-          "Could not load the project file. It may have been moved or " +
-          "deleted. Switching to the builder anyway — use Sidebar → Load " +
-          "Project to pick a new path.",
-        );
+        await alertDialog({
+          title: "Load failed",
+          body: "Could not load the project file. It may have been moved or "
+            + "deleted. Switching to the builder anyway — use Sidebar → Load "
+            + "Project to pick a new path.",
+        });
       }
     }
     setMode("builder");

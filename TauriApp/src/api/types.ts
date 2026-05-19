@@ -43,6 +43,13 @@ export interface ScaleBarSettings {
   scale_name: string;
   styled_segments: StyledSegment[];
   draggable: boolean;
+  /** Where to put the label text relative to the bar.
+   *  "auto"  — pick based on the bar's vertical position (default).
+   *            Bar near bottom → label above, bar near top → label below.
+   *  "above" — always render above.
+   *  "below" — always render below.
+   *  Optional for back-compat with projects saved before this field. */
+  label_position?: "auto" | "above" | "below";
 }
 
 export interface SymbolSettings {
@@ -234,7 +241,7 @@ export interface PanelInfo {
   input_white_b: number;      // 0-255, blue white-point
   invert: boolean;            // default false
   grayscale: boolean;         // default false
-  pseudocolor: string;        // "" = none, or colormap name: "hot", "cool", "viridis", "magma", "inferno", "plasma", "green", "red", "blue", "cyan", "magenta", "yellow"
+  pseudocolor: string;        // "" = none; "#rrggbb" = custom user tint (linear black→color ramp by intensity); or named matplotlib colormap: "hot", "cool", "viridis", "magma", "inferno", "plasma", "green", "red", "blue", "cyan", "magenta", "yellow"
 
   // Video fields — only meaningful when image_name points to a video
   // file. `frame` is the statically-displayed frame; `frame_start`,

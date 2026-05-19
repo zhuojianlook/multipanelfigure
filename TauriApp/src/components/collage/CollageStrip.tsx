@@ -14,6 +14,7 @@ import { Box, IconButton, Tooltip, Typography, Chip } from "@mui/material";
 import DeleteIcon from "@mui/icons-material/Delete";
 import VerticalAlignTopIcon from "@mui/icons-material/VerticalAlignTop";
 import { useCollageStore } from "../../store/collageStore";
+import { confirm as confirmDialog } from "../shared/ConfirmDialog";
 
 export function CollageStrip() {
   const items = useCollageStore((s) => s.items);
@@ -122,11 +123,15 @@ export function CollageStrip() {
                 <Tooltip title="Remove this item from the collage (your project file stays on disk)">
                   <IconButton
                     size="small"
-                    onClick={(e) => {
+                    onClick={async (e) => {
                       e.stopPropagation();
-                      if (window.confirm(`Remove "${it.name}" from the collage? Your saved .mpf file is not deleted.`)) {
-                        removeItem(it.id);
-                      }
+                      const ok = await confirmDialog({
+                        title: "Remove from collage",
+                        body: `Remove "${it.name}" from the collage? Your saved .mpf file is not deleted.`,
+                        confirmLabel: "Remove",
+                        destructive: true,
+                      });
+                      if (ok) removeItem(it.id);
                     }}
                     sx={{ width: 18, height: 18, color: "#ff8a80" }}
                   >

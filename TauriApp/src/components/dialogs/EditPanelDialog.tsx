@@ -62,10 +62,13 @@ import { VolumeViewerDialog } from "./VolumeViewer";
 import { useFigureStore } from "../../store/figureStore";
 import { api } from "../../api/client";
 import { niceScaleBarUm } from "../../utils/scaleBarRounding";
+import { alert as alertDialog } from "../shared/ConfirmDialog";
+import { StyledTextField } from "../shared/StyledTextField";
 import type {
   PanelInfo,
   LabelSettings,
   ScaleBarSettings,
+  StyledSegment,
   SymbolSettings,
   ZoomInsetSettings,
 } from "../../api/types";
@@ -253,6 +256,59 @@ function defaultSymbol(fontName?: string): SymbolSettings {
 
 function makeInsetId(): string {
   return `inset_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+/** Render a styled-segments array as inline `<span>`s so the
+ *  EditPanelDialog's interactive CSS overlay can show per-character
+ *  formatting (Bold/Italic/Underline/Strike/Sub/Sup + per-seg colour /
+ *  font / size) without round-tripping through the backend's
+ *  matplotlib pass.  When segments are empty / not present, the
+ *  caller should fall back to plain text rendering.
+ *
+ *  `hidden` — when true (i.e. the matplotlib-rendered preview is
+ *  on screen and this label isn't selected), the segments still
+ *  contribute to the bounding-box layout for the drag hitbox but
+ *  are visually invisible.  Otherwise the segment <span>s would
+ *  ignore the parent's `color: transparent` (each seg sets its
+ *  own colour) and double-render on top of the baked PNG. */
+function renderStyledSegmentsInline(
+  segments: StyledSegment[],
+  scaleFactorPxPerPt: number,
+  defaultColor: string,
+  hidden: boolean = false,
+): React.ReactNode {
+  return segments.map((seg, idx) => {
+    const style = seg.font_style || [];
+    const isBold = style.includes("Bold");
+    const isItalic = style.includes("Italic");
+    const isUnderline = style.includes("Underline");
+    const isStrike = style.includes("Strikethrough");
+    const isSup = style.includes("Superscript");
+    const isSub = style.includes("Subscript");
+    const decorations: string[] = [];
+    if (isUnderline) decorations.push("underline");
+    if (isStrike) decorations.push("line-through");
+    return (
+      <span
+        key={`seg-${idx}-${seg.text.length}`}
+        style={{
+          // hidden mode = transparent text + no decorations so the
+          // matplotlib-baked rendering underneath is the only visible
+          // copy of the label.  Layout (width) still matches so the
+          // drag hitbox lines up with the visible PNG.
+          color: hidden ? "transparent" : (seg.color || defaultColor),
+          fontFamily: seg.font_name ? seg.font_name.replace(/\.(ttf|otf|ttc)$/i, "") + ", sans-serif" : undefined,
+          fontSize: seg.font_size ? `${seg.font_size * scaleFactorPxPerPt}px` : undefined,
+          fontWeight: isBold ? 700 : undefined,
+          fontStyle: isItalic ? "italic" : undefined,
+          textDecoration: hidden ? "none" : (decorations.length ? decorations.join(" ") : undefined),
+          verticalAlign: isSup ? "super" : isSub ? "sub" : undefined,
+        }}
+      >
+        {seg.text}
+      </span>
+    );
+  });
 }
 
 function defaultZoomInset(): ZoomInsetSettings {
@@ -1577,6 +1633,115 @@ function VideoFrameSelector({
 }
 
 
+// ── Multichannel z-stack channel UI ─────────────────────────────────
+//
+// When the source TIFF carries multiple channels (CYX/ZCYX/...), the
+// backend exposes per-channel state via /api/zstack/{name}/channels.
+// Each channel gets its own tint colour (any user-pickable hex), a
+// visibility toggle, and a 0-255 black/white window. The backend
+// recomputes the composite on every PATCH and writes it to
+// `loaded_images[name]`, so the panel render picks up the new look
+// without any frontend re-routing.
+function ChannelsBlock({ imageName, panelRow, panelCol, onChange }: {
+  imageName: string; panelRow?: number; panelCol?: number;
+  onChange: () => void;
+}) {
+  type ChInfo = {
+    is_multichannel: boolean;
+    num_channels?: number; num_z?: number; current_z?: number;
+    tints?: string[]; enabled?: boolean[];
+    black_levels?: number[]; white_levels?: number[];
+  };
+  const [info, setInfo] = useState<ChInfo | null>(null);
+  const [pending, setPending] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getChannelInfo(imageName)
+      .then(i => { if (!cancelled) setInfo(i); })
+      .catch(() => { if (!cancelled) setInfo({ is_multichannel: false }); });
+    return () => { cancelled = true; };
+  }, [imageName]);
+
+  const patch = async (body: Parameters<typeof api.updateChannels>[1]) => {
+    setPending(true);
+    try {
+      const res = await api.updateChannels(imageName, { ...body, row: panelRow, col: panelCol });
+      setInfo(prev => prev ? { ...prev, ...res } : prev);
+      onChange();
+    } catch (e) { console.error("[channels]", e); }
+    setPending(false);
+  };
+
+  if (!info || !info.is_multichannel) return null;
+  const n = info.num_channels ?? 0;
+  if (n <= 1) return null;
+
+  return (
+    <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5, mt: 1, p: 1, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
+      <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.7rem" }}>
+        Channels ({n}) {pending && <span style={{ opacity: 0.6 }}> · applying…</span>}
+      </Typography>
+      <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>
+        Pick a tint for each channel. The image is composited as the sum of all enabled channels.
+      </Typography>
+      {Array.from({ length: n }).map((_, c) => {
+        const tint = info.tints?.[c] ?? "#ffffff";
+        const enabled = info.enabled?.[c] ?? true;
+        const bl = info.black_levels?.[c] ?? 0;
+        const wl = info.white_levels?.[c] ?? 255;
+        return (
+          <Box key={c} sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
+            <Checkbox
+              size="small" checked={enabled} sx={{ p: 0.25 }}
+              onChange={(e) => {
+                const next = [...(info.enabled ?? Array(n).fill(true))];
+                next[c] = e.target.checked;
+                patch({ enabled: next });
+              }}
+            />
+            <Typography variant="caption" sx={{ width: 14, fontSize: "0.6rem" }}>{c + 1}</Typography>
+            <input
+              type="color"
+              value={tint}
+              disabled={!enabled || pending}
+              onChange={(e) => {
+                const next = [...(info.tints ?? Array(n).fill("#ffffff"))];
+                next[c] = e.target.value;
+                patch({ tints: next });
+              }}
+              title={`Channel ${c + 1} tint`}
+              style={{ width: 24, height: 22, border: "1px solid #ccc", borderRadius: 3, padding: 0, cursor: enabled ? "pointer" : "not-allowed" }}
+            />
+            <Slider
+              value={[bl, wl]} min={0} max={255} step={1} disabled={!enabled || pending}
+              onChange={(_, v) => {
+                const [b, w] = v as [number, number];
+                const blArr = [...(info.black_levels ?? Array(n).fill(0))];
+                const wlArr = [...(info.white_levels ?? Array(n).fill(255))];
+                blArr[c] = b; wlArr[c] = w;
+                setInfo({ ...info, black_levels: blArr, white_levels: wlArr });
+              }}
+              onChangeCommitted={(_, v) => {
+                const [b, w] = v as [number, number];
+                const blArr = [...(info.black_levels ?? Array(n).fill(0))];
+                const wlArr = [...(info.white_levels ?? Array(n).fill(255))];
+                blArr[c] = b; wlArr[c] = w;
+                patch({ black_levels: blArr, white_levels: wlArr });
+              }}
+              size="small"
+              sx={{ flex: 1, mx: 0.5, "& .MuiSlider-thumb": { width: 10, height: 10 } }}
+            />
+            <Typography variant="caption" sx={{ width: 60, textAlign: "right", fontSize: "0.55rem", color: "text.secondary" }}>
+              {bl}–{wl}
+            </Typography>
+          </Box>
+        );
+      })}
+    </Box>
+  );
+}
+
 // ── Z-Stack TIFF Frame Selector Component ─────────────────────────────
 function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, setFrame, panelRow, panelCol, onAppliedToPanel }: { imageName: string; onFrameChange: () => void; onFrameImage?: (b64: string) => void; frame: number; setFrame: (f: number) => void; panelRow?: number; panelCol?: number; onAppliedToPanel?: () => void }) {
   const [info, setInfo] = useState<{ frame_count: number; width: number; height: number } | null>(null);
@@ -1620,6 +1785,11 @@ function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, se
 
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 1.5, mt: 1 }}>
+      {/* Per-channel controls (only renders for multichannel TIFFs).
+          Lives at the top of the z-stack tab so users see the colour
+          mapping before scrubbing through slices. */}
+      <ChannelsBlock imageName={imageName} panelRow={panelRow} panelCol={panelCol} onChange={onFrameChange} />
+
       {/* Single slice selection */}
       <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.7rem" }}>Single Slice</Typography>
       <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary" }}>
@@ -2001,7 +2171,33 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   const [processedH, setProcessedH] = useState(0);
   const [renderedPreviewB64, setRenderedPreviewB64] = useState<string>("");
   const renderedPreviewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // True while a matplotlib-rendered preview refresh is queued or in
+  // flight after a local edit.  Drives the duplicate-label and lag
+  // mitigation: when stale, we show the BASE (no-labels-baked-in)
+  // preview instead of the renderedPreviewB64 PNG.  That way the
+  // CSS overlay (which updates instantly with every edit and drag)
+  // becomes the SOLE rendering of labels for the brief debounce
+  // window.  Once the new matplotlib output lands, this flips back
+  // to false and we switch back to the rendered preview.
+  // Without this:
+  //   • During drag, the OLD-position matplotlib label was visible
+  //     simultaneously with the NEW-position CSS overlay → visible
+  //     duplicate.
+  //   • After mouseup but before the 200 ms refresh debounce + the
+  //     ~300 ms matplotlib render, the CSS overlay vanished (because
+  //     dragging stopped) and the matplotlib showed the OLD position
+  //     for ~500 ms → label "jumped" backwards then forwards.
+  //   • Styling toggles (Bold etc.) similarly lagged.
+  const [pendingRenderedRefresh, setPendingRenderedRefresh] = useState(false);
   const [selectedLabelIdx, setSelectedLabelIdx] = useState<number>(-1);
+  // Drag-state for the live CSS overlay.  We track the index of the
+  // label currently being mouse-dragged so the overlay's text can
+  // stay visible WHILE dragging (so the user sees what they're
+  // moving) but hide whenever the matplotlib-rendered preview has
+  // caught up.  Without this, every selected label would render
+  // both in the matplotlib-baked PNG AND in the CSS overlay,
+  // producing two visibly-offset copies.
+  const [draggingLabelIdx, setDraggingLabelIdx] = useState<number>(-1);
   const [extImageThumb, setExtImageThumb] = useState<string>("");
   const extImageNameRef = useRef<string>("");
   const [extImageDims, setExtImageDims] = useState<{ w: number; h: number }>({ w: 1000, h: 1000 });
@@ -2396,6 +2592,10 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   // mouse was released (because release triggers a render with state
   // that happens to match by then). Now we always sync first.
   const refreshRenderedPreview = useCallback(() => {
+    // Mark the matplotlib preview as stale immediately — the dialog
+    // switches to the BASE (no-labels) preview + CSS overlay while
+    // we wait for the refresh to come back.
+    setPendingRenderedRefresh(true);
     if (renderedPreviewTimerRef.current) clearTimeout(renderedPreviewTimerRef.current);
     renderedPreviewTimerRef.current = setTimeout(async () => {
       try {
@@ -2413,12 +2613,56 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
         }
         const resp = await api.getPanelRenderedPreview(row, col);
         if (resp.image) setRenderedPreviewB64(resp.image);
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      } finally {
+        // Clear the stale flag REGARDLESS of success — a failed
+        // refresh still means the last in-flight request resolved,
+        // so we shouldn't get stuck on the base preview forever.
+        setPendingRenderedRefresh(false);
+      }
     }, 200);
   }, [row, col, isZoomTarget]);
 
-  // Refresh rendered preview when overlays change or tab switches to overlay tabs
-  const overlayHash = `${local?.labels?.length || 0}-${local?.add_scale_bar || false}-${local?.scale_bar?.bar_length_microns || 0}-${local?.scale_bar?.font_size || 0}-${local?.symbols?.length || 0}`;
+  // Refresh rendered preview when overlays change or tab switches to overlay tabs.
+  //
+  // Crucial: this hash must change whenever ANY field that affects the
+  // matplotlib-rendered preview changes — not just structural counts.
+  // The previous version only tracked array lengths + a couple of
+  // scale-bar primitives, so per-character styling edits (toggling
+  // Bold on a selection, picking a font for a run, changing one
+  // character's colour) never invalidated it and the rendered
+  // preview kept showing stale styling.
+  //
+  // The fingerprint walks every text-bearing element and segments
+  // their {text, font_name/size/style/color, styled_segments} into
+  // a compact string.  Cheap O(N) per render but N is tiny (one
+  // panel's overlays) so the cost is negligible.
+  const overlayHash = (() => {
+    if (!local) return "empty";
+    const labelFp = (local.labels || []).map((l) => {
+      const segs = (l.styled_segments || []).map((s) => `${s.text}|${s.color || ""}|${s.font_name || ""}|${s.font_size || ""}|${(s.font_style || []).join(",")}`).join("/");
+      return `L:${l.text}|${l.color}|${l.font_name}|${l.font_size}|${(l.font_style || []).join(",")}|${l.position_x},${l.position_y}|${l.rotation || 0}|segs(${segs})`;
+    }).join(";;");
+    const sb = local.scale_bar;
+    const sbSegs = sb ? (sb.styled_segments || []).map((s) => `${s.text}|${s.color || ""}|${s.font_name || ""}|${s.font_size || ""}|${(s.font_style || []).join(",")}`).join("/") : "";
+    const sbFp = sb ? `SB:${local.add_scale_bar ? "on" : "off"}|${sb.label}|${sb.label_color}|${sb.font_name}|${sb.font_size}|${(sb.label_font_style || []).join(",")}|${sb.bar_length_microns}|${sb.bar_color}|${sb.bar_height}|${sb.position_x},${sb.position_y}|segs(${sbSegs})` : "SB:none";
+    const symFp = (local.symbols || []).map((s) => {
+      const segs = (s.label_styled_segments || []).map((g) => `${g.text}|${g.color || ""}|${g.font_name || ""}|${g.font_size || ""}|${(g.font_style || []).join(",")}`).join("/");
+      return `S:${s.label_text || ""}|${s.label_color}|${s.label_font_name}|${s.label_font_size}|${(s.label_font_style || []).join(",")}|${s.shape}|${s.x},${s.y}|${s.size}|segs(${segs})`;
+    }).join(";;");
+    const lineFp = (local.lines || []).map((ln) => {
+      const segs = (ln.measure_styled_segments || []).map((g) => `${g.text}|${g.color || ""}|${g.font_name || ""}|${g.font_size || ""}|${(g.font_style || []).join(",")}`).join("/");
+      return `Ln:${ln.measure_text || ""}|${ln.measure_color}|${ln.measure_font_name}|${ln.measure_font_size}|${(ln.measure_font_style || []).join(",")}|${ln.show_measure}|segs(${segs})`;
+    }).join(";;");
+    const areaFp = (local.areas || []).map((a) => {
+      // AreaAnnotation has no measure_font_style — keep field set
+      // narrow to only what the type exposes.
+      const segs = (a.measure_styled_segments || []).map((g) => `${g.text}|${g.color || ""}|${g.font_name || ""}|${g.font_size || ""}|${(g.font_style || []).join(",")}`).join("/");
+      return `A:${a.measure_text || ""}|${a.measure_color}|${a.measure_font_name}|${a.measure_font_size}|${a.show_measure}|segs(${segs})`;
+    }).join(";;");
+    return `${labelFp}::${sbFp}::${symFp}::${lineFp}::${areaFp}`;
+  })();
   useEffect(() => {
     if (OVERLAY_TABS.includes(tabIdx) && (local?.image_name || isZoomTarget)) {
       refreshRenderedPreview();
@@ -3124,7 +3368,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       updatePanel(row, c2, { rotation: rot });
                       applied++;
                     }
-                    if (applied === 0) alert("No other panels in this row have images assigned.");
+                    if (applied === 0) void alertDialog({ title: "Nothing to apply", body: "No other panels in this row have images assigned." });
                   }}
                 >Copy rotation to row</Button>
                 <Button size="small" variant="outlined" sx={{ fontSize: "0.6rem", textTransform: "none" }}
@@ -3140,7 +3384,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       updatePanel(r2, col, { rotation: rot });
                       applied++;
                     }
-                    if (applied === 0) alert("No other panels in this column have images assigned.");
+                    if (applied === 0) void alertDialog({ title: "Nothing to apply", body: "No other panels in this column have images assigned." });
                   }}
                 >Copy rotation to column</Button>
               </Box>
@@ -3232,7 +3476,10 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       // Check if crop fits in current image
                       const { rotW: rotOrigW, rotH: rotOrigH } = computeRotatedDims(origFullW, origFullH, displayRotation);
                       if (cw > rotOrigW || ch > rotOrigH) {
-                        alert(`Crop from ${src.label} (${cw}×${ch}) exceeds this image (${rotOrigW}×${rotOrigH}). Cannot apply.`);
+                        void alertDialog({
+                          title: "Crop doesn't fit",
+                          body: `Crop from ${src.label} (${cw}×${ch}) exceeds this image (${rotOrigW}×${rotOrigH}). Cannot apply.`,
+                        });
                         return;
                       }
                       // Apply: center the crop if it would go out of bounds
@@ -3272,7 +3519,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       updatePanel(row, c2, { crop: local.crop, crop_image: true, aspect_ratio_str: local.aspect_ratio_str });
                       applied++;
                     }
-                    if (applied === 0) alert("No other panels in this row have images assigned.");
+                    if (applied === 0) void alertDialog({ title: "Nothing to apply", body: "No other panels in this row have images assigned." });
                   }}
                 >Copy crop to row</Button>
                 <Button size="small" variant="outlined" sx={{ fontSize: "0.6rem", textTransform: "none" }}
@@ -3287,7 +3534,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       updatePanel(r2, col, { crop: local.crop, crop_image: true, aspect_ratio_str: local.aspect_ratio_str });
                       applied++;
                     }
-                    if (applied === 0) alert("No other panels in this column have images assigned.");
+                    if (applied === 0) void alertDialog({ title: "Nothing to apply", body: "No other panels in this column have images assigned." });
                   }}
                 >Copy crop to column</Button>
               </Box>
@@ -3452,7 +3699,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       updatePanel(row, c2, adjPatch as unknown as Partial<PanelInfo>);
                       applied++;
                     }
-                    if (applied === 0) alert("No other panels in this row have images assigned.");
+                    if (applied === 0) void alertDialog({ title: "Nothing to apply", body: "No other panels in this row have images assigned." });
                   }}
                 >Copy adjustments to row</Button>
                 <Button size="small" variant="outlined" sx={{ fontSize: "0.6rem", textTransform: "none" }}
@@ -3477,7 +3724,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       updatePanel(r2, col, adjPatch as unknown as Partial<PanelInfo>);
                       applied++;
                     }
-                    if (applied === 0) alert("No other panels in this column have images assigned.");
+                    if (applied === 0) void alertDialog({ title: "Nothing to apply", body: "No other panels in this column have images assigned." });
                   }}
                 >Copy adjustments to column</Button>
               </Box>
@@ -3576,34 +3823,86 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
               />
             </Box>
 
-            {/* Pseudocolor */}
+            {/* Pseudocolor — fixed palette OR custom user-picked tint.
+                Custom mode stores a hex color (#rrggbb) directly in
+                `pseudocolor`, which the backend treats as a linear
+                black→tint ramp modulated by intensity.  This makes
+                volume / z-stack channels fully user-assignable instead
+                of being constrained to a fixed list like inferno. */}
             <Box>
               <Typography variant="caption" sx={{ fontSize: "0.7rem", fontWeight: 600, mb: 0.5, display: "block" }}>Pseudocolor (LUT)</Typography>
-              <Select
-                size="small"
-                value={local.pseudocolor || ""}
-                onChange={(e) => updateLocal({ pseudocolor: e.target.value })}
-                displayEmpty
-                sx={{ fontSize: "0.65rem", width: "100%", "& .MuiSelect-select": { py: 0.4, px: 1 } }}
-              >
-                <MenuItem value="" sx={{ fontSize: "0.65rem" }}>None (original colors)</MenuItem>
-                <MenuItem value="green" sx={{ fontSize: "0.65rem" }}>🟢 Green</MenuItem>
-                <MenuItem value="red" sx={{ fontSize: "0.65rem" }}>🔴 Red</MenuItem>
-                <MenuItem value="blue" sx={{ fontSize: "0.65rem" }}>🔵 Blue</MenuItem>
-                <MenuItem value="cyan" sx={{ fontSize: "0.65rem" }}>🔵 Cyan</MenuItem>
-                <MenuItem value="magenta" sx={{ fontSize: "0.65rem" }}>🟣 Magenta</MenuItem>
-                <MenuItem value="yellow" sx={{ fontSize: "0.65rem" }}>🟡 Yellow</MenuItem>
-                <MenuItem value="hot" sx={{ fontSize: "0.65rem" }}>🔥 Hot</MenuItem>
-                <MenuItem value="cool" sx={{ fontSize: "0.65rem" }}>❄️ Cool</MenuItem>
-                <MenuItem value="viridis" sx={{ fontSize: "0.65rem" }}>🌿 Viridis</MenuItem>
-                <MenuItem value="magma" sx={{ fontSize: "0.65rem" }}>🌋 Magma</MenuItem>
-                <MenuItem value="inferno" sx={{ fontSize: "0.65rem" }}>🔥 Inferno</MenuItem>
-                <MenuItem value="plasma" sx={{ fontSize: "0.65rem" }}>⚡ Plasma</MenuItem>
-              </Select>
+              {(() => {
+                const ps = local.pseudocolor || "";
+                const isCustom = ps.startsWith("#");
+                return (
+                  <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
+                    <Select
+                      size="small"
+                      value={isCustom ? "__custom__" : ps}
+                      onChange={(e) => {
+                        const v = e.target.value as string;
+                        if (v === "__custom__") {
+                          // Default custom tint = green if user had no prior hex
+                          updateLocal({ pseudocolor: isCustom ? ps : "#00ff66" });
+                        } else {
+                          updateLocal({ pseudocolor: v });
+                        }
+                      }}
+                      displayEmpty
+                      sx={{ flex: 1, fontSize: "0.65rem", "& .MuiSelect-select": { py: 0.4, px: 1 } }}
+                    >
+                      <MenuItem value="" sx={{ fontSize: "0.65rem" }}>None (original colors)</MenuItem>
+                      <MenuItem value="__custom__" sx={{ fontSize: "0.65rem" }}>🎨 Custom tint…</MenuItem>
+                      <MenuItem value="green" sx={{ fontSize: "0.65rem" }}>🟢 Green</MenuItem>
+                      <MenuItem value="red" sx={{ fontSize: "0.65rem" }}>🔴 Red</MenuItem>
+                      <MenuItem value="blue" sx={{ fontSize: "0.65rem" }}>🔵 Blue</MenuItem>
+                      <MenuItem value="cyan" sx={{ fontSize: "0.65rem" }}>🔵 Cyan</MenuItem>
+                      <MenuItem value="magenta" sx={{ fontSize: "0.65rem" }}>🟣 Magenta</MenuItem>
+                      <MenuItem value="yellow" sx={{ fontSize: "0.65rem" }}>🟡 Yellow</MenuItem>
+                      <MenuItem value="hot" sx={{ fontSize: "0.65rem" }}>🔥 Hot</MenuItem>
+                      <MenuItem value="cool" sx={{ fontSize: "0.65rem" }}>❄️ Cool</MenuItem>
+                      <MenuItem value="viridis" sx={{ fontSize: "0.65rem" }}>🌿 Viridis</MenuItem>
+                      <MenuItem value="magma" sx={{ fontSize: "0.65rem" }}>🌋 Magma</MenuItem>
+                      <MenuItem value="inferno" sx={{ fontSize: "0.65rem" }}>🔥 Inferno</MenuItem>
+                      <MenuItem value="plasma" sx={{ fontSize: "0.65rem" }}>⚡ Plasma</MenuItem>
+                    </Select>
+                    {isCustom && (
+                      <input
+                        type="color"
+                        value={ps}
+                        onChange={(e) => updateLocal({ pseudocolor: e.target.value })}
+                        title="Pick custom tint color"
+                        style={{ width: 32, height: 26, border: "1px solid #ccc", borderRadius: 4, padding: 0, cursor: "pointer" }}
+                      />
+                    )}
+                  </Box>
+                );
+              })()}
               <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", mt: 0.5, display: "block" }}>
-                Applies a false-color mapping to grayscale images
+                Applies a false-color mapping to grayscale images. Custom tint = linear black→color ramp scaled by intensity.
               </Typography>
             </Box>
+
+            {/* Per-channel tint controls — only renders for multichannel
+                TIFFs (CYX / ZCYX / ...).  Mirrors the block on the
+                Z-Stack tab so users still get channel controls when the
+                image has channels but no Z axis.  ChannelsBlock itself
+                returns null when the image isn't multichannel, so this
+                is safe to always mount. */}
+            {local.image_name && (
+              <ChannelsBlock
+                imageName={local.image_name}
+                panelRow={row}
+                panelCol={col}
+                onChange={() => {
+                  // Bump the panel's render so the new composite shows
+                  // up immediately. The store re-fetches the thumbnail
+                  // on its own; we just need to nudge the preview.
+                  try { useFigureStore.getState().requestPreview(); } catch { /* ignore */ }
+                  try { useFigureStore.getState().refreshPanelThumbnail(row, col); } catch { /* ignore */ }
+                }}
+              />
+            )}
           </Box>
         </TabPanel>
 
@@ -3627,44 +3926,51 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   <IconButton onClick={(e) => { e.stopPropagation(); removeLabel(i); }} size="small"><DeleteIcon sx={{ fontSize: 16 }} /></IconButton>
                 </Box>
 
-                {/* Text + Color */}
-                <Box sx={{ display: "flex", gap: 1, alignItems: "center", mb: 1.5 }}>
-                  <TextField label="Text" value={lbl.text} onChange={(e) => updateLabel(i, { text: e.target.value })} fullWidth size="small" sx={{ "& input": { fontSize: "0.8rem" } }} />
-                  <Tooltip title="Label color">
-                    <input type="color" value={lbl.color} onChange={(e) => updateLabel(i, { color: e.target.value, default_color: e.target.value })} style={{ width: 36, height: 36, border: "none", padding: 0, cursor: "pointer", borderRadius: 4, flexShrink: 0 }} />
-                  </Tooltip>
-                </Box>
+                {/* Text — uses StyledTextField with an inline hovermenu
+                    that handles per-character styling: font, size, B/I/U/
+                    Strike/Sup/Sub, colour.  Drag-select text to summon
+                    the toolbar; Cmd+A then apply to format the whole
+                    label at once.  Per-element font / size / colour
+                    fields were removed — the hovermenu is the single
+                    source of truth so users can't end up with conflicting
+                    settings that diverge between element-level defaults
+                    and per-segment overrides. */}
+                <StyledTextField
+                  label="Text"
+                  text={lbl.text}
+                  segments={lbl.styled_segments}
+                  defaultColor={lbl.color}
+                  fontStyle={lbl.font_style}
+                  baseFontSize={lbl.font_size}
+                  fonts={fonts}
+                  onChange={(text, styled_segments) => updateLabel(i, { text, styled_segments })}
+                />
 
-                {/* Font row */}
-                <Typography variant="caption" sx={{ fontWeight: 600, mb: 0.5, display: "block", color: "text.secondary" }}>Font</Typography>
-                <Box sx={{ display: "flex", gap: 1, alignItems: "center", mb: 1 }}>
-                  <FormControl size="small" sx={{ flex: 1 }}>
-                    <Select value={lbl.font_name} onChange={(e) => updateLabel(i, { font_name: e.target.value })} sx={{ fontSize: "0.75rem" }}>
-                      {fontList.slice().sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" })).map((f) => <MenuItem key={f} value={f} sx={{ fontSize: "0.75rem" }}>{f.replace(/\.(ttf|otf|ttc)$/i, "")}</MenuItem>)}
-                    </Select>
-                  </FormControl>
-                  <TextField label="Size" type="number" value={lbl.font_size} onChange={(e) => updateLabel(i, { font_size: Number(e.target.value) })}
-                    size="small" inputProps={{ min: 4, max: 200 }}
-                    sx={{ width: 72, "& input": { fontSize: "0.75rem", py: 0.5, textAlign: "center" } }}
-                  />
+                {/* Header-link toggle — keeps the label's font size
+                    in sync with the column/row header it lives under.
+                    Not a per-character setting, so it stays as a
+                    discrete control. */}
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, mt: 1, mb: 1 }}>
                   <Tooltip title={lbl.linked_to_header ? "Linked to header size (click to unlink)" : "Link to header font size"}>
                     <IconButton size="small" onClick={(e) => { e.stopPropagation(); updateLabel(i, { linked_to_header: !lbl.linked_to_header }); }}
                       sx={{ color: lbl.linked_to_header ? "primary.main" : "text.disabled" }}>
-                      {lbl.linked_to_header ? <span style={{ fontSize: "0.85rem" }}>{"\uD83D\uDD17"}</span> : <span style={{ fontSize: "0.85rem" }}>{"\u26D3"}</span>}
+                      <span style={{ fontSize: "0.85rem" }}>{lbl.linked_to_header ? "🔗" : "⛓"}</span>
                     </IconButton>
                   </Tooltip>
+                  <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary" }}>
+                    {lbl.linked_to_header ? "Linked to header size" : "Click to link to header size"}
+                  </Typography>
                 </Box>
 
-                {/* Style buttons */}
-                <Box sx={{ mb: 1.5 }}>
-                  <ToggleButtonGroup size="small" value={lbl.font_style} onChange={(_, v) => updateLabel(i, { font_style: v })}>
-                    <ToggleButton value="Bold" sx={{ px: 1, py: 0.25, fontWeight: 700, fontSize: "0.8rem" }}>B</ToggleButton>
-                    <ToggleButton value="Italic" sx={{ px: 1, py: 0.25, fontStyle: "italic", fontSize: "0.8rem" }}>I</ToggleButton>
-                    <ToggleButton value="Strikethrough" sx={{ px: 1, py: 0.25, textDecoration: "line-through", fontSize: "0.8rem" }}>S</ToggleButton>
-                    <ToggleButton value="Superscript" sx={{ px: 1, py: 0.25, fontSize: "0.7rem" }}>X<sup style={{ fontSize: "0.55rem" }}>2</sup></ToggleButton>
-                    <ToggleButton value="Subscript" sx={{ px: 1, py: 0.25, fontSize: "0.7rem" }}>X<sub style={{ fontSize: "0.55rem" }}>2</sub></ToggleButton>
-                  </ToggleButtonGroup>
-                </Box>
+                {/* Per-character Bold / Italic / etc. now live in the
+                    StyledTextField's inline hovermenu — select text in
+                    the field above, the toolbar pops up, apply any
+                    combination of styles to the selected range.  Same
+                    for whole-label changes: drag-select all text first.
+                    The duplicate per-element ToggleButtonGroup was
+                    removed (was confusing — two paths for the same
+                    setting that mutated different fields).  See:
+                    components/shared/StyledTextField.tsx */}
 
                 {/* Position */}
                 <Typography variant="caption" sx={{ fontWeight: 600, mb: 0.5, display: "block", color: "text.secondary" }}>Position</Typography>
@@ -3957,37 +4263,41 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 {/* ── Label ── */}
                 <Divider />
                 <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary" }}>Label</Typography>
-                <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-                  <TextField
-                    label="Label text"
-                    value={sb.label || autoLabel}
-                    onChange={(e) => updateLocal({ scale_bar: { ...sb, label: e.target.value } })}
-                    size="small" fullWidth
-                    sx={{ "& input": { fontSize: "0.8rem" } }}
-                  />
-                  <Tooltip title="Label color">
-                    <input type="color" value={sb.label_color || sb.bar_color}
-                      onChange={(e) => updateLocal({ scale_bar: { ...sb, label_color: e.target.value } })}
-                      style={{ width: 32, height: 32, border: "none", padding: 0, cursor: "pointer", borderRadius: 4, flexShrink: 0 }} />
-                  </Tooltip>
+                {/* Per-element font / size / colour pickers removed —
+                    all styling lives in the StyledTextField hovermenu.
+                    Drag-select the label text to summon the toolbar. */}
+                <StyledTextField
+                  label="Label text"
+                  text={sb.label || autoLabel}
+                  segments={sb.styled_segments}
+                  defaultColor={sb.label_color || sb.bar_color}
+                  fontStyle={sb.label_font_style}
+                  baseFontSize={sb.font_size}
+                  fonts={fonts}
+                  onChange={(text, styled_segments) =>
+                    updateLocal({ scale_bar: { ...sb, label: text, styled_segments } })}
+                />
+
+                {/* Above / below toggle.  Auto = decide based on whether
+                    the bar is in the top or bottom half of the panel
+                    (the historical behaviour).  Explicit above / below
+                    overrides that so users can put the label on whichever
+                    side they want even when the bar is in the centre. */}
+                <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 1 }}>
+                  <Typography variant="caption" sx={{ fontSize: "0.7rem", color: "text.secondary", flexShrink: 0 }}>
+                    Label position
+                  </Typography>
+                  <ToggleButtonGroup
+                    size="small"
+                    exclusive
+                    value={sb.label_position ?? "auto"}
+                    onChange={(_, v) => { if (v) updateLocal({ scale_bar: { ...sb, label_position: v } }); }}
+                  >
+                    <ToggleButton value="above" sx={{ px: 1, py: 0.25, fontSize: "0.65rem", textTransform: "none" }}>Above</ToggleButton>
+                    <ToggleButton value="auto"  sx={{ px: 1, py: 0.25, fontSize: "0.65rem", textTransform: "none" }}>Auto</ToggleButton>
+                    <ToggleButton value="below" sx={{ px: 1, py: 0.25, fontSize: "0.65rem", textTransform: "none" }}>Below</ToggleButton>
+                  </ToggleButtonGroup>
                 </Box>
-                <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-                  <FormControl size="small" sx={{ flex: 1 }}>
-                    <Select value={sb.font_name} onChange={(e) => updateLocal({ scale_bar: { ...sb, font_name: e.target.value } })} sx={{ fontSize: "0.75rem" }}>
-                      {fontList.slice().sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" })).map((f) => <MenuItem key={f} value={f} sx={{ fontSize: "0.75rem" }}>{f.replace(/\.(ttf|otf|ttc)$/i, "")}</MenuItem>)}
-                    </Select>
-                  </FormControl>
-                  <TextField label="Size" type="number" value={sb.font_size}
-                    onChange={(e) => updateLocal({ scale_bar: { ...sb, font_size: Number(e.target.value) } })}
-                    size="small" inputProps={{ min: 4, max: 100 }}
-                    sx={{ width: 72, "& input": { fontSize: "0.75rem", py: 0.5, textAlign: "center" } }} />
-                </Box>
-                <ToggleButtonGroup size="small" value={sb.label_font_style || []}
-                  onChange={(_, v) => updateLocal({ scale_bar: { ...sb, label_font_style: v } })}>
-                  <ToggleButton value="Bold" sx={{ px: 1, py: 0.25, fontWeight: 700, fontSize: "0.8rem" }}>B</ToggleButton>
-                  <ToggleButton value="Italic" sx={{ px: 1, py: 0.25, fontStyle: "italic", fontSize: "0.8rem" }}>I</ToggleButton>
-                  <ToggleButton value="Strikethrough" sx={{ px: 1, py: 0.25, textDecoration: "line-through", fontSize: "0.8rem" }}>S</ToggleButton>
-                </ToggleButtonGroup>
 
                 {/* ── Position ── */}
                 <Divider />
@@ -4177,58 +4487,21 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   <IconButton size="small" title="Reset rotation" onClick={() => updateSymbol(i, { rotation: 0 })} sx={{ p: 0.25, ml: 0.5 }}><RestartAltIcon sx={{ fontSize: 14 }} /></IconButton>
                 </Box>
 
-                {/* Label */}
+                {/* Label.  All styling (font, size, colour, B/I/U) is
+                    in the StyledTextField hovermenu — drag-select the
+                    text to summon the toolbar. */}
                 <Typography variant="caption" sx={{ fontWeight: 600, mt: 1.5, mb: 0.5, display: "block", fontSize: "0.7rem" }}>Label</Typography>
-                <Box sx={{ display: "flex", gap: 1, alignItems: "center", mb: 1 }}>
-                  <TextField label="Text" value={sym.label_text} onChange={(e) => updateSymbol(i, { label_text: e.target.value })} size="small" sx={{ flex: 1, "& input": { fontSize: "0.8rem", px: 1.5, py: 1 } }} />
-                  <input type="color" value={sym.label_color} onChange={(e) => updateSymbol(i, { label_color: e.target.value })} title="Label color" style={{ width: 32, height: 32, border: "none", padding: 0, cursor: "pointer", borderRadius: 4, flexShrink: 0 }} />
-                </Box>
-                {/* Label font */}
-                <Typography variant="caption" sx={{ fontWeight: 600, mb: 0.5, display: "block", fontSize: "0.7rem" }}>Font</Typography>
-                <Box sx={{ display: "flex", gap: 1, alignItems: "center", mb: 1 }}>
-                  <select
-                    value={sym.label_font_name || "arial.ttf"}
-                    onChange={(e) => updateSymbol(i, { label_font_name: e.target.value })}
-                    style={{ flex: 1, fontSize: "0.8rem", padding: "8px 10px", background: "transparent", color: "inherit", border: "1px solid rgba(255,255,255,0.23)", borderRadius: 4, minWidth: 0 }}
-                  >
-                    {fontList.slice().sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" })).map(f => (
-                      <option key={f} value={f}>{f.replace(/\.(ttf|otf|ttc)$/i, "")}</option>
-                    ))}
-                  </select>
-                  <TextField
-                    label="Size"
-                    type="number"
-                    value={sym.label_font_size}
-                    onChange={(e) => updateSymbol(i, { label_font_size: Number(e.target.value) || 10 })}
-                    size="small"
-                    inputProps={{ min: 4, max: 100 }}
-                    sx={{ width: 68, "& input": { fontSize: "0.8rem", px: 1, py: 0.75, textAlign: "center" } }}
-                  />
-                </Box>
-                <Box sx={{ display: "flex", gap: 0.5 }}>
-                  {["Bold", "Italic", "Strikethrough"].map(style => {
-                    const active = (sym.label_font_style || []).includes(style);
-                    return (
-                      <Button
-                        key={style}
-                        size="small"
-                        variant={active ? "contained" : "outlined"}
-                        onClick={() => {
-                          const styles = [...(sym.label_font_style || [])];
-                          if (active) styles.splice(styles.indexOf(style), 1);
-                          else styles.push(style);
-                          updateSymbol(i, { label_font_style: styles });
-                        }}
-                        sx={{ minWidth: 32, px: 0.5, py: 0.25, fontSize: "0.7rem",
-                              fontWeight: style === "Bold" ? 700 : 400,
-                              fontStyle: style === "Italic" ? "italic" : "normal",
-                              textDecoration: style === "Strikethrough" ? "line-through" : "none" }}
-                      >
-                        {style === "Bold" ? "B" : style === "Italic" ? "I" : "S"}
-                      </Button>
-                    );
-                  })}
-                </Box>
+                <StyledTextField
+                  label="Text"
+                  text={sym.label_text}
+                  segments={sym.label_styled_segments}
+                  defaultColor={sym.label_color}
+                  fontStyle={sym.label_font_style}
+                  baseFontSize={sym.label_font_size}
+                  fonts={fonts}
+                  onChange={(text, label_styled_segments) =>
+                    updateSymbol(i, { label_text: text, label_styled_segments })}
+                />
                 {/* Label position hint */}
                 {sym.label_text && (
                   <Typography variant="caption" sx={{ mt: 0.5, color: "text.secondary", fontSize: "0.65rem", fontStyle: "italic" }}>
@@ -4411,59 +4684,26 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     )}
                   </Box>
                 )}
-                {/* Measurement text customization */}
+                {/* Measurement text — styling via StyledTextField hover-
+                    menu only.  Per-element font / size / colour pickers
+                    removed; drag-select the text to apply formats. */}
                 {line.show_measure && (
                   <Box sx={{ mt: 1, display: "flex", flexDirection: "column", gap: 1 }}>
                     <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.7rem" }}>Measurement Label</Typography>
-                    <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-                      <TextField label="Text (auto if empty)" value={line.measure_text || ""} onChange={(e) => {
+                    <StyledTextField
+                      label="Text (auto if empty)"
+                      text={line.measure_text || ""}
+                      segments={line.measure_styled_segments}
+                      defaultColor={line.measure_color || "#FFFF00"}
+                      fontStyle={line.measure_font_style}
+                      baseFontSize={line.measure_font_size}
+                      fonts={fonts}
+                      onChange={(text, measure_styled_segments) => {
                         const lines2 = [...(local.lines ?? [])];
-                        lines2[i] = { ...lines2[i], measure_text: e.target.value };
+                        lines2[i] = { ...lines2[i], measure_text: text, measure_styled_segments };
                         updateLocal({ lines: lines2 } as unknown as Partial<PanelInfo>);
-                      }} size="small" sx={{ flex: 1, "& input": { fontSize: "0.8rem", px: 1.5, py: 1 } }} />
-                      <input type="color" value={line.measure_color || "#FFFF00"} onChange={(e) => {
-                        const lines2 = [...(local.lines ?? [])];
-                        lines2[i] = { ...lines2[i], measure_color: e.target.value };
-                        updateLocal({ lines: lines2 } as unknown as Partial<PanelInfo>);
-                      }} style={{ width: 32, height: 32, border: "none", padding: 0, cursor: "pointer", borderRadius: 4, flexShrink: 0 }} />
-                    </Box>
-                    <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-                      <select value={line.measure_font_name || "arial.ttf"} onChange={(e) => {
-                        const lines2 = [...(local.lines ?? [])];
-                        lines2[i] = { ...lines2[i], measure_font_name: e.target.value };
-                        updateLocal({ lines: lines2 } as unknown as Partial<PanelInfo>);
-                      }} style={{ flex: 1, fontSize: "0.8rem", padding: "8px 10px", background: "transparent", color: "inherit", border: "1px solid rgba(255,255,255,0.23)", borderRadius: 4, minWidth: 0 }}>
-                        {fontList.slice().sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" })).map(f => (
-                          <option key={f} value={f}>{f.replace(/\.(ttf|otf|ttc)$/i, "")}</option>
-                        ))}
-                      </select>
-                      <TextField label="Size" type="number" value={line.measure_font_size || 12} onChange={(e) => {
-                        const lines2 = [...(local.lines ?? [])];
-                        lines2[i] = { ...lines2[i], measure_font_size: Number(e.target.value) || 12 };
-                        updateLocal({ lines: lines2 } as unknown as Partial<PanelInfo>);
-                      }} size="small" inputProps={{ min: 4, max: 100 }} sx={{ width: 68, "& input": { fontSize: "0.8rem", px: 1, py: 0.75, textAlign: "center" } }} />
-                    </Box>
-                    <Box sx={{ display: "flex", gap: 0.5 }}>
-                      {["Bold", "Italic", "Strikethrough"].map(style => {
-                        const mfs = (line as any).measure_font_style || [];
-                        const active = mfs.includes(style);
-                        return (
-                          <Button key={style} size="small" variant={active ? "contained" : "outlined"}
-                            onClick={() => {
-                              const styles = [...mfs];
-                              if (active) styles.splice(styles.indexOf(style), 1); else styles.push(style);
-                              const lines2 = [...(local.lines ?? [])];
-                              lines2[i] = { ...lines2[i], measure_font_style: styles } as any;
-                              updateLocal({ lines: lines2 } as unknown as Partial<PanelInfo>);
-                            }}
-                            sx={{ minWidth: 32, px: 0.5, py: 0.25, fontSize: "0.7rem",
-                              fontWeight: style === "Bold" ? 700 : 400,
-                              fontStyle: style === "Italic" ? "italic" : "normal",
-                              textDecoration: style === "Strikethrough" ? "line-through" : "none" }}
-                          >{style === "Bold" ? "B" : style === "Italic" ? "I" : "S"}</Button>
-                        );
-                      })}
-                    </Box>
+                      }}
+                    />
                     <Typography variant="caption" sx={{ color: "text.secondary", fontSize: "0.65rem", fontStyle: "italic" }}>
                       Drag measurement text on preview to reposition
                     </Typography>
@@ -4723,57 +4963,24 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       </ToggleButtonGroup>
                     </Box>
 
-                    {/* Measurement label customization */}
+                    {/* Measurement label — styling via StyledTextField
+                        hovermenu only.  Per-element font / size / colour
+                        pickers removed; drag-select the text to apply
+                        formats. */}
                     <Typography variant="caption" sx={{ fontWeight: 600, mt: 1, mb: 0.5, display: "block", fontSize: "0.7rem" }}>Measurement Label</Typography>
-                    <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-                      <TextField label="Text (auto if empty)" value={area.measure_text || ""} onChange={(e) => {
+                    <StyledTextField
+                      label="Text (auto if empty)"
+                      text={area.measure_text || ""}
+                      segments={area.measure_styled_segments}
+                      defaultColor={area.measure_color || "#FFFF00"}
+                      baseFontSize={area.measure_font_size}
+                      fonts={fonts}
+                      onChange={(text, measure_styled_segments) => {
                         const areas = [...(local.areas ?? [])];
-                        areas[i] = { ...areas[i], measure_text: e.target.value };
+                        areas[i] = { ...areas[i], measure_text: text, measure_styled_segments };
                         updateLocal({ areas } as unknown as Partial<PanelInfo>);
-                      }} size="small" sx={{ flex: 1, "& input": { fontSize: "0.8rem", px: 1.5, py: 1 } }} />
-                      <input type="color" value={area.measure_color || "#FFFF00"} onChange={(e) => {
-                        const areas = [...(local.areas ?? [])];
-                        areas[i] = { ...areas[i], measure_color: e.target.value };
-                        updateLocal({ areas } as unknown as Partial<PanelInfo>);
-                      }} title="Text color" style={{ width: 28, height: 28, border: "none", padding: 0, cursor: "pointer", borderRadius: 4, flexShrink: 0 }} />
-                    </Box>
-                    <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-                      <select value={area.measure_font_name || "arial.ttf"} onChange={(e) => {
-                        const areas = [...(local.areas ?? [])];
-                        areas[i] = { ...areas[i], measure_font_name: e.target.value };
-                        updateLocal({ areas } as unknown as Partial<PanelInfo>);
-                      }} style={{ flex: 1, fontSize: "0.8rem", padding: "8px 10px", background: "transparent", color: "inherit", border: "1px solid rgba(255,255,255,0.23)", borderRadius: 4, minWidth: 0 }}>
-                        {fontList.slice().sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" })).map(f => (
-                          <option key={f} value={f}>{f.replace(/\.(ttf|otf|ttc)$/i, "")}</option>
-                        ))}
-                      </select>
-                      <TextField label="Size" type="number" value={area.measure_font_size || 12} onChange={(e) => {
-                        const areas = [...(local.areas ?? [])];
-                        areas[i] = { ...areas[i], measure_font_size: Number(e.target.value) || 12 };
-                        updateLocal({ areas } as unknown as Partial<PanelInfo>);
-                      }} size="small" inputProps={{ min: 4, max: 100 }} sx={{ width: 68, "& input": { fontSize: "0.8rem", px: 1, py: 0.75, textAlign: "center" } }} />
-                    </Box>
-                    <Box sx={{ display: "flex", gap: 0.5 }}>
-                      {["Bold", "Italic", "Strikethrough"].map(style => {
-                        const mfs = (area as any).measure_font_style || [];
-                        const active = mfs.includes(style);
-                        return (
-                          <Button key={style} size="small" variant={active ? "contained" : "outlined"}
-                            onClick={() => {
-                              const styles = [...mfs];
-                              if (active) styles.splice(styles.indexOf(style), 1); else styles.push(style);
-                              const areas = [...(local.areas ?? [])];
-                              areas[i] = { ...areas[i], measure_font_style: styles } as any;
-                              updateLocal({ areas } as unknown as Partial<PanelInfo>);
-                            }}
-                            sx={{ minWidth: 32, px: 0.5, py: 0.25, fontSize: "0.7rem",
-                              fontWeight: style === "Bold" ? 700 : 400,
-                              fontStyle: style === "Italic" ? "italic" : "normal",
-                              textDecoration: style === "Strikethrough" ? "line-through" : "none" }}
-                          >{style === "Bold" ? "B" : style === "Italic" ? "I" : "S"}</Button>
-                        );
-                      })}
-                    </Box>
+                      }}
+                    />
                     <Typography variant="caption" sx={{ color: "text.secondary", fontSize: "0.65rem", fontStyle: "italic" }}>
                       Drag measurement text on preview to reposition
                     </Typography>
@@ -4964,7 +5171,10 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       pickedSide = s; break;
                     }
                     if (!pickedSide) {
-                      alert("No free neighbouring panel — clear one before spawning an adjacent zoom.");
+                      void alertDialog({
+                        title: "No room for adjacent zoom",
+                        body: "No free neighbouring panel — clear one before spawning an adjacent zoom.",
+                      });
                       return;
                     }
                     // Ensure the spawn-source inset has an id so we
@@ -5430,6 +5640,76 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     fullWidth
                   />
                 </Box>
+
+                {/* Copy this primary inset to every other panel in the
+                    same row / column.  Disabled when this inset is a
+                    SECONDARY (spawned-from-another) inset — those have
+                    a parent_inset_id referring to a sibling on the
+                    same panel, which doesn't exist on the target
+                    panels, so the copy would fan out into orphaned
+                    chains.  Each target gets a fresh inset id so the
+                    save round-trip doesn't collide. */}
+                {!local.zoom_inset.parent_inset_id && config && (
+                  <Box sx={{ display: "flex", gap: 0.5, mt: 1 }}>
+                    <Button size="small" variant="outlined" sx={{ fontSize: "0.6rem", textTransform: "none" }}
+                      onClick={() => {
+                        if (!config || !local.zoom_inset) return;
+                        const updatePanel = useFigureStore.getState().updatePanel;
+                        const template = local.zoom_inset;
+                        let applied = 0;
+                        for (let c2 = 0; c2 < config.cols; c2++) {
+                          if (c2 === col) continue;
+                          const p2 = config.panels[row]?.[c2];
+                          if (!p2?.image_name) continue;
+                          // Fresh copy with a NEW id so the backend
+                          // treats it as a distinct inset (avoids
+                          // duplicate-id collisions when re-saving).
+                          const copy: ZoomInsetSettings = {
+                            ...template,
+                            id: makeInsetId(),
+                          };
+                          updatePanel(row, c2, {
+                            add_zoom_inset: true,
+                            zoom_inset: copy,
+                            zoom_insets: [copy],
+                          });
+                          applied++;
+                        }
+                        if (applied === 0) void alertDialog({
+                          title: "Nothing to apply",
+                          body: "No other panels in this row have images assigned.",
+                        });
+                      }}
+                    >Copy inset to row</Button>
+                    <Button size="small" variant="outlined" sx={{ fontSize: "0.6rem", textTransform: "none" }}
+                      onClick={() => {
+                        if (!config || !local.zoom_inset) return;
+                        const updatePanel = useFigureStore.getState().updatePanel;
+                        const template = local.zoom_inset;
+                        let applied = 0;
+                        for (let r2 = 0; r2 < config.rows; r2++) {
+                          if (r2 === row) continue;
+                          const p2 = config.panels[r2]?.[col];
+                          if (!p2?.image_name) continue;
+                          const copy: ZoomInsetSettings = {
+                            ...template,
+                            id: makeInsetId(),
+                          };
+                          updatePanel(r2, col, {
+                            add_zoom_inset: true,
+                            zoom_inset: copy,
+                            zoom_insets: [copy],
+                          });
+                          applied++;
+                        }
+                        if (applied === 0) void alertDialog({
+                          title: "Nothing to apply",
+                          body: "No other panels in this column have images assigned.",
+                        });
+                      }}
+                    >Copy inset to column</Button>
+                  </Box>
+                )}
 
                 <Typography variant="caption" sx={{ fontWeight: 600, mt: 2 }}>Styling</Typography>
                 <Divider />
@@ -5904,9 +6184,21 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   // (no image_name), so fall back to renderedPreviewB64
                   // for any tab when the base is empty — otherwise the
                   // <img> would be sourced from a broken data URI.
+                  //
+                  // CRITICAL: when the matplotlib preview is STALE (the
+                  // user just edited a label / scale bar / etc. and we
+                  // haven't received the new render yet), fall through
+                  // to the base preview so the CSS overlay is the only
+                  // visible copy.  Without this guard, drags and style
+                  // toggles produced a "ghost" of the old baked label
+                  // sitting next to the moving CSS overlay, AND a brief
+                  // jump-back-then-forward after drop while waiting
+                  // for the new render.
                   const useRendered =
-                    ([TAB_ADJ, TAB_LABELS, TAB_SCALE, TAB_ZOOM].includes(tabIdx) && renderedPreviewB64) ||
-                    (!previewB64 && !!renderedPreviewB64);
+                    ([TAB_ADJ, TAB_LABELS, TAB_SCALE, TAB_ZOOM].includes(tabIdx)
+                      && renderedPreviewB64
+                      && !pendingRenderedRefresh) ||
+                    (!previewB64 && !!renderedPreviewB64 && !pendingRenderedRefresh);
                   return (
                     <Box
                       component="img"
@@ -5960,14 +6252,28 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     "verdana.ttf": "Verdana, sans-serif",
                   };
                   const fontFamily = fontFamilyMap[lbl.font_name] || lbl.font_name.replace(/\.ttf$/i, "") + ", sans-serif";
-                  // When rendered preview is active, labels are baked in.
-                  // CSS overlays serve as invisible drag hitboxes only —
-                  // EXCEPT the currently-selected label, which we keep
-                  // visible so the user sees what they are dragging (fixes
-                  // the "new label invisible while dragging" bug).
+                  // Hide CSS overlay text ONLY when the displayed image
+                  // is the matplotlib-rendered version (which already
+                  // has labels baked into the PNG).  When the user is
+                  // mid-edit and `pendingRenderedRefresh` flips the
+                  // displayed image back to the BASE preview (no
+                  // labels), the CSS overlay becomes the sole label
+                  // copy — and must be visible.
+                  //
+                  // The OLD logic used `hasRendered = !!renderedPreviewB64`
+                  // which stayed true as soon as the FIRST matplotlib
+                  // refresh ever landed.  That meant during subsequent
+                  // edits we'd hide the CSS text even though the
+                  // displayed image was the BASE preview (because
+                  // useRendered above falls back to base while stale).
+                  // Result: the label disappeared briefly during every
+                  // edit.  Aligning hideText with useRendered keeps the
+                  // two layers in sync.
                   const hasRendered = !!renderedPreviewB64;
+                  const matplotlibShowing = hasRendered && !pendingRenderedRefresh;
                   const isSelected = selectedLabelIdx === i;
-                  const hideText = hasRendered && !isSelected;
+                  const isDragging = draggingLabelIdx === i;
+                  const hideText = matplotlibShowing && !isDragging;
                   return (
                     <Box
                       key={`label-${i}`}
@@ -5999,6 +6305,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         e.preventDefault();
                         e.stopPropagation();
                         setSelectedLabelIdx(i);
+                        setDraggingLabelIdx(i);  // show CSS overlay text during drag
                         const imgEl = (e.currentTarget.parentElement?.querySelector("img")) as HTMLImageElement | null;
                         if (!imgEl) return;
                         const onMove = (ev: MouseEvent) => {
@@ -6011,6 +6318,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         const onUp = () => {
                           window.removeEventListener("mousemove", onMove);
                           window.removeEventListener("mouseup", onUp);
+                          setDraggingLabelIdx(-1);  // matplotlib preview re-renders, no need for live CSS text any more
                           setTimeout(() => refreshPreview(), 0);
                         };
                         window.addEventListener("mousemove", onMove);
@@ -6018,7 +6326,28 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       } : undefined}
                       onClick={() => setSelectedLabelIdx(i)}
                     >
-                      {lbl.text || `L${i + 1}`}
+                      {/* Per-character styled rendering when segments
+                          are present.  The CSS overlay shows what the
+                          final rendered PNG will look like (during the
+                          short window before the matplotlib re-render
+                          comes back from the backend) so the user sees
+                          immediate visual feedback for B/I/U/colour/
+                          font changes in the inline toolbar.
+                          When `hideText` is true (matplotlib-rendered
+                          preview is on screen and label isn't selected),
+                          render the segments invisibly so the baked
+                          rendering is the only visible copy — without
+                          this, the spans' per-seg colour overrode the
+                          parent's `color: transparent` and produced
+                          duplicate labels on top of the PNG. */}
+                      {(lbl.styled_segments && lbl.styled_segments.length > 0)
+                        ? renderStyledSegmentsInline(
+                            lbl.styled_segments,
+                            previewW / 216,
+                            lbl.color || lbl.default_color || "#fff",
+                            hideText,
+                          )
+                        : (lbl.text || `L${i + 1}`)}
                     </Box>
                   );
                 })}
@@ -6070,7 +6399,19 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     posXPct = edgePct;
                     posYPct = edgePct;
                   }
-                  const isBottom = posYPct > 50;
+                  // Whether the label sits above or below the bar.
+                  // sb.label_position is the explicit user pick:
+                  //   "above" / "below" → honour that
+                  //   "auto"           → fall back to vertical position
+                  // (default behaviour: bar near bottom → label above,
+                  // bar near top → label below, so the label doesn't
+                  // clip off the image edge).
+                  const labelPosMode = (sb.label_position ?? "auto") as "auto" | "above" | "below";
+                  const isBottom = labelPosMode === "above"
+                    ? true
+                    : labelPosMode === "below"
+                      ? false
+                      : posYPct > 50;
                   const isRight = posXPct > 50;
                   // Position matching backend: bar right edge at (100-edge)%,
                   // bar bottom at (100-edge)% - 5px offset
@@ -6165,15 +6506,33 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       return (
                         <>
                           <Box sx={{ width: barW, height: barH, bgcolor: local.scale_bar!.bar_color, borderRadius: 0.25 }} />
-                          <Typography sx={{ fontSize: `${fontSize}px`, color: local.scale_bar!.label_color || local.scale_bar!.bar_color, textShadow: "0 1px 2px rgba(0,0,0,0.8)", whiteSpace: "nowrap" }}>
-                            {local.scale_bar!.label || (() => {
-                              const sbU = local.scale_bar!.unit || "um";
-                              const uToUm: Record<string, number> = { km: 1e9, m: 1e6, cm: 10000, mm: 1000, um: 1, nm: 0.001, pm: 1e-6 };
-                              const uLabels: Record<string, string> = { km: "km", m: "m", cm: "cm", mm: "mm", um: "\u00B5m", nm: "nm", pm: "pm" };
-                              const val = local.scale_bar!.bar_length_microns / (uToUm[sbU] || 1);
-                              return `${Number(val.toPrecision(6))} ${uLabels[sbU] || sbU}`;
-                            })()}
-                          </Typography>
+                          {/* When styled_segments are present (user
+                              applied per-character styling via the
+                              StyledTextField hovermenu), render each
+                              segment as its own span so the Bold /
+                              Italic / colour / font overrides show
+                              live in the dialog preview before the
+                              matplotlib re-render lands. */}
+                          {(local.scale_bar!.styled_segments && local.scale_bar!.styled_segments.length > 0) ? (
+                            <Typography sx={{ fontSize: `${fontSize}px`, color: local.scale_bar!.label_color || local.scale_bar!.bar_color, textShadow: "0 1px 2px rgba(0,0,0,0.8)", whiteSpace: "nowrap", fontFamily: (local.scale_bar!.font_name || "arial.ttf").replace(/\.(ttf|otf|ttc)$/i, "") + ", sans-serif" }}>
+                              {renderStyledSegmentsInline(
+                                local.scale_bar!.styled_segments,
+                                fontSize / (local.scale_bar!.font_size || 12),
+                                local.scale_bar!.label_color || local.scale_bar!.bar_color,
+                                false,
+                              )}
+                            </Typography>
+                          ) : (
+                            <Typography sx={{ fontSize: `${fontSize}px`, color: local.scale_bar!.label_color || local.scale_bar!.bar_color, textShadow: "0 1px 2px rgba(0,0,0,0.8)", whiteSpace: "nowrap", fontFamily: (local.scale_bar!.font_name || "arial.ttf").replace(/\.(ttf|otf|ttc)$/i, "") + ", sans-serif" }}>
+                              {local.scale_bar!.label || (() => {
+                                const sbU = local.scale_bar!.unit || "um";
+                                const uToUm: Record<string, number> = { km: 1e9, m: 1e6, cm: 10000, mm: 1000, um: 1, nm: 0.001, pm: 1e-6 };
+                                const uLabels: Record<string, string> = { km: "km", m: "m", cm: "cm", mm: "mm", um: "\u00B5m", nm: "nm", pm: "pm" };
+                                const val = local.scale_bar!.bar_length_microns / (uToUm[sbU] || 1);
+                                return `${Number(val.toPrecision(6))} ${uLabels[sbU] || sbU}`;
+                              })()}
+                            </Typography>
+                          )}
                         </>
                       );
                     })()}

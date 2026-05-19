@@ -37,6 +37,7 @@ import {
 import { useFigureStore } from "../../store/figureStore";
 import { api } from "../../api/client";
 import { CollageStrip } from "./CollageStrip";
+import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 
 type Corner = "nw" | "ne" | "sw" | "se";
 
@@ -200,14 +201,20 @@ export function CollageView() {
     if (projectInputRef.current) projectInputRef.current.value = "";
     if (!file) return;
     if (!file.name.toLowerCase().endsWith(".mpf")) {
-      window.alert("Please choose a .mpf project file.");
+      await alertDialog({
+        title: "Wrong file type",
+        body: "Please choose a .mpf project file.",
+      });
       return;
     }
-    const ok = window.confirm(
-      `Load "${file.name}" into the Multi-Panel Builder?\n\n` +
-      "Your current builder state will be replaced. Then you can review " +
-      "the figure and click \"Add to Collage\" to insert it.",
-    );
+    const ok = await confirmDialog({
+      title: "Load project into builder",
+      body: `Load "${file.name}" into the Multi-Panel Builder?\n\n`
+        + "Your current builder state will be replaced. Then you can review "
+        + 'the figure and click "Add to Collage" to insert it.',
+      confirmLabel: "Load",
+      destructive: true,
+    });
     if (!ok) return;
     try {
       try {
@@ -224,14 +231,18 @@ export function CollageView() {
       } catch {
         /* not in Tauri — fall through */
       }
-      window.alert(
-        "Project import currently requires the desktop app's native file " +
-        "dialog. Use Sidebar → Load Project from the Multi-Panel Builder, " +
-        "then return here and click Add to Collage.",
-      );
+      await alertDialog({
+        title: "Use desktop file picker",
+        body: "Project import currently requires the desktop app's native file "
+          + "dialog. Use Sidebar → Load Project from the Multi-Panel Builder, "
+          + "then return here and click Add to Collage.",
+      });
     } catch (err) {
       console.error(err);
-      window.alert("Could not load project. Check the console for details.");
+      await alertDialog({
+        title: "Load failed",
+        body: "Could not load project. Check the console for details.",
+      });
     }
   };
 

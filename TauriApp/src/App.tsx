@@ -1,5 +1,6 @@
 import { ThemeProvider, createTheme, CssBaseline } from "@mui/material";
 import { AppShell } from "./components/layout/AppShell";
+import { ConfirmHost } from "./components/shared/ConfirmDialog";
 
 const darkTheme = createTheme({
   palette: {
@@ -50,6 +51,11 @@ export default function App() {
     <ThemeProvider theme={darkTheme}>
       <CssBaseline />
       <AppShell />
+      {/* Singleton host for the imperative confirm()/alert() helpers
+          (see components/shared/ConfirmDialog.tsx).  Mounted once at
+          the root so any deeply-nested component can call confirm()
+          without needing to wire a provider through the tree. */}
+      <ConfirmHost />
     </ThemeProvider>
   );
 }
