@@ -3268,8 +3268,12 @@ import glob as glob_mod
 
 class RAnalysisRequest(BaseModel):
     code: str
-    data_csv: str  # CSV string
-    rscript_path: Optional[str] = None  # custom Rscript path
+    data_csv: str = ""  # CSV string (optional — node graph sends an empty header row)
+    rscript_path: Optional[str] = None        # legacy field name
+    interpreter_path: Optional[str] = None    # unified field across engines
+    # Tolerate the node graph's `measurements_csv` alias so older
+    # frontends and the new analysis canvas can share this endpoint.
+    measurements_csv: Optional[str] = None
 
 
 def _find_rscript(custom_path: Optional[str] = None) -> Optional[str]:
@@ -3335,6 +3339,15 @@ def check_r_installed(rscript_path: Optional[str] = None):
 @app.post("/api/analysis/run-r")
 def run_r_code(body: RAnalysisRequest):
     """Run R code with provided data, return stdout/stderr and any generated plots."""
+    # `interpreter_path` is the unified name across engines; fall
+    # back to the legacy `rscript_path` field if only the older name
+    # is sent (keeps the analysis canvas + saved projects in sync).
+    if body.interpreter_path and not body.rscript_path:
+        body.rscript_path = body.interpreter_path
+    # New analysis canvas sends `measurements_csv`; legacy field is
+    # `data_csv`.  Coalesce.
+    if (not body.data_csv) and body.measurements_csv:
+        body.data_csv = body.measurements_csv
     rscript = _find_rscript(body.rscript_path)
     if not rscript:
         return {"success": False, "stdout": "", "stderr": "R is not installed. Please install R from https://cran.r-project.org/ or specify the Rscript path.", "plots": [], "tables": []}
@@ -3471,19 +3484,138 @@ def _collect_analysis_insets(include_thumbnails: bool = True):
     label (panel coords + inset index), location, dimensions, AND
     (when `include_thumbnails` is True) a base64 PNG thumbnail so the
     Analysis dialog can show the user exactly which pixels its
-    pipelines will operate on.
+    pipelines will operate on.  Also ships a SECOND thumbnail of the
+    PARENT panel (post-crop, post-rotation) plus the inset's bbox in
+    that parent's coordinate space — the analysis library uses these
+    to render a hover preview showing the inset's location on the
+    host panel.
 
-    Thumbnails go through `_extract_inset_image()` so they reflect
-    the same cascade / crop math the runner uses; the result is then
-    PIL-thumbnailed to ≤256 px on the long edge to keep payload size
-    sane (a high-res inset would otherwise be ~MB).
+    Thumbnails go through `_extract_inset_image()` / `process_panel()`
+    so they reflect the same cascade / crop math the runner uses; the
+    result is PIL-thumbnailed to ≤256 px on the long edge to keep
+    payload size sane.  Parent thumbnails are memoised per (row, col)
+    so a panel with multiple insets doesn't re-render N times.
     """
     out: List[Dict[str, object]] = []
     if cfg is None:
         return out
+    parent_cache: Dict[Tuple[int, int], Dict[str, object]] = {}
+    # Per-panel POST-CROP pixel size — keyed by (r, c).  Used to
+    # build the figure-context thumbnail below; doubles as a way to
+    # avoid re-running process_panel just to read the dimensions.
+    panel_pix_size: Dict[Tuple[int, int], Tuple[int, int]] = {}
+    # Memoise raw processed PIL images per panel for the figure-grid
+    # composite (uniform-cell layout, see below).
+    panel_processed: Dict[Tuple[int, int], Image.Image] = {}
+
+    def _render_panel_thumb(panel_obj, r: int, c: int) -> Tuple[str, int, int]:
+        """Render the parent panel post-crop/rotate, sans overlays.
+        Returns (b64_thumb, full_w, full_h).  Memoised per (r, c).
+        """
+        cached = parent_cache.get((r, c))
+        if cached is not None:
+            return cached["thumb"], cached["w"], cached["h"]  # type: ignore[return-value]
+        b64 = ""
+        pw = ph = 0
+        try:
+            src_img = _get_panel_image(panel_obj) if panel_obj.image_name else None
+            if src_img is not None:
+                pc = _from_dict(PanelInfo, _to_dict(panel_obj))
+                pc.add_zoom_inset = False
+                pc.add_scale_bar = False
+                pc.labels = []
+                pc.symbols = []
+                pc.lines = []
+                pc.areas = []
+                processed = process_panel(src_img, pc, min_dims, loaded_images,
+                                          skip_labels=True, skip_symbols=True)
+                pw, ph = int(processed.size[0]), int(processed.size[1])
+                # Cache the FULL processed panel for the figure-grid
+                # composite built after the per-source loop completes.
+                panel_processed[(r, c)] = processed
+                panel_pix_size[(r, c)] = (pw, ph)
+                pthumb = processed.copy()
+                pthumb.thumbnail((320, 320), Image.LANCZOS)
+                buf = io.BytesIO()
+                pthumb.convert("RGB").save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception as _e:
+            import sys as _s
+            print(f"[inset-sources] parent thumb failed for ({r},{c}): {_e}", file=_s.stderr, flush=True)
+        parent_cache[(r, c)] = {"thumb": b64, "w": pw, "h": ph}
+        return b64, pw, ph
+
     for r in range(cfg.rows):
         for c in range(cfg.cols):
             panel = cfg.panels[r][c]
+
+            # 1) PANEL-LEVEL flag — the cropped panel itself as a
+            #    source.  Lets users analyse the whole panel image
+            #    (or its crop region) without needing a zoom inset.
+            if getattr(panel, "include_in_analysis", False) and panel.image_name:
+                try:
+                    pthumb_b64, pw, ph = _render_panel_thumb(panel, r, c)
+                    if pw > 0 and ph > 0:
+                        # Inset thumbnail for the library card = a
+                        # smaller copy of the parent thumb (same
+                        # pixels), so the library row looks right.
+                        out.append({
+                            "key": f"r{r}c{c}_panel",
+                            "row": r, "col": c,
+                            "inset_index": -1,
+                            "inset_type": "Panel",
+                            "x": 0, "y": 0, "width": pw, "height": ph,
+                            "zoom_factor": 1.0,
+                            "label": f"R{r+1}C{c+1} (panel)",
+                            "natural_width": pw,
+                            "natural_height": ph,
+                            "thumbnail": pthumb_b64,
+                            "parent_thumbnail": pthumb_b64,
+                            "parent_natural_width": pw,
+                            "parent_natural_height": ph,
+                            "parent_bbox": [0, 0, pw, ph],
+                        })
+                except Exception as _e:
+                    import sys as _s
+                    print(f"[inset-sources] panel-as-source failed for ({r},{c}): {_e}", file=_s.stderr, flush=True)
+
+            # 2) AREA-LEVEL flag — masked polygon regions exposed
+            #    as image sources.  Each area's pixels are extracted
+            #    via _extract_area_image (defined below).
+            for ai, area in enumerate(getattr(panel, "areas", []) or []):
+                if not getattr(area, "include_in_analysis", False):
+                    continue
+                try:
+                    masked, bbox_px = _extract_area_image(r, c, ai)
+                    if masked is None or bbox_px is None:
+                        continue
+                    pthumb_b64, pw, ph = _render_panel_thumb(panel, r, c)
+                    mw, mh = int(masked.size[0]), int(masked.size[1])
+                    thumb = masked.copy()
+                    thumb.thumbnail((256, 256), Image.LANCZOS)
+                    tb = io.BytesIO(); thumb.convert("RGB").save(tb, format="PNG")
+                    out.append({
+                        "key": f"r{r}c{c}_area{ai}",
+                        "row": r, "col": c,
+                        "inset_index": -1,
+                        "area_index": ai,
+                        "inset_type": "Area",
+                        "x": int(bbox_px[0]), "y": int(bbox_px[1]),
+                        "width": int(bbox_px[2]), "height": int(bbox_px[3]),
+                        "zoom_factor": 1.0,
+                        "label": f"R{r+1}C{c+1} area {ai+1}" + (f" ({area.name})" if area.name else ""),
+                        "natural_width": mw,
+                        "natural_height": mh,
+                        "thumbnail": base64.b64encode(tb.getvalue()).decode("ascii"),
+                        "parent_thumbnail": pthumb_b64,
+                        "parent_natural_width": pw,
+                        "parent_natural_height": ph,
+                        "parent_bbox": [int(bbox_px[0]), int(bbox_px[1]), int(bbox_px[2]), int(bbox_px[3])],
+                    })
+                except Exception as _e:
+                    import sys as _s
+                    print(f"[inset-sources] area-as-source failed for ({r},{c}) area {ai}: {_e}", file=_s.stderr, flush=True)
+
             insets = _panel_zoom_insets(panel)
             for idx, zi in enumerate(insets):
                 if zi is None:
@@ -3502,6 +3634,10 @@ def _collect_analysis_insets(include_thumbnails: bool = True):
                     "natural_width": 0,
                     "natural_height": 0,
                     "thumbnail": "",
+                    "parent_thumbnail": "",
+                    "parent_natural_width": 0,
+                    "parent_natural_height": 0,
+                    "parent_bbox": [int(zi.x), int(zi.y), int(zi.width), int(zi.height)],
                 }
                 if include_thumbnails:
                     try:
@@ -3517,8 +3653,263 @@ def _collect_analysis_insets(include_thumbnails: bool = True):
                     except Exception as _e:
                         import sys as _s
                         print(f"[inset-sources] thumb extract failed for ({r},{c}) inset {idx}: {_e}", file=_s.stderr, flush=True)
+                    # Parent panel preview — memoised per (r, c).
+                    try:
+                        cached = parent_cache.get((r, c))
+                        if cached is None:
+                            pthumb_b64 = ""
+                            pw = ph = 0
+                            src_img = _get_panel_image(panel) if panel.image_name else None
+                            if src_img is not None:
+                                # Render the parent with no zoom-inset
+                                # overlay so the bbox we ship lines up
+                                # with what the user sees in the popover.
+                                panel_copy = _from_dict(PanelInfo, _to_dict(panel))
+                                panel_copy.add_zoom_inset = False
+                                panel_copy.add_scale_bar = False
+                                panel_copy.labels = []
+                                panel_copy.symbols = []
+                                panel_copy.lines = []
+                                panel_copy.areas = []
+                                processed = process_panel(src_img, panel_copy, min_dims, loaded_images,
+                                                           skip_labels=True, skip_symbols=True)
+                                pw, ph = int(processed.size[0]), int(processed.size[1])
+                                pthumb = processed.copy()
+                                pthumb.thumbnail((320, 320), Image.LANCZOS)
+                                buf = io.BytesIO()
+                                pthumb.convert("RGB").save(buf, format="PNG")
+                                pthumb_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                            cached = {"thumb": pthumb_b64, "w": pw, "h": ph}
+                            parent_cache[(r, c)] = cached
+                        entry["parent_thumbnail"] = cached["thumb"]
+                        entry["parent_natural_width"] = cached["w"]
+                        entry["parent_natural_height"] = cached["h"]
+                    except Exception as _e:
+                        import sys as _s
+                        print(f"[inset-sources] parent thumb failed for ({r},{c}): {_e}", file=_s.stderr, flush=True)
                 out.append(entry)
+
+    # ── Figure-context thumbnail ─────────────────────────────────
+    # Build a single low-res tiled thumbnail of the WHOLE figure
+    # (every image-bearing panel, not just those flagged for
+    # analysis) so the analysis library's hover preview shows where
+    # the source sits relative to the entire figure.  Each cell is
+    # `CELL` pixels; panels are letterboxed to a uniform cell rect
+    # so the grid is coherent regardless of varying panel aspect
+    # ratios.  We pre-render every panel that wasn't already in
+    # `panel_processed` so even purely "context" panels appear.
+    try:
+        rows_n, cols_n = cfg.rows, cfg.cols
+        CELL = 110
+        # First pass — fill `panel_processed` for every image-bearing
+        # panel so the composite shows the full figure, not just the
+        # analysis-flagged subset.
+        for rr in range(rows_n):
+            for cc in range(cols_n):
+                if (rr, cc) in panel_processed:
+                    continue
+                p = cfg.panels[rr][cc]
+                if not p or not getattr(p, "image_name", ""):
+                    continue
+                try:
+                    src_img = _get_panel_image(p)
+                    if src_img is None:
+                        continue
+                    pc = _from_dict(PanelInfo, _to_dict(p))
+                    pc.add_zoom_inset = False
+                    pc.add_scale_bar = False
+                    pc.labels = []
+                    pc.symbols = []
+                    pc.lines = []
+                    pc.areas = []
+                    proc = process_panel(src_img, pc, min_dims, loaded_images,
+                                         skip_labels=True, skip_symbols=True)
+                    panel_processed[(rr, cc)] = proc
+                    panel_pix_size[(rr, cc)] = (int(proc.size[0]), int(proc.size[1]))
+                except Exception as _e:
+                    import sys as _s
+                    print(f"[inset-sources] panel render for figure-context failed at ({rr},{cc}): {_e}",
+                          file=_s.stderr, flush=True)
+        figW = max(1, cols_n * CELL)
+        figH = max(1, rows_n * CELL)
+        composite = Image.new("RGB", (figW, figH), (245, 245, 245))
+        cell_geom: Dict[Tuple[int, int], Tuple[int, int, int, int]] = {}  # (r,c) -> (cx, cy, cw, ch)
+        for (r, c), pim in panel_processed.items():
+            pw, ph = pim.size
+            if pw <= 0 or ph <= 0:
+                continue
+            scale = min(CELL / pw, CELL / ph)
+            cw, ch = max(1, int(pw * scale)), max(1, int(ph * scale))
+            cell = pim.copy()
+            cell.thumbnail((cw, ch), Image.LANCZOS)
+            cx = c * CELL + (CELL - cw) // 2
+            cy = r * CELL + (CELL - ch) // 2
+            composite.paste(cell, (cx, cy))
+            cell_geom[(r, c)] = (cx, cy, cw, ch)
+        # Light cell borders + RxCy labels in the top-left of each
+        # cell so users can identify which panel a region belongs to.
+        try:
+            from PIL import ImageDraw as _ImageDraw, ImageFont as _ImageFont
+            d = _ImageDraw.Draw(composite)
+            try:
+                font = _ImageFont.load_default()
+            except Exception:
+                font = None
+            for r in range(rows_n):
+                for c in range(cols_n):
+                    d.rectangle([c * CELL, r * CELL, (c + 1) * CELL - 1, (r + 1) * CELL - 1],
+                                outline=(190, 190, 190), width=1)
+                    if font is not None:
+                        d.text((c * CELL + 3, r * CELL + 2), f"R{r+1}C{c+1}",
+                               fill=(110, 110, 110), font=font)
+        except Exception:
+            pass
+        buf = io.BytesIO()
+        composite.save(buf, format="PNG", optimize=True)
+        figure_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        for entry in out:
+            try:
+                rr = int(entry.get("row", 0)); cc = int(entry.get("col", 0))
+                if (rr, cc) not in cell_geom or (rr, cc) not in panel_pix_size:
+                    continue
+                cx, cy, cw, ch = cell_geom[(rr, cc)]
+                pw, ph = panel_pix_size[(rr, cc)]
+                bbox = entry.get("parent_bbox") or [0, 0, pw, ph]
+                bx, by, bw, bh = (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
+                sx = cw / max(1, pw); sy = ch / max(1, ph)
+                fx = int(cx + bx * sx)
+                fy = int(cy + by * sy)
+                fw = max(2, int(bw * sx))
+                fh = max(2, int(bh * sy))
+                entry["figure_thumbnail"] = figure_b64
+                entry["figure_natural_width"] = figW
+                entry["figure_natural_height"] = figH
+                entry["figure_bbox"] = [fx, fy, fw, fh]
+                entry["figure_cell_bbox"] = [cx, cy, cw, ch]
+            except Exception:
+                continue
+    except Exception as _e:
+        import sys as _s
+        print(f"[inset-sources] figure-context build failed: {_e}", file=_s.stderr, flush=True)
+
     return out
+
+
+def _extract_area_image(row: int, col: int, area_index: int) -> Tuple[Optional[Image.Image], Optional[Tuple[int, int, int, int]]]:
+    """Return (masked_image, bbox_in_processed_panel_coords) for the
+    area annotation at (row, col)[area_index].  The masked image has
+    pixels OUTSIDE the polygon set to transparent / black so the
+    analysis pipeline operates only on the area's interior.  Bbox is
+    in the processed (post-crop / rotate) panel's pixel space.
+
+    Returns (None, None) when the area / panel doesn't exist or
+    can't be extracted.
+    """
+    if cfg is None or row < 0 or col < 0 or row >= cfg.rows or col >= cfg.cols:
+        return None, None
+    panel = cfg.panels[row][col]
+    areas = list(getattr(panel, "areas", []) or [])
+    if area_index < 0 or area_index >= len(areas):
+        return None, None
+    area = areas[area_index]
+    src_img = _get_panel_image(panel) if panel.image_name else None
+    if src_img is None:
+        return None, None
+
+    # Process the panel the same way the figure renderer does so
+    # the area's % coords land on the right pixels.
+    pc = _from_dict(PanelInfo, _to_dict(panel))
+    pc.add_zoom_inset = False
+    pc.add_scale_bar = False
+    pc.labels = []
+    pc.symbols = []
+    pc.lines = []
+    pc.areas = []
+    processed = process_panel(src_img, pc, min_dims, loaded_images,
+                              skip_labels=True, skip_symbols=True)
+    W, H = processed.size
+
+    # Resolve polygon points (in % of the processed panel) into pixels.
+    pts: List[Tuple[float, float]] = []
+    shape = (area.shape or "Rectangle")
+    if shape in ("Rectangle", "Ellipse") and len(area.points) >= 2:
+        # First point = centre (x%, y%); second point = (w%, h%).
+        cx, cy = area.points[0]
+        ww, hh = area.points[1]
+        x0 = (cx - ww / 2) / 100.0 * W
+        y0 = (cy - hh / 2) / 100.0 * H
+        x1 = (cx + ww / 2) / 100.0 * W
+        y1 = (cy + hh / 2) / 100.0 * H
+        if shape == "Rectangle":
+            pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        else:
+            import math as _math
+            steps = 64
+            cxp = (x0 + x1) / 2; cyp = (y0 + y1) / 2
+            rx = (x1 - x0) / 2; ry = (y1 - y0) / 2
+            pts = [(cxp + rx * _math.cos(2 * _math.pi * i / steps),
+                    cyp + ry * _math.sin(2 * _math.pi * i / steps)) for i in range(steps)]
+    elif shape in ("Custom", "Magic") and len(area.points) >= 3:
+        pts = [(p[0] / 100.0 * W, p[1] / 100.0 * H) for p in area.points]
+    else:
+        return None, None
+
+    # Bbox-crop the masked region for a tight output image.
+    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+    bx = max(0, int(min(xs))); by = max(0, int(min(ys)))
+    bw = min(W - bx, int(max(xs)) - bx + 1)
+    bh = min(H - by, int(max(ys)) - by + 1)
+    if bw <= 0 or bh <= 0:
+        return None, None
+
+    # Render a mask the same size as `processed`, then crop both to
+    # the area's bbox so the output is just the masked ROI.
+    from PIL import ImageDraw as _ImageDraw
+    mask = Image.new("L", (W, H), 0)
+    _ImageDraw.Draw(mask).polygon([(p[0], p[1]) for p in pts], fill=255)
+    masked_full = Image.composite(processed, Image.new("RGB", (W, H), (0, 0, 0)), mask)
+    masked = masked_full.crop((bx, by, bx + bw, by + bh))
+    return masked, (bx, by, bw, bh)
+
+
+def _extract_source_image(s: Dict[str, object]) -> Optional[Image.Image]:
+    """Unified source-image dispatcher.  The analysis library now
+    exposes three flavours of source (zoom insets, whole panels,
+    area annotations); each materialises through a different path
+    but the runners just want a PIL image.  We route by the key
+    suffix ("_panel" / "_area<N>") with `inset_index` as the legacy
+    fallback for normal zoom-inset sources."""
+    key = str(s.get("key") or "")
+    try:
+        row = int(s.get("row") or 0)
+        col = int(s.get("col") or 0)
+    except Exception:
+        return None
+    if cfg is None or row < 0 or col < 0 or row >= cfg.rows or col >= cfg.cols:
+        return None
+    if key.endswith("_panel") or s.get("inset_type") == "Panel":
+        panel = cfg.panels[row][col]
+        src_img = _get_panel_image(panel) if panel.image_name else None
+        if src_img is None:
+            return None
+        pc = _from_dict(PanelInfo, _to_dict(panel))
+        pc.add_zoom_inset = False
+        pc.add_scale_bar = False
+        pc.labels = []; pc.symbols = []; pc.lines = []; pc.areas = []
+        return process_panel(src_img, pc, min_dims, loaded_images,
+                             skip_labels=True, skip_symbols=True)
+    if "_area" in key or s.get("inset_type") == "Area":
+        import re as _re
+        m = _re.search(r"_area(\d+)$", key)
+        ai = int(m.group(1)) if m else int(s.get("area_index") or 0)
+        masked, _bbox = _extract_area_image(row, col, ai)
+        return masked
+    # Standard zoom inset.
+    try:
+        idx = int(s.get("inset_index") or 0)
+    except Exception:
+        idx = 0
+    return _extract_inset_image(row, col, idx)
 
 
 def _extract_inset_image(row: int, col: int, inset_index: int) -> Optional[Image.Image]:
@@ -3635,6 +4026,10 @@ class PyAnalysisRequest(BaseModel):
     # outputs without going through the inset registry.
     extra_inputs: List[Dict[str, object]] = []
     timeout_sec: int = 30
+    # Optional custom Python interpreter path. When set, run the
+    # script via this binary instead of `sys.executable`; lets users
+    # pin a particular venv / conda environment / system Python.
+    interpreter_path: Optional[str] = None
 
 
 @app.post("/api/analysis/run-python")
@@ -3673,10 +4068,9 @@ def run_python_pipeline(body: PyAnalysisRequest):
             try:
                 key = str(s.get("key", ""))
                 r = int(s.get("row", -1)); c = int(s.get("col", -1))
-                i = int(s.get("inset_index", -1))
-                if not key or r < 0 or c < 0 or i < 0:
+                if not key or r < 0 or c < 0:
                     continue
-                img = _extract_inset_image(r, c, i)
+                img = _extract_source_image(s)  # dispatches: inset / panel / area
                 if img is None:
                     continue
                 arr = _np.asarray(img.convert("RGB"))
@@ -3685,7 +4079,7 @@ def run_python_pipeline(body: PyAnalysisRequest):
                     "width": int(arr.shape[1]),
                     "height": int(arr.shape[0]),
                     "label": str(s.get("label") or key),
-                    "row": r, "col": c, "inset_index": i,
+                    "row": r, "col": c, "inset_index": int(s.get("inset_index", -1)),
                 }
             except Exception as _e:
                 import sys as __s
@@ -3853,9 +4247,20 @@ except Exception:
         with open(script_path, "w") as f:
             f.write(harness)
 
+        # Resolve which Python binary to use.  User override wins
+        # (Settings dialog stores `interpreter_path` per-engine);
+        # otherwise we fall back to the sidecar's own sys.executable
+        # so the pipeline shares the bundled deps.
+        py_bin = _sys.executable
+        if body.interpreter_path and os.path.isfile(body.interpreter_path):
+            py_bin = body.interpreter_path
+        elif body.interpreter_path:
+            return {"success": False, "stdout": "",
+                    "stderr": f"Configured Python interpreter not found at: {body.interpreter_path}",
+                    "plots": [], "tables": [], "images": []}
         try:
             result = subprocess.run(
-                [_sys.executable, script_path],
+                [py_bin, script_path],
                 capture_output=True, text=True, timeout=timeout_sec, cwd=tmpdir,
             )
         except subprocess.TimeoutExpired:
@@ -3905,27 +4310,44 @@ except Exception:
         }
 
 
-def _find_matlab_executable() -> Tuple[Optional[str], str]:
+def _find_matlab_executable(custom_path: Optional[str] = None) -> Tuple[Optional[str], str]:
     """Locate a MATLAB-or-compatible interpreter on the host. Returns
     (path, kind) where kind ∈ {"matlab", "octave", ""}.
 
     Octave is preferred when both are installed because it starts in
-    ~1 s while MATLAB takes 15-30 s and consumes a license. The user
-    can override by editing this list. Detection is best-effort:
-      • shutil.which("octave") / which("matlab")
-      • common install paths on macOS / Linux / Windows
+    ~1 s while MATLAB takes 15-30 s and consumes a license.
+
+    Detection order: custom_path > PATH > common install dirs across
+    macOS / Linux / Windows.
     """
     import shutil as _shutil
+    import glob as _g
+    # 0. User override wins outright.
+    if custom_path and os.path.isfile(custom_path):
+        name = os.path.basename(custom_path).lower()
+        kind = "octave" if "octave" in name else "matlab"
+        return custom_path, kind
     # 1. Octave (free, fast startup)
-    p = _shutil.which("octave")
-    if p:
-        return p, "octave"
+    for c in ("octave-cli", "octave"):
+        p = _shutil.which(c)
+        if p:
+            return p, "octave"
     for candidate in [
         "/opt/homebrew/bin/octave", "/usr/local/bin/octave", "/usr/bin/octave",
         "/Applications/Octave.app/Contents/Resources/usr/bin/octave",
     ]:
         if os.path.isfile(candidate):
             return candidate, "octave"
+    # 1b. Windows Octave (Octave-Forge MinGW build).
+    prog_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    prog_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    for pf in [prog_files, prog_files_x86, r"C:\Octave"]:
+        for hit in _g.glob(os.path.join(pf, "Octave*", "*", "bin", "octave-cli.exe")):
+            if os.path.isfile(hit):
+                return hit, "octave"
+        for hit in _g.glob(os.path.join(pf, "GNU Octave", "Octave-*", "mingw64", "bin", "octave-cli.exe")):
+            if os.path.isfile(hit):
+                return hit, "octave"
     # 2. MATLAB (commercial, slow startup)
     p = _shutil.which("matlab")
     if p:
@@ -3938,26 +4360,40 @@ def _find_matlab_executable() -> Tuple[Optional[str], str]:
     ]:
         if os.path.isfile(candidate):
             return candidate, "matlab"
+    # 2b. Windows MATLAB.  C:\Program Files\MATLAB\R20*\bin\matlab.exe.
+    for pf in [prog_files, prog_files_x86]:
+        for hit in _g.glob(os.path.join(pf, "MATLAB", "R*", "bin", "matlab.exe")):
+            if os.path.isfile(hit):
+                return hit, "matlab"
     return None, ""
 
 
 @app.get("/api/analysis/check-matlab")
-def check_matlab_installed():
+def check_matlab_installed(path: Optional[str] = None):
     """Tell the frontend whether the Run MATLAB button should be
-    enabled, and which interpreter it'd use."""
-    path, kind = _find_matlab_executable()
-    return {"installed": bool(path), "kind": kind, "path": path or ""}
+    enabled, and which interpreter it'd use.  Accepts an optional
+    ?path= override so the Settings dialog can probe a user-pinned
+    binary before the user commits to it."""
+    found, kind = _find_matlab_executable(path)
+    return {"installed": bool(found), "kind": kind, "path": found or ""}
 
 
-def _find_imagej_executable():
+def _find_imagej_executable(custom_path: Optional[str] = None):
     """Locate an ImageJ / Fiji executable on PATH or in common
     install locations. Returns (path, kind) where kind is one of
     {'fiji', 'imagej'} or '' when nothing is installed. ImageJ-*
-    names (e.g. ImageJ-linux64, ImageJ-macosx) are version-suffixed
-    so we have to glob a couple of well-known parents."""
+    names (e.g. ImageJ-linux64, ImageJ-macosx, ImageJ-win64.exe)
+    are version-suffixed so we glob a couple of well-known parents.
+
+    Detection order: custom_path > PATH > common install dirs on
+    macOS / Linux / Windows."""
     import shutil as _sh
     import glob as _g
     import os as _os
+    # 0. User override.
+    if custom_path and _os.path.isfile(custom_path):
+        kind = "fiji" if "Fiji" in custom_path or "fiji" in custom_path.lower() else "imagej"
+        return custom_path, kind
     # 1. shutil.which preferring Fiji.
     for cand in ("ImageJ-linux64", "ImageJ-macosx", "ImageJ-win64.exe",
                  "fiji", "fiji-macosx", "Fiji.app/ImageJ-macosx", "ImageJ"):
@@ -3973,23 +4409,398 @@ def _find_imagej_executable():
         _os.path.expanduser("~/Applications/Fiji.app/Contents/MacOS/ImageJ-macosx"),
         _os.path.expanduser("~/Fiji.app/ImageJ-linux64"),
     ]
+    # 2b. Windows install locations — Fiji ships as a portable folder
+    #     so users tend to drop it in a few standard places.
+    prog_files = _os.environ.get("ProgramFiles", r"C:\Program Files")
+    prog_files_x86 = _os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    for parent in [prog_files, prog_files_x86, r"C:\\", _os.path.expanduser("~"), _os.path.expanduser("~/Downloads")]:
+        for sub in ("Fiji.app", "fiji-win64", "ImageJ"):
+            candidates.append(_os.path.join(parent, sub, "ImageJ-win64.exe"))
+            candidates.append(_os.path.join(parent, sub, "ImageJ.exe"))
     for c in candidates:
-        if _os.path.isfile(c) and _os.access(c, _os.X_OK):
-            return c, "fiji"
+        if _os.path.isfile(c) and (_os.access(c, _os.X_OK) or c.lower().endswith(".exe")):
+            kind = "fiji" if "Fiji" in c or "fiji" in c.lower() else "imagej"
+            return c, kind
     # 3. Glob for ImageJ-* binaries on PATH so users with a versioned
     #    install (ImageJ-2.14.0) still get detected.
     for d in _os.environ.get("PATH", "").split(_os.pathsep):
         for hit in _g.glob(_os.path.join(d, "ImageJ-*")):
-            if _os.access(hit, _os.X_OK):
+            if _os.access(hit, _os.X_OK) or hit.lower().endswith(".exe"):
                 return hit, "fiji" if "Fiji" in hit else "imagej"
     return None, ""
 
 
 @app.get("/api/analysis/check-imagej")
-def check_imagej_installed():
-    """Tell the frontend whether the ImageJ button should be enabled."""
-    path, kind = _find_imagej_executable()
-    return {"installed": bool(path), "kind": kind, "path": path or ""}
+def check_imagej_installed(path: Optional[str] = None):
+    """Tell the frontend whether the ImageJ button should be enabled.
+    Accepts an optional ?path= override so Settings can probe a
+    user-pinned binary before committing it."""
+    found, kind = _find_imagej_executable(path)
+    return {"installed": bool(found), "kind": kind, "path": found or ""}
+
+
+# ── Cellpose 3 module ─────────────────────────────────────────
+@app.get("/api/analysis/check-cellpose")
+def check_cellpose_installed():
+    """Tell the frontend whether Cellpose is importable in the sidecar's
+    Python environment.  Returns the package version when available so
+    the UI tooltip can show e.g. "cellpose 3.0.10"."""
+    try:
+        import importlib
+        m = importlib.import_module("cellpose")
+        ver = getattr(m, "version", None) or getattr(m, "__version__", None) or ""
+        return {"installed": True, "kind": f"cellpose {ver}".strip(), "path": getattr(m, "__file__", "")}
+    except Exception as e:
+        return {"installed": False, "kind": "", "path": "", "error": str(e)[:200]}
+
+
+@app.post("/api/analysis/install-cellpose")
+def install_cellpose():
+    """Run `pip install --upgrade cellpose` against the sidecar's own
+    Python interpreter.  Returns a structured result so the frontend
+    can surface stdout/stderr inline.  The download is large (~500 MB
+    with torch); the timeout is generous.  Idempotent — re-running
+    upgrades to the latest version.
+
+    For LIVE progress, the streaming endpoint
+    `/api/analysis/install-cellpose-stream` returns text/event-stream
+    chunks as pip writes them.  This non-streaming version is kept
+    for callers that just want a final pass/fail summary."""
+    import sys as _sys
+    import subprocess as _sp
+    try:
+        proc = _sp.run(
+            [_sys.executable, "-m", "pip", "install", "--upgrade", "cellpose"],
+            capture_output=True, text=True, timeout=900,
+        )
+        ok = proc.returncode == 0
+        return {
+            "success": ok,
+            "stdout": proc.stdout[-4000:],
+            "stderr": proc.stderr[-4000:],
+            "returncode": proc.returncode,
+        }
+    except _sp.TimeoutExpired:
+        return {"success": False, "stdout": "", "stderr": "pip install cellpose timed out (>15 min). "
+                "Try running it manually in a terminal: "
+                f"`{_sys.executable} -m pip install --upgrade cellpose`."}
+    except Exception as e:
+        return {"success": False, "stdout": "", "stderr": f"pip launch failed: {e}"}
+
+
+from fastapi.responses import StreamingResponse  # noqa: E402
+
+@app.post("/api/analysis/install-cellpose-stream")
+def install_cellpose_stream():
+    """Streaming variant: pipes pip's stdout/stderr line-by-line via
+    Server-Sent Events so the frontend's Console panel can show
+    real-time progress (download bars, "Collecting torch…", etc.).
+    Ends with a final event containing the exit code.
+    """
+    import sys as _sys
+    import subprocess as _sp
+
+    def gen():
+        # Use unbuffered output so pip's progress lines flush as they
+        # arrive (PYTHONUNBUFFERED + --no-input + --progress-bar).
+        env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+        # `--break-system-packages` is a no-op inside a venv (the
+        # case for the bundled Tauri sidecar) but lets us bypass
+        # PEP-668's externally-managed-environment guard when the
+        # sidecar happens to be the system Python (dev installs).
+        # Without it pip 23+ aborts immediately with a confusing
+        # error and the button looked like it "did nothing".
+        cmd = [_sys.executable, "-u", "-m", "pip", "install",
+               "--upgrade", "--no-input",
+               "--progress-bar", "on",
+               "--break-system-packages",
+               "cellpose"]
+        try:
+            proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                             text=True, bufsize=1, env=env)
+        except Exception as e:
+            yield f"data: {{\"line\":\"pip launch failed: {e}\"}}\n\n"
+            yield "data: {\"done\":true,\"returncode\":-1}\n\n"
+            return
+        yield f'data: {{"line":"using interpreter: {_sys.executable}"}}\n\n'
+        yield 'data: {"line":"pip install --upgrade cellpose (may take 5-15 min, ~500 MB download)"}\n\n'
+        assert proc.stdout is not None
+        for raw in iter(proc.stdout.readline, ""):
+            line = raw.rstrip("\n")
+            # Escape for JSON-ish event payload.
+            esc = line.replace("\\", "\\\\").replace('"', '\\"')
+            yield f'data: {{"line":"{esc}"}}\n\n'
+        proc.wait()
+        yield f'data: {{"done":true,"returncode":{proc.returncode}}}\n\n'
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+class CellposeAnalysisRequest(BaseModel):
+    # JSON config + optional `//`-prefixed comment lines (we strip
+    # them server-side).  See CELLPOSE_DEFAULT on the frontend for
+    # the recognised keys.
+    config: str
+    sources: List[Dict[str, object]] = []
+    extra_inputs: List[Dict[str, object]] = []
+    timeout_sec: int = 300
+
+
+@app.post("/api/analysis/run-cellpose")
+def run_cellpose_pipeline(body: CellposeAnalysisRequest):
+    """Run the configured Cellpose model against every upstream image.
+
+    Emits, per input image:
+      • <label>_mask.png — labelled mask (uint16 → palette-mapped PNG)
+      • <label>_outlines.png — original image with outlines overlaid
+    Plus a single per-pipeline CSV:
+      • cellpose_counts.csv — source, n_cells, mean_area_px, median_area_px
+
+    The cellpose import is heavy (loads torch).  We import lazily so
+    the sidecar doesn't pay the cost when no Cellpose node is used.
+    """
+    import sys as _sys
+    import os as _os
+    import io as _io
+    import re as _re
+    import json as _json
+    import base64 as _b64
+    import numpy as _np
+
+    # 1) Parse config — strip `// ...` and `# ...` comment lines so
+    #    json.loads is happy.  We keep the value-token strings raw.
+    raw = body.config or "{}"
+    raw = "\n".join(line for line in raw.splitlines() if not _re.match(r"\s*(//|#)", line))
+    try:
+        cfg_dict = _json.loads(raw or "{}")
+        if not isinstance(cfg_dict, dict):
+            raise ValueError("config must be a JSON object")
+    except Exception as e:
+        return {"success": False, "stdout": "", "stderr": f"Cellpose config is not valid JSON: {e}",
+                "plots": [], "tables": [], "images": []}
+
+    model_name        = str(cfg_dict.get("model", "cyto3"))
+    diameter          = cfg_dict.get("diameter")  # None or number
+    channels          = cfg_dict.get("channels", [0, 0])
+    flow_threshold    = float(cfg_dict.get("flow_threshold", 0.4))
+    cellprob_threshold = float(cfg_dict.get("cellprob_threshold", 0.0))
+    min_size          = int(cfg_dict.get("min_size", 15))
+    use_gpu           = bool(cfg_dict.get("use_gpu", False))
+
+    # 2) Try to import cellpose.  Give a clear "install hint" on miss.
+    try:
+        from cellpose import models as cp_models, utils as cp_utils  # type: ignore
+    except Exception as e:
+        return {"success": False, "stdout": "",
+                "stderr": ("Cellpose isn't installed in the sidecar's Python environment. "
+                           f"Run `pip install cellpose` and restart the app.  Import error: {e}"),
+                "plots": [], "tables": [], "images": []}
+
+    # 3) Materialise every image input (sources + extras) into a
+    #    common [(label, np.ndarray)] list.  Source insets are
+    #    re-extracted at full resolution; extras arrive base64 PNG.
+    images_in: List[Tuple[str, _np.ndarray]] = []
+    for s in (body.sources or []):
+        try:
+            arr = _extract_source_image(s)  # dispatches: inset / panel / area
+            if arr is None: continue
+            images_in.append((str(s.get("label") or s.get("key") or f"src_{len(images_in)}"), _np.array(arr)))
+        except Exception as _e:
+            print(f"[run-cellpose] source extract failed: {_e}", file=_sys.stderr, flush=True)
+    for x in (body.extra_inputs or []):
+        if x.get("kind") != "image": continue
+        b64 = x.get("image_b64") or ""
+        if not b64: continue
+        try:
+            from PIL import Image as _Im
+            arr = _np.array(_Im.open(_io.BytesIO(_b64.b64decode(b64))).convert("RGB"))
+            images_in.append((str(x.get("label") or x.get("key") or f"in_{len(images_in)}"), arr))
+        except Exception as _e:
+            print(f"[run-cellpose] extra decode failed: {_e}", file=_sys.stderr, flush=True)
+    if not images_in:
+        return {"success": False, "stdout": "",
+                "stderr": "No image inputs — wire source insets or upstream image outputs into this node.",
+                "plots": [], "tables": [], "images": []}
+
+    stdout_lines: List[str] = []
+    images_out: List[Dict[str, str]] = []
+    rows: List[Dict[str, object]] = []
+    try:
+        # 4) Detect Cellpose API surface and instantiate the model.
+        # Behaviour confirmed against an installed cellpose 4.1.1
+        # (the latest as of writing):
+        #   v3:  cellpose.models.Cellpose(gpu, model_type=NAME)
+        #        .eval(img, channels=, diameter=, …) → 4-tuple
+        #   v4:  cellpose.models.CellposeModel(gpu, pretrained_model=NAME)
+        #        .eval(img, channels=, diameter=, …) → 3-tuple
+        #        Only 'cpsam' is a built-in name; anything else falls
+        #        back to cpsam after a noisy download.  channels= is
+        #        deprecated but still accepted (just emits a warning).
+        import importlib as _il
+        _cp_mod = _il.import_module("cellpose")
+        # Version string for diagnostics.  v3 used ``__version__``;
+        # v4 dropped that in favour of a plain ``version`` attribute
+        # plus a multi-line ``version_str`` banner.  Take whichever
+        # exists, and trim to the first line so we don't bury the log.
+        cp_ver = (getattr(_cp_mod, "version", None)
+                  or getattr(_cp_mod, "__version__", None)
+                  or "").strip().splitlines()[0] if (
+                    getattr(_cp_mod, "version", None)
+                    or getattr(_cp_mod, "__version__", None)
+                  ) else ""
+        # v4 reliably signals itself by removing the ``Cellpose`` (size
+        # model + seg model) wrapper class.  Anything that still has
+        # cp_models.Cellpose is treated as the v3 API.
+        is_v4 = not hasattr(cp_models, "Cellpose")
+
+        # In v4 only "cpsam" is a built-in pretrained model.  If the
+        # user's config still names a v3 cyto/nuclei model, accept it
+        # but log a clear warning — cellpose will silently download &
+        # use cpsam instead, which produces confusingly different
+        # results from what the preset name implies.
+        V4_BUILTIN = {"cpsam"}
+        if is_v4 and model_name not in V4_BUILTIN:
+            stdout_lines.append(
+                f"WARNING: cellpose 4.x only ships the 'cpsam' model — "
+                f"your requested {model_name!r} will fall back to cpsam. "
+                f"Update your config's \"model\" field to \"cpsam\" to silence."
+            )
+            model_name = "cpsam"
+
+        if is_v4:
+            # v4 path — CellposeModel only.
+            model = cp_models.CellposeModel(gpu=use_gpu, pretrained_model=model_name)
+        else:
+            # v3 path — combined wrapper (does size estimation + seg).
+            model = cp_models.Cellpose(gpu=use_gpu, model_type=model_name)
+        load_line = (
+            f"loaded cellpose {cp_ver or '(version unknown)'} model={model_name!r} "
+            f"gpu={use_gpu} api={'v4' if is_v4 else 'v3'}"
+        )
+        stdout_lines.append(load_line)
+        # Real-time flush to the sidecar terminal so the user can
+        # watch progress while the run is happening.  (The frontend
+        # Console pane only sees stdout after the response returns
+        # — a full SSE refactor is a separate change.)
+        print(f"[run-cellpose] {load_line}", flush=True)
+
+        import time as _time
+        t_total_start = _time.monotonic()
+        for img_idx, (label, img) in enumerate(images_in, start=1):
+            seg_line = (
+                f"[{img_idx}/{len(images_in)}] segmenting {label!r} "
+                f"shape={img.shape} dtype={img.dtype}"
+            )
+            stdout_lines.append(seg_line)
+            print(f"[run-cellpose] {seg_line}", flush=True)
+            t_img_start = _time.monotonic()
+            eval_kwargs: Dict[str, object] = dict(
+                diameter=diameter,
+                flow_threshold=flow_threshold,
+                cellprob_threshold=cellprob_threshold,
+                min_size=min_size,
+            )
+            # channels=: required in v3; deprecated-but-accepted in v4.
+            # Pass it always for compatibility; both paths handle it.
+            try:
+                result = model.eval(img, channels=channels, **eval_kwargs)
+            except TypeError:
+                # Future v5 may drop channels entirely — fall back.
+                result = model.eval(img, **eval_kwargs)
+            # v3: (masks, flows, styles, diams).  v4: (masks, flows, styles).
+            if isinstance(result, tuple) and len(result) >= 4:
+                masks, flows, styles, diams = result[0], result[1], result[2], result[3]
+            else:
+                masks, flows, styles = result[0], result[1], result[2]
+                diams = None
+            # Mask → coloured palette PNG for output.
+            from PIL import Image as _Im
+            n_cells = int(masks.max())
+            mask_rgb = _np.zeros((*masks.shape, 3), dtype=_np.uint8)
+            if n_cells > 0:
+                rng = _np.random.default_rng(42)
+                palette = rng.integers(64, 255, size=(n_cells + 1, 3), dtype=_np.uint8)
+                palette[0] = (0, 0, 0)  # background
+                mask_rgb = palette[masks]
+            buf = _io.BytesIO(); _Im.fromarray(mask_rgb).save(buf, format="PNG")
+            images_out.append({"name": f"{label}_mask", "image": _b64.b64encode(buf.getvalue()).decode()})
+
+            # Labels image — 8-bit grayscale where pixel value = cell
+            # label ID.  This is the format ImageJ macros can iterate
+            # over directly (threshold to label==N → measure).  If
+            # n_cells > 255 we re-pack labels modulo 255 + 1 so the
+            # image still fits in 8-bit (rare edge case — typical
+            # microscopy fields have <200 cells).
+            labels8 = masks.astype(_np.int64)
+            if n_cells > 255:
+                # Map to 1..255 cyclically; cells with the same packed
+                # value won't be separable but the user gets a warning.
+                labels8 = ((labels8 - 1) % 255 + 1) * (labels8 > 0)
+                stdout_lines.append(
+                    f"WARNING: {label!r} has {n_cells} cells (>255) — "
+                    "packed label image cyclically; downstream ImageJ "
+                    "analysis may merge cells with the same packed ID."
+                )
+            labels8 = labels8.astype(_np.uint8)
+            buf_lbl = _io.BytesIO()
+            _Im.fromarray(labels8, mode="L").save(buf_lbl, format="PNG")
+            images_out.append({
+                "name": f"{label}_labels",
+                "image": _b64.b64encode(buf_lbl.getvalue()).decode(),
+            })
+
+            # Outlines overlay on the original image.
+            outline_img = img.copy()
+            if outline_img.ndim == 2:
+                outline_img = _np.stack([outline_img]*3, axis=-1)
+            try:
+                outlines = cp_utils.outlines_list(masks)
+                for o in outlines:
+                    for (xx, yy) in o.astype(int):
+                        if 0 <= yy < outline_img.shape[0] and 0 <= xx < outline_img.shape[1]:
+                            outline_img[yy, xx] = (255, 80, 80)
+            except Exception:
+                pass
+            buf2 = _io.BytesIO(); _Im.fromarray(outline_img).save(buf2, format="PNG")
+            images_out.append({"name": f"{label}_outlines", "image": _b64.b64encode(buf2.getvalue()).decode()})
+
+            # Per-cell stats for the counts table.
+            sizes = _np.bincount(masks.ravel())[1:] if n_cells > 0 else _np.array([0])
+            rows.append({
+                "source": label,
+                "n_cells": n_cells,
+                "mean_area_px": float(sizes.mean()) if n_cells > 0 else 0.0,
+                "median_area_px": float(_np.median(sizes)) if n_cells > 0 else 0.0,
+                "model": model_name,
+            })
+            # Per-image timing so the post-run log makes the cost
+            # visible (cellpose 4 / cpsam is heavy on first inference).
+            elapsed = _time.monotonic() - t_img_start
+            done_line = (
+                f"[{img_idx}/{len(images_in)}] {label!r}: {n_cells} cell(s) "
+                f"in {elapsed:.1f}s"
+            )
+            stdout_lines.append(done_line)
+            print(f"[run-cellpose] {done_line}", flush=True)
+        total_elapsed = _time.monotonic() - t_total_start
+        total_line = f"total: {len(images_in)} image(s) in {total_elapsed:.1f}s"
+        stdout_lines.append(total_line)
+        print(f"[run-cellpose] {total_line}", flush=True)
+    except Exception as e:
+        return {"success": False, "stdout": "\n".join(stdout_lines),
+                "stderr": f"Cellpose run failed: {e}",
+                "plots": [], "tables": [], "images": images_out}
+
+    # 5) Pack the per-image counts table.
+    csv_lines = ["source,n_cells,mean_area_px,median_area_px,model"]
+    for r in rows:
+        csv_lines.append(",".join(str(r[k]) for k in ("source", "n_cells", "mean_area_px", "median_area_px", "model")))
+    tables = [{"name": "cellpose_counts", "csv": "\n".join(csv_lines) + "\n"}]
+    return {"success": True, "kind": "cellpose",
+            "stdout": "\n".join(stdout_lines), "stderr": "",
+            "plots": [], "tables": tables, "images": images_out}
 
 
 class ImageJAnalysisRequest(BaseModel):
@@ -3997,6 +4808,11 @@ class ImageJAnalysisRequest(BaseModel):
     sources: List[Dict[str, object]] = []
     extra_inputs: List[Dict[str, object]] = []
     timeout_sec: int = 120
+    # Optional path to the Fiji / ImageJ launcher binary.  When set,
+    # `_find_imagej_executable` returns it directly; otherwise the
+    # sidecar falls back to its auto-detection across the standard
+    # macOS / Linux / Windows install locations.
+    interpreter_path: Optional[str] = None
 
 
 @app.post("/api/analysis/run-imagej")
@@ -4013,66 +4829,140 @@ def run_imagej_pipeline(body: ImageJAnalysisRequest):
     """
     import sys as _sys
     import os as _os
+    import io as _io
     import json as _json
     import base64 as _b64
     import subprocess as _sp
     import tempfile as _tf
-    path, kind = _find_imagej_executable()
+    path, kind = _find_imagej_executable(body.interpreter_path)
     if not path:
         return {
             "success": False,
             "kind": "",
             "stdout": "",
             "stderr": (
-                "ImageJ / Fiji not detected on this host. Install Fiji from "
-                "https://imagej.net/software/fiji/ and ensure the `ImageJ-*` "
-                "binary is on PATH (or place Fiji.app in /Applications or ~/Applications)."
+                "ImageJ / Fiji not detected on this host. "
+                + (f"Configured path: {body.interpreter_path!r} not found. " if body.interpreter_path else "")
+                + "Install Fiji from https://imagej.net/software/fiji/ and ensure the `ImageJ-*` "
+                "binary is on PATH (or place Fiji.app in /Applications, ~/Applications, "
+                "or under %ProgramFiles% on Windows)."
             ),
             "plots": [], "tables": [], "images": [],
         }
 
     out_dir = _tf.mkdtemp(prefix="mpfig_imagej_")
     try:
-        # 1. Materialise each inset to a PNG on disk.
+        # 1. Materialise every image input (sources + upstream extras)
+        #    to PNG on disk so the macro can `open(path)` them.
         materialised: List[Dict[str, str]] = []
+        # 1a. Source insets — flagged regions from the host figure.
         for s in (body.sources or []):
             key = str(s.get("key") or "")
             label = str(s.get("label") or key)
             try:
-                row = int(s.get("row") or 0)
-                col = int(s.get("col") or 0)
-                inset_idx = int(s.get("inset_index") or 0)
-                arr = _extract_inset_image(row, col, inset_idx)
+                arr = _extract_source_image(s)  # dispatches: inset / panel / area
                 if arr is None:
                     continue
-                from PIL import Image as _Im
                 fpath = _os.path.join(out_dir, f"{key}.png")
-                _Im.fromarray(arr).save(fpath)
+                arr.save(fpath)
                 materialised.append({"path": fpath, "label": label, "key": key})
             except Exception as _e:  # pragma: no cover
                 print(f"[run-imagej] extract failed for {s}: {_e}", file=_sys.stderr, flush=True)
-        # 2. Build the macro: prelude that defines `inputs` + helper
-        #    functions, followed by the user's code.  IJ Macro is
-        #    not Java — variables are loose; we write a JSON sidecar
-        #    so the user's code can `loadJSON("inputs.json")`-ish.
-        inputs_json = _json.dumps(materialised)
+        # 1b. extra_inputs — upstream node outputs piped in by the
+        #     graph runner (e.g. Cellpose's *_mask / *_labels images).
+        #     Each entry is {kind, key, label, image_b64} or
+        #     {kind="table", csv}.  We only materialise images here;
+        #     table inputs would need a different path.
+        for x in (body.extra_inputs or []):
+            if x.get("kind") != "image":
+                continue
+            b64 = x.get("image_b64") or ""
+            if not b64:
+                continue
+            key = str(x.get("key") or f"extra_{len(materialised)}")
+            label = str(x.get("label") or key)
+            try:
+                from PIL import Image as _Im
+                img = _Im.open(_io.BytesIO(_b64.b64decode(b64)))
+                # Sanitise key for use as a filename (no slashes / colons).
+                safe_key = key.replace("/", "_").replace(":", "_").replace(" ", "_")
+                fpath = _os.path.join(out_dir, f"{safe_key}.png")
+                img.save(fpath)
+                materialised.append({"path": fpath, "label": label, "key": key})
+            except Exception as _e:  # pragma: no cover
+                print(f"[run-imagej] extra decode failed for {key}: {_e}", file=_sys.stderr, flush=True)
+
+        # 2. Build the macro prelude.  ImageJ macro language has no
+        #    objects, no JSON parser, and only flat arrays — so we
+        #    expose the input list as THREE PARALLEL ARRAYS that the
+        #    user iterates by index:
+        #        input_paths[]   absolute filesystem paths
+        #        input_labels[]  human labels (source name etc.)
+        #        input_keys[]    stable keys (e.g. "out_image_0")
+        #    The `inputs[i].path` / `inputs[i].label` aliases used by
+        #    older presets are emulated via 2-D nameless arrays — no
+        #    longer recommended (no member access in IJ macro).  New
+        #    code should use input_paths / input_labels / input_keys.
+        #
+        #    mpfig_data(name, headers, ...arrays) writes a CSV with
+        #    arbitrary column count.  Macro signature is limited (no
+        #    real varargs), so we shim with fixed-arity variants:
+        #        mpfig_data1(name, headers, a)
+        #        mpfig_data2(name, headers, a, b)
+        #        ... up to mpfig_data7.
+        #    `headers` is a comma-joined string (e.g. "x,y,z").
+
+        def _macro_str_array(name: str, values: List[str]) -> str:
+            """Render a newArray(...) initializer for IJ macro."""
+            if not values:
+                return f'{name} = newArray(0);\n'
+            escaped = ['"' + v.replace('\\', '\\\\').replace('"', '\\"') + '"' for v in values]
+            return f'{name} = newArray({", ".join(escaped)});\n'
+
         macro_path = _os.path.join(out_dir, "_main.ijm")
         results_csv = _os.path.join(out_dir, "_results.csv")
-        prelude = (
-            f'INPUTS_JSON = \'{inputs_json}\';\n'
-            f'OUT_DIR = \'{out_dir}\';\n'
+
+        # mpfig_dataN helpers — write CSV with N data columns.  Macro
+        # functions can't loop over a variadic arg list, so we generate
+        # variants for column counts 1..12 (12 covers the full cell-
+        # shape metrics emit: source/group/cell_id + 9 metrics).
+        # Headers are split by comma in the prelude.
+        _data_fns: List[str] = []
+        for ncols in range(1, 13):
+            args = ", ".join(["c%d" % i for i in range(ncols)])
+            row_concat = ' + "," + '.join(["c%d[k]" % i for i in range(ncols)])
+            _data_fns.append(
+                f'function mpfig_data{ncols}(name, headers, {args}) {{ '
+                f'  out = OUT_DIR + "/" + name + ".csv"; '
+                f'  f = File.open(out); '
+                f'  print(f, headers); '
+                f'  for (k = 0; k < lengthOf(c0); k++) print(f, {row_concat}); '
+                f'  File.close(f); }}\n'
+            )
+
+        prelude_parts: List[str] = [
+            f'OUT_DIR = "{out_dir}";\n',
+            _macro_str_array("input_paths",  [m["path"]  for m in materialised]),
+            _macro_str_array("input_labels", [m["label"] for m in materialised]),
+            _macro_str_array("input_keys",   [m["key"]   for m in materialised]),
+            # Back-compat: many existing presets reference inputs[i].path
+            # and inputs[i].label.  IJ macro can't do member access so
+            # we provide a sentinel that warns when used.
+            '// Use input_paths[i] / input_labels[i] / input_keys[i].\n',
+            '// (Legacy `inputs[i].path` syntax is no longer supported.)\n',
+        ]
+        prelude_parts.extend(_data_fns)
+        prelude_parts.append(
+            # 3-arg backward-compat shim (was: mpfig_data(name, labels, a, b)).
             'function mpfig_data(name, labels, a, b) { '
-            '  out = OUT_DIR + "/" + name + ".csv";'
-            '  f = File.open(out);'
-            '  print(f, "label,a,b");'
-            '  for (k = 0; k < lengthOf(labels); k++) print(f, labels[k] + "," + a[k] + "," + b[k]);'
-            '  File.close(f); }\n'
+            '  mpfig_data3(name, "label,a,b", labels, a, b); }\n'
+        )
+        prelude_parts.append(
             'function mpfig_image(name) { '
             '  saveAs("PNG", OUT_DIR + "/" + name + ".png"); }\n'
-            '// `inputs` is a global array of objects — IJ macro doesn\'t '
-            '// have JSON parsing, so for now we expose individual fields '
-            '// via newArray() helpers.  Users can `open(...)` images by path.\n'
         )
+        prelude = "".join(prelude_parts)
+
         with open(macro_path, "w") as _fh:
             _fh.write(prelude)
             _fh.write(body.code or "")
@@ -4131,6 +5021,9 @@ class MatlabAnalysisRequest(BaseModel):
     sources: List[Dict[str, object]] = []
     extra_inputs: List[Dict[str, object]] = []
     timeout_sec: int = 60
+    # Optional path to a MATLAB / Octave binary; honoured before the
+    # sidecar's auto-detection across PATH and common install dirs.
+    interpreter_path: Optional[str] = None
 
 
 @app.post("/api/analysis/run-matlab")
@@ -4159,11 +5052,15 @@ def run_matlab_pipeline(body: MatlabAnalysisRequest):
                           "Install scipy in the sidecar's Python environment.",
                 "plots": [], "tables": [], "images": []}
 
-    matlab_path, kind = _find_matlab_executable()
+    matlab_path, kind = _find_matlab_executable(body.interpreter_path)
     if not matlab_path:
         return {"success": False, "stdout": "",
-                "stderr": "Neither Octave nor MATLAB found. Install Octave from "
-                          "https://octave.org/ (free) or MATLAB from MathWorks.",
+                "stderr": (
+                    "Neither Octave nor MATLAB found. "
+                    + (f"Configured path: {body.interpreter_path!r} not found. " if body.interpreter_path else "")
+                    + "Install Octave from https://octave.org/ (free) or MATLAB from MathWorks, "
+                    + "or set a custom path in Analysis → ⚙ Engines."
+                ),
                 "plots": [], "tables": [], "images": []}
 
     code = (body.code or "").strip()
@@ -4185,10 +5082,9 @@ def run_matlab_pipeline(body: MatlabAnalysisRequest):
             try:
                 orig = str(s.get("key", ""))
                 r = int(s.get("row", -1)); c = int(s.get("col", -1))
-                i = int(s.get("inset_index", -1))
-                if not orig or r < 0 or c < 0 or i < 0:
+                if not orig or r < 0 or c < 0:
                     continue
-                img = _extract_inset_image(r, c, i)
+                img = _extract_source_image(s)  # dispatches: inset / panel / area
                 if img is None:
                     continue
                 arr = _np.asarray(img.convert("RGB"))
@@ -4199,7 +5095,7 @@ def run_matlab_pipeline(body: MatlabAnalysisRequest):
                     "width": int(arr.shape[1]),
                     "height": int(arr.shape[0]),
                     "label": str(s.get("label") or orig),
-                    "row": r, "col": c, "inset_index": i,
+                    "row": r, "col": c, "inset_index": int(s.get("inset_index", -1)),
                 }
             except Exception as _e:
                 import sys as __s
@@ -4439,6 +5335,21 @@ def main():
         parser = argparse.ArgumentParser(description="Multi-Panel Figure Builder API Server")
         parser.add_argument("--port", type=int, default=0, help="Port (0 = auto)")
         parser.add_argument("--host", default="127.0.0.1")
+        # Dev-only: watch this directory and auto-restart uvicorn workers
+        # whenever a .py file changes.  Mirrors Vite's HMR feel for the
+        # Python side, so editing api_server.py / models.py / figure_builder.py
+        # no longer requires a manual kill + restart.
+        # Implemented via uvicorn's `reload=True`, which needs the app
+        # passed as an import string ("api_server:app") instead of the
+        # already-imported `app` object.
+        # NOTE: doesn't work under PyInstaller --onefile (no source files
+        # on disk for the watcher).  We detect that via sys.frozen and
+        # silently ignore --reload there.
+        parser.add_argument(
+            "--reload", action="store_true",
+            help="Dev mode: auto-restart when .py files in the sidecar "
+                 "directory change.  Ignored when running as a frozen binary.",
+        )
         args = parser.parse_args()
 
         port = args.port
@@ -4449,7 +5360,28 @@ def main():
                 port = s.getsockname()[1]
 
         print(f"READY:{port}", flush=True)
-        uvicorn.run(app, host=args.host, port=port, log_level="warning")
+
+        # Detect PyInstaller / frozen-binary context — reload watchers
+        # need source files on disk that match what's imported, which
+        # isn't the case after PyInstaller bundles everything into a
+        # single executable.  Fall back to the non-reload path.
+        is_frozen = getattr(sys, "frozen", False)
+        if args.reload and not is_frozen:
+            # Watching just SCRIPT_DIR avoids the parent venv firehose
+            # of irrelevant .py changes (numpy, fastapi, etc.) that
+            # would otherwise restart on every git checkout.
+            print(f"DEV-RELOAD: watching {SCRIPT_DIR} for *.py changes", flush=True)
+            uvicorn.run(
+                "api_server:app",
+                host=args.host,
+                port=port,
+                log_level="warning",
+                reload=True,
+                reload_dirs=[str(SCRIPT_DIR)],
+                reload_includes=["*.py"],
+            )
+        else:
+            uvicorn.run(app, host=args.host, port=port, log_level="warning")
     except Exception as e:
         print(f"FATAL: {e}", file=sys.stderr, flush=True)
         import traceback

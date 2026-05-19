@@ -109,6 +109,11 @@ export interface AreaAnnotation {
   measure_color: string;
   measure_font_name: string;
   measure_styled_segments: StyledSegment[];
+  /** When true, the area's polygon-masked pixels are exposed as a
+   *  source in the Analysis dialog's library so the user can run
+   *  pipelines on just the region of interest.  Backend mirror:
+   *  AreaAnnotation.include_in_analysis. */
+  include_in_analysis?: boolean;
 }
 
 export interface ZoomInsetSettings {
@@ -189,6 +194,11 @@ export interface PanelInfo {
   final_resize: boolean;
   final_width: number;
   final_height: number;
+  /** When true, the whole (cropped) panel is exposed as a source in
+   *  the Analysis dialog's library, alongside any zoom insets and
+   *  area annotations that have the same flag set.  Backend mirror:
+   *  PanelInfo.include_in_analysis. */
+  include_in_analysis?: boolean;
   brightness: number;
   contrast: number;
   hue: number;

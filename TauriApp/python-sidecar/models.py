@@ -165,6 +165,10 @@ class AreaAnnotation:
     magic_tolerance: int = 30           # magic wand tolerance
     magic_click_x: float = -1          # stored click point for re-selection
     magic_click_y: float = -1
+    # When True, this area is exposed as a source in the Analysis
+    # dialog's library so the user can run pipelines over just the
+    # masked region's pixels (not the whole panel).
+    include_in_analysis: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +266,10 @@ class PanelInfo:
     final_resize: bool = False
     final_width: int = 400
     final_height: int = 300
+    # When True, this panel's cropped image is exposed as a source
+    # in the Analysis dialog's library so the user can run pipelines
+    # over the whole panel (not just zoom insets).
+    include_in_analysis: bool = False
 
     brightness: float = 1.0
     contrast: float = 1.0

@@ -2507,6 +2507,65 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     }
   }, [local?.zoom_inset?.separate_image_name]); // eslint-disable-line
 
+  /** Pure helper: given a panel with a (possibly new) crop, return a
+   *  copy with every zoom-inset's SOURCE rectangle (and target arrow
+   *  endpoint) clamped into the post-crop bounds.  Insets whose
+   *  source rect partially or fully falls outside the new crop are
+   *  reset to a centred ~50% box; insets that already fit are left
+   *  untouched.  Used by both updateLocal (when crop is patched via
+   *  the UI fields / aspect-ratio buttons) AND by handleCropCommit
+   *  (when the user drags the crop rectangle on the canvas — which
+   *  bypasses updateLocal entirely).  Without this in BOTH paths,
+   *  cropping smaller via drag silently leaves existing insets
+   *  pointing outside the new crop, producing broken / empty zoom
+   *  renders downstream.
+   *
+   *  CRITICAL: this useCallback MUST sit above the `if (!local) return
+   *  null` early return below.  React requires the same hook count
+   *  on every render; placing a hook AFTER an early return means
+   *  the first render (local === null) calls N hooks and the next
+   *  (local !== null) calls N+1 → "change in the order of Hooks"
+   *  crash that paints the entire app black. */
+  const clampInsetsToCrop = useCallback((panel: PanelInfo): PanelInfo => {
+    const oW = origFullW > 0 ? origFullW : 1000;
+    const oH = origFullH > 0 ? origFullH : 1000;
+    const newCrop = (panel.crop_image && panel.crop?.length === 4) ? panel.crop : [0, 0, oW, oH];
+    const newCw = newCrop[2] - newCrop[0];
+    const newCh = newCrop[3] - newCrop[1];
+    if (newCw <= 0 || newCh <= 0) return panel;
+
+    const resetIfOutOfBounds = (zi: ZoomInsetSettings): ZoomInsetSettings => {
+      const out = { ...zi };
+      const srcOutside = out.x < 0 || out.y < 0 || out.x + out.width > newCw || out.y + out.height > newCh;
+      if (srcOutside) {
+        // Reset source rect to a centred ~50% box, clamped to bounds.
+        const w = Math.max(20, Math.min(out.width, Math.floor(newCw * 0.5)));
+        const h = Math.max(20, Math.min(out.height, Math.floor(newCh * 0.5)));
+        out.x = Math.max(0, Math.floor((newCw - w) / 2));
+        out.y = Math.max(0, Math.floor((newCh - h) / 2));
+        out.width = w;
+        out.height = h;
+      }
+      // Target position: only reset if completely off-canvas.
+      const tx = out.target_x ?? 0;
+      const ty = out.target_y ?? 0;
+      if (tx < 0 || ty < 0 || tx > newCw || ty > newCh) {
+        out.target_x = Math.max(0, Math.min(newCw - 1, Math.floor(newCw * 0.6)));
+        out.target_y = Math.max(0, Math.min(newCh - 1, Math.floor(newCh * 0.05)));
+      }
+      return out;
+    };
+
+    let next = panel;
+    if (next.zoom_inset && next.add_zoom_inset) {
+      next = { ...next, zoom_inset: resetIfOutOfBounds(next.zoom_inset) };
+    }
+    if (next.zoom_insets && next.zoom_insets.length > 0) {
+      next = { ...next, zoom_insets: next.zoom_insets.map(resetIfOutOfBounds) };
+    }
+    return next;
+  }, [origFullW, origFullH]);
+
   if (!local) return null;
 
   const handleSave = () => {
@@ -2527,43 +2586,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       // which case we reset position to a sensible default rather
       // than letting the box silently disappear off-image.
       if (patch.crop !== undefined || patch.crop_image !== undefined) {
-        const oW = origFullW > 0 ? origFullW : 1000;
-        const oH = origFullH > 0 ? origFullH : 1000;
-        const newCrop = (next.crop_image && next.crop?.length === 4) ? next.crop : [0, 0, oW, oH];
-        const newCw = newCrop[2] - newCrop[0];
-        const newCh = newCrop[3] - newCrop[1];
-
-        if (newCw > 0 && newCh > 0) {
-          const resetIfOutOfBounds = (zi: ZoomInsetSettings): ZoomInsetSettings => {
-            const out = { ...zi };
-            const srcOutside = out.x < 0 || out.y < 0 || out.x + out.width > newCw || out.y + out.height > newCh;
-            if (srcOutside) {
-              // Reset source rect to a centred ~50% box, clamped to bounds.
-              const w = Math.max(20, Math.min(out.width, Math.floor(newCw * 0.5)));
-              const h = Math.max(20, Math.min(out.height, Math.floor(newCh * 0.5)));
-              out.x = Math.max(0, Math.floor((newCw - w) / 2));
-              out.y = Math.max(0, Math.floor((newCh - h) / 2));
-              out.width = w;
-              out.height = h;
-            }
-            // Target position: only reset if completely off-canvas.
-            const tx = out.target_x ?? 0;
-            const ty = out.target_y ?? 0;
-            if (tx < 0 || ty < 0 || tx > newCw || ty > newCh) {
-              out.target_x = Math.max(0, Math.min(newCw - 1, Math.floor(newCw * 0.6)));
-              out.target_y = Math.max(0, Math.min(newCh - 1, Math.floor(newCh * 0.05)));
-            }
-            return out;
-          };
-
-          // Apply to legacy singular field and all entries in the array.
-          if (next.zoom_inset && next.add_zoom_inset) {
-            next = { ...next, zoom_inset: resetIfOutOfBounds(next.zoom_inset) };
-          }
-          if (next.zoom_insets && next.zoom_insets.length > 0) {
-            next = { ...next, zoom_insets: next.zoom_insets.map(resetIfOutOfBounds) };
-          }
-        }
+        next = clampInsetsToCrop(next);
       }
 
       // Mirror panel.zoom_inset (legacy singular) into
@@ -2715,11 +2738,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
 
     // Build the full panel to send BEFORE calling setLocal (avoid React batching issues).
     // localRef.current always has the latest panel state from previous updates.
-    const panelToSend = { ...localRef.current, ...cropPatch };
+    // Then clamp any existing zoom insets into the new crop's bounds —
+    // dragging the crop smaller would otherwise silently strand insets
+    // outside the new view, producing broken zoom renders.  Mirror of
+    // the path inside updateLocal so canvas-drag commits get the same
+    // safety net as numeric / aspect-ratio edits.
+    const panelToSend = clampInsetsToCrop({ ...localRef.current, ...cropPatch } as PanelInfo);
 
     // Update local state + ref immediately
-    localRef.current = panelToSend as PanelInfo;
-    setLocal(panelToSend as PanelInfo);
+    localRef.current = panelToSend;
+    setLocal(panelToSend);
 
     // Cancel any pending debounced preview (we're doing it now)
     if (previewTimerRef.current) clearTimeout(previewTimerRef.current);
@@ -3305,6 +3333,28 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 </Typography>
               </Box>
             )}
+
+            {/* Add to analysis — exposes the whole (cropped) panel
+                as a source in the Analysis dialog's library, so
+                pipelines can run on the panel image directly
+                (no zoom inset required). */}
+            <FormControlLabel
+              sx={{ mt: 1, ml: 0 }}
+              control={
+                <Checkbox
+                  size="small"
+                  checked={!!local.include_in_analysis}
+                  onChange={(e) => updateLocal({ include_in_analysis: e.target.checked } as Partial<PanelInfo>)}
+                />
+              }
+              label={
+                <Tooltip placement="top" title="Make the whole (cropped) panel available as a source in the Analysis dialog's library. The panel's processed pixels are sent — same crop, rotation and flips you've configured above.">
+                  <Typography variant="caption" sx={{ fontSize: "0.75rem" }}>
+                    Add to analysis (panel as source)
+                  </Typography>
+                </Tooltip>
+              }
+            />
 
           </Box>
         </TabPanel>
@@ -4586,6 +4636,23 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     updateLocal({ areas } as unknown as Partial<PanelInfo>);
                   }} />}
                   label={<Typography variant="caption" sx={{ fontSize: "0.75rem" }}>Show measurement</Typography>}
+                />
+                {/* Add to analysis — exposes the polygon-masked pixel
+                    region as a source in the Analysis dialog so the
+                    user can run pipelines on just the area's interior. */}
+                <FormControlLabel sx={{ ml: 0 }}
+                  control={<Checkbox size="small" checked={!!area.include_in_analysis} onChange={(e) => {
+                    const areas = [...(local.areas ?? [])];
+                    areas[i] = { ...areas[i], include_in_analysis: e.target.checked };
+                    updateLocal({ areas } as unknown as Partial<PanelInfo>);
+                  }} />}
+                  label={
+                    <Tooltip placement="top" title="Expose this area's masked pixels (everything outside the polygon is blacked out) as a source in the Analysis dialog. Lets you run pipelines on just the region of interest.">
+                      <Typography variant="caption" sx={{ fontSize: "0.75rem" }}>
+                        Add to analysis (area pixels as source)
+                      </Typography>
+                    </Tooltip>
+                  }
                 />
                 {area.show_measure && (
                   <Box sx={{ display: "flex", flexDirection: "column", gap: 1, mt: 0.5 }}>
