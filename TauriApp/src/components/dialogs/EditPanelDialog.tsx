@@ -1651,9 +1651,13 @@ function ChannelsBlock({ imageName, panelRow, panelCol, onChange }: {
     num_channels?: number; num_z?: number; current_z?: number;
     tints?: string[]; enabled?: boolean[];
     black_levels?: number[]; white_levels?: number[];
+    names?: string[];
   };
   const [info, setInfo] = useState<ChInfo | null>(null);
   const [pending, setPending] = useState(false);
+  // Debounced name edits — typing into the name field shouldn't fire a
+  // PATCH per keystroke.
+  const [nameDrafts, setNameDrafts] = useState<Record<number, string>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -1673,6 +1677,15 @@ function ChannelsBlock({ imageName, panelRow, panelCol, onChange }: {
     setPending(false);
   };
 
+  const commitName = (c: number) => {
+    const v = nameDrafts[c];
+    if (v == null) return;
+    const next = [...(info?.names ?? Array(info?.num_channels ?? 0).fill(""))];
+    next[c] = v;
+    setNameDrafts(prev => { const x = { ...prev }; delete x[c]; return x; });
+    patch({ names: next });
+  };
+
   if (!info || !info.is_multichannel) return null;
   const n = info.num_channels ?? 0;
   if (n <= 1) return null;
@@ -1683,13 +1696,16 @@ function ChannelsBlock({ imageName, panelRow, panelCol, onChange }: {
         Channels ({n}) {pending && <span style={{ opacity: 0.6 }}> · applying…</span>}
       </Typography>
       <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>
-        Pick a tint for each channel. The image is composited as the sum of all enabled channels.
+        Pick a tint + name for each channel. The image is composited as the sum of all enabled channels.
       </Typography>
       {Array.from({ length: n }).map((_, c) => {
         const tint = info.tints?.[c] ?? "#ffffff";
         const enabled = info.enabled?.[c] ?? true;
         const bl = info.black_levels?.[c] ?? 0;
         const wl = info.white_levels?.[c] ?? 255;
+        const savedName = info.names?.[c] ?? `Ch ${c + 1}`;
+        const draft = nameDrafts[c];
+        const displayName = draft ?? savedName;
         return (
           <Box key={c} sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
             <Checkbox
@@ -1700,7 +1716,6 @@ function ChannelsBlock({ imageName, panelRow, panelCol, onChange }: {
                 patch({ enabled: next });
               }}
             />
-            <Typography variant="caption" sx={{ width: 14, fontSize: "0.6rem" }}>{c + 1}</Typography>
             <input
               type="color"
               value={tint}
@@ -1710,8 +1725,23 @@ function ChannelsBlock({ imageName, panelRow, panelCol, onChange }: {
                 next[c] = e.target.value;
                 patch({ tints: next });
               }}
-              title={`Channel ${c + 1} tint`}
+              title={`${displayName} tint`}
               style={{ width: 24, height: 22, border: "1px solid #ccc", borderRadius: 3, padding: 0, cursor: enabled ? "pointer" : "not-allowed" }}
+            />
+            <TextField
+              value={displayName}
+              variant="standard"
+              size="small"
+              disabled={pending}
+              onChange={(e) => setNameDrafts(prev => ({ ...prev, [c]: e.target.value }))}
+              onBlur={() => commitName(c)}
+              onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+              title="Rename channel (e.g. DAPI, GFP). Enter to commit."
+              sx={{
+                width: 90,
+                "& .MuiInputBase-input": { fontSize: "0.65rem", py: 0, px: 0.5 },
+                "& .MuiInputBase-root:before": { borderBottomStyle: "dotted" },
+              }}
             />
             <Slider
               value={[bl, wl]} min={0} max={255} step={1} disabled={!enabled || pending}
@@ -1743,19 +1773,35 @@ function ChannelsBlock({ imageName, panelRow, panelCol, onChange }: {
 }
 
 // ── Z-Stack TIFF Frame Selector Component ─────────────────────────────
-function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, setFrame, panelRow, panelCol, onAppliedToPanel }: { imageName: string; onFrameChange: () => void; onFrameImage?: (b64: string) => void; frame: number; setFrame: (f: number) => void; panelRow?: number; panelCol?: number; onAppliedToPanel?: () => void }) {
+function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, setFrame, panelRow, panelCol, onAppliedToPanel, onPanelImageNameChange }: { imageName: string; onFrameChange: () => void; onFrameImage?: (b64: string) => void; frame: number; setFrame: (f: number) => void; panelRow?: number; panelCol?: number; onAppliedToPanel?: () => void; onPanelImageNameChange?: (newName: string) => void }) {
   const [info, setInfo] = useState<{ frame_count: number; width: number; height: number } | null>(null);
   const [loading, setLoading] = useState(false);
   const [projRange, setProjRange] = useState<[number, number]>([0, 0]);
   const [projMethod, setProjMethod] = useState<"max" | "avg" | "min">("max");
   const [projecting, setProjecting] = useState(false);
   const [volumeOpen, setVolumeOpen] = useState(false);
+  // Alignment availability + run state (shared with VolumeViewer's UI).
+  const [alignAvail, setAlignAvail] = useState<{ sift: { available: boolean; kind: string; path: string }; phase_correlation: { available: boolean; kind: string } } | null>(null);
+  const [alignMethod, setAlignMethod] = useState<"sift" | "phase_correlation">("phase_correlation");
+  const [aligning, setAligning] = useState(false);
+  const [alignError, setAlignError] = useState("");
+  const [alignedName, setAlignedName] = useState<string | null>(null);
+  const [alignProgress, setAlignProgress] = useState(0);
+  const [alignStage, setAlignStage] = useState("");
+  // Folded into the Projection block as a checkbox — alignment really
+  // only matters when you're about to collapse Z, so this is where the
+  // toggle naturally lives. Defaults match the new backend smart-ref
+  // behaviour: max-projection of enabled channels, no CLAHE.
+  const [alignBeforeProject, setAlignBeforeProject] = useState(false);
+  const [alignSource, setAlignSource] = useState<"max" | "mean" | "sum" | "channel">("max");
+  const [alignUseClahe, setAlignUseClahe] = useState(false);
 
   useEffect(() => {
     api.getZStackInfo(imageName).then(i => {
       setInfo(i);
       setProjRange([0, i.frame_count - 1]);
     }).catch(() => setInfo(null));
+    api.getAlignAvailability().then(setAlignAvail).catch(() => setAlignAvail(null));
   }, [imageName]);
 
   const seekToFrame = async (f: number) => {
@@ -1764,6 +1810,14 @@ function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, se
       const resp = await api.getZStackFrame(imageName, f, panelRow, panelCol);
       setFrame(f);
       if (onFrameImage && resp.thumbnail) onFrameImage(resp.thumbnail);
+      // Backend now stores the seeked slice on `panel.frame` and the
+      // renderer reads it via _get_panel_image. We mirror that into
+      // `local.frame` so the next refreshPreview PATCH sends the new
+      // frame number — the image_name stays the original multichannel
+      // source so channel controls keep working.
+      if (onPanelImageNameChange) {
+        onPanelImageNameChange(imageName); // image_name unchanged
+      }
       onFrameChange();
     } catch { /* ignore */ }
     setLoading(false);
@@ -1772,7 +1826,11 @@ function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, se
   const applyProjection = async () => {
     setProjecting(true);
     try {
-      const resp = await api.projectZStack(imageName, projRange[0], projRange[1], projMethod);
+      // Use the aligned stack if the user ran Align — otherwise the
+      // original. Projection respects per-channel tints for multichannel
+      // sources (server composites RGB).
+      const sourceName = alignedName ?? imageName;
+      const resp = await api.projectZStack(sourceName, projRange[0], projRange[1], projMethod);
       if (onFrameImage && resp.thumbnail) onFrameImage(resp.thumbnail);
       onFrameChange();
     } catch (e) {
@@ -1816,7 +1874,12 @@ function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, se
 
       <Divider sx={{ my: 0.5 }} />
 
-      {/* Projection */}
+      {/* Projection — with optional slice alignment inline.
+          Alignment really only matters when you're about to collapse Z
+          (projection), so we fold it into this section as a checkbox
+          instead of a free-standing module that begs the question
+          "aligned for what?". When the box is ticked, Apply runs
+          alignment first (with progress bar) and projects on the result. */}
       <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.7rem" }}>Projection</Typography>
       <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary" }}>
         Range: slice {projRange[0]} – {projRange[1]} ({projRange[1] - projRange[0] + 1} slices)
@@ -1844,13 +1907,124 @@ function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, se
         <Button
           size="small"
           variant="contained"
-          disabled={projecting}
-          onClick={applyProjection}
+          disabled={projecting || aligning}
+          onClick={async () => {
+            // If the user wants alignment, run it first (with progress)
+            // and then project on the aligned stack.
+            let projectSource = imageName;
+            if (alignBeforeProject) {
+              setAligning(true); setAlignError("");
+              setAlignProgress(0); setAlignStage("starting…");
+              try {
+                const res = await api.alignAndWait(imageName, {
+                  method: alignMethod,
+                  startFrame: projRange[0], endFrame: projRange[1],
+                  alignmentSource: alignSource,
+                  useClahe: alignUseClahe,
+                }, (p, stage) => { setAlignProgress(p); setAlignStage(stage); });
+                setAlignedName(res.aligned_name);
+                projectSource = res.aligned_name;
+              } catch (e) {
+                setAlignError(e instanceof Error ? e.message : String(e));
+                setAligning(false);
+                return;
+              }
+              setAligning(false);
+            }
+            // Project using the (possibly aligned) source. We replicate
+            // the original applyProjection logic so the right name flows
+            // through — applyProjection uses the parent-scope alignedName
+            // which won't reflect a brand-new align done in this click.
+            setProjecting(true);
+            try {
+              const resp = await api.projectZStack(projectSource, projRange[0], projRange[1], projMethod);
+              if (onFrameImage && resp.thumbnail) onFrameImage(resp.thumbnail);
+              onFrameChange();
+            } catch (e) { console.error("[project]", e); }
+            setProjecting(false);
+          }}
           sx={{ fontSize: "0.6rem", textTransform: "none" }}
         >
-          {projecting ? "Projecting..." : "Apply"}
+          {aligning ? "Aligning…" : projecting ? "Projecting…" : "Apply"}
         </Button>
       </Box>
+
+      {/* Inline alignment options — only render when the user enables it. */}
+      <FormControlLabel
+        sx={{ ml: 0 }}
+        control={
+          <Checkbox
+            size="small" checked={alignBeforeProject}
+            onChange={(e) => setAlignBeforeProject(e.target.checked)}
+            sx={{ p: 0.25 }}
+          />
+        }
+        label={
+          <Typography variant="caption" sx={{ fontSize: "0.65rem" }}>
+            Align slices before projecting
+          </Typography>
+        }
+      />
+      {alignBeforeProject && (
+        <Box sx={{ display: "flex", flexDirection: "column", gap: 0.4, pl: 1, borderLeft: "2px solid", borderColor: "divider" }}>
+          <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
+            <Typography variant="caption" sx={{ fontSize: "0.55rem", minWidth: 56 }}>Algorithm</Typography>
+            <Select
+              size="small" value={alignMethod}
+              onChange={(e) => setAlignMethod(e.target.value as "sift" | "phase_correlation")}
+              sx={{ flex: 1, fontSize: "0.6rem", "& .MuiSelect-select": { py: 0.2, px: 0.75 } }}
+            >
+              <MenuItem value="phase_correlation" sx={{ fontSize: "0.6rem" }}>Phase correlation</MenuItem>
+              <MenuItem
+                value="sift" disabled={!alignAvail?.sift.available} sx={{ fontSize: "0.6rem" }}
+                title={alignAvail?.sift.available ? `Uses Fiji at ${alignAvail.sift.path}` : "Requires ImageJ/Fiji"}
+              >
+                ImageJ SIFT {alignAvail && !alignAvail.sift.available ? "(not detected)" : ""}
+              </MenuItem>
+            </Select>
+          </Box>
+          <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
+            <Typography variant="caption" sx={{ fontSize: "0.55rem", minWidth: 56 }} title="Which image SIFT/phase corr sees. 'Max' pools features across all enabled channels.">Reference</Typography>
+            <Select
+              size="small" value={alignSource}
+              onChange={(e) => setAlignSource(e.target.value as "max" | "mean" | "sum" | "channel")}
+              sx={{ flex: 1, fontSize: "0.6rem", "& .MuiSelect-select": { py: 0.2, px: 0.75 } }}
+            >
+              <MenuItem value="max"     sx={{ fontSize: "0.6rem" }}>Max-projection of channels</MenuItem>
+              <MenuItem value="mean"    sx={{ fontSize: "0.6rem" }}>Mean of channels</MenuItem>
+              <MenuItem value="sum"     sx={{ fontSize: "0.6rem" }}>Sum of channels</MenuItem>
+              <MenuItem value="channel" sx={{ fontSize: "0.6rem" }}>Single channel (first enabled)</MenuItem>
+            </Select>
+          </Box>
+          <FormControlLabel sx={{ ml: 0 }}
+            control={<Checkbox size="small" checked={alignUseClahe} onChange={(e) => setAlignUseClahe(e.target.checked)} sx={{ p: 0.25 }} />}
+            label={<Typography variant="caption" sx={{ fontSize: "0.6rem" }} title="Local contrast normalization — helps SIFT find features when Z intensity drifts.">CLAHE pre-process</Typography>}
+          />
+          {aligning && (
+            <Box>
+              <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", display: "block" }}>
+                {alignStage} — {Math.round(alignProgress * 100)}%
+              </Typography>
+              <Box sx={{ height: 4, bgcolor: "action.disabledBackground", borderRadius: 2, overflow: "hidden", mt: 0.25 }}>
+                <Box sx={{
+                  height: "100%",
+                  width: `${Math.max(2, alignProgress * 100)}%`,
+                  bgcolor: "primary.main",
+                  transition: "width 0.2s ease",
+                }} />
+              </Box>
+            </Box>
+          )}
+          {alignError && (
+            <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "error.light" }}>{alignError}</Typography>
+          )}
+          {alignedName && !alignError && !aligning && (
+            <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "primary.light" }}>
+              Aligned stack ready ({alignedName.split("::").pop()}) — 3D view will use this.
+            </Typography>
+          )}
+        </Box>
+      )}
 
       <Divider sx={{ my: 0.5 }} />
 
@@ -1861,14 +2035,14 @@ function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, se
         onClick={() => setVolumeOpen(true)}
         sx={{ fontSize: "0.6rem", textTransform: "none" }}
       >
-        🔬 3D Volume View
+        🔬 3D Volume View {alignedName ? "(aligned)" : ""}
       </Button>
 
       {volumeOpen && (
         <VolumeViewerDialog
           open={volumeOpen}
           onClose={() => setVolumeOpen(false)}
-          imageName={imageName}
+          imageName={alignedName ?? imageName}
           startFrame={projRange[0]}
           endFrame={projRange[1]}
           panelRow={panelRow}
@@ -2340,7 +2514,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       const rot = p.rotation ?? 0;
       setDisplayRotation(rot > 180 ? rot - 360 : rot);
     }
-  }, [panel, open]);
+    // IMPORTANT: only hydrate from the canonical `panel` when the panel
+    // COORDINATE changes (different row/col) or when the dialog opens.
+    // Using `[panel, open]` would re-fire whenever the store mutates —
+    // e.g. after seekToFrame → requestPreview → config update — which
+    // would clobber transient edit state like `videoFrame` (slider
+    // snapping back to the last-saved frame). The editor's working copy
+    // (`local`) is intentionally decoupled from external store edits
+    // until the user closes the dialog.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [row, col, open]);
 
   // Hook undo/redo into every local-state mutation. We watch `local` itself
   // (not the updateLocal fn) so direct setLocal calls and slider updates
@@ -3242,7 +3425,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
               <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.85rem" }}>
                 📚 Z-Stack Slice Selector
               </Typography>
-              <ZStackFrameSelector imageName={local?.image_name || ""} frame={videoFrame} setFrame={setVideoFrame} panelRow={row} panelCol={col} onFrameChange={() => {
+              <ZStackFrameSelector imageName={local?.image_name || ""} frame={videoFrame} setFrame={setVideoFrame} panelRow={row} panelCol={col}
+              onPanelImageNameChange={() => {
+                // Sync `local.frame` with `videoFrame` so the next
+                // refreshPreview/patch sends the new frame number. The
+                // image_name stays the original multichannel source —
+                // the renderer reads panel.frame to pick the slice
+                // (see _get_panel_image), so channel controls and
+                // per-panel slice browsing both work.
+                setLocal(prev => (prev ? { ...prev, frame: videoFrame } : prev));
+              }} onFrameChange={() => {
                 refreshPreview();
               }} onFrameImage={(b64) => {
                 setPreviewB64(b64);

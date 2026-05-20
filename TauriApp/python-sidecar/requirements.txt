@@ -8,3 +8,7 @@ numpy>=1.24
 # Used for per-channel z-stack support (channel groups) and the
 # NIfTI fast path.
 tifffile>=2023.0
+# NIfTI export for the 3D volume viewer (NiiVue path).  The /api/zstack
+# /{name}/nifti endpoint hard-requires this; without it the 3D Volume
+# View button fails with "nibabel not bundled".
+nibabel>=5.0

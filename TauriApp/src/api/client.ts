@@ -549,7 +549,7 @@ class ApiClient {
     return apiJson(`/api/zstack/${encodeURIComponent(name)}/info`);
   }
 
-  async getZStackFrame(name: string, frameNum: number, row?: number, col?: number): Promise<{ frame: number; width: number; height: number; thumbnail: string }> {
+  async getZStackFrame(name: string, frameNum: number, row?: number, col?: number): Promise<{ frame: number; width: number; height: number; thumbnail: string; image_name?: string }> {
     const params = (row != null && col != null) ? `?row=${row}&col=${col}` : "";
     return apiJson(`/api/zstack/${encodeURIComponent(name)}/frame/${frameNum}${params}`);
   }
@@ -573,6 +573,7 @@ class ApiClient {
     enabled?: boolean[];
     black_levels?: number[];
     white_levels?: number[];
+    names?: string[];
   }> {
     return apiJson(`/api/zstack/${encodeURIComponent(name)}/channels/info`);
   }
@@ -584,13 +585,126 @@ class ApiClient {
     tints?: string[]; enabled?: boolean[];
     black_levels?: number[]; white_levels?: number[];
     current_z?: number;
+    names?: string[];
     row?: number; col?: number;
   }): Promise<{
     thumbnail: string; width: number; height: number;
     current_z: number; tints: string[]; enabled: boolean[];
     black_levels: number[]; white_levels: number[];
+    names?: string[];
   }> {
     return apiJson(`/api/zstack/${encodeURIComponent(name)}/channels`, "PATCH", JSON.stringify(body));
+  }
+
+  // Ask the server which z-stack alignment algorithms are usable.
+  // SIFT needs ImageJ/Fiji installed; phase_correlation is always available.
+  async getAlignAvailability(): Promise<{
+    sift: { available: boolean; kind: string; path: string };
+    phase_correlation: { available: boolean; kind: string };
+  }> {
+    return apiJson("/api/zstack/align/availability");
+  }
+
+  // Run alignment on a z-stack. Returns a new in-memory name (e.g.
+  // "Composite.tif::aligned") that the caller can swap into the panel.
+  async alignZStack(name: string, opts: {
+    method: "sift" | "phase_correlation";
+    startFrame?: number; endFrame?: number;
+    alignChannel?: number;
+    // SIFT params
+    siftInitialGaussianBlur?: number;
+    siftStepsPerScaleOctave?: number;
+    siftMinimumImageSize?: number;
+    siftMaximumImageSize?: number;
+    siftFeatureDescriptorSize?: number;
+    siftFeatureDescriptorOrientationBins?: number;
+    siftClosestNextClosestRatio?: number;
+    siftMaximalAlignmentError?: number;
+    siftInlierRatio?: number;
+    siftExpectedTransformation?: "Translation" | "Rigid" | "Similarity" | "Affine";
+    siftInterpolate?: boolean;
+    // Phase correlation
+    pcWindow?: "hann" | "rect";
+    pcMaxShiftFrac?: number;
+    // Performance knobs
+    alignMaxDim?: number;   // cap the per-frame size before alignment (default 1024 px)
+    timeoutSec?: number;    // subprocess timeout for SIFT (default 1800)
+    // Reference source — which image(s) to feed into SIFT/phase corr.
+    // "max" (default) pools features across all enabled channels.
+    alignmentSource?: "max" | "mean" | "sum" | "channel";
+    // CLAHE pre-processing — local contrast normalization.
+    useClahe?: boolean;
+    claheClipLimit?: number;
+    claheTileGrid?: number;
+  }): Promise<{
+    /** Job id — pass to `pollAlignStatus` to track progress. */
+    job_id: string;
+    status: string;
+  }> {
+    return apiJson(`/api/zstack/${encodeURIComponent(name)}/align`, "POST", JSON.stringify({
+      method: opts.method,
+      start_frame: opts.startFrame ?? 0,
+      end_frame: opts.endFrame ?? -1,
+      align_channel: opts.alignChannel ?? -1,
+      sift_initial_gaussian_blur: opts.siftInitialGaussianBlur ?? 1.6,
+      sift_steps_per_scale_octave: opts.siftStepsPerScaleOctave ?? 3,
+      sift_minimum_image_size: opts.siftMinimumImageSize ?? 64,
+      sift_maximum_image_size: opts.siftMaximumImageSize ?? 1024,
+      sift_feature_descriptor_size: opts.siftFeatureDescriptorSize ?? 4,
+      sift_feature_descriptor_orientation_bins: opts.siftFeatureDescriptorOrientationBins ?? 8,
+      sift_closest_next_closest_ratio: opts.siftClosestNextClosestRatio ?? 0.92,
+      sift_maximal_alignment_error: opts.siftMaximalAlignmentError ?? 25,
+      sift_inlier_ratio: opts.siftInlierRatio ?? 0.05,
+      sift_expected_transformation: opts.siftExpectedTransformation ?? "Rigid",
+      sift_interpolate: opts.siftInterpolate ?? true,
+      pc_window: opts.pcWindow ?? "hann",
+      pc_max_shift_frac: opts.pcMaxShiftFrac ?? 0.25,
+      align_max_dim: opts.alignMaxDim ?? 1024,
+      timeout_sec: opts.timeoutSec ?? 1800,
+      alignment_source: opts.alignmentSource ?? "max",
+      use_clahe: opts.useClahe ?? false,
+      clahe_clip_limit: opts.claheClipLimit ?? 2.0,
+      clahe_tile_grid: opts.claheTileGrid ?? 8,
+    }));
+  }
+
+  /** Poll the status of an alignment job started via `alignZStack`. */
+  async pollAlignStatus(jobId: string): Promise<{
+    status: "starting" | "running" | "done" | "error";
+    progress: number;   // 0..1
+    stage: string;      // human-readable
+    result: null | {
+      aligned_name: string;
+      method: string;
+      n_frames: number;
+      n_channels: number;
+      shifts: number[][];
+      log: Record<string, string>;
+    };
+    error: string | null;
+  }> {
+    return apiJson(`/api/zstack/align/status/${encodeURIComponent(jobId)}`);
+  }
+
+  /** Convenience: start an alignment job and poll until done/error.
+   *  `onProgress` is called with (progress 0..1, stage label) on each
+   *  poll, throttled by `pollIntervalMs`. */
+  async alignAndWait(
+    name: string,
+    opts: Parameters<ApiClient["alignZStack"]>[1],
+    onProgress?: (progress: number, stage: string) => void,
+    pollIntervalMs: number = 500,
+  ): Promise<NonNullable<Awaited<ReturnType<ApiClient["pollAlignStatus"]>>["result"]>> {
+    const start = await this.alignZStack(name, opts);
+    for (;;) {
+      const status = await this.pollAlignStatus(start.job_id);
+      onProgress?.(status.progress, status.stage);
+      if (status.status === "done" && status.result) return status.result;
+      if (status.status === "error") {
+        throw new Error(status.error || "Alignment failed");
+      }
+      await new Promise(r => setTimeout(r, pollIntervalMs));
+    }
   }
 
   async projectZStack(name: string, startFrame: number, endFrame: number, method: string): Promise<{ method: string; start_frame: number; end_frame: number; width: number; height: number; thumbnail: string }> {
@@ -609,7 +723,13 @@ class ApiClient {
 
   async getZStackNifti(name: string, opts: {
     startFrame?: number; endFrame?: number; maxDim?: number; zSpacing?: number;
-  } = {}): Promise<{ data: string; width: number; height: number; depth: number }> {
+  } = {}): Promise<{
+    data: string; width: number; height: number; depth: number;
+    /** True when the server composited the source's per-channel tints
+     *  into an RGB24 NIfTI volume (multichannel TIFFs only). NiiVue
+     *  ignores the colormap dropdown for RGB volumes. */
+    rgb?: boolean;
+  }> {
     return apiJson(`/api/zstack/${encodeURIComponent(name)}/nifti`, "POST", JSON.stringify({
       start_frame: opts.startFrame ?? 0, end_frame: opts.endFrame ?? -1,
       max_dim: opts.maxDim ?? 256,

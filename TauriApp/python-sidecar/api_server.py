@@ -175,7 +175,7 @@ zstack_counts: Dict[str, int] = {}     # name → total frame count
 class _ChannelGroup:
     __slots__ = ("axes", "arr", "num_channels", "num_z",
                  "current_z", "tints", "enabled",
-                 "black_levels", "white_levels", "max_vals")
+                 "black_levels", "white_levels", "max_vals", "names")
 
     def __init__(self, axes: str, arr: "np.ndarray"):
         self.axes = axes
@@ -188,8 +188,34 @@ class _ChannelGroup:
         self.black_levels: List[int] = []   # 0-255
         self.white_levels: List[int] = []   # 0-255
         self.max_vals: List[float] = []     # native max per channel (for level mapping)
+        # Human-readable channel names so the user can label "DAPI", "GFP",
+        # etc. Surfaced in tooltips on the swatches and used in the 3D
+        # viewer's channel toggles. Defaults to "Ch 1", "Ch 2", …
+        self.names: List[str] = []
 
 channel_groups: Dict[str, _ChannelGroup] = {}
+
+
+def _resolve_channel_group_key(name: str) -> Optional[str]:
+    """Return the canonical channel_groups key for `name`. Handles the
+    per-panel snapshot keys (e.g. `__zstack_Composite.tif_r0c0`) by
+    falling back to the embedded source name so the Channels block
+    keeps working after a frame seek (which renames the panel's
+    image_name to the per-panel snapshot key)."""
+    if name in channel_groups:
+        return name
+    if name.startswith("__zstack_"):
+        # Strip the "__zstack_" prefix and the trailing "_r{R}c{C}"
+        rest = name[len("__zstack_"):]
+        # Last "_rNcM" suffix
+        import re as _re
+        m = _re.match(r"(.+?)_r\d+c\d+$", rest)
+        if m and m.group(1) in channel_groups:
+            return m.group(1)
+        # Or for aligned outputs: "{name}::aligned" stored under panel_key
+        if rest in channel_groups:
+            return rest
+    return None
 
 # Default per-channel tints — cycled for groups with > 7 channels.
 _DEFAULT_CHANNEL_TINTS = [
@@ -203,9 +229,67 @@ _DEFAULT_CHANNEL_TINTS = [
 ]
 
 
+def _canonicalize_tiff_axes(arr: "np.ndarray", axes: str):
+    """Normalize a tifffile axes string + array to a canonical TZCYX
+    (or subset) layout. Single helper used by every TIFF code path so
+    they all interpret the same letter the same way.
+
+    Behaviour by axis label:
+      - T, Z, C, Y, X: kept, reordered to canonical TZCYX
+      - S (sample-per-pixel, e.g. RGB-as-samples): max-merged into a
+        single luminance plane — we don't treat sample-axis RGB as a
+        user-tintable channel group; PIL renders those natively.
+      - I (ImageJ "image" / sequential frame index): promoted to Z when
+        no Z is present (the common multi-page-as-z pattern); otherwise
+        max-collapsed defensively.
+      - Q (tifffile's "unknown axis"): same as I — Z-promotion first,
+        max-collapse if Z already exists.
+      - Any other letter (rare microscope-specific dims like A=angle,
+        M=mosaic, R=rotation): treated identically to I/Q — promote to
+        Z if absent, else max-collapse. Better to merge an unknown dim
+        than to crash with "axes don't match array".
+
+    Returns (arr, canonical_axes_substring). The caller is responsible
+    for further reductions like collapsing T to a single frame.
+    """
+    if not axes:
+        return arr, ""
+    axes = axes.upper()
+
+    # 1) Merge S (sample-per-pixel) axis early.
+    while "S" in axes:
+        i = axes.index("S")
+        arr = arr.max(axis=i)
+        axes = axes[:i] + axes[i+1:]
+
+    # 2) Re-label any non-canonical letter (I, Q, A, M, R, …) as either
+    #    a brand-new Z (when no Z exists) or max-collapse it. We loop so
+    #    multiple unknown axes all get handled deterministically.
+    CANONICAL = set("TZCYX")
+    while True:
+        unknown = [c for c in axes if c not in CANONICAL]
+        if not unknown:
+            break
+        letter = unknown[0]
+        i = axes.index(letter)
+        if "Z" not in axes:
+            axes = axes[:i] + "Z" + axes[i+1:]
+        else:
+            arr = arr.max(axis=i)
+            axes = axes[:i] + axes[i+1:]
+
+    # 3) Reorder to canonical TZCYX (just the subset that's present).
+    canonical = "".join(a for a in "TZCYX" if a in axes)
+    if canonical and axes != canonical:
+        arr = np.transpose(arr, [axes.index(a) for a in canonical])
+        axes = canonical
+    return arr, axes
+
+
 def _detect_multichannel_tiff(tiff_path: str):
-    """Read a TIFF with tifffile and return (axes, arr) if it has > 1
-    channel, else None. Robust to single-page and pyramidal TIFFs."""
+    """Read a TIFF with tifffile and return (canonical_axes, arr) if
+    it has > 1 channel, else None. Robust to single-page, pyramidal,
+    ImageJ-hyperstack, and unknown-axis TIFFs."""
     try:
         import tifffile
     except ImportError:
@@ -214,19 +298,21 @@ def _detect_multichannel_tiff(tiff_path: str):
         with tifffile.TiffFile(tiff_path) as tf:
             if not tf.series:
                 return None
-            s = tf.series[0]
+            # Pick the largest series (typically series[0], but pyramidal
+            # TIFFs put downsampled levels in later series — guard against
+            # accidentally picking a 256×256 preview).
+            s = max(tf.series, key=lambda ser: int(np.prod(ser.shape)))
             axes = (s.axes or "").upper()
             shape = s.shape
-            # Find C axis
-            if "C" in axes:
-                ci = axes.index("C")
-                if ci < len(shape) and shape[ci] > 1:
-                    arr = s.asarray()
-                    return axes, arr
-            # Some TIFFs carry channel data in "S" (sample/photometric)
-            # — e.g. RGB stored as 3 samples per pixel. We don't treat
-            # standard RGB TIFFs as channel groups (PIL handles them).
-            return None
+            if "C" not in axes:
+                return None
+            ci = axes.index("C")
+            if ci >= len(shape) or shape[ci] <= 1:
+                return None
+            arr = s.asarray()
+        # Canonicalize so downstream code always sees ZCYX (or a substring).
+        arr, axes = _canonicalize_tiff_axes(arr, axes)
+        return axes, arr
     except Exception as e:
         import sys
         print(f"[multichannel-detect] {tiff_path}: {e}", file=sys.stderr, flush=True)
@@ -234,7 +320,9 @@ def _detect_multichannel_tiff(tiff_path: str):
 
 
 def _init_channel_group(name: str, axes: str, arr: "np.ndarray") -> _ChannelGroup:
-    """Build initial channel group state with sane defaults."""
+    """Build initial channel group state with sane defaults. `axes` is
+    expected to be already canonicalised by `_canonicalize_tiff_axes` —
+    a substring of TZCYX in that order."""
     g = _ChannelGroup(axes, arr)
 
     # Collapse any T axis to first (we don't expose time-as-channels yet).
@@ -258,6 +346,7 @@ def _init_channel_group(name: str, axes: str, arr: "np.ndarray") -> _ChannelGrou
     g.enabled  = [True] * g.num_channels
     g.black_levels = [0]   * g.num_channels
     g.white_levels = [255] * g.num_channels
+    g.names    = [f"Ch {c + 1}" for c in range(g.num_channels)]
 
     # Compute per-channel max for normalization (important for 16-bit /
     # float data — a 16-bit channel with peak 4000 would otherwise
@@ -308,11 +397,16 @@ def _extract_channel_plane(g: _ChannelGroup, c: int, z: int) -> "np.ndarray":
     return a
 
 
-def _composite_channel_group(name: str) -> Image.Image:
-    """Re-render the composite RGB image for the channel group's current
-    z-slice using each channel's tint colour + black/white levels."""
+def _composite_channel_group(name: str, z: Optional[int] = None) -> Image.Image:
+    """Re-render the composite RGB image for the channel group at the
+    given z-slice (or the group's `current_z` when z is None). The
+    z-override lets the panel render its OWN frame without mutating
+    the group's shared state — important so two panels showing the
+    same source can hold different frames simultaneously."""
     g = channel_groups[name]
-    z = g.current_z
+    if z is None:
+        z = g.current_z
+    z = max(0, min(int(z), g.num_z - 1))
     H = W = None
     out = None
 
@@ -382,9 +476,9 @@ _VIDEO_FRAME_CACHE_MAX = 128
 
 def _get_panel_image(panel) -> Optional[Image.Image]:
     """Return the PIL image for *panel*, honouring its per-panel
-    `frame` field for video sources so multiple panels using the
-    same video name can each show a different frame. Falls back to
-    loaded_images for non-video sources or unknown names.
+    `frame` field for video / z-stack / channel-group sources so
+    multiple panels using the same source can each show a different
+    frame. Falls back to loaded_images for non-frame-bearing names.
     """
     name = getattr(panel, "image_name", None)
     if not name:
@@ -407,6 +501,19 @@ def _get_panel_image(panel) -> Optional[Image.Image]:
             if first_key != key:
                 del _video_frame_cache[first_key]
         return img
+    # Multichannel z-stack: composite at the panel's frame using the
+    # group's tints / levels. This is the resolution-of-truth so the
+    # panel keeps its OWN view of the source — the slider doesn't
+    # mutate the group's shared `current_z` (which would bleed across
+    # panels showing the same TIFF).
+    if name in channel_groups:
+        g = channel_groups[name]
+        frame_num = int(getattr(panel, "frame", 0) or 0)
+        return _composite_channel_group(name, z=frame_num)
+    # Single-channel z-stack: extract the slice at panel.frame on demand.
+    if name in loaded_zstacks:
+        frame_num = int(getattr(panel, "frame", 0) or 0)
+        return _extract_tiff_frame(loaded_zstacks[name], frame_num)
     return loaded_images.get(name)
 
 def _is_tiff(filename: str) -> bool:
@@ -1057,21 +1164,18 @@ def get_zstack_frame(name: str, frame_num: int, row: Optional[int] = None, col: 
     else:
         img = _extract_tiff_frame(loaded_zstacks[name], frame_num)
 
-    # If row/col provided, update that specific panel's image assignment
-    # so different panels can show different frames of the same z-stack
+    # If row/col provided, store the seeked frame ON THE PANEL ITSELF
+    # via `panel.frame`. The rendering pipeline reads this via
+    # `_get_panel_image` so each panel keeps its OWN view of the source
+    # — no snapshot keys, no panel.image_name rewrites. This means:
+    #   • Two panels can show the same multichannel TIFF at different Z
+    #   • Channel toggles (tints / names) still resolve via the original
+    #     image_name → channel_groups[name]
+    #   • Browsing slices doesn't "freeze" the panel to a static image
     if row is not None and col is not None:
-        panel_key = f"__zstack_{name}_r{row}c{col}"
-        loaded_images[panel_key] = img
-        zstack_frames[panel_key] = frame_num
-        # Also update the panel's image_name to use the panel-specific key
         if row < cfg.rows and col < cfg.cols:
-            cfg.panels[row][col].image_name = panel_key
-        # Register as a virtual z-stack so info lookups work. Channel
-        # groups don't always have an underlying tiff path (when they're
-        # purely in-memory composite outputs), so guard the lookup.
-        if name in loaded_zstacks:
-            loaded_zstacks[panel_key] = loaded_zstacks[name]
-        zstack_counts[panel_key] = zstack_counts.get(name, 1)
+            cfg.panels[row][col].frame = frame_num
+        zstack_frames[f"__zstack_{name}_r{row}c{col}"] = frame_num
     else:
         loaded_images[name] = img
         zstack_frames[name] = frame_num
@@ -1085,12 +1189,566 @@ def get_zstack_frame(name: str, frame_num: int, row: Optional[int] = None, col: 
     buf = io.BytesIO()
     preview.save(buf, format="PNG")
     preview_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    # No image_name rewrite: panels keep their original multichannel
+    # source and the renderer reads panel.frame to pick the slice.
     return {"frame": frame_num, "width": img.size[0], "height": img.size[1],
             "thumbnail": preview_b64}
 
 @app.get("/api/zstack/list")
 def list_zstacks():
     return {"zstacks": list(loaded_zstacks.keys())}
+
+
+# ── Z-stack alignment ──────────────────────────────────────────────────────
+#
+# Two implementations:
+#   1. ImageJ "Linear Stack Alignment with SIFT" — full SIFT feature
+#      matching. Best quality but requires Fiji installed on the host.
+#   2. OpenCV phase correlation — translation-only alignment using
+#      `cv2.phaseCorrelate`. Always available (cv2 is already bundled).
+#
+# Both produce a new aligned z-stack stored under a derived name so the
+# original isn't destroyed. The frontend can then re-load the aligned
+# stack by switching the panel's image_name.
+
+# Job-tracking dict for /align — keeps progress + result so the
+# frontend can poll instead of blocking on a multi-minute fetch (which
+# browsers abort with "Failed to fetch" after a few minutes of silence).
+_align_jobs: Dict[str, Dict] = {}
+_ALIGN_JOBS_MAX = 32
+
+
+def _new_align_job() -> str:
+    """Allocate a job id, LRU-evicting old completed entries."""
+    import uuid
+    job_id = uuid.uuid4().hex[:12]
+    _align_jobs[job_id] = {
+        "status": "starting",      # starting | running | done | error
+        "progress": 0.0,           # 0..1
+        "stage": "queued",          # human-readable
+        "result": None,
+        "error": None,
+    }
+    if len(_align_jobs) > _ALIGN_JOBS_MAX:
+        first = next(iter(_align_jobs))
+        if first != job_id:
+            del _align_jobs[first]
+    return job_id
+
+
+@app.get("/api/zstack/align/availability")
+def zstack_align_availability():
+    """Tell the frontend which alignment algorithms are usable here.
+    `sift` requires ImageJ/Fiji on the host; `phase_correlation` is
+    always available via OpenCV."""
+    path, kind = _find_imagej_executable()
+    return {
+        "sift": {"available": bool(path), "kind": kind, "path": path or ""},
+        "phase_correlation": {"available": True, "kind": "opencv"},
+    }
+
+
+class ZStackAlignRequest(BaseModel):
+    method: str = "sift"  # "sift" | "phase_correlation"
+    start_frame: int = 0
+    end_frame: int = -1
+    # Channel index to use for alignment when source is multichannel
+    # (default = first enabled channel). Translations computed on this
+    # channel are applied to all channels so the registration stays in
+    # sync across colours.
+    align_channel: int = -1
+    # SIFT fine controls — defaults match Fiji's "Linear Stack Alignment
+    # with SIFT" defaults. See https://imagej.net/Linear_Stack_Alignment_with_SIFT
+    sift_initial_gaussian_blur: float = 1.6
+    sift_steps_per_scale_octave: int = 3
+    sift_minimum_image_size: int = 64
+    sift_maximum_image_size: int = 1024
+    sift_feature_descriptor_size: int = 4
+    sift_feature_descriptor_orientation_bins: int = 8
+    sift_closest_next_closest_ratio: float = 0.92
+    sift_maximal_alignment_error: float = 25.0
+    sift_inlier_ratio: float = 0.05
+    sift_expected_transformation: str = "Rigid"   # Translation | Rigid | Similarity | Affine
+    sift_interpolate: bool = True
+    # Phase correlation fine controls
+    pc_window: str = "hann"       # hann | rect — windowing for cv2.phaseCorrelate
+    pc_max_shift_frac: float = 0.25  # discard suggested shifts beyond this fraction of width
+    # ── Performance knobs (SIFT) ──
+    # Cap the input frame size for SIFT before invoking Fiji. SIFT runtime
+    # scales superlinearly with pixel count, and the algorithm itself
+    # downsamples internally to `sift_maximum_image_size` anyway — so
+    # giving it 2048² when SIFT max is 1024 is just wasted I/O. Default
+    # 1024 keeps a 114-frame stack alignable in a couple of minutes
+    # instead of >10. Set to 0 to disable.
+    align_max_dim: int = 1024
+    # subprocess timeout for Fiji; users with huge stacks may want more.
+    timeout_sec: int = 1800
+    # ── Alignment reference source ──
+    #   "max"      — element-wise max-projection across enabled channels
+    #                (default; pools features from every channel, robust
+    #                when no single channel has good signal everywhere)
+    #   "mean"     — element-wise mean across enabled channels
+    #   "sum"      — element-wise sum (clipped to uint8 max)
+    #   "channel"  — use only `align_channel` (legacy single-channel)
+    alignment_source: str = "max"
+    # Apply CLAHE (contrast-limited adaptive histogram equalization)
+    # before alignment. Dramatically improves SIFT/phase-correlation
+    # on biological volumes where intensity drifts in Z.
+    use_clahe: bool = False
+    clahe_clip_limit: float = 2.0
+    clahe_tile_grid: int = 8
+
+
+def _recover_affines_from_alignment(orig: "np.ndarray", aligned: "np.ndarray",
+                                     transformation: str = "Rigid",
+                                     progress_cb=None) -> List["np.ndarray"]:
+    """For each frame, compute the 2×3 affine that maps `orig[i]` to
+    `aligned[i]`. Used after Fiji's SIFT plugin (which doesn't expose
+    its transforms directly) so we can apply the same per-frame
+    registration to channels other than the alignment reference.
+
+    Uses cv2.findTransformECC with the motion model chosen by the user
+    (Translation/Euclidean/Affine/Homography). Returns identity for any
+    frame where ECC fails to converge.
+    """
+    import cv2
+    n = orig.shape[0]
+    H, W = orig.shape[-2:]
+    # Map our names → cv2 motion-model constants
+    motion = {
+        "Translation": cv2.MOTION_TRANSLATION,
+        "Rigid": cv2.MOTION_EUCLIDEAN,        # rotation + translation
+        "Similarity": cv2.MOTION_EUCLIDEAN,   # cv2 has no similarity, fall back to euclidean
+        "Affine": cv2.MOTION_AFFINE,
+    }.get(transformation, cv2.MOTION_EUCLIDEAN)
+    transforms: List[np.ndarray] = []
+    crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-5)
+    for i in range(n):
+        warp = np.eye(2, 3, dtype=np.float32)
+        try:
+            o = orig[i].astype(np.float32) / 255.0
+            a = aligned[i].astype(np.float32) / 255.0
+            cc, warp = cv2.findTransformECC(a, o, warp, motion, crit, None, 1)
+        except Exception as e:
+            print(f"[align-recover] frame {i} ECC failed: {e}", file=sys.stderr, flush=True)
+        transforms.append(warp.astype(np.float32))
+        if progress_cb:
+            progress_cb(i + 1, n)
+    return transforms
+
+
+def _apply_affines_to_channel_stack(stack: "np.ndarray", transforms: List["np.ndarray"]) -> "np.ndarray":
+    """Apply per-frame 2×3 affines to `stack` (Z, Y, X), returning a
+    same-shape aligned stack. Frames without a transform pass through."""
+    import cv2
+    n = stack.shape[0]
+    H, W = stack.shape[-2:]
+    out = np.zeros_like(stack)
+    for i in range(n):
+        if i < len(transforms):
+            out[i] = cv2.warpAffine(stack[i], transforms[i], (W, H), flags=cv2.INTER_LINEAR, borderValue=0)
+        else:
+            out[i] = stack[i]
+    return out
+
+
+def _align_phase_correlation(stack: "np.ndarray", body: ZStackAlignRequest):
+    """OpenCV phaseCorrelate-based translation alignment.
+
+    `stack` is (Z, Y, X) uint8 or float. Returns (aligned_stack, shifts)
+    where shifts is [(dx0, dy0), ...] of length Z. Frame 0 is anchored;
+    every subsequent frame is aligned to its predecessor's *aligned*
+    position (cumulative shift) so we don't drift far from frame 0.
+    """
+    import cv2
+    n = stack.shape[0]
+    H, W = stack.shape[-2:]
+    max_shift_px = max(2.0, float(body.pc_max_shift_frac) * min(H, W))
+    # Hann window damps edge artefacts which is the standard prerequisite.
+    if body.pc_window == "hann":
+        win = (np.hanning(H)[:, None] * np.hanning(W)[None, :]).astype(np.float32)
+    else:
+        win = np.ones((H, W), dtype=np.float32)
+    out = np.zeros_like(stack)
+    out[0] = stack[0]
+    shifts = [(0.0, 0.0)]
+    cum_dx, cum_dy = 0.0, 0.0
+    prev = stack[0].astype(np.float32)
+    for i in range(1, n):
+        cur = stack[i].astype(np.float32)
+        (dx, dy), _ = cv2.phaseCorrelate(prev * win, cur * win)
+        # Clamp to max_shift_px
+        if abs(dx) > max_shift_px or abs(dy) > max_shift_px:
+            dx, dy = 0.0, 0.0
+        cum_dx += dx
+        cum_dy += dy
+        M = np.float32([[1, 0, -cum_dx], [0, 1, -cum_dy]])
+        warped = cv2.warpAffine(stack[i], M, (W, H), flags=cv2.INTER_LINEAR, borderValue=0)
+        out[i] = warped
+        shifts.append((float(cum_dx), float(cum_dy)))
+        prev = cur
+    return out, shifts
+
+
+def _align_sift_imagej(stack: "np.ndarray", body: ZStackAlignRequest, ij_path: str):
+    """Run Fiji's "Linear Stack Alignment with SIFT" headless against
+    `stack` (Z, Y, X). Returns (aligned_stack, log) — log includes the
+    raw stdout/stderr from Fiji which we surface to the UI on failure.
+
+    Times out cleanly via HTTPException 504 instead of bubbling
+    `TimeoutExpired` (which produces an opaque 500 / connection drop
+    that the browser reports as "Failed to fetch").
+    """
+    import subprocess as _sp, tempfile as _tf, os as _os, time as _time
+    import tifffile as _tf2
+    import sys as _sys
+    workdir = _tf.mkdtemp(prefix="mpfig_align_")
+    try:
+        in_tif = _os.path.join(workdir, "in.tif")
+        out_tif = _os.path.join(workdir, "out.tif")
+        _tf2.imwrite(in_tif, stack)
+        # Build the SIFT command-string. We replicate Fiji's exact param
+        # names so users running the same algorithm in Fiji's GUI can
+        # reproduce these results.
+        opts = (
+            f"initial_gaussian_blur={body.sift_initial_gaussian_blur} "
+            f"steps_per_scale_octave={body.sift_steps_per_scale_octave} "
+            f"minimum_image_size={body.sift_minimum_image_size} "
+            f"maximum_image_size={body.sift_maximum_image_size} "
+            f"feature_descriptor_size={body.sift_feature_descriptor_size} "
+            f"feature_descriptor_orientation_bins={body.sift_feature_descriptor_orientation_bins} "
+            f"closest/next_closest_ratio={body.sift_closest_next_closest_ratio} "
+            f"maximal_alignment_error={body.sift_maximal_alignment_error} "
+            f"inlier_ratio={body.sift_inlier_ratio} "
+            f"expected_transformation={body.sift_expected_transformation}"
+            + (" interpolate" if body.sift_interpolate else "")
+        )
+        in_macro  = in_tif.replace("\\", "/")
+        out_macro = out_tif.replace("\\", "/")
+        macro = (
+            f'open("{in_macro}");\n'
+            f'run("Linear Stack Alignment with SIFT", "{opts}");\n'
+            f'saveAs("Tiff", "{out_macro}");\n'
+            f'run("Quit");\n'
+        )
+        macro_path = _os.path.join(workdir, "align.ijm")
+        with open(macro_path, "w") as fh:
+            fh.write(macro)
+        cmd = [ij_path, "--headless", "--console", "-macro", macro_path]
+        t0 = _time.monotonic()
+        print(f"[align-sift] running {' '.join(cmd)} (timeout={body.timeout_sec}s)",
+              file=_sys.stderr, flush=True)
+        try:
+            proc = _sp.run(cmd, capture_output=True, text=True, timeout=max(60, int(body.timeout_sec)))
+        except _sp.TimeoutExpired as te:
+            # Clean 504 with a hint, instead of letting the unhandled
+            # TimeoutExpired drop the HTTP connection (which the browser
+            # surfaces as "Failed to fetch").
+            elapsed = _time.monotonic() - t0
+            raise HTTPException(
+                504,
+                (f"SIFT alignment timed out after {elapsed:.0f}s (Fiji subprocess limit). "
+                 f"Tips: reduce frame range, lower `align_max_dim` (current={body.align_max_dim}px), "
+                 f"or pick 'Translation' transformation. Partial stdout: {(te.stdout or '')[-400:]}")
+            ) from None
+        if not _os.path.isfile(out_tif):
+            raise HTTPException(500, f"SIFT alignment produced no output. ImageJ stdout: {proc.stdout[-400:]} stderr: {proc.stderr[-400:]}")
+        out_arr = _tf2.imread(out_tif)
+        elapsed = _time.monotonic() - t0
+        print(f"[align-sift] done in {elapsed:.1f}s, out shape {out_arr.shape}", file=_sys.stderr, flush=True)
+        return out_arr, {"stdout": proc.stdout[-2000:], "stderr": proc.stderr[-2000:], "elapsed_sec": f"{elapsed:.1f}"}
+    finally:
+        try:
+            import shutil as _shutil
+            _shutil.rmtree(workdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _run_alignment_job(job_id: str, name: str, body: ZStackAlignRequest):
+    """Background-thread implementation of alignment. Updates the job
+    record so the polling endpoint can report progress + outcome.
+
+    Multichannel-preserving behaviour:
+      1. Compute per-frame transforms on the reference (alignment) channel
+         (phase_correlation gives shifts directly; SIFT runs through Fiji,
+         then we recover transforms via cv2.findTransformECC by comparing
+         input vs Fiji-aligned frames).
+      2. Apply the same transforms to EVERY channel of the source stack.
+      3. Write a ZCYX multichannel TIFF and register it as a new channel
+         group inheriting the parent's tints / names / levels.
+    """
+    job = _align_jobs.get(job_id)
+    if job is None:
+        return  # job got evicted before it even started
+    job["status"] = "running"
+    try:
+        job["stage"] = "loading source"
+        job["progress"] = 0.02
+        grp = channel_groups.get(name)
+        method = body.method.lower()
+        sift_path, _ = _find_imagej_executable()
+        if method == "sift" and not sift_path:
+            raise HTTPException(400, "SIFT alignment requested but ImageJ/Fiji is not installed on this host.")
+
+        # Build full (Z, C?, Y, X) array for the source.
+        if grp is not None:
+            a = grp.arr
+            ax = grp.axes
+            while "T" in ax:
+                i = ax.index("T")
+                a = np.take(a, 0, axis=i)
+                ax = ax[:i] + ax[i+1:]
+            if "Z" not in ax:
+                raise HTTPException(400, "Source has no Z axis to align over")
+            order = [ax.index(c) for c in "ZCYX" if c in ax]
+            sub_axes = "".join(c for c in "ZCYX" if c in ax)
+            a = np.transpose(a, order)
+            has_c = "C" in sub_axes
+            nz = a.shape[0]
+            start = max(0, body.start_frame)
+            end = body.end_frame if body.end_frame >= 0 else nz - 1
+            end = min(end, nz - 1)
+            if has_c:
+                full = a[start:end+1]   # (Z, C, Y, X)
+                n_ch = full.shape[1]
+                align_channel = body.align_channel
+                if align_channel < 0:
+                    align_channel = next((i for i, en in enumerate(grp.enabled) if en), 0)
+                align_channel = max(0, min(align_channel, n_ch - 1))
+            else:
+                full = a[start:end+1][:, np.newaxis, :, :]  # (Z, 1, Y, X)
+                n_ch = 1
+                align_channel = 0
+        else:
+            tiff_path = loaded_zstacks[name]
+            img_obj = Image.open(tiff_path)
+            n_frames = getattr(img_obj, "n_frames", 1)
+            start = max(0, body.start_frame)
+            end = body.end_frame if body.end_frame >= 0 else n_frames - 1
+            end = min(end, n_frames - 1)
+            frames = []
+            for i in range(start, end + 1):
+                img_obj.seek(i)
+                frames.append(np.array(img_obj.convert("L"), dtype=np.uint8))
+            full = (np.stack(frames, axis=0)
+                    if frames else np.zeros((1, 64, 64), dtype=np.uint8))
+            full = full[:, np.newaxis, :, :]  # (Z, 1, Y, X)
+            n_ch = 1
+            align_channel = 0
+
+        Z, C, H, W = full.shape
+
+        # ── Build the alignment reference stack ─────────────────────
+        # The reference is what SIFT/phase-correlation actually sees.
+        # Pooling features across channels (max/mean/sum) is more robust
+        # than picking a single channel — especially when the chosen
+        # channel has weak signal in parts of the volume.
+        job["stage"] = "preparing reference"
+        job["progress"] = 0.04
+        src_mode = (body.alignment_source or "max").lower()
+        if grp is not None and C > 1:
+            enabled = [bool(e) for e in (grp.enabled or [True] * C)]
+            # Index of channels to combine (or just the one when mode="channel")
+            keep_idx = [i for i, e in enumerate(enabled) if e] or list(range(C))
+        else:
+            keep_idx = [0]
+            src_mode = "channel"
+
+        if src_mode == "channel":
+            ref_full_f = full[:, align_channel].astype(np.float32)
+            ref_max = max(float(ref_full_f.max()), 1.0)
+            stage_label = f"channel {align_channel + 1}"
+        else:
+            sub_f = full[:, keep_idx].astype(np.float32)  # (Z, k, Y, X)
+            if src_mode == "max":
+                ref_full_f = sub_f.max(axis=1)
+                stage_label = f"max-projection of {len(keep_idx)} channel(s)"
+            elif src_mode == "mean":
+                ref_full_f = sub_f.mean(axis=1)
+                stage_label = f"mean of {len(keep_idx)} channel(s)"
+            elif src_mode == "sum":
+                ref_full_f = sub_f.sum(axis=1)
+                stage_label = f"sum of {len(keep_idx)} channel(s)"
+            else:
+                # Unknown mode falls back to max-projection (the safest default).
+                ref_full_f = sub_f.max(axis=1)
+                stage_label = f"max-projection (fallback) of {len(keep_idx)} channel(s)"
+            ref_max = max(float(ref_full_f.max()), 1.0)
+
+        # Optional CLAHE pre-processing — applied per-slice. Helps when
+        # intensity drops off in Z (common in light-sheet) by locally
+        # equalising contrast so SIFT finds features in dim regions.
+        if body.use_clahe:
+            import cv2 as _cv2
+            tile = max(2, int(body.clahe_tile_grid))
+            clahe = _cv2.createCLAHE(
+                clipLimit=max(0.1, float(body.clahe_clip_limit)),
+                tileGridSize=(tile, tile),
+            )
+            tmp_u8 = np.clip(ref_full_f / ref_max * 255.0, 0, 255).astype(np.uint8)
+            for i in range(Z):
+                tmp_u8[i] = clahe.apply(tmp_u8[i])
+            ref_full_f = tmp_u8.astype(np.float32)
+            ref_max = max(float(ref_full_f.max()), 1.0)
+            stage_label += " + CLAHE"
+        job["stage"] = f"reference = {stage_label}"
+
+        # Optional downsample for the *transform computation only*. The
+        # final aligned output stays at full resolution because we apply
+        # the (rescaled) transforms back to the original-size channels.
+        align_max = max(0, int(body.align_max_dim or 0))
+        if align_max > 0 and max(H, W) > align_max:
+            import cv2 as _cv2
+            scale = align_max / max(H, W)
+            new_h = max(8, int(H * scale))
+            new_w = max(8, int(W * scale))
+            small_ref = np.zeros((Z, new_h, new_w), dtype=np.uint8)
+            for i in range(Z):
+                norm = np.clip(ref_full_f[i] / ref_max * 255.0, 0, 255)
+                small_ref[i] = _cv2.resize(norm.astype(np.uint8), (new_w, new_h), interpolation=_cv2.INTER_AREA)
+            ref_u8 = small_ref
+            ds_scale = scale
+        else:
+            ref_u8 = np.clip(ref_full_f / ref_max * 255.0, 0, 255).astype(np.uint8)
+            ds_scale = 1.0
+
+        job["stage"] = f"running {method} on {stage_label}"
+        job["progress"] = 0.10
+
+        if method == "phase_correlation":
+            # Single-pass: phase correlation gives us (dx, dy) per frame
+            # directly, so we skip ECC recovery and apply translation
+            # transforms to all channels.
+            _, shifts_tuples = _align_phase_correlation(ref_u8, body)
+            # Rescale shifts back to original resolution
+            transforms: List[np.ndarray] = []
+            for (dx, dy) in shifts_tuples:
+                T = np.float32([[1, 0, -dx / max(ds_scale, 1e-6)],
+                                [0, 1, -dy / max(ds_scale, 1e-6)]])
+                transforms.append(T)
+            shifts_out = [[float(s[0]), float(s[1])] for s in shifts_tuples]
+            log: Dict[str, str] = {}
+        elif method == "sift":
+            # Run Fiji SIFT on the reference channel
+            aligned_ref_u8, log = _align_sift_imagej(ref_u8, body, sift_path)
+            job["stage"] = "recovering per-frame transforms from SIFT output"
+            job["progress"] = 0.55
+            def _recover_cb(done, total):
+                job["progress"] = 0.55 + 0.30 * (done / max(total, 1))
+                job["stage"] = f"recovering transforms ({done}/{total})"
+            small_transforms = _recover_affines_from_alignment(
+                ref_u8, aligned_ref_u8, body.sift_expected_transformation, progress_cb=_recover_cb
+            )
+            # Upscale the affine translation components to full-res
+            transforms = []
+            for T in small_transforms:
+                T_full = T.copy()
+                if ds_scale != 1.0:
+                    # Translation scales linearly; rotation matrix part
+                    # stays identical (it's resolution-independent).
+                    T_full[0, 2] = T[0, 2] / ds_scale
+                    T_full[1, 2] = T[1, 2] / ds_scale
+                transforms.append(T_full)
+            shifts_out = [[float(T[0, 2]), float(T[1, 2])] for T in transforms]
+        else:
+            raise HTTPException(400, f"Unknown alignment method: {method!r}")
+
+        # Apply transforms to every channel at original resolution
+        job["stage"] = f"applying transforms to {C} channel(s)"
+        job["progress"] = 0.85
+        aligned_4d = np.zeros_like(full)  # (Z, C, Y, X)
+        for c in range(C):
+            aligned_4d[:, c] = _apply_affines_to_channel_stack(full[:, c], transforms)
+            job["progress"] = 0.85 + 0.10 * ((c + 1) / max(C, 1))
+
+        # Save: multichannel ZCYX TIFF if more than one channel,
+        # otherwise the single-plane TIFF.
+        job["stage"] = "writing aligned TIFF"
+        job["progress"] = 0.96
+        import tifffile as _tf2
+        import tempfile as _tf
+        aligned_path = _tf.NamedTemporaryFile(delete=False, suffix=".tif")
+        aligned_path.close()
+        if C > 1:
+            _tf2.imwrite(aligned_path.name, aligned_4d, photometric='minisblack',
+                         metadata={'axes': 'ZCYX'})
+        else:
+            _tf2.imwrite(aligned_path.name, aligned_4d[:, 0])
+
+        aligned_name = f"{name}::aligned"
+        loaded_zstacks[aligned_name] = aligned_path.name
+        zstack_frames[aligned_name] = 0
+        zstack_counts[aligned_name] = int(Z)
+        if C > 1:
+            # Re-register the aligned stack as a channel group so the UI
+            # still shows tints / names. Inherit parent's metadata.
+            new_grp = _init_channel_group(aligned_name, "ZCYX", aligned_4d)
+            if grp is not None:
+                # Inherit user-set tints / names / enabled / levels for
+                # channels that overlap between source and aligned stack.
+                for c in range(min(grp.num_channels, new_grp.num_channels)):
+                    new_grp.tints[c]        = grp.tints[c]
+                    new_grp.names[c]        = grp.names[c]
+                    new_grp.enabled[c]      = grp.enabled[c]
+                    new_grp.black_levels[c] = grp.black_levels[c]
+                    new_grp.white_levels[c] = grp.white_levels[c]
+            # Initial composite for the panel thumbnail
+            loaded_images[aligned_name] = _composite_channel_group(aligned_name)
+        else:
+            loaded_images[aligned_name] = _extract_tiff_frame(aligned_path.name, 0)
+        _recalc_min_dims()
+
+        job["status"] = "done"
+        job["stage"] = "done"
+        job["progress"] = 1.0
+        job["result"] = {
+            "aligned_name": aligned_name,
+            "method": method,
+            "n_frames": int(Z),
+            "n_channels": int(C),
+            "shifts": shifts_out,
+            "log": log,
+        }
+    except HTTPException as he:
+        job["status"] = "error"
+        job["error"] = he.detail if isinstance(he.detail, str) else str(he.detail)
+        job["progress"] = 1.0
+    except Exception as e:
+        import traceback
+        job["status"] = "error"
+        job["error"] = f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}"
+        job["progress"] = 1.0
+
+
+@app.post("/api/zstack/{name}/align")
+def align_zstack(name: str, body: ZStackAlignRequest):
+    """Start an alignment job in the background. Returns a job_id; the
+    client polls /api/zstack/align/status/{job_id} for progress and the
+    final result. We chose async-with-polling over a blocking request
+    because Fiji SIFT can take minutes on large stacks and the browser
+    aborts long pending fetches as "Failed to fetch"."""
+    if name not in loaded_zstacks and name not in channel_groups:
+        raise HTTPException(404, f"Z-stack '{name}' not found")
+    job_id = _new_align_job()
+    import threading
+    t = threading.Thread(target=_run_alignment_job, args=(job_id, name, body), daemon=True)
+    t.start()
+    return {"job_id": job_id, "status": "started"}
+
+
+@app.get("/api/zstack/align/status/{job_id}")
+def align_status(job_id: str):
+    job = _align_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Alignment job not found (may have been evicted)")
+    return {
+        "status": job["status"],   # starting | running | done | error
+        "progress": float(job["progress"]),
+        "stage": job["stage"],
+        "result": job["result"],
+        "error": job["error"],
+    }
 
 
 # ── Multichannel TIFF Endpoints ───────────────────────────────────────────
@@ -1101,9 +1759,10 @@ def get_channel_info(name: str):
     Returns 404 with `is_multichannel: false` for single-channel images,
     so the frontend can probe any image to discover whether the channel
     UI should be shown."""
-    if name not in channel_groups:
+    key = _resolve_channel_group_key(name)
+    if key is None:
         return {"is_multichannel": False}
-    g = channel_groups[name]
+    g = channel_groups[key]
     return {
         "is_multichannel": True,
         "axes": g.axes,
@@ -1114,6 +1773,7 @@ def get_channel_info(name: str):
         "enabled": list(g.enabled),
         "black_levels": list(g.black_levels),
         "white_levels": list(g.white_levels),
+        "names": list(g.names),
     }
 
 
@@ -1124,6 +1784,7 @@ class ChannelUpdateRequest(BaseModel):
     black_levels: Optional[List[int]] = None
     white_levels: Optional[List[int]] = None
     current_z: Optional[int] = None
+    names: Optional[List[str]] = None
     # When provided, also reassign panel.image_name = panel_key (mirrors
     # the per-panel pattern used by the frame endpoint, so two panels can
     # show the same multichannel TIFF with different tints).
@@ -1135,9 +1796,12 @@ class ChannelUpdateRequest(BaseModel):
 def update_channels(name: str, body: ChannelUpdateRequest):
     """Update channel-group state (tints, enabled, levels, z-slice) and
     recompose. Returns the new composite as a base64 PNG preview."""
-    if name not in channel_groups:
+    key = _resolve_channel_group_key(name)
+    if key is None:
         raise HTTPException(404, f"'{name}' is not a multichannel image")
-    g = channel_groups[name]
+    # `name` may be a panel-specific snapshot key (e.g. __zstack_X_r0c0);
+    # `key` is the canonical channel-group key.
+    g = channel_groups[key]
 
     if body.tints is not None:
         # Length-guard: pad/truncate to num_channels.
@@ -1160,21 +1824,20 @@ def update_channels(name: str, body: ChannelUpdateRequest):
         while len(ws) < g.num_channels:
             ws.append(255)
         g.white_levels = ws
+    if body.names is not None:
+        ns = [str(v)[:64] for v in body.names][:g.num_channels]
+        while len(ns) < g.num_channels:
+            ns.append(f"Ch {len(ns) + 1}")
+        g.names = ns
     if body.current_z is not None:
         g.current_z = max(0, min(int(body.current_z), g.num_z - 1))
 
-    img = _composite_channel_group(name)
-
-    # Per-panel override (mirrors /frame): give this panel its own image_name
-    # so changing channel tints on one panel doesn't bleed into another that
-    # shares the source.
-    if body.row is not None and body.col is not None:
-        panel_key = f"__chgrp_{name}_r{body.row}c{body.col}"
-        loaded_images[panel_key] = img
-        if body.row < cfg.rows and body.col < cfg.cols:
-            cfg.panels[body.row][body.col].image_name = panel_key
-    else:
-        loaded_images[name] = img
+    # Tints / names / levels are SHARED state across all panels showing
+    # this multichannel TIFF (analogous to a global LUT). Each panel
+    # still gets its own Z slice via `panel.frame` (see _get_panel_image),
+    # but the channel display settings apply uniformly.
+    img = _composite_channel_group(key)
+    loaded_images[key] = img
 
     _recalc_min_dims()
     preview = img.copy()
@@ -1193,6 +1856,7 @@ def update_channels(name: str, body: ChannelUpdateRequest):
         "enabled": list(g.enabled),
         "black_levels": list(g.black_levels),
         "white_levels": list(g.white_levels),
+        "names": list(g.names),
     }
 
 
@@ -1203,43 +1867,124 @@ class ZStackProjectRequest(BaseModel):
 
 @app.post("/api/zstack/{name}/project")
 def project_zstack(name: str, body: ZStackProjectRequest):
-    """Create a projection (max/avg/min) from a range of z-stack frames."""
-    if name not in loaded_zstacks:
+    """Create a projection (max/avg/min) from a range of z-stack frames.
+
+    For multichannel z-stacks (sources registered in `channel_groups`),
+    the projection is computed PER-CHANNEL and then composited using
+    the user's tint colours + per-channel levels. This is what the user
+    expects: a max-intensity projection that looks like the 2D view at
+    each Z slice, just summarised across Z.
+
+    For single-channel sources the legacy path applies — projection
+    runs on the RGB-converted PIL frames.
+    """
+    if name not in loaded_zstacks and name not in channel_groups:
         raise HTTPException(404, f"Z-stack '{name}' not found")
 
-    tiff_path = loaded_zstacks[name]
-    img_obj = Image.open(tiff_path)
-    n_frames = getattr(img_obj, "n_frames", 1)
+    grp = channel_groups.get(name)
+    if grp is not None:
+        # ── Channel-aware projection ─────────────────────────────────
+        # grp.arr is canonicalised (T already collapsed by _init_channel_group's
+        # caller chain, but we re-check). Layout is "ZCYX" / "CYX" / "ZYX".
+        a = grp.arr
+        ax = grp.axes
+        # Collapse any remaining T (defensive).
+        while "T" in ax:
+            i = ax.index("T")
+            a = np.take(a, 0, axis=i)
+            ax = ax[:i] + ax[i+1:]
+        if "Z" not in ax:
+            raise HTTPException(400, "Source has no Z axis to project over")
+        zi = ax.index("Z")
+        nz = a.shape[zi]
+        start = max(0, body.start_frame)
+        end = body.end_frame if body.end_frame >= 0 else nz - 1
+        end = min(end, nz - 1)
+        if start > end:
+            start, end = end, start
 
-    start = max(0, body.start_frame)
-    end = body.end_frame if body.end_frame >= 0 else n_frames - 1
-    end = min(end, n_frames - 1)
-    if start > end:
-        start, end = end, start
+        # Slice z range
+        idx = [slice(None)] * a.ndim
+        idx[zi] = slice(start, end + 1)
+        sub = a[tuple(idx)]
+        # Move Z to axis 0 if not already; move C to axis 1 if present.
+        order = []
+        for letter in ("Z", "C", "Y", "X"):
+            if letter in ax:
+                order.append(ax.index(letter))
+        sub = np.transpose(sub, order)
+        sub_axes = "".join(letter for letter in ("Z", "C", "Y", "X") if letter in ax)
 
-    # Read frames into numpy stack
-    frames = []
-    for i in range(start, end + 1):
-        img_obj.seek(i)
-        frame = np.array(img_obj.convert("RGB"), dtype=np.float32)
-        frames.append(frame)
+        # Compute projection per channel
+        method = body.method
+        def _project(stack):
+            if method == "max":  return np.max(stack, axis=0)
+            if method == "min":  return np.min(stack, axis=0)
+            if method == "avg":  return np.mean(stack, axis=0)
+            raise HTTPException(400, f"Unknown projection method: {method}")
 
-    if not frames:
-        raise HTTPException(400, "No frames in range")
+        if "C" in sub_axes:
+            # sub now (Z, C, Y, X)
+            projected_per_ch = _project(sub.astype(np.float32))  # (C, Y, X)
+        else:
+            # sub is (Z, Y, X); wrap as single channel for uniform code
+            projected_per_ch = _project(sub.astype(np.float32))[np.newaxis, ...]  # (1, Y, X)
 
-    stack = np.stack(frames, axis=0)
-
-    # Apply projection
-    if body.method == "max":
-        result = np.max(stack, axis=0).astype(np.uint8)
-    elif body.method == "min":
-        result = np.min(stack, axis=0).astype(np.uint8)
-    elif body.method == "avg":
-        result = np.mean(stack, axis=0).astype(np.uint8)
+        # Composite using channel tints + per-channel windows.
+        C = projected_per_ch.shape[0]
+        H, W = projected_per_ch.shape[-2], projected_per_ch.shape[-1]
+        rgb = np.zeros((H, W, 3), dtype=np.float32)
+        for c in range(C):
+            if c < len(grp.enabled) and not grp.enabled[c]:
+                continue
+            plane = projected_per_ch[c]
+            denom = max(grp.max_vals[c] if c < len(grp.max_vals) else 1.0, 1.0)
+            norm = plane / denom
+            bl = grp.black_levels[c] / 255.0 if c < len(grp.black_levels) else 0.0
+            wl = grp.white_levels[c] / 255.0 if c < len(grp.white_levels) else 1.0
+            if wl > bl:
+                norm = np.clip((norm - bl) / (wl - bl), 0.0, 1.0)
+            else:
+                norm = np.zeros_like(norm)
+            hex_ = grp.tints[c] if c < len(grp.tints) else "#ffffff"
+            try:
+                tr = int(hex_[1:3], 16) / 255.0
+                tg = int(hex_[3:5], 16) / 255.0
+                tb = int(hex_[5:7], 16) / 255.0
+            except (ValueError, IndexError):
+                tr = tg = tb = 1.0
+            rgb[..., 0] += norm * tr
+            rgb[..., 1] += norm * tg
+            rgb[..., 2] += norm * tb
+        result = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
+        projected = Image.fromarray(result, "RGB")
     else:
-        raise HTTPException(400, f"Unknown projection method: {body.method}")
+        # ── Legacy single-channel / PIL projection path ──────────────
+        tiff_path = loaded_zstacks[name]
+        img_obj = Image.open(tiff_path)
+        n_frames = getattr(img_obj, "n_frames", 1)
 
-    projected = Image.fromarray(result)
+        start = max(0, body.start_frame)
+        end = body.end_frame if body.end_frame >= 0 else n_frames - 1
+        end = min(end, n_frames - 1)
+        if start > end:
+            start, end = end, start
+
+        frames = []
+        for i in range(start, end + 1):
+            img_obj.seek(i)
+            frame = np.array(img_obj.convert("RGB"), dtype=np.float32)
+            frames.append(frame)
+        if not frames:
+            raise HTTPException(400, "No frames in range")
+        stack = np.stack(frames, axis=0)
+
+        if body.method == "max":   result = np.max(stack, axis=0).astype(np.uint8)
+        elif body.method == "min": result = np.min(stack, axis=0).astype(np.uint8)
+        elif body.method == "avg": result = np.mean(stack, axis=0).astype(np.uint8)
+        else: raise HTTPException(400, f"Unknown projection method: {body.method}")
+        projected = Image.fromarray(result)
+
     loaded_images[name] = projected
     _recalc_min_dims()
 
@@ -1259,6 +2004,7 @@ def project_zstack(name: str, body: ZStackProjectRequest):
         "width": projected.size[0],
         "height": projected.size[1],
         "thumbnail": preview_b64,
+        "is_multichannel": grp is not None,
     }
 
 
@@ -1278,13 +2024,21 @@ def get_zstack_nifti(name: str, body: ZStackNiftiRequest):
         raise HTTPException(404, f"Z-stack '{name}' not found")
     tiff_path = loaded_zstacks[name]
 
-    # Try tifffile first (fast), fall back to PIL loop
+    # Try tifffile first (fast), fall back to PIL loop. We also capture
+    # the axes string so we can locate channel / Z dimensions explicitly
+    # — assuming "channels are last" is wrong for ZCYX / TZCYX files,
+    # which would otherwise get sliced along X and produce a 1-pixel-
+    # wide garbage volume.
     arr = None
+    axes = ""
     try:
         import tifffile
         print(f"[nifti] Using tifffile to read {tiff_path}", file=sys.stderr, flush=True)
-        arr = tifffile.imread(tiff_path)
-        print(f"[nifti] tifffile read {arr.shape} {arr.dtype}", file=sys.stderr, flush=True)
+        with tifffile.TiffFile(tiff_path) as tf:
+            if tf.series:
+                axes = (tf.series[0].axes or "").upper()
+            arr = tifffile.imread(tiff_path)
+        print(f"[nifti] tifffile read {arr.shape} {arr.dtype} axes={axes!r}", file=sys.stderr, flush=True)
     except ImportError:
         print(f"[nifti] tifffile not available, falling back to PIL", file=sys.stderr, flush=True)
     except Exception as e:
@@ -1300,68 +2054,179 @@ def get_zstack_nifti(name: str, body: ZStackNiftiRequest):
             img_obj.seek(i)
             frames.append(np.array(img_obj.convert("L"), dtype=np.uint8))
         arr = np.stack(frames, axis=0) if frames else np.zeros((1, 64, 64), dtype=np.uint8)
+        axes = "ZYX"
 
     try:
         import nibabel as nib
     except ImportError as e:
         raise HTTPException(500, f"nibabel not bundled: {e}")
 
-    # Ensure 3D shape: (depth, height, width)
-    if arr.ndim == 2:
-        arr = arr[np.newaxis, :, :]
-    elif arr.ndim == 4:
-        # Multi-channel: take first channel or max across channels
-        arr = arr.max(axis=-1) if arr.shape[-1] <= 4 else arr[..., 0]
+    # ── Reduce to a canonical layout, channel-aware ───────────────────
+    # We try to preserve a 4D (Z, C, Y, X) shape when the source is
+    # multichannel AND we have a channel_group for it, so the RGB
+    # compositing branch below can apply the user's per-channel tints
+    # + levels to produce a coloured 3D volume.  Otherwise we collapse
+    # to (Z, Y, X) and emit a grayscale volume.
+    if axes and len(axes) == arr.ndim:
+        # Use the same canonicaliser the upload + channel-group paths
+        # use, so I/Q/A/M/R/etc. all get interpreted identically.
+        arr, axes = _canonicalize_tiff_axes(arr, axes)
+        # Collapse T (we render a single time-point for 3D view).
+        while "T" in axes:
+            i = axes.index("T")
+            arr = np.take(arr, 0, axis=i)
+            axes = axes[:i] + axes[i+1:]
+        # Promote pure-2D output to (1, Y, X) so we always emit at
+        # least a 1-z volume.
+        if "Z" not in axes:
+            arr = arr[np.newaxis, ...]
+            axes = "Z" + axes
+    else:
+        # No reliable axes string — fall back to shape-based reduction.
         if arr.ndim == 2:
             arr = arr[np.newaxis, :, :]
+            axes = "ZYX"
+        elif arr.ndim == 3:
+            axes = "ZYX"
+        elif arr.ndim == 4:
+            # Pick the smallest-sized axis (other than 0 and the last
+            # two, which are conventionally Z, Y, X) as the channel axis.
+            shape = arr.shape
+            candidate_axes = [i for i in range(arr.ndim) if i not in (0, arr.ndim - 1, arr.ndim - 2)]
+            ch_axis = min(candidate_axes, key=lambda i: shape[i]) if candidate_axes else 1
+            if ch_axis != 1:
+                arr = np.moveaxis(arr, ch_axis, 1)
+            axes = "ZCYX"
+
+    # Does this volume have a channel axis AND a registered channel
+    # group? If yes, take the RGB-composite path further below.
+    grp = channel_groups.get(name) if "C" in axes else None
+    use_rgb_composite = grp is not None and grp.num_channels == arr.shape[axes.index("C")]
+
+    if not use_rgb_composite and "C" in axes:
+        # No tint info available — collapse channels by max-projection
+        # (preserves brightest signal per voxel; sensible grayscale
+        # default for fluorescence and structural volumes alike).
+        i = axes.index("C")
+        arr = arr.max(axis=i)
+        axes = axes[:i] + axes[i+1:]
 
     depth = arr.shape[0]
 
-    # Slice to requested range
+    # Slice to requested Z range
     start = max(0, body.start_frame)
     end = body.end_frame if body.end_frame >= 0 else depth - 1
     end = min(end, depth - 1)
     arr = arr[start:end + 1]
 
-    # Normalize to uint8
-    if arr.dtype != np.uint8:
-        if arr.max() > 0:
-            arr = ((arr - arr.min()) / (arr.max() - arr.min()) * 255).astype(np.uint8)
-        else:
-            arr = arr.astype(np.uint8)
-
-    # Downsample if needed
-    d, h, w = arr.shape
-    if max(w, h, d) > body.max_dim:
-        import cv2
-        scale = body.max_dim / max(w, h, d)
-        new_w = max(1, int(w * scale))
-        new_h = max(1, int(h * scale))
-        new_d = max(1, int(d * scale))
-        # Downsample depth by subsampling
-        z_step = max(1, d // new_d)
-        resized = []
-        for i in range(0, d, z_step):
-            if len(resized) >= new_d:
-                break
-            resized.append(cv2.resize(arr[i], (new_w, new_h), interpolation=cv2.INTER_AREA))
-        arr = np.stack(resized, axis=0)
-
-    # NiiVue expects (x, y, z) axis order — transpose from (z, y, x)
-    arr_nii = np.transpose(arr, (2, 1, 0))  # (w, h, d) → x, y, z
-
-    # Build affine with requested z-spacing so NiiVue renders the volume
-    # with user-specified z-step thickness.
     z_spacing = max(0.05, float(body.z_spacing))
-    affine = np.diag([1.0, 1.0, z_spacing, 1.0]).astype(np.float32)
 
-    # Create NIfTI image
-    nii = nib.Nifti1Image(arr_nii, affine=affine)
-    nii.header.set_data_dtype(np.uint8)
-    # Explicitly set pixdim for x, y, z
-    nii.header["pixdim"][1] = 1.0
-    nii.header["pixdim"][2] = 1.0
-    nii.header["pixdim"][3] = z_spacing
+    if use_rgb_composite:
+        # ─── RGB composite path ──────────────────────────────────────
+        # arr is now (Z, C, Y, X). We normalize each channel against
+        # its native max (so 16-bit channels span 0..1), apply the
+        # user's black/white window, multiply by the channel's tint
+        # colour, and sum into an RGB buffer. The same math as the
+        # 2D `_composite_channel_group` so the 3D view exactly mirrors
+        # what the user sees on the panel.
+        z, c, h, w = arr.shape
+        arr_f = arr.astype(np.float32)
+
+        # Downsample BEFORE compositing — cheaper to interp grayscale
+        # planes than per-RGB.
+        max_dim = body.max_dim
+        if max(w, h, z) > max_dim:
+            import cv2
+            scale = max_dim / max(w, h, z)
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            new_z = max(1, int(z * scale))
+            z_step = max(1, z // new_z)
+            keep_zs = list(range(0, z, z_step))[:new_z]
+            resized = np.zeros((len(keep_zs), c, new_h, new_w), dtype=np.float32)
+            for out_i, in_i in enumerate(keep_zs):
+                for ch in range(c):
+                    resized[out_i, ch] = cv2.resize(arr_f[in_i, ch], (new_w, new_h), interpolation=cv2.INTER_AREA)
+            arr_f = resized
+            z, _, h, w = arr_f.shape
+
+        # Compose RGB per voxel
+        rgb = np.zeros((z, h, w, 3), dtype=np.float32)
+        for ch in range(c):
+            if ch < len(grp.enabled) and not grp.enabled[ch]:
+                continue
+            plane = arr_f[:, ch, :, :]
+            denom = max(grp.max_vals[ch] if ch < len(grp.max_vals) else 1.0, 1.0)
+            norm = plane / denom
+            bl = grp.black_levels[ch] / 255.0 if ch < len(grp.black_levels) else 0.0
+            wl = grp.white_levels[ch] / 255.0 if ch < len(grp.white_levels) else 1.0
+            if wl > bl:
+                norm = np.clip((norm - bl) / (wl - bl), 0.0, 1.0)
+            else:
+                norm = np.zeros_like(norm)
+            hex_ = grp.tints[ch] if ch < len(grp.tints) else "#ffffff"
+            try:
+                tr = int(hex_[1:3], 16) / 255.0
+                tg = int(hex_[3:5], 16) / 255.0
+                tb = int(hex_[5:7], 16) / 255.0
+            except (ValueError, IndexError):
+                tr = tg = tb = 1.0
+            rgb[..., 0] += norm * tr
+            rgb[..., 1] += norm * tg
+            rgb[..., 2] += norm * tb
+
+        rgb = np.clip(rgb, 0.0, 1.0)
+        rgb_uint8 = (rgb * 255).astype(np.uint8)  # (Z, Y, X, 3)
+
+        # NIfTI expects (X, Y, Z) spatial layout. Reorder + repack into
+        # a structured-dtype array so nibabel emits NIFTI_TYPE_RGB24 (128).
+        rgb_xyz = np.transpose(rgb_uint8, (2, 1, 0, 3))  # (X, Y, Z, 3)
+        rgb_struct = np.zeros(rgb_xyz.shape[:3], dtype=[('R', 'u1'), ('G', 'u1'), ('B', 'u1')])
+        rgb_struct['R'] = rgb_xyz[..., 0]
+        rgb_struct['G'] = rgb_xyz[..., 1]
+        rgb_struct['B'] = rgb_xyz[..., 2]
+
+        affine = np.diag([1.0, 1.0, z_spacing, 1.0]).astype(np.float32)
+        nii = nib.Nifti1Image(rgb_struct, affine=affine)
+        nii.header["pixdim"][1] = 1.0
+        nii.header["pixdim"][2] = 1.0
+        nii.header["pixdim"][3] = z_spacing
+        # Datatype 128 = NIFTI_TYPE_RGB24 — NiiVue renders these natively
+        # without applying a colormap.
+
+        out_d, out_h, out_w = rgb_uint8.shape[:3]
+    else:
+        # ─── Grayscale path (single channel or no tint info) ─────────
+        # arr is (Z, Y, X)
+        if arr.dtype != np.uint8:
+            if arr.max() > 0:
+                arr = ((arr - arr.min()) / (arr.max() - arr.min()) * 255).astype(np.uint8)
+            else:
+                arr = arr.astype(np.uint8)
+
+        d, h, w = arr.shape
+        if max(w, h, d) > body.max_dim:
+            import cv2
+            scale = body.max_dim / max(w, h, d)
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            new_d = max(1, int(d * scale))
+            z_step = max(1, d // new_d)
+            resized = []
+            for i in range(0, d, z_step):
+                if len(resized) >= new_d:
+                    break
+                resized.append(cv2.resize(arr[i], (new_w, new_h), interpolation=cv2.INTER_AREA))
+            arr = np.stack(resized, axis=0)
+
+        arr_nii = np.transpose(arr, (2, 1, 0))  # (Z, Y, X) → (X, Y, Z)
+        affine = np.diag([1.0, 1.0, z_spacing, 1.0]).astype(np.float32)
+        nii = nib.Nifti1Image(arr_nii, affine=affine)
+        nii.header.set_data_dtype(np.uint8)
+        nii.header["pixdim"][1] = 1.0
+        nii.header["pixdim"][2] = 1.0
+        nii.header["pixdim"][3] = z_spacing
+        out_d, out_h, out_w = arr.shape
 
     # Serialize to bytes
     buf = io.BytesIO()
@@ -1373,9 +2238,10 @@ def get_zstack_nifti(name: str, body: ZStackNiftiRequest):
 
     return {
         "data": data_b64,
-        "width": arr.shape[2],
-        "height": arr.shape[1],
-        "depth": arr.shape[0],
+        "width": out_w,
+        "height": out_h,
+        "depth": out_d,
+        "rgb": bool(use_rgb_composite),
     }
 
 
@@ -5829,7 +6695,15 @@ def main():
             # Watching just SCRIPT_DIR avoids the parent venv firehose
             # of irrelevant .py changes (numpy, fastapi, etc.) that
             # would otherwise restart on every git checkout.
-            print(f"DEV-RELOAD: watching {SCRIPT_DIR} for *.py changes", flush=True)
+            #
+            # `reload_delay=3` collapses bursty file events (e.g. Dropbox
+            # cloud-sync touching every .py mtime in one second) into a
+            # single reload — otherwise every Dropbox round-trip restarts
+            # the sidecar mid-request and the user loses any uploaded
+            # images / channel-group state.  Three seconds is short
+            # enough that a real code-save still gives quick HMR, and
+            # long enough that Dropbox bursts don't thrash.
+            print(f"DEV-RELOAD: watching {SCRIPT_DIR} for *.py changes (3s debounce)", flush=True)
             uvicorn.run(
                 "api_server:app",
                 host=args.host,
@@ -5838,6 +6712,7 @@ def main():
                 reload=True,
                 reload_dirs=[str(SCRIPT_DIR)],
                 reload_includes=["*.py"],
+                reload_delay=3.0,
             )
         else:
             uvicorn.run(app, host=args.host, port=port, log_level="warning")

@@ -42,6 +42,12 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
   const [error, setError] = useState("");
   const [sliceType, setSliceType] = useState<number>(SLICE_TYPE.RENDER);
   const [colormap, setColormap] = useState("gray");
+  // True when the backend returned an RGB24 NIfTI (multichannel TIFF
+  // composited with the per-channel tints from the Channels block in the
+  // Edit Panel). In that case NiiVue ignores the colormap dropdown, so
+  // we surface a hint instead of leaving the control there confusingly
+  // disabled.
+  const [isRgbVolume, setIsRgbVolume] = useState(false);
   const [opacity, setOpacity] = useState(1.0);
   const [showCrosshairs, setShowCrosshairs] = useState(false);
   const [showOrientationCube, setShowOrientationCube] = useState(true);
@@ -50,6 +56,65 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
   const [interpolation, setInterpolation] = useState<"linear" | "nearest">("linear");
   // Debounced z-spacing that actually triggers a backend refetch
   const [appliedZThickness, setAppliedZThickness] = useState(1.0);
+
+  // Per-channel state for the in-viewer Channels block. Mirrors the
+  // EditPanelDialog ChannelsBlock state shape so the UI feels identical;
+  // toggling a channel here PATCH'es the same /channels endpoint and we
+  // re-fetch the NIfTI so the 3D render picks up the new composite.
+  type ChInfo = {
+    is_multichannel: boolean;
+    num_channels?: number; num_z?: number; current_z?: number;
+    tints?: string[]; enabled?: boolean[];
+    black_levels?: number[]; white_levels?: number[];
+    names?: string[];
+  };
+  const [chanInfo, setChanInfo] = useState<ChInfo | null>(null);
+  // Used by both Channels + Align sections — bumps to force a NIfTI
+  // re-fetch when something mutates the underlying data.
+  const [reloadTick, setReloadTick] = useState(0);
+  // What's actually being rendered (after Align replaces the source).
+  const [activeImageName, setActiveImageName] = useState(imageName);
+  useEffect(() => { setActiveImageName(imageName); }, [imageName]);
+
+  // Alignment state.  Availability is fetched once per open and tells us
+  // which methods can run on this host (SIFT requires ImageJ/Fiji).
+  type AlignAvail = {
+    sift: { available: boolean; kind: string; path: string };
+    phase_correlation: { available: boolean; kind: string };
+  };
+  const [alignAvail, setAlignAvail] = useState<AlignAvail | null>(null);
+  const [alignMethod, setAlignMethod] = useState<"sift" | "phase_correlation">("phase_correlation");
+  const [alignRunning, setAlignRunning] = useState(false);
+  const [alignError, setAlignError] = useState("");
+  const [alignAdvancedOpen, setAlignAdvancedOpen] = useState(false);
+  // Progress reporting from the polling job.
+  const [alignProgress, setAlignProgress] = useState(0);
+  const [alignStage, setAlignStage] = useState("");
+  // SIFT controls — same defaults as Fiji's "Linear Stack Alignment with SIFT"
+  const [siftBlur, setSiftBlur] = useState(1.6);
+  const [siftSteps, setSiftSteps] = useState(3);
+  const [siftMinSize, setSiftMinSize] = useState(64);
+  const [siftMaxSize, setSiftMaxSize] = useState(1024);
+  const [siftDescSize, setSiftDescSize] = useState(4);
+  const [siftDescBins, setSiftDescBins] = useState(8);
+  const [siftRatio, setSiftRatio] = useState(0.92);
+  const [siftError, setSiftError] = useState(25);
+  const [siftInlier, setSiftInlier] = useState(0.05);
+  const [siftTransform, setSiftTransform] = useState<"Translation" | "Rigid" | "Similarity" | "Affine">("Rigid");
+  const [siftInterpolate, setSiftInterpolate] = useState(true);
+  const [pcWindow, setPcWindow] = useState<"hann" | "rect">("hann");
+  const [pcMaxShift, setPcMaxShift] = useState(0.25);
+  // Shared performance knobs — cap the per-frame size before alignment
+  // (Fiji caps it anyway at sift_maximum_image_size) and subprocess
+  // timeout. 1024px keeps 100-frame stacks alignable in ~2-3 minutes.
+  const [alignMaxDim, setAlignMaxDim] = useState(1024);
+  const [alignTimeout, setAlignTimeout] = useState(1800);
+  // Reference source for alignment + optional CLAHE pre-processing.
+  // Default 'max' pools features from all enabled channels and is more
+  // robust than picking a single channel — see the backend docstring
+  // for the strategy trade-offs.
+  const [alignSource, setAlignSource] = useState<"max" | "mean" | "sum" | "channel">("max");
+  const [alignUseClahe, setAlignUseClahe] = useState(false);
 
   // Save dialog
   const [saveOpen, setSaveOpen] = useState(false);
@@ -89,9 +154,18 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
       try {
         setLoadingStage("Reading TIFF (fast)...");
         const t0 = performance.now();
-        const resp = await api.getZStackNifti(imageName, { startFrame, endFrame, maxDim: 256, zSpacing: appliedZThickness });
-        console.log(`[VolumeViewer] NIfTI fetched (${resp.width}×${resp.height}×${resp.depth}, z=${appliedZThickness}) in ${(performance.now() - t0).toFixed(0)}ms`);
+        const resp = await api.getZStackNifti(activeImageName, { startFrame, endFrame, maxDim: 256, zSpacing: appliedZThickness });
+        console.log(`[VolumeViewer] NIfTI fetched (${resp.width}×${resp.height}×${resp.depth}, z=${appliedZThickness}, rgb=${resp.rgb ?? false}) in ${(performance.now() - t0).toFixed(0)}ms`);
         if (disposed) return;
+        // RGB volumes carry baked-in channel tints; NiiVue ignores the
+        // colormap dropdown for them, so surface a hint instead.
+        setIsRgbVolume(Boolean(resp.rgb));
+        // Fetch channel info in parallel with the rest of the init.
+        api.getChannelInfo(activeImageName).then(ci => { if (!disposed) setChanInfo(ci as ChInfo); }).catch(() => { if (!disposed) setChanInfo(null); });
+        // Detect ImageJ availability once per session of the dialog.
+        if (!alignAvail) {
+          api.getAlignAvailability().then(a => { if (!disposed) setAlignAvail(a); }).catch(() => {/*ignore*/});
+        }
 
         setLoadingStage("Decoding volume...");
         const raw = atob(resp.data);
@@ -146,7 +220,7 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
         } catch { /* ignore */ }
       }
     };
-  }, [open, imageName, startFrame, endFrame, appliedZThickness]); // eslint-disable-line
+  }, [open, activeImageName, startFrame, endFrame, appliedZThickness, reloadTick]); // eslint-disable-line
 
   // Update slice type when changed
   useEffect(() => {
@@ -182,8 +256,31 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
   // Update crosshairs
   useEffect(() => {
     if (nvRef.current) {
-      (nvRef.current.opts as { crosshairWidth: number }).crosshairWidth = showCrosshairs ? 1 : 0;
-      nvRef.current.drawScene();
+      // NiiVue ignores `opts.crosshairWidth` mutations unless we call
+      // setCrosshairWidth() AND force a GL refresh (drawScene alone
+      // doesn't repaint the overlay). Setting the crosshair colour
+      // explicitly too — the default is fully transparent on some
+      // builds which makes "width = 1" invisible.
+      const w = showCrosshairs ? 2 : 0;
+      try {
+        const nv = nvRef.current as unknown as {
+          setCrosshairWidth?: (w: number) => void;
+          setCrosshairColor?: (rgba: number[]) => void;
+          opts: { crosshairWidth?: number; show3Dcrosshair?: boolean };
+          updateGLVolume?: () => void;
+          drawScene?: () => void;
+        };
+        if (nv.setCrosshairWidth) nv.setCrosshairWidth(w);
+        else nv.opts.crosshairWidth = w;
+        if (nv.setCrosshairColor) nv.setCrosshairColor([1, 0.5, 0.1, 1]);
+        // Also flip the 3D-mode crosshair so users see something when
+        // they tick the box while the viewer is on 3D Volume mode.
+        nv.opts.show3Dcrosshair = showCrosshairs;
+        if (nv.updateGLVolume) nv.updateGLVolume();
+        if (nv.drawScene) nv.drawScene();
+      } catch (e) {
+        console.warn("[VolumeViewer] crosshair toggle failed:", e);
+      }
     }
   }, [showCrosshairs]);
 
@@ -281,7 +378,7 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
       const b64 = dataUrl.split(",")[1];
       // Backend will store the render as a hidden, panel-internal image
       // (not visible in the media timeline) and assign it to this panel.
-      await api.saveCanvasAsPanel(imageName, panelRow, panelCol, b64);
+      await api.saveCanvasAsPanel(activeImageName, panelRow, panelCol, b64);
       // fetchImages() will refresh the timeline — because the new image is
       // hidden on the backend, the timeline stays clean.
       await fetchImages();
@@ -337,12 +434,22 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
 
           <Box>
             <Typography variant="caption" sx={{ fontSize: "0.6rem" }}>Colormap</Typography>
-            <Select size="small" value={colormap} onChange={(e) => setColormap(e.target.value)}
-              sx={{ fontSize: "0.65rem", width: "100%", "& .MuiSelect-select": { py: 0.3 } }}>
+            <Select
+              size="small"
+              value={colormap}
+              onChange={(e) => setColormap(e.target.value)}
+              disabled={isRgbVolume}
+              sx={{ fontSize: "0.65rem", width: "100%", "& .MuiSelect-select": { py: 0.3 } }}
+            >
               {COLORMAPS.map(c => (
                 <MenuItem key={c} value={c} sx={{ fontSize: "0.65rem" }}>{c.charAt(0).toUpperCase() + c.slice(1)}</MenuItem>
               ))}
             </Select>
+            {isRgbVolume && (
+              <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "primary.light", display: "block", mt: 0.5 }}>
+                Multichannel volume — colors come from per-channel tints set in the Edit Panel → Channels block. The colormap dropdown has no effect.
+              </Typography>
+            )}
           </Box>
 
           <Box>
@@ -396,6 +503,275 @@ export function VolumeViewerDialog({ open, onClose, imageName, startFrame, endFr
           <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>
             Drag to rotate. Scroll to zoom. Powered by NiiVue (WebGL2).
           </Typography>
+
+          {/* ── Channels block (multichannel sources only) ─────────────
+              Toggling a channel here PATCHes the same /channels endpoint
+              used in EditPanelDialog and bumps reloadTick so the NIfTI
+              gets refetched with the updated tints/visibility. */}
+          {chanInfo?.is_multichannel && (chanInfo.num_channels ?? 0) > 1 && (
+            <Box sx={{ mt: 1, p: 1, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
+              <Typography variant="caption" sx={{ fontWeight: 700, textTransform: "uppercase", letterSpacing: 1, display: "block", mb: 0.5 }}>
+                Channels ({chanInfo.num_channels})
+              </Typography>
+              {Array.from({ length: chanInfo.num_channels ?? 0 }).map((_, c) => {
+                const tint = chanInfo.tints?.[c] ?? "#ffffff";
+                const enabled = chanInfo.enabled?.[c] ?? true;
+                const name = chanInfo.names?.[c] ?? `Ch ${c + 1}`;
+                return (
+                  <Box key={c} sx={{ display: "flex", gap: 0.5, alignItems: "center", mb: 0.25 }}>
+                    <Checkbox
+                      size="small" checked={enabled} sx={{ p: 0.25 }}
+                      onChange={async (e) => {
+                        const next = [...(chanInfo.enabled ?? Array(chanInfo.num_channels).fill(true))];
+                        next[c] = e.target.checked;
+                        try {
+                          const res = await api.updateChannels(activeImageName, { enabled: next });
+                          setChanInfo(prev => prev ? { ...prev, ...res } : prev);
+                          setReloadTick(t => t + 1);
+                        } catch (err) { console.error("[channels]", err); }
+                      }}
+                    />
+                    <Box sx={{ width: 16, height: 16, bgcolor: tint, border: "1px solid #999", borderRadius: 0.5, opacity: enabled ? 1 : 0.4 }} title={`${name} tint`} />
+                    <Typography variant="caption" sx={{ fontSize: "0.6rem", flex: 1, ml: 0.5, opacity: enabled ? 1 : 0.5 }} title={name}>
+                      {name}
+                    </Typography>
+                  </Box>
+                );
+              })}
+              <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", display: "block", mt: 0.5 }}>
+                Tints + names come from Edit Panel → Channels. Toggle here to refresh the 3D composite.
+              </Typography>
+            </Box>
+          )}
+
+          {/* ── Z-stack alignment ───────────────────────────────────────
+              SIFT runs through ImageJ/Fiji (greyed out when Fiji isn't
+              installed). Phase correlation is always available. After
+              alignment runs we swap `activeImageName` to the new
+              ::aligned stack so the 3D viewer shows the registered
+              result; the user can also Apply-to-Panel to commit it. */}
+          <Box sx={{ mt: 1, p: 1, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
+            <Typography variant="caption" sx={{ fontWeight: 700, textTransform: "uppercase", letterSpacing: 1, display: "block", mb: 0.5 }}>
+              Slice alignment
+            </Typography>
+            <Select
+              size="small" value={alignMethod} onChange={(e) => setAlignMethod(e.target.value as "sift" | "phase_correlation")}
+              sx={{ fontSize: "0.65rem", width: "100%", "& .MuiSelect-select": { py: 0.3 } }}
+            >
+              <MenuItem value="phase_correlation" sx={{ fontSize: "0.65rem" }}>
+                Phase correlation (always available)
+              </MenuItem>
+              <MenuItem
+                value="sift"
+                disabled={!alignAvail?.sift.available}
+                sx={{ fontSize: "0.65rem" }}
+                title={alignAvail?.sift.available
+                  ? `Uses Fiji at ${alignAvail.sift.path}`
+                  : "Requires ImageJ/Fiji on this host (not detected)"}
+              >
+                ImageJ SIFT — Linear Stack Align {alignAvail && !alignAvail.sift.available ? "(ImageJ not detected)" : ""}
+              </MenuItem>
+            </Select>
+            {/* Reference source — what the alignment algorithm actually
+                sees. Max-projection pools features across enabled
+                channels, giving SIFT more to lock onto and avoiding
+                misalignment when a single chosen channel has weak signal
+                in some slices. Channel toggles in the Channels block
+                above directly influence what's pooled. */}
+            <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", mt: 0.5 }}>
+              <Typography variant="caption" sx={{ fontSize: "0.55rem", minWidth: 56 }}
+                title="Which image SIFT/phase corr sees. 'Max' pools features across all enabled channels.">
+                Reference
+              </Typography>
+              <Select
+                size="small" value={alignSource}
+                onChange={(e) => setAlignSource(e.target.value as "max" | "mean" | "sum" | "channel")}
+                sx={{ flex: 1, fontSize: "0.6rem", "& .MuiSelect-select": { py: 0.2, px: 0.75 } }}
+              >
+                <MenuItem value="max"     sx={{ fontSize: "0.6rem" }}>Max-projection of channels</MenuItem>
+                <MenuItem value="mean"    sx={{ fontSize: "0.6rem" }}>Mean of channels</MenuItem>
+                <MenuItem value="sum"     sx={{ fontSize: "0.6rem" }}>Sum of channels</MenuItem>
+                <MenuItem value="channel" sx={{ fontSize: "0.6rem" }}>Single channel (first enabled)</MenuItem>
+              </Select>
+            </Box>
+            <FormControlLabel sx={{ ml: 0 }}
+              control={<Checkbox size="small" checked={alignUseClahe} onChange={(e) => setAlignUseClahe(e.target.checked)} sx={{ p: 0.25 }} />}
+              label={<Typography variant="caption" sx={{ fontSize: "0.6rem" }}
+                title="Local contrast normalization — helps SIFT find features when Z intensity drifts.">
+                CLAHE pre-process
+              </Typography>}
+            />
+            <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", mt: 0.5 }}>
+              <Button
+                size="small" variant="contained"
+                disabled={alignRunning || loading || (alignMethod === "sift" && !alignAvail?.sift.available)}
+                onClick={async () => {
+                  setAlignRunning(true);
+                  setAlignError("");
+                  setAlignProgress(0);
+                  setAlignStage("starting…");
+                  try {
+                    const res = await api.alignAndWait(activeImageName, {
+                      method: alignMethod,
+                      startFrame, endFrame,
+                      siftInitialGaussianBlur: siftBlur,
+                      siftStepsPerScaleOctave: siftSteps,
+                      siftMinimumImageSize: siftMinSize,
+                      siftMaximumImageSize: siftMaxSize,
+                      siftFeatureDescriptorSize: siftDescSize,
+                      siftFeatureDescriptorOrientationBins: siftDescBins,
+                      siftClosestNextClosestRatio: siftRatio,
+                      siftMaximalAlignmentError: siftError,
+                      siftInlierRatio: siftInlier,
+                      siftExpectedTransformation: siftTransform,
+                      siftInterpolate,
+                      pcWindow, pcMaxShiftFrac: pcMaxShift,
+                      alignMaxDim, timeoutSec: alignTimeout,
+                      alignmentSource: alignSource,
+                      useClahe: alignUseClahe,
+                    }, (p, stage) => {
+                      setAlignProgress(p);
+                      setAlignStage(stage);
+                    });
+                    // Swap the active image so the NIfTI refetch picks
+                    // up the aligned stack; the original stays intact.
+                    setActiveImageName(res.aligned_name);
+                    setReloadTick(t => t + 1);
+                    // Re-fetch channels info since the aligned stack
+                    // gets its own channel-group entry inheriting
+                    // tints/names from the source.
+                    api.getChannelInfo(res.aligned_name).then(ci => setChanInfo(ci as ChInfo)).catch(() => {});
+                  } catch (e) {
+                    setAlignError(e instanceof Error ? e.message : String(e));
+                  }
+                  setAlignRunning(false);
+                }}
+                sx={{ fontSize: "0.6rem", textTransform: "none", flex: 1 }}
+              >
+                {alignRunning ? "Aligning…" : "Run alignment"}
+              </Button>
+              {activeImageName !== imageName && (
+                <Button
+                  size="small" variant="outlined" disabled={alignRunning}
+                  onClick={() => { setActiveImageName(imageName); setReloadTick(t => t + 1); }}
+                  sx={{ fontSize: "0.55rem", textTransform: "none" }}
+                  title="Revert to the unaligned source stack"
+                >
+                  Revert
+                </Button>
+              )}
+            </Box>
+            {alignRunning && (
+              <Box sx={{ mt: 0.5 }}>
+                <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", display: "block" }}>
+                  {alignStage} — {Math.round(alignProgress * 100)}%
+                </Typography>
+                <Box sx={{ height: 4, bgcolor: "action.disabledBackground", borderRadius: 2, overflow: "hidden", mt: 0.25 }}>
+                  <Box sx={{
+                    height: "100%",
+                    width: `${Math.max(2, alignProgress * 100)}%`,
+                    bgcolor: "primary.main",
+                    transition: "width 0.2s ease",
+                  }} />
+                </Box>
+              </Box>
+            )}
+            {alignError && (
+              <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "error.light", display: "block", mt: 0.5 }}>
+                {alignError}
+              </Typography>
+            )}
+            {activeImageName !== imageName && !alignError && (
+              <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "primary.light", display: "block", mt: 0.5 }}>
+                Showing aligned stack. Click Apply to Panel below to commit.
+              </Typography>
+            )}
+            <Button
+              size="small" variant="text"
+              onClick={() => setAlignAdvancedOpen(o => !o)}
+              sx={{ fontSize: "0.55rem", textTransform: "none", mt: 0.5, p: 0 }}
+            >
+              {alignAdvancedOpen ? "▼" : "▶"} Advanced
+            </Button>
+            {alignAdvancedOpen && (
+              <Box sx={{ display: "flex", flexDirection: "column", gap: 0.4, mt: 0.5, pl: 0.5 }}>
+                {/* Performance knobs — applies to both methods. Capping
+                    frame size before SIFT keeps runtime under control
+                    for big light-sheet stacks; the algorithm internally
+                    downsamples to sift_maximum_image_size anyway. */}
+                <Typography variant="caption" sx={{ fontSize: "0.55rem" }}>
+                  Align max-dim (px / frame, 0 = no cap): {alignMaxDim}
+                </Typography>
+                <Slider size="small" value={alignMaxDim} min={0} max={2048} step={64}
+                  marks={[{ value: 0, label: "off" }, { value: 1024, label: "1024" }, { value: 2048, label: "2048" }]}
+                  onChange={(_, v) => setAlignMaxDim(v as number)} />
+                <Typography variant="caption" sx={{ fontSize: "0.55rem" }}>
+                  SIFT subprocess timeout: {alignTimeout}s
+                </Typography>
+                <Slider size="small" value={alignTimeout} min={120} max={3600} step={60}
+                  onChange={(_, v) => setAlignTimeout(v as number)} />
+                {alignMethod === "phase_correlation" ? (
+                  <>
+                    <Typography variant="caption" sx={{ fontSize: "0.55rem" }}>Window</Typography>
+                    <Select size="small" value={pcWindow} onChange={(e) => setPcWindow(e.target.value as "hann" | "rect")}
+                      sx={{ fontSize: "0.55rem", "& .MuiSelect-select": { py: 0.2 } }}>
+                      <MenuItem value="hann" sx={{ fontSize: "0.55rem" }}>Hann (recommended)</MenuItem>
+                      <MenuItem value="rect" sx={{ fontSize: "0.55rem" }}>Rectangular</MenuItem>
+                    </Select>
+                    <Typography variant="caption" sx={{ fontSize: "0.55rem" }}>Max shift (fraction of image): {pcMaxShift.toFixed(2)}</Typography>
+                    <Slider size="small" value={pcMaxShift} min={0.05} max={0.5} step={0.01}
+                      onChange={(_, v) => setPcMaxShift(v as number)} />
+                  </>
+                ) : (
+                  <>
+                    <Typography variant="caption" sx={{ fontSize: "0.55rem" }}>Initial Gaussian blur: {siftBlur.toFixed(2)}</Typography>
+                    <Slider size="small" value={siftBlur} min={0.5} max={5} step={0.1} onChange={(_, v) => setSiftBlur(v as number)} />
+                    <Typography variant="caption" sx={{ fontSize: "0.55rem" }}>Steps per scale octave: {siftSteps}</Typography>
+                    <Slider size="small" value={siftSteps} min={1} max={8} step={1} onChange={(_, v) => setSiftSteps(v as number)} />
+                    <Typography variant="caption" sx={{ fontSize: "0.55rem" }}>Min/Max image size</Typography>
+                    <Box sx={{ display: "flex", gap: 0.5 }}>
+                      <TextField type="number" size="small" value={siftMinSize}
+                        onChange={(e) => setSiftMinSize(Math.max(8, Number(e.target.value)))}
+                        inputProps={{ min: 8, max: 4096 }}
+                        sx={{ width: 70, "& input": { fontSize: "0.55rem", py: 0.25 } }} />
+                      <TextField type="number" size="small" value={siftMaxSize}
+                        onChange={(e) => setSiftMaxSize(Math.max(siftMinSize, Number(e.target.value)))}
+                        inputProps={{ min: 8, max: 8192 }}
+                        sx={{ width: 70, "& input": { fontSize: "0.55rem", py: 0.25 } }} />
+                    </Box>
+                    <Typography variant="caption" sx={{ fontSize: "0.55rem" }}>Descriptor size / orient. bins</Typography>
+                    <Box sx={{ display: "flex", gap: 0.5 }}>
+                      <TextField type="number" size="small" value={siftDescSize}
+                        onChange={(e) => setSiftDescSize(Math.max(2, Number(e.target.value)))}
+                        inputProps={{ min: 2, max: 32 }}
+                        sx={{ width: 70, "& input": { fontSize: "0.55rem", py: 0.25 } }} />
+                      <TextField type="number" size="small" value={siftDescBins}
+                        onChange={(e) => setSiftDescBins(Math.max(2, Number(e.target.value)))}
+                        inputProps={{ min: 2, max: 32 }}
+                        sx={{ width: 70, "& input": { fontSize: "0.55rem", py: 0.25 } }} />
+                    </Box>
+                    <Typography variant="caption" sx={{ fontSize: "0.55rem" }}>Closest/next ratio: {siftRatio.toFixed(2)}</Typography>
+                    <Slider size="small" value={siftRatio} min={0.5} max={0.99} step={0.01} onChange={(_, v) => setSiftRatio(v as number)} />
+                    <Typography variant="caption" sx={{ fontSize: "0.55rem" }}>Max alignment error (px): {siftError}</Typography>
+                    <Slider size="small" value={siftError} min={1} max={100} step={1} onChange={(_, v) => setSiftError(v as number)} />
+                    <Typography variant="caption" sx={{ fontSize: "0.55rem" }}>Inlier ratio: {siftInlier.toFixed(2)}</Typography>
+                    <Slider size="small" value={siftInlier} min={0.01} max={0.5} step={0.01} onChange={(_, v) => setSiftInlier(v as number)} />
+                    <Typography variant="caption" sx={{ fontSize: "0.55rem" }}>Expected transformation</Typography>
+                    <Select size="small" value={siftTransform} onChange={(e) => setSiftTransform(e.target.value as "Translation" | "Rigid" | "Similarity" | "Affine")}
+                      sx={{ fontSize: "0.55rem", "& .MuiSelect-select": { py: 0.2 } }}>
+                      <MenuItem value="Translation" sx={{ fontSize: "0.55rem" }}>Translation</MenuItem>
+                      <MenuItem value="Rigid"       sx={{ fontSize: "0.55rem" }}>Rigid</MenuItem>
+                      <MenuItem value="Similarity"  sx={{ fontSize: "0.55rem" }}>Similarity</MenuItem>
+                      <MenuItem value="Affine"      sx={{ fontSize: "0.55rem" }}>Affine</MenuItem>
+                    </Select>
+                    <FormControlLabel sx={{ ml: 0 }}
+                      control={<Checkbox size="small" checked={siftInterpolate} onChange={(e) => setSiftInterpolate(e.target.checked)} sx={{ p: 0.25 }} />}
+                      label={<Typography variant="caption" sx={{ fontSize: "0.55rem" }}>Bilinear interpolation</Typography>} />
+                  </>
+                )}
+              </Box>
+            )}
+          </Box>
 
           <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5, mt: 1 }}>
             <Button size="small" variant="outlined" onClick={openSaveDialog} startIcon={<SaveAltIcon sx={{ fontSize: 12 }} />}
