@@ -462,6 +462,16 @@ class ApiClient {
     dataCsv: string,
     rscriptPath?: string,
     baseFontSize?: number | null,
+    opts?: {
+      /** Per-slot ggplot text overrides (title/axis/legend …) applied to
+       *  last_plot() — see backend RAnalysisRequest.text_overrides. */
+      textOverrides?: Record<string, unknown> | null;
+      /** Return ONLY the override-applied plot (zz_mpfig_override.png). */
+      overrideOnly?: boolean;
+      /** Pixel size for the override plot (match the collage item). */
+      overrideWidth?: number;
+      overrideHeight?: number;
+    },
   ): Promise<{
     success: boolean;
     stdout: string;
@@ -474,6 +484,10 @@ class ApiClient {
     return apiJson("/api/analysis/run-r", "POST", JSON.stringify({
       code, data_csv: dataCsv, rscript_path: rscriptPath || null,
       base_font_size: baseFontSize && baseFontSize > 0 ? Math.round(baseFontSize) : null,
+      text_overrides: opts?.textOverrides && Object.keys(opts.textOverrides).length ? opts.textOverrides : null,
+      override_only: !!opts?.overrideOnly,
+      override_width: opts?.overrideWidth && opts.overrideWidth > 0 ? Math.round(opts.overrideWidth) : 800,
+      override_height: opts?.overrideHeight && opts.overrideHeight > 0 ? Math.round(opts.overrideHeight) : 600,
     }));
   }
 

@@ -313,9 +313,19 @@ function CollageSidebar() {
           if (!isIncluded(it.id)) continue;
           const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
           const baseFs = Math.max(1, Math.round(targetPt / Math.max(0.001, scale)));
+          // Preserve any per-element text overrides the user set by clicking
+          // the plot's title/axis/legend hotspots — re-apply them on the size
+          // re-run so they don't get lost.
+          const hasOv = !!(it.rTextOverrides && Object.keys(it.rTextOverrides).length);
           try {
-            const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, baseFs);
-            const idx = it.rPlotIndex ?? 0;
+            const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, baseFs,
+              hasOv ? {
+                textOverrides: it.rTextOverrides as Record<string, unknown>,
+                overrideOnly: true,
+                overrideWidth: it.naturalW || 800,
+                overrideHeight: it.naturalH || 600,
+              } : undefined);
+            const idx = hasOv ? 0 : (it.rPlotIndex ?? 0);
             const png = res.plots?.[idx] ?? res.plots?.[0];
             if (res.success && png) {
               const dataUrl = `data:image/png;base64,${png}`;

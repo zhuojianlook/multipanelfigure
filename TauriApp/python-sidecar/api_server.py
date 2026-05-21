@@ -4966,6 +4966,21 @@ class RAnalysisRequest(BaseModel):
     # AFTER the user's own theming (so it wins even over a full theme_*),
     # and base-graphics get par(cex) inside mpfig_plot.
     base_font_size: Optional[int] = None
+    # Per-text-element overrides for a ggplot, keyed by slot name
+    # (title / subtitle / xaxis / yaxis / caption / legend_title / xticks /
+    # yticks / legend_text). Each value is a dict with optional
+    # text / size (pt) / color / bold / italic. Applied AFTER the user's code
+    # via ggplot2::last_plot(), so they win over the user's theming. Used by
+    # the collage to make R-plot title/axis/legend text editable.
+    text_overrides: Optional[dict] = None
+    # When True (with text_overrides), return ONLY the override-applied plot
+    # (named zz_mpfig_override.png) instead of all of the script's plots.
+    override_only: bool = False
+    # Pixel dimensions for the override-applied plot (match the collage item's
+    # natural size so the aspect ratio is preserved). res stays 150 to match
+    # mpfig_plot's default so point sizes map consistently.
+    override_width: int = 800
+    override_height: int = 600
 
 
 def _find_rscript(custom_path: Optional[str] = None) -> Optional[str]:
@@ -5027,6 +5042,103 @@ def check_r_installed(rscript_path: Optional[str] = None):
         return {"installed": True, "version": version, "path": rscript}
     except Exception as e:
         return {"installed": False, "version": str(e), "path": rscript}
+
+def _r_escape(s: str) -> str:
+    """Escape a Python string for embedding inside an R double-quoted string."""
+    return str(s).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _r_face(o: dict) -> str:
+    """Map bold/italic flags to a ggplot element_text `face` value."""
+    b, i = bool(o.get("bold")), bool(o.get("italic"))
+    if b and i:
+        return "bold.italic"
+    if b:
+        return "bold"
+    if i:
+        return "italic"
+    return "plain"
+
+
+def _r_text_override_block(ov: dict, width: int, height: int) -> str:
+    """Build an R snippet that takes ggplot2::last_plot(), applies per-slot
+    text/size/color/face overrides via labs()+theme(), and writes it to
+    zz_mpfig_override.png. Returns "" when nothing to apply."""
+    if not ov or not isinstance(ov, dict):
+        return ""
+
+    def elem_text(o: dict):
+        args = []
+        if o.get("size") is not None:
+            try:
+                args.append(f"size={float(o['size'])}")
+            except (TypeError, ValueError):
+                pass
+        if o.get("color"):
+            args.append(f'colour="{_r_escape(o["color"])}"')
+        face = _r_face(o)
+        if face != "plain":
+            args.append(f'face="{face}"')
+        return "ggplot2::element_text(" + ", ".join(args) + ")" if args else None
+
+    # slot -> (theme element name, labs key or None)
+    slot_map = {
+        "title": ("plot.title", "title"),
+        "subtitle": ("plot.subtitle", "subtitle"),
+        "xaxis": ("axis.title.x", "x"),
+        "yaxis": ("axis.title.y", "y"),
+        "caption": ("plot.caption", "caption"),
+        "xticks": ("axis.text.x", None),
+        "yticks": ("axis.text.y", None),
+        "legend_text": ("legend.text", None),
+    }
+    labs_parts, theme_parts = [], []
+    for slot, o in ov.items():
+        if not isinstance(o, dict):
+            continue
+        if slot == "legend_title":
+            txt = o.get("text")
+            if txt is not None and txt != "":
+                # The legend title comes from the mapped aesthetic — set the
+                # common ones to the same text so whichever is in use updates.
+                for aes in ("colour", "fill", "linetype", "shape", "size", "alpha"):
+                    labs_parts.append(f'{aes}="{_r_escape(txt)}"')
+            et = elem_text(o)
+            if et:
+                theme_parts.append(f"legend.title={et}")
+            continue
+        elem_name, labs_key = slot_map.get(slot, (None, None))
+        if elem_name is None:
+            continue
+        if labs_key and o.get("text") is not None and o.get("text") != "":
+            labs_parts.append(f'{labs_key}="{_r_escape(o["text"])}"')
+        et = elem_text(o)
+        if et:
+            theme_parts.append(f"{elem_name}={et}")
+
+    add = []
+    if labs_parts:
+        add.append("ggplot2::labs(" + ", ".join(labs_parts) + ")")
+    if theme_parts:
+        add.append("ggplot2::theme(" + ", ".join(theme_parts) + ")")
+    if not add:
+        return ""
+    additions = " + ".join(add)
+    return (
+        "\n# ── mpfig R text overrides (collage) ──\n"
+        "try({\n"
+        '  if (requireNamespace("ggplot2", quietly=TRUE)) {\n'
+        "    .mpfig_p <- tryCatch(ggplot2::last_plot(), error=function(e) NULL)\n"
+        '    if (!is.null(.mpfig_p) && inherits(.mpfig_p, "ggplot")) {\n'
+        f"      .mpfig_p <- .mpfig_p + {additions}\n"
+        f'      png(file.path(.plot_dir, "zz_mpfig_override.png"), width={int(width)}, height={int(height)}, res=150)\n'
+        "      print(.mpfig_p)\n"
+        "      while (dev.cur() > 1) dev.off()\n"
+        "    }\n"
+        "  }\n"
+        "}, silent=TRUE)\n"
+    )
+
 
 @app.post("/api/analysis/run-r")
 def run_r_code(body: RAnalysisRequest):
@@ -5105,6 +5217,10 @@ def run_r_code(body: RAnalysisRequest):
         script += '# User code\n'
         script += body.code
         script += '\n\n# Close any open graphics devices\nwhile (dev.cur() > 1) dev.off()\n'
+        # Per-element text overrides (collage R-plot text editing): re-render
+        # last_plot() with title/axis/legend overrides into zz_mpfig_override.png.
+        if body.text_overrides:
+            script += _r_text_override_block(body.text_overrides, body.override_width, body.override_height)
 
         script_path = os.path.join(tmpdir, "analysis.R")
         with open(script_path, "w") as f:
@@ -5121,8 +5237,12 @@ def run_r_code(body: RAnalysisRequest):
         except Exception as e:
             return {"success": False, "stdout": "", "stderr": str(e), "plots": [], "tables": []}
 
+        plot_files = sorted(glob_mod.glob(os.path.join(plot_dir, "*.png")))
+        # When the caller only wants the override-applied plot, drop the rest.
+        if body.text_overrides and body.override_only:
+            plot_files = [p for p in plot_files if os.path.basename(p) == "zz_mpfig_override.png"]
         plots_b64 = []
-        for png_path in sorted(glob_mod.glob(os.path.join(plot_dir, "*.png"))):
+        for png_path in plot_files:
             with open(png_path, "rb") as pf:
                 plots_b64.append(base64.b64encode(pf.read()).decode())
 

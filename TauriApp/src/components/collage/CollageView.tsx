@@ -22,6 +22,7 @@ import {
   Menu,
   MenuItem,
   ListSubheader,
+  Popover,
 } from "@mui/material";
 import AddPhotoAlternateIcon from "@mui/icons-material/AddPhotoAlternate";
 import GridOnIcon from "@mui/icons-material/GridOn";
@@ -43,7 +44,7 @@ import {
   PT_TO_PX,
   DEFAULT_TEXT_PT,
 } from "../../store/collageStore";
-import type { CollageItem } from "../../store/collageStore";
+import type { CollageItem, RTextSlot, RTextOverride } from "../../store/collageStore";
 import { useFigureStore } from "../../store/figureStore";
 import { CollageStrip } from "./CollageStrip";
 import { RichTextEditor } from "../dialogs/RichTextEditor";
@@ -169,6 +170,16 @@ const CANVAS_PRESET_GROUPS: PresetGroup[] = [
   },
 ];
 
+/** Heuristic on-plot positions (item-local fractions: left, top, w, h) for the
+ *  editable text slots of an R/ggplot figure. ggplot doesn't expose element
+ *  geometry, so these are fixed regions matching ggplot's default layout. */
+const R_TEXT_SLOTS: { slot: RTextSlot; label: string; rect: [number, number, number, number] }[] = [
+  { slot: "title", label: "Title", rect: [0.12, 0.0, 0.76, 0.085] },
+  { slot: "xaxis", label: "X axis", rect: [0.12, 0.915, 0.76, 0.085] },
+  { slot: "yaxis", label: "Y axis", rect: [0.0, 0.18, 0.065, 0.64] },
+  { slot: "legend_title", label: "Legend", rect: [0.80, 0.05, 0.20, 0.14] },
+];
+
 export function CollageView() {
   const items = useCollageStore((s) => s.items);
   const canvasW = useCollageStore((s) => s.canvasW);
@@ -284,6 +295,75 @@ export function CollageView() {
   const [elemEditor, setElemEditor] = useState<
     { itemId: string; elemId: string; anchorEl: HTMLElement; segments: StyledSegment[]; plainText: string } | null
   >(null);
+  // R-plot text-element editor (click a ggplot title/axis/legend hotspot).
+  const [rTextEditor, setRTextEditor] = useState<
+    { itemId: string; slot: RTextSlot; label: string; anchorEl: HTMLElement; value: RTextOverride } | null
+  >(null);
+  const [rBusyItem, setRBusyItem] = useState<string | null>(null);
+
+  // Re-render an R-plot item, applying its stored per-element text overrides
+  // (and the current synchronized base size, if any) by re-running its R code.
+  const rerenderRPlot = async (itemId: string) => {
+    const it = useCollageStore.getState().items.find((i) => i.id === itemId);
+    if (!it || !it.rCode) return;
+    const ov = it.rTextOverrides || {};
+    const hasOv = Object.keys(ov).length > 0;
+    const pt = useCollageStore.getState().globalHeaderPt;
+    const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
+    const baseFs = pt ? Math.max(1, Math.round(pt / Math.max(0.001, scale))) : null;
+    setRBusyItem(itemId);
+    try {
+      // With overrides: render only the override-applied plot. Without any
+      // overrides (e.g. after Clear): re-run normally and pick the original
+      // plot index so the plot reverts to its un-edited form.
+      const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, baseFs,
+        hasOv ? {
+          textOverrides: ov as Record<string, unknown>,
+          overrideOnly: true,
+          overrideWidth: it.naturalW || 800,
+          overrideHeight: it.naturalH || 600,
+        } : undefined);
+      const png = hasOv ? res.plots?.[0] : (res.plots?.[it.rPlotIndex ?? 0] ?? res.plots?.[0]);
+      if (res.success && png) {
+        const dataUrl = `data:image/png;base64,${png}`;
+        const dims = await new Promise<{ w: number; h: number }>((resolve) => {
+          const im = new window.Image();
+          im.onload = () => resolve({ w: im.naturalWidth, h: im.naturalHeight });
+          im.onerror = () => resolve({ w: it.naturalW, h: it.naturalH });
+          im.src = dataUrl;
+        });
+        const aspect = dims.h > 0 ? dims.w / dims.h : (it.naturalW / Math.max(1, it.naturalH));
+        updateItem(itemId, { src: dataUrl, naturalW: dims.w, naturalH: dims.h, h: it.w / Math.max(0.001, aspect) });
+      } else {
+        await alertDialog({
+          title: "Couldn't update R text",
+          body: res.stderr?.slice(0, 500)
+            || "No ggplot output was produced. R text editing works on ggplot plots (the editor styles last_plot()). Make sure R is installed.",
+        });
+      }
+    } catch (e) {
+      console.error("[collage] R override re-render failed", e);
+      await alertDialog({ title: "R re-render error", body: String(e) });
+    } finally {
+      setRBusyItem(null);
+    }
+  };
+
+  // Open the R text-slot editor seeded from the item's current override.
+  const openRTextEditor = (it: CollageItem, slot: RTextSlot, label: string, anchorEl: HTMLElement) => {
+    const cur = (it.rTextOverrides || {})[slot] || {};
+    setRTextEditor({ itemId: it.id, slot, label, anchorEl, value: { ...cur } });
+  };
+
+  const applyRText = () => {
+    const ed = rTextEditor;
+    if (!ed) return;
+    const cur = useCollageStore.getState().items.find((i) => i.id === ed.itemId);
+    const next = { ...(cur?.rTextOverrides || {}), [ed.slot]: ed.value };
+    updateItem(ed.itemId, { rTextOverrides: next });
+    setRTextEditor(null);
+    void rerenderRPlot(ed.itemId);
+  };
 
   // Re-render one figure item with the current sync pt + element selection +
   // per-element style overrides (used after a customization edit).
@@ -868,6 +948,45 @@ export function CollageView() {
                   boxShadow: "0 1px 2px rgba(0,0,0,0.4)",
                 }}>✓</Box>
               )}
+            </Box>
+          );
+        })}
+      </>
+    );
+  };
+
+  // Clickable text-slot hotspots for an R/ggplot item (title, axis titles,
+  // legend). ggplot exposes no element geometry, so positions are heuristic
+  // (R_TEXT_SLOTS). Clicking opens the R text editor for that slot.
+  const renderRTextHotspots = (it: CollageItem) => {
+    const ov = it.rTextOverrides || {};
+    return (
+      <>
+        {R_TEXT_SLOTS.map(({ slot, label, rect }) => {
+          const [lf, tf, wf, hf] = rect;
+          const set = !!ov[slot] && (ov[slot]!.text !== undefined || ov[slot]!.size !== undefined || ov[slot]!.color !== undefined || ov[slot]!.bold !== undefined || ov[slot]!.italic !== undefined);
+          return (
+            <Box
+              key={slot}
+              onMouseDown={(ev) => { ev.preventDefault(); ev.stopPropagation(); }}
+              onClick={(ev) => { ev.stopPropagation(); openRTextEditor(it, slot, label, ev.currentTarget as HTMLElement); }}
+              title={`Edit ${label} text · click to set content / size / color`}
+              sx={{
+                position: "absolute",
+                left: lf * it.w, top: tf * it.h, width: wf * it.w, height: hf * it.h,
+                cursor: "pointer", borderRadius: "4px", boxSizing: "border-box",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                border: set ? "1.5px solid #4FC3F7" : "1px dashed rgba(79,195,247,0.55)",
+                backgroundColor: set ? "rgba(79,195,247,0.18)" : "rgba(79,195,247,0.05)",
+                transition: "background-color 120ms, border-color 120ms",
+                "&:hover": { backgroundColor: "rgba(255,213,79,0.30)", borderColor: "#FFD54F", borderStyle: "solid" },
+              }}
+            >
+              <Box component="span" sx={{
+                fontSize: Math.max(9, Math.min(13, it.w * 0.018)), color: "#0b3a4a",
+                backgroundColor: "rgba(255,255,255,0.75)", px: 0.5, borderRadius: "3px",
+                fontWeight: 600, whiteSpace: "nowrap", pointerEvents: "none",
+              }}>{label}</Box>
             </Box>
           );
         })}
@@ -1510,6 +1629,17 @@ export function CollageView() {
                   {/* Per-element font-sync hotspots while this figure is
                       expanded in the sidebar. */}
                   {elemSyncItemId === it.id && it.kind === "figure" && renderElementHotspots(it)}
+                  {/* R/ggplot text-element hotspots when an R plot is selected. */}
+                  {isSelected && selectedIds.length === 1 && cropItemId !== it.id
+                    && it.kind === "image" && it.rCode && renderRTextHotspots(it)}
+                  {/* Busy overlay while an R plot re-renders. */}
+                  {rBusyItem === it.id && (
+                    <Box sx={{
+                      position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
+                      backgroundColor: "rgba(0,0,0,0.35)", color: "#fff", fontSize: 12, fontWeight: 600,
+                      pointerEvents: "none",
+                    }}>Updating…</Box>
+                  )}
                 </Box>
               );
             })}
@@ -1566,6 +1696,69 @@ export function CollageView() {
             void rerenderFigure(ed.itemId);
           }}
         />
+      )}
+
+      {/* R-plot text-slot editor (click a ggplot title/axis/legend hotspot). */}
+      {rTextEditor && (
+        <Popover
+          open
+          anchorEl={rTextEditor.anchorEl}
+          onClose={() => setRTextEditor(null)}
+          anchorOrigin={{ vertical: "bottom", horizontal: "left" }}
+          transformOrigin={{ vertical: "top", horizontal: "left" }}
+        >
+          <Box sx={{ p: 1.5, width: 260, display: "flex", flexDirection: "column", gap: 1 }}>
+            <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary" }}>
+              {rTextEditor.label} text
+            </Typography>
+            <TextField
+              size="small" autoFocus placeholder="(leave blank to keep)"
+              value={rTextEditor.value.text ?? ""}
+              onChange={(e) => setRTextEditor((s) => s && ({ ...s, value: { ...s.value, text: e.target.value } }))}
+              sx={{ "& input": { fontSize: "0.78rem" } }}
+            />
+            <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+              <TextField
+                type="number" size="small" label="Size (pt)"
+                value={rTextEditor.value.size ?? ""}
+                onChange={(e) => setRTextEditor((s) => s && ({ ...s, value: { ...s.value, size: e.target.value === "" ? undefined : Math.max(1, Math.min(120, Number(e.target.value))) } }))}
+                inputProps={{ min: 1, max: 120, step: 1 }}
+                sx={{ width: 96, "& input": { fontSize: "0.75rem" } }}
+              />
+              <Tooltip title="Text color">
+                <Box component="input" type="color"
+                  value={rTextEditor.value.color ?? "#000000"}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setRTextEditor((s) => s && ({ ...s, value: { ...s.value, color: e.target.value } }))}
+                  sx={{ width: 30, height: 28, p: 0, border: "none", bgcolor: "transparent", cursor: "pointer" }} />
+              </Tooltip>
+              <ToggleButton value="bold" size="small" selected={!!rTextEditor.value.bold}
+                onChange={() => setRTextEditor((s) => s && ({ ...s, value: { ...s.value, bold: !s.value.bold } }))}
+                sx={{ p: 0.5, fontWeight: 700, fontSize: "0.75rem", lineHeight: 1, minWidth: 26 }}>B</ToggleButton>
+              <ToggleButton value="italic" size="small" selected={!!rTextEditor.value.italic}
+                onChange={() => setRTextEditor((s) => s && ({ ...s, value: { ...s.value, italic: !s.value.italic } }))}
+                sx={{ p: 0.5, fontStyle: "italic", fontSize: "0.75rem", lineHeight: 1, minWidth: 26 }}>i</ToggleButton>
+            </Box>
+            <Box sx={{ display: "flex", justifyContent: "space-between", gap: 1 }}>
+              <Button size="small" color="warning" sx={{ fontSize: "0.65rem", textTransform: "none" }}
+                onClick={() => {
+                  // Clear this slot's override + re-render.
+                  const ed = rTextEditor;
+                  const cur = useCollageStore.getState().items.find((i) => i.id === ed.itemId);
+                  const next = { ...(cur?.rTextOverrides || {}) };
+                  delete next[ed.slot];
+                  updateItem(ed.itemId, { rTextOverrides: next });
+                  setRTextEditor(null);
+                  void rerenderRPlot(ed.itemId);
+                }}>
+                Clear
+              </Button>
+              <Box sx={{ display: "flex", gap: 0.5 }}>
+                <Button size="small" onClick={() => setRTextEditor(null)} sx={{ fontSize: "0.65rem", textTransform: "none" }}>Cancel</Button>
+                <Button size="small" variant="contained" onClick={applyRText} sx={{ fontSize: "0.65rem", textTransform: "none" }}>Apply</Button>
+              </Box>
+            </Box>
+          </Box>
+        </Popover>
       )}
     </Box>
   );

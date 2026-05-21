@@ -15,6 +15,22 @@ import { immer } from "zustand/middleware/immer";
 
 export type CollageItemKind = "figure" | "image" | "text" | "line";
 
+/** Editable text slots of an R (ggplot) plot, surfaced as clickable hotspots
+ *  on the collage canvas. Mirrors the backend `text_overrides` slot names. */
+export type RTextSlot =
+  | "title" | "subtitle" | "xaxis" | "yaxis" | "caption"
+  | "legend_title" | "xticks" | "yticks" | "legend_text";
+
+/** A single R text-element override (text content + style). All fields
+ *  optional — only set ones are applied. Sizes are in points. */
+export type RTextOverride = {
+  text?: string;
+  size?: number;
+  color?: string;
+  bold?: boolean;
+  italic?: boolean;
+};
+
 /** One styled run within a header (per-character styling support). */
 export type CollageHeaderSegment = {
   text: string;
@@ -97,6 +113,10 @@ export type CollageItem = {
   rDataCsv?: string;
   rInterpreter?: string | null;
   rPlotIndex?: number;
+  /** Per-text-element overrides for an R (ggplot) plot item, keyed by slot.
+   *  Edited by clicking the plot's text hotspots on the canvas; re-applied on
+   *  every re-render so title/axis/legend customizations persist. */
+  rTextOverrides?: Partial<Record<RTextSlot, RTextOverride>>;
   /** Text-item ("text" kind) styling. `text` is the content; the rest are
    *  optional style overrides with sensible defaults. */
   text?: string;
