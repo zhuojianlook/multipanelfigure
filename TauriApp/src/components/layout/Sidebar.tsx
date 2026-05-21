@@ -35,6 +35,7 @@ import UploadFileIcon from "@mui/icons-material/UploadFile";
 import StraightenIcon from "@mui/icons-material/Straighten";
 import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
+import type { CollageItem } from "../../store/collageStore";
 import { api } from "../../api/client";
 import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 import { detectGlobalFont, describeDetectedFont } from "../../utils/detectGlobalFont";
@@ -129,6 +130,8 @@ function CollageSidebar() {
   const globalHeaderPt = useCollageStore((s) => s.globalHeaderPt);
   const setGlobalHeaderPt = useCollageStore((s) => s.setGlobalHeaderPt);
   const updateItem = useCollageStore((s) => s.updateItem);
+  const setElemOverride = useCollageStore((s) => s.setElemOverride);
+  const fonts = useFigureStore((s) => s.fonts);
   const [applyBusy, setApplyBusy] = useState(false);
   const [pendingPt, setPendingPt] = useState<number>(globalHeaderPt ?? 12);
   // Free-text draft for the pt field so the user can type intermediate
@@ -140,6 +143,17 @@ function CollageSidebar() {
     setPtText(String(v));
     return v;
   };
+  // Which properties the Synchronize button applies. Size is on by default
+  // (legacy behaviour); colour + font are opt-in so existing flows are
+  // unchanged. Each has its own target value.
+  const [applySize, setApplySize] = useState(true);
+  const [applyColor, setApplyColor] = useState(false);
+  const [syncColor, setSyncColor] = useState("#000000");
+  const [applyFont, setApplyFont] = useState(false);
+  const [syncFont, setSyncFont] = useState<string>("");
+  // Element-id prefixes the default (un-expanded) sync targets, mirroring the
+  // backend's _DEFAULT_FONT_SYNC_PREFIXES.
+  const DEFAULT_SYNC_PREFIXES = ["colhdr", "rowhdr", "collbl", "rowlbl"];
 
   const figureItems = items.filter((it) => it.kind === "figure" && it.projectPath);
   // R/analysis plots can also be re-rendered at a target font size by
@@ -216,6 +230,14 @@ function CollageSidebar() {
       });
       return;
     }
+    if (!applySize && !applyColor && !applyFont) {
+      await alertDialog({
+        title: "Nothing to apply",
+        body: "Tick at least one property to synchronize — Size, Color, and/or Font.",
+      });
+      return;
+    }
+    const font = syncFont || fonts[0] || "arial.ttf";
     setApplyBusy(true);
     let succeeded = 0;
     let failed = 0;
@@ -228,17 +250,41 @@ function CollageSidebar() {
         // pass the explicitly-checked element ids; otherwise null = the
         // backend default set (column/row headers + axis labels).
         let elementIds: string[] | null = null;
-        const sel = elemSel[it.id];
+        const sel = useCollageStore.getState().elemSelByItem[it.id];
         if (sel) {
           const ids = Object.keys(sel).filter((k) => sel[k]);
           if (ids.length === 0) { skipped++; continue; }
           elementIds = ids;
         }
+        // Colour/font are applied as per-element overrides. We need explicit
+        // element ids for those: use the selection if known, else load the
+        // element list and target the default header/axis-label set.
+        if (applyColor || applyFont) {
+          let els = useCollageStore.getState().elemListByItem[it.id];
+          if (!els) {
+            try {
+              const r = await api.getFigureElements(it.projectPath);
+              setElemList(it.id, r.elements);
+              els = r.elements;
+            } catch (e) {
+              console.error("[collage] load elements for sync failed", it.name, e);
+            }
+          }
+          const targetIds = elementIds
+            ?? (els ? els.filter((e) => DEFAULT_SYNC_PREFIXES.includes(e.id.split(":")[0])).map((e) => e.id) : []);
+          for (const eid of targetIds) {
+            const prev = (useCollageStore.getState().elemOverridesByItem[it.id] || {})[eid] || {};
+            const next = { ...prev };
+            if (applyColor) next.color = syncColor;
+            if (applyFont) next.font_name = font;
+            setElemOverride(it.id, eid, next);
+          }
+        }
         const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
         const overrides = useCollageStore.getState().elemOverridesByItem[it.id] || null;
         try {
           const resp = await api.renderCollageFigure(
-            it.projectPath, targetPt, Math.max(0.001, scale), it.w, elementIds,
+            it.projectPath, applySize ? targetPt : null, Math.max(0.001, scale), it.w, elementIds,
             overrides as Record<string, unknown> | null,
           );
           if (resp?.image && resp.width && resp.height) {
@@ -258,64 +304,76 @@ function CollageSidebar() {
           failed++;
         }
       }
-      // R/analysis plots: re-run their captured R code with the target font
-      // size injected, then swap in the regenerated PNG. The base size is
-      // compensated for the item's collage scale (approximate for R since
-      // its text units differ from matplotlib's).
-      for (const it of useCollageStore.getState().items) {
-        if (!(it.kind === "image" && it.fromAnalysis && it.rCode)) continue;
-        if (!isIncluded(it.id)) continue;
-        const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
-        const baseFs = Math.max(1, Math.round(targetPt / Math.max(0.001, scale)));
-        try {
-          const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, baseFs);
-          const idx = it.rPlotIndex ?? 0;
-          const png = res.plots?.[idx] ?? res.plots?.[0];
-          if (res.success && png) {
-            const dataUrl = `data:image/png;base64,${png}`;
-            // Recompute height from the regenerated plot's aspect so text
-            // isn't stretched (objectFit:"fill"); keep the user's width.
-            const dims = await new Promise<{ w: number; h: number }>((resolve) => {
-              const im = new window.Image();
-              im.onload = () => resolve({ w: im.naturalWidth, h: im.naturalHeight });
-              im.onerror = () => resolve({ w: it.naturalW, h: it.naturalH });
-              im.src = dataUrl;
-            });
-            const newAspect = dims.h > 0 ? dims.w / dims.h : (it.naturalW / Math.max(1, it.naturalH));
-            updateItem(it.id, {
-              src: dataUrl,
-              naturalW: dims.w,
-              naturalH: dims.h,
-              h: it.w / Math.max(0.001, newAspect),
-            });
-            succeeded++;
-          } else {
-            console.error("[collage] R re-run failed for", it.name, res.stderr);
+      // R/analysis plots: only the font SIZE can be re-injected by re-running
+      // the R code (colour/font family aren't generically extractable). Skip
+      // entirely when size isn't being synced.
+      if (applySize) {
+        for (const it of useCollageStore.getState().items) {
+          if (!(it.kind === "image" && it.fromAnalysis && it.rCode)) continue;
+          if (!isIncluded(it.id)) continue;
+          const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
+          const baseFs = Math.max(1, Math.round(targetPt / Math.max(0.001, scale)));
+          try {
+            const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, baseFs);
+            const idx = it.rPlotIndex ?? 0;
+            const png = res.plots?.[idx] ?? res.plots?.[0];
+            if (res.success && png) {
+              const dataUrl = `data:image/png;base64,${png}`;
+              const dims = await new Promise<{ w: number; h: number }>((resolve) => {
+                const im = new window.Image();
+                im.onload = () => resolve({ w: im.naturalWidth, h: im.naturalHeight });
+                im.onerror = () => resolve({ w: it.naturalW, h: it.naturalH });
+                im.src = dataUrl;
+              });
+              const newAspect = dims.h > 0 ? dims.w / dims.h : (it.naturalW / Math.max(1, it.naturalH));
+              updateItem(it.id, {
+                src: dataUrl,
+                naturalW: dims.w,
+                naturalH: dims.h,
+                h: it.w / Math.max(0.001, newAspect),
+              });
+              succeeded++;
+            } else {
+              console.error("[collage] R re-run failed for", it.name, res.stderr);
+              failed++;
+            }
+          } catch (e) {
+            console.error("[collage] R re-run error for", it.name, e);
             failed++;
           }
-        } catch (e) {
-          console.error("[collage] R re-run error for", it.name, e);
-          failed++;
         }
       }
-      // Text boxes: set the font size to the same physical pt. The canvas is
-      // a 300-DPI virtual page, so 1 pt = 300/72 px. (Approximate for
-      // non-default canvas DPIs.)
-      const PT_TO_PX = 300 / 72;
+      // Text boxes: apply the chosen properties directly. Sizes are stored in
+      // points (matching figures) so no conversion is needed. When the box
+      // carries per-character segments, apply across all of them too so the
+      // sync is uniform.
       for (const it of useCollageStore.getState().items) {
         if (it.kind !== "text") continue;
         if (!isIncluded(it.id)) continue;
-        updateItem(it.id, { fontSize: Math.round(targetPt * PT_TO_PX) });
+        const patch: Partial<CollageItem> = {};
+        if (applySize) { patch.fontSize = targetPt; patch.fontSizeUnit = "pt"; }
+        if (applyColor) patch.fontColor = syncColor;
+        if (applyFont) patch.fontFamily = font;
+        if (it.styledSegments?.length) {
+          patch.styledSegments = it.styledSegments.map((s) => ({
+            ...s,
+            ...(applySize ? { font_size: targetPt } : {}),
+            ...(applyColor ? { color: syncColor } : {}),
+            ...(applyFont ? { font_name: font } : {}),
+          }));
+        }
+        updateItem(it.id, patch);
         succeeded++;
       }
-      setGlobalHeaderPt(targetPt);
+      if (applySize) setGlobalHeaderPt(targetPt);
     } finally {
       setApplyBusy(false);
     }
     if (failed > 0 || skipped > 0) {
+      const props = [applySize ? `${targetPt} pt` : null, applyColor ? "color" : null, applyFont ? "font" : null].filter(Boolean).join(" + ");
       void alertDialog({
         title: "Finished",
-        body: `Synchronized ${succeeded} figure${succeeded === 1 ? "" : "s"} to ${targetPt} pt`
+        body: `Synchronized ${succeeded} item${succeeded === 1 ? "" : "s"} (${props})`
           + (skipped ? ` · ${skipped} skipped (no elements selected)` : "")
           + (failed ? ` · ${failed} failed (the .mpf may have moved; check the console)` : "")
           + ".",
@@ -339,39 +397,73 @@ function CollageSidebar() {
 
       <Box>
         <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mb: 0.5, display: "block", fontWeight: 600 }}>
-          Synchronize headers to size (pt)
+          Synchronize text (size · color · font)
         </Typography>
         <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary", mb: 1, display: "block", lineHeight: 1.4 }}>
-          Arrange + scale figures first, then Synchronize. Each selected figure
-          is re-rendered so its chosen text elements land at this point size
-          after collage scaling — uniform across differently-scaled figures.
+          Arrange + scale figures first, then tick the properties to unify and
+          Synchronize. Each selected figure re-renders so its chosen text
+          elements land at the same size/color/font after collage scaling.
           Expand a figure to pick exactly which text elements to apply to.
         </Typography>
-        <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", mb: 1 }}>
-          <TextField
-            type="number"
-            size="small"
-            value={ptText}
-            onChange={(e) => setPtText(e.target.value)}
-            onBlur={commitPt}
-            onKeyDown={(e) => { if (e.key === "Enter") { commitPt(); (e.target as HTMLInputElement).blur(); } }}
-            inputProps={{ min: 1, max: 200, step: 1 }}
-            sx={{
-              width: 64,
-              "& input": { fontSize: "0.7rem", py: 0.5, textAlign: "center", colorScheme: "dark" },
-              "& input[type=number]::-webkit-inner-spin-button, & input[type=number]::-webkit-outer-spin-button": {
-                filter: "invert(1)", opacity: 1,
-              },
-            }}
-          />
+        {/* Property toggles + targets */}
+        <Box sx={{ display: "flex", flexDirection: "column", gap: 0.25, mb: 1 }}>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+            <Checkbox size="small" checked={applySize} onChange={() => setApplySize((v) => !v)} sx={{ p: 0.25 }} />
+            <Typography variant="caption" sx={{ fontSize: "0.62rem", width: 40 }}>Size</Typography>
+            <TextField
+              type="number"
+              size="small"
+              value={ptText}
+              disabled={!applySize}
+              onChange={(e) => setPtText(e.target.value)}
+              onBlur={commitPt}
+              onKeyDown={(e) => { if (e.key === "Enter") { commitPt(); (e.target as HTMLInputElement).blur(); } }}
+              inputProps={{ min: 1, max: 200, step: 1 }}
+              sx={{
+                width: 64,
+                "& input": { fontSize: "0.7rem", py: 0.5, textAlign: "center", colorScheme: "dark" },
+                "& input[type=number]::-webkit-inner-spin-button, & input[type=number]::-webkit-outer-spin-button": {
+                  filter: "invert(1)", opacity: 1,
+                },
+              }}
+            />
+            <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>pt</Typography>
+          </Box>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+            <Checkbox size="small" checked={applyColor} onChange={() => setApplyColor((v) => !v)} sx={{ p: 0.25 }} />
+            <Typography variant="caption" sx={{ fontSize: "0.62rem", width: 40 }}>Color</Typography>
+            <Box
+              component="input"
+              type="color"
+              value={syncColor}
+              disabled={!applyColor}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSyncColor(e.target.value)}
+              sx={{ width: 32, height: 24, p: 0, border: "none", bgcolor: "transparent", cursor: "pointer", opacity: applyColor ? 1 : 0.4 }}
+            />
+          </Box>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+            <Checkbox size="small" checked={applyFont} onChange={() => setApplyFont((v) => !v)} sx={{ p: 0.25 }} />
+            <Typography variant="caption" sx={{ fontSize: "0.62rem", width: 40 }}>Font</Typography>
+            <Box
+              component="select"
+              value={syncFont || fonts[0] || "arial.ttf"}
+              disabled={!applyFont}
+              onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setSyncFont(e.target.value)}
+              sx={{ flex: 1, minWidth: 0, fontSize: "0.65rem", height: 24, bgcolor: "var(--c-surface)", color: "var(--c-text)", border: "1px solid var(--c-border)", borderRadius: 1, px: 0.5, opacity: applyFont ? 1 : 0.4 }}
+            >
+              {(fonts.length > 0 ? fonts : ["arial.ttf"]).map((f) => (
+                <option key={f} value={f}>{f.replace(/\.(ttf|otf|ttc|woff2?)$/i, "")}</option>
+              ))}
+            </Box>
+          </Box>
           <Button
             variant="contained"
             size="small"
-            disabled={applyBusy || includedCount === 0}
+            disabled={applyBusy || includedCount === 0 || (!applySize && !applyColor && !applyFont)}
             onClick={applyNow}
-            sx={{ fontSize: "0.65rem", textTransform: "none", flex: 1 }}
+            sx={{ fontSize: "0.65rem", textTransform: "none", mt: 0.5 }}
           >
-            {applyBusy ? "Synchronizing…" : `Synchronize headers${includedCount ? ` (${includedCount})` : ""}`}
+            {applyBusy ? "Synchronizing…" : `Synchronize${includedCount ? ` (${includedCount})` : ""}`}
           </Button>
         </Box>
 

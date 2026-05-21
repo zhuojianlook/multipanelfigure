@@ -100,7 +100,12 @@ export type CollageItem = {
   /** Text-item ("text" kind) styling. `text` is the content; the rest are
    *  optional style overrides with sensible defaults. */
   text?: string;
+  /** Whole-box font size in POINTS (pt). Rendered as fontSize × PT_TO_PX px.
+   *  Legacy items stored px and are migrated on load (see loadInitial). */
   fontSize?: number;
+  /** Marker that `fontSize` (and any styledSegments sizes) are in points.
+   *  Absent on legacy px-based items so the loader can convert them once. */
+  fontSizeUnit?: "pt";
   fontColor?: string;
   fontFamily?: string;
   fontBold?: boolean;
@@ -177,6 +182,13 @@ export const DEFAULT_CANVAS_H = 2917;
 /** Grid step in canvas pixels. 50 px ≈ 4.2 mm at 300 DPI — fine enough for
  *  alignment without being claustrophobic on the screen. */
 export const DEFAULT_GRID_STEP = 50;
+/** Canvas is a 300-DPI virtual page, so one typographic point = 300/72 px.
+ *  Text-box font sizes are stored in POINTS (matching figure headers + the
+ *  Synchronize panel); renderers multiply by this to get canvas pixels. */
+export const PT_TO_PX = 300 / 72;
+/** Default text-box size in points (was 28 px ≈ 6.7 pt; bumped to a legible
+ *  publication size on a 300-DPI page). */
+export const DEFAULT_TEXT_PT = 14;
 
 export type CollageState = {
   /** Top-level workspace toggle. The builder shows the panel grid +
@@ -314,11 +326,30 @@ function loadInitial(): Persisted {
         // Migrate older collage items that pre-date later fields.
         // The 0.1.145 build briefly used `stashPath`; rename to
         // `projectPath` while preserving any existing values.
-        const items = data.items.map((it: any) => ({
-          kind: it.kind || "image",
-          projectPath: it.projectPath ?? it.stashPath ?? null,
-          ...it,
-        })) as CollageItem[];
+        const items = data.items.map((it: any) => {
+          const migrated: any = {
+            kind: it.kind || "image",
+            projectPath: it.projectPath ?? it.stashPath ?? null,
+            ...it,
+          };
+          // Migrate legacy px-based text sizes → points (preserving the
+          // visual size: pt = px / PT_TO_PX, since renderers now multiply
+          // pt × PT_TO_PX). Marked with fontSizeUnit so it runs only once.
+          if (migrated.kind === "text" && migrated.fontSizeUnit !== "pt") {
+            if (typeof migrated.fontSize === "number") {
+              migrated.fontSize = Math.max(1, Math.round(migrated.fontSize / PT_TO_PX));
+            }
+            if (Array.isArray(migrated.styledSegments)) {
+              migrated.styledSegments = migrated.styledSegments.map((s: any) =>
+                typeof s?.font_size === "number"
+                  ? { ...s, font_size: Math.max(1, Math.round(s.font_size / PT_TO_PX)) }
+                  : s,
+              );
+            }
+            migrated.fontSizeUnit = "pt";
+          }
+          return migrated;
+        }) as CollageItem[];
         return {
           items,
           canvasW: data.canvasW || DEFAULT_CANVAS_W,

@@ -40,6 +40,8 @@ import {
   useCollageStore,
   DEFAULT_CANVAS_W,
   DEFAULT_CANVAS_H,
+  PT_TO_PX,
+  DEFAULT_TEXT_PT,
 } from "../../store/collageStore";
 import type { CollageItem } from "../../store/collageStore";
 import { useFigureStore } from "../../store/figureStore";
@@ -64,19 +66,20 @@ function cssFamily(name?: string): string {
 
 /** Build the React inline style for one rich-text segment (per-character
  *  styling), inheriting the text box's base size/colour where the segment
- *  doesn't override them. Used for live preview AND export parity. */
+ *  doesn't override them. `baseSizePt` and segment sizes are in POINTS;
+ *  converted to canvas px here. Used for live preview AND export parity. */
 function segmentStyle(
   seg: StyledSegment,
-  baseSize: number,
+  baseSizePt: number,
   baseColor: string,
 ): React.CSSProperties {
   const styles = seg.font_style ?? [];
   const isSuper = styles.includes("Superscript");
   const isSub = styles.includes("Subscript");
-  const baseSeg = seg.font_size ?? baseSize;
+  const segPt = seg.font_size ?? baseSizePt;
   return {
     fontFamily: cssFamily(seg.font_name),
-    fontSize: `${isSuper || isSub ? baseSeg * 0.7 : baseSeg}px`,
+    fontSize: `${(isSuper || isSub ? segPt * 0.7 : segPt) * PT_TO_PX}px`,
     color: seg.color || baseColor,
     fontWeight: styles.includes("Bold") ? 700 : 400,
     fontStyle: styles.includes("Italic") ? "italic" : "normal",
@@ -254,7 +257,7 @@ export function CollageView() {
             text: it.text || "",
             color: it.fontColor || "#000000",
             font_name: it.fontFamily || "arial.ttf",
-            font_size: it.fontSize || 28,
+            font_size: it.fontSize || DEFAULT_TEXT_PT,
             font_style: [
               ...(it.fontBold ? ["Bold"] : []),
               ...(it.fontItalic ? ["Italic"] : []),
@@ -328,8 +331,9 @@ export function CollageView() {
       text: "Double-click to edit",
       x: Math.round(canvasW / 2 - 160),
       y: Math.round(canvasH / 2 - 30),
-      w: 320, h: 60, naturalW: 320, naturalH: 60,
-      fontSize: 28, fontColor: "#000000", fontFamily: "Arial",
+      w: 320, h: 90, naturalW: 320, naturalH: 90,
+      fontSize: DEFAULT_TEXT_PT, fontSizeUnit: "pt",
+      fontColor: "#000000", fontFamily: (fonts[0] ?? "arial.ttf"),
       fontBold: false, fontItalic: false, align: "left",
     });
     setSelectedId(id);
@@ -945,10 +949,10 @@ export function CollageView() {
               ) : (
                 <>
                   <TextField
-                    type="number" size="small" title="Font size (px)"
-                    value={t.fontSize ?? 28}
-                    onChange={(e) => updateItem(t.id, { fontSize: Math.max(4, Math.min(400, Number(e.target.value) || 28)) })}
-                    inputProps={{ min: 4, max: 400, step: 1 }}
+                    type="number" size="small" title="Font size (pt)"
+                    value={t.fontSize ?? DEFAULT_TEXT_PT}
+                    onChange={(e) => updateItem(t.id, { fontSize: Math.max(1, Math.min(200, Number(e.target.value) || DEFAULT_TEXT_PT)), fontSizeUnit: "pt" })}
+                    inputProps={{ min: 1, max: 200, step: 1 }}
                     sx={{ width: 64, "& input": { fontSize: "0.75rem", py: 0.5, textAlign: "center", colorScheme: "dark" },
                       "& input[type=number]::-webkit-inner-spin-button, & input[type=number]::-webkit-outer-spin-button": { filter: "invert(1)", opacity: 1 } }}
                   />
@@ -1420,7 +1424,7 @@ export function CollageView() {
                           width: "100%", height: "100%", boxSizing: "border-box",
                           border: "none", outline: "none", resize: "none", background: "transparent",
                           padding: 0, lineHeight: 1.2, overflow: "hidden",
-                          fontSize: it.fontSize ?? 28, color: it.fontColor ?? "#000000",
+                          fontSize: (it.fontSize ?? DEFAULT_TEXT_PT) * PT_TO_PX, color: it.fontColor ?? "#000000",
                           fontFamily: cssFamily(it.fontFamily),
                           fontWeight: it.fontBold ? "bold" : "normal",
                           fontStyle: it.fontItalic ? "italic" : "normal",
@@ -1436,7 +1440,7 @@ export function CollageView() {
                         textAlign: it.align ?? "left",
                       }}>
                         {it.styledSegments.map((seg, i) => (
-                          <span key={`${i}-${seg.text.slice(0, 6)}`} style={segmentStyle(seg, it.fontSize ?? 28, it.fontColor ?? "#000000")}>
+                          <span key={`${i}-${seg.text.slice(0, 6)}`} style={segmentStyle(seg, it.fontSize ?? DEFAULT_TEXT_PT, it.fontColor ?? "#000000")}>
                             {seg.text}
                           </span>
                         ))}
@@ -1446,7 +1450,7 @@ export function CollageView() {
                         width: "100%", height: "100%", overflow: "hidden",
                         whiteSpace: "pre-wrap", wordBreak: "break-word", lineHeight: 1.2,
                         pointerEvents: "none", userSelect: "none",
-                        fontSize: it.fontSize ?? 28, color: it.fontColor ?? "#000000",
+                        fontSize: (it.fontSize ?? DEFAULT_TEXT_PT) * PT_TO_PX, color: it.fontColor ?? "#000000",
                         fontFamily: cssFamily(it.fontFamily),
                         fontWeight: it.fontBold ? "bold" : "normal",
                         fontStyle: it.fontItalic ? "italic" : "normal",

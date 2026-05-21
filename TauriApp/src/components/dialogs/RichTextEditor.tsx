@@ -28,6 +28,15 @@ import FormatTextdirectionLToRIcon from "@mui/icons-material/FormatTextdirection
 import FormatTextdirectionRToLIcon from "@mui/icons-material/FormatTextdirectionRToL";
 import type { StyledSegment } from "../../api/types";
 
+/** Map a stored font value (usually a file name like `arial.ttf`) to a CSS
+ *  font-family. Custom fonts are registered (loadCustomFonts.ts) under a
+ *  family equal to the file name without its extension, so the live preview
+ *  can show the actual typeface the renderer will use. */
+function previewFamily(name?: string): string | undefined {
+  if (!name) return undefined;
+  return `"${name.replace(/\.(ttf|otf|ttc|woff2?)$/i, "")}", Arial, sans-serif`;
+}
+
 interface Props {
   open: boolean;
   anchorEl: HTMLElement | null;
@@ -96,6 +105,21 @@ export function RichTextEditor({ open, anchorEl, onClose, segments: initialSegme
       setSelStart(el.selectionStart ?? 0);
       setSelEnd(el.selectionEnd ?? 0);
     }
+  };
+
+  // Re-focus the text field and restore the highlighted range after applying
+  // a style/property. Controls like the font Select and colour swatch steal
+  // focus and collapse the visual selection; restoring it lets the user keep
+  // styling the same run without re-selecting each time.
+  const restoreSelection = (start: number, end: number) => {
+    requestAnimationFrame(() => {
+      const el = inputRef.current;
+      if (!el) return;
+      el.focus();
+      try { el.setSelectionRange(start, end); } catch { /* ignore */ }
+      setSelStart(start);
+      setSelEnd(end);
+    });
   };
 
   const handleTextChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -199,6 +223,7 @@ export function RichTextEditor({ open, anchorEl, onClose, segments: initialSegme
       pos = segEnd;
     }
     setLocalSegments(newSegs);
+    restoreSelection(start, end);
   };
 
   const applyPropertyToSelection = (prop: "font_name" | "font_size" | "color", value: string | number) => {
@@ -234,6 +259,7 @@ export function RichTextEditor({ open, anchorEl, onClose, segments: initialSegme
       pos = segEnd;
     }
     setLocalSegments(newSegs);
+    restoreSelection(start, end);
   };
 
   const handleSave = () => {
@@ -260,32 +286,32 @@ export function RichTextEditor({ open, anchorEl, onClose, segments: initialSegme
         {/* Toolbar row 1: style buttons */}
         <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, mb: 1, flexWrap: "wrap" }}>
           <Tooltip title="Bold">
-            <IconButton size="small" onClick={() => applyStyleToSelection("Bold")}>
+            <IconButton size="small" onMouseDown={(e) => e.preventDefault()} onClick={() => applyStyleToSelection("Bold")}>
               <FormatBoldIcon fontSize="small" />
             </IconButton>
           </Tooltip>
           <Tooltip title="Italic">
-            <IconButton size="small" onClick={() => applyStyleToSelection("Italic")}>
+            <IconButton size="small" onMouseDown={(e) => e.preventDefault()} onClick={() => applyStyleToSelection("Italic")}>
               <FormatItalicIcon fontSize="small" />
             </IconButton>
           </Tooltip>
           <Tooltip title="Underline">
-            <IconButton size="small" onClick={() => applyStyleToSelection("Underline")}>
+            <IconButton size="small" onMouseDown={(e) => e.preventDefault()} onClick={() => applyStyleToSelection("Underline")}>
               <FormatUnderlinedIcon fontSize="small" />
             </IconButton>
           </Tooltip>
           <Tooltip title="Strikethrough">
-            <IconButton size="small" onClick={() => applyStyleToSelection("Strikethrough")}>
+            <IconButton size="small" onMouseDown={(e) => e.preventDefault()} onClick={() => applyStyleToSelection("Strikethrough")}>
               <StrikethroughSIcon fontSize="small" />
             </IconButton>
           </Tooltip>
           <Tooltip title="Superscript">
-            <IconButton size="small" onClick={() => applyStyleToSelection("Superscript")}>
+            <IconButton size="small" onMouseDown={(e) => e.preventDefault()} onClick={() => applyStyleToSelection("Superscript")}>
               <SuperscriptIcon fontSize="small" />
             </IconButton>
           </Tooltip>
           <Tooltip title="Subscript">
-            <IconButton size="small" onClick={() => applyStyleToSelection("Subscript")}>
+            <IconButton size="small" onMouseDown={(e) => e.preventDefault()} onClick={() => applyStyleToSelection("Subscript")}>
               <SubscriptIcon fontSize="small" />
             </IconButton>
           </Tooltip>
@@ -381,6 +407,7 @@ export function RichTextEditor({ open, anchorEl, onClose, segments: initialSegme
                 key={`${i}-${seg.text.slice(0, 8)}`}
                 style={{
                   color: seg.color,
+                  fontFamily: previewFamily(seg.font_name),
                   fontWeight: seg.font_style?.includes("Bold") ? 700 : 400,
                   fontStyle: seg.font_style?.includes("Italic") ? "italic" : "normal",
                   textDecoration: [

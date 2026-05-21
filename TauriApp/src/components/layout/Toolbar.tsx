@@ -35,7 +35,7 @@ import SystemUpdateAltIcon from "@mui/icons-material/SystemUpdateAlt";
 import DownloadIcon from "@mui/icons-material/Download";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import LibraryAddIcon from "@mui/icons-material/LibraryAdd";
-import { useCollageStore } from "../../store/collageStore";
+import { useCollageStore, PT_TO_PX, DEFAULT_TEXT_PT } from "../../store/collageStore";
 import { api } from "../../api/client";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -239,7 +239,9 @@ function SaveCollageButton() {
     for (const it of sorted) {
       if (it.kind === "text") {
         withRotation(it, () => {
-          const baseSize = it.fontSize ?? 28;
+          // Text font sizes are stored in POINTS; the canvas is a 300-DPI
+          // page, so multiply by PT_TO_PX to get device pixels.
+          const baseSizePx = (it.fontSize ?? DEFAULT_TEXT_PT) * PT_TO_PX;
           const baseColor = it.fontColor ?? "#000000";
           const align = it.align ?? "left";
           // Custom fonts register under their file-name-without-extension.
@@ -251,10 +253,11 @@ function SaveCollageButton() {
             // strikethrough/super-subscript. Two passes: wrap into lines,
             // then draw each line with its alignment offset.
             type Tok = { text: string; seg: typeof it.styledSegments[number]; space: boolean };
+            // Returns device px for a segment (point size × PT_TO_PX, ×0.7 for super/sub).
             const sizeOf = (seg: Tok["seg"]) => {
               const st = seg.font_style ?? [];
               const sub = st.includes("Superscript") || st.includes("Subscript");
-              return (seg.font_size ?? baseSize) * (sub ? 0.7 : 1);
+              return (seg.font_size ?? (it.fontSize ?? DEFAULT_TEXT_PT)) * (sub ? 0.7 : 1) * PT_TO_PX;
             };
             const fontOf = (seg: Tok["seg"]) => {
               const st = seg.font_style ?? [];
@@ -290,7 +293,7 @@ function SaveCollageButton() {
             for (const line of lines) {
               const widths = line.map(measure);
               const lineW = widths.reduce((a, b) => a + b, 0);
-              const lineH = Math.max(baseSize, ...line.map((t) => sizeOf(t.seg))) * 1.2;
+              const lineH = Math.max(baseSizePx, ...line.map((t) => sizeOf(t.seg))) * 1.2;
               let x = align === "center" ? it.x + (it.w - lineW) / 2 : align === "right" ? it.x + (it.w - lineW) : it.x;
               line.forEach((tk, i) => {
                 const st = tk.seg.font_style ?? [];
@@ -315,7 +318,7 @@ function SaveCollageButton() {
           }
 
           // Plain text box (whole-box font props, incl. underline).
-          const fs = baseSize;
+          const fs = baseSizePx;
           const weight = it.fontBold ? "bold" : "normal";
           const style = it.fontItalic ? "italic" : "normal";
           ctx.font = `${style} ${weight} ${fs}px ${fam(it.fontFamily)}`;
