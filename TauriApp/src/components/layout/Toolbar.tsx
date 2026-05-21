@@ -1297,6 +1297,19 @@ function RecordAppButton() {
   const mediaRecRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  // Native (ffmpeg) recording state — used on macOS, where the WKWebView
+  // has no navigator.mediaDevices.getDisplayMedia.
+  const nativeChildRef = useRef<{ write: (d: string) => Promise<void>; kill: () => Promise<void> } | null>(null);
+  const nativePathRef = useRef<string>("");
+  const stoppingRef = useRef<boolean>(false);
+
+  /** True when the webview supports browser screen capture (Windows WebView2,
+   *  most Linux WebKitGTK, and any plain-browser dev preview). macOS WKWebView
+   *  returns false → we fall back to native ffmpeg capture. */
+  const canWebCapture = () =>
+    typeof navigator !== "undefined"
+    && !!navigator.mediaDevices
+    && typeof navigator.mediaDevices.getDisplayMedia === "function";
 
   // Best-effort detection of which container/codec the host webview
   // is willing to record. Falls back through a few standard ones.
@@ -1313,7 +1326,7 @@ function RecordAppButton() {
     return "";
   };
 
-  const stopRecording = async (save: boolean) => {
+  const stopWeb = async (save: boolean) => {
     const rec = mediaRecRef.current;
     const stream = streamRef.current;
     if (!rec) return;
@@ -1355,7 +1368,7 @@ function RecordAppButton() {
     });
   };
 
-  const startRecording = async () => {
+  const startWeb = async () => {
     setRecError("");
     try {
       // Ask the host for a screen / window stream.  In Tauri this
@@ -1373,17 +1386,112 @@ function RecordAppButton() {
       mediaRecRef.current = rec;
       setRecording(true);
       // If the user stops sharing via the OS-level UI, end gracefully.
-      stream.getVideoTracks()[0]?.addEventListener("ended", () => { stopRecording(true); });
+      stream.getVideoTracks()[0]?.addEventListener("ended", () => { stopWeb(true); });
     } catch (e) {
       setRecError(e instanceof Error ? e.message : String(e));
     }
   };
 
-  // If the About dialog unmounts mid-recording, stop the stream so
-  // the OS recording indicator goes away.
+  // ── Native (ffmpeg) screen capture for macOS WKWebView ──
+
+  /** Query ffmpeg for the avfoundation index of the main screen capture
+   *  device. Falls back to "1" (0 is usually the camera). */
+  const getScreenDeviceIndex = async (): Promise<string> => {
+    try {
+      const { Command } = await import("@tauri-apps/plugin-shell");
+      const out = await Command.sidecar("binaries/ffmpeg", [
+        "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", "",
+      ]).execute();
+      const text = `${out.stderr || ""}\n${out.stdout || ""}`;
+      const m = text.match(/\[(\d+)\]\s+Capture screen 0/) || text.match(/\[(\d+)\]\s+Capture screen/);
+      if (m) return m[1];
+    } catch (e) {
+      console.warn("[record] avfoundation device list failed", e);
+    }
+    return "1";
+  };
+
+  const startNative = async () => {
+    setRecError("");
+    try {
+      const { save: saveDialog } = await import("@tauri-apps/plugin-dialog");
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const path = await saveDialog({
+        defaultPath: `mpfig-recording-${stamp}.mp4`,
+        filters: [{ name: "Video", extensions: ["mp4"] }],
+      });
+      if (!path) return;
+      const idx = await getScreenDeviceIndex();
+      const { Command } = await import("@tauri-apps/plugin-shell");
+      const cmd = Command.sidecar("binaries/ffmpeg", [
+        "-hide_banner", "-y",
+        "-f", "avfoundation", "-capture_cursor", "1", "-framerate", "30",
+        "-i", `${idx}:none`,
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        path,
+      ]);
+      let stderrTail = "";
+      cmd.stderr.on("data", (line: string) => { stderrTail = (stderrTail + line).slice(-1200); });
+      cmd.on("error", (err: string) => {
+        nativeChildRef.current = null;
+        setRecording(false);
+        setRecError(`ffmpeg failed to start: ${err}`);
+      });
+      cmd.on("close", async () => {
+        const child = nativeChildRef.current;
+        nativeChildRef.current = null;
+        setRecording(false);
+        if (!stoppingRef.current) {
+          // Process exited on its own — almost always a missing macOS Screen
+          // Recording permission. Surface a clear, actionable message.
+          const perm = /denied|not authorized|permission|abort|Operation not permitted/i.test(stderrTail);
+          setRecError(
+            perm
+              ? "Screen Recording permission needed: System Settings → Privacy & Security → Screen Recording → enable this app, then restart it and try again."
+              : `Recording stopped unexpectedly. ${stderrTail.slice(-300)}`,
+          );
+        } else {
+          await alertDialog({ title: "Recording saved", body: `Screen recording saved to ${nativePathRef.current}` });
+        }
+        stoppingRef.current = false;
+        void child; // referenced for clarity
+      });
+      const child = await cmd.spawn();
+      nativeChildRef.current = child as unknown as { write: (d: string) => Promise<void>; kill: () => Promise<void> };
+      nativePathRef.current = path;
+      stoppingRef.current = false;
+      setRecording(true);
+    } catch (e) {
+      setRecording(false);
+      setRecError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const stopNative = async (save: boolean) => {
+    const child = nativeChildRef.current;
+    if (!child) return;
+    stoppingRef.current = save;
+    try {
+      // 'q' on stdin makes ffmpeg finalize the file cleanly; killing would
+      // truncate the moov atom and corrupt the mp4.
+      if (save) await child.write("q");
+      else await child.kill();
+    } catch {
+      try { await child.kill(); } catch { /* ignore */ }
+    }
+  };
+
+  // Dispatch to the web or native implementation.
+  const startRecording = () => (canWebCapture() ? startWeb() : startNative());
+  const stopRecording = (save: boolean) =>
+    (mediaRecRef.current ? stopWeb(save) : nativeChildRef.current ? stopNative(save) : Promise.resolve());
+
+  // If the host unmounts mid-recording, stop the stream / kill ffmpeg so the
+  // OS recording indicator goes away.
   useEffect(() => {
     return () => {
       try { streamRef.current?.getTracks().forEach((t) => t.stop()); } catch { /* ignore */ }
+      try { void nativeChildRef.current?.kill(); } catch { /* ignore */ }
     };
   }, []);
 
