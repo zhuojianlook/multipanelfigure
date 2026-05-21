@@ -62,17 +62,6 @@ function svgToDataUrl(svg: string): string {
   return `data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(svg)))}`;
 }
 
-/** Parse an SVG's intrinsic size from its viewBox (preferred) or width/height
- *  so the collage item can keep the right aspect ratio. */
-function svgSize(svg: string): { w: number; h: number } | null {
-  const vb = svg.match(/viewBox=["']\s*[-\d.]+\s+[-\d.]+\s+([\d.]+)\s+([\d.]+)/);
-  if (vb) { const w = parseFloat(vb[1]), h = parseFloat(vb[2]); if (w > 0 && h > 0) return { w, h }; }
-  const wm = svg.match(/\bwidth=["']([\d.]+)/);
-  const hm = svg.match(/\bheight=["']([\d.]+)/);
-  if (wm && hm) { const w = parseFloat(wm[1]), h = parseFloat(hm[1]); if (w > 0 && h > 0) return { w, h }; }
-  return null;
-}
-
 /** Map a stored font value to a CSS font-family. Custom fonts are
  *  registered (loadCustomFonts.ts) under a family equal to the file name
  *  without its extension, so `arial.ttf` → `"arial", Arial, sans-serif`.
@@ -253,6 +242,7 @@ export function CollageView() {
   const updateItem = useCollageStore((s) => s.updateItem);
   const moveItem = useCollageStore((s) => s.moveItem);
   const bringToFront = useCollageStore((s) => s.bringToFront);
+  const reorderItem = useCollageStore((s) => s.reorderItem);
   const setCanvasSize = useCollageStore((s) => s.setCanvasSize);
   const setBackground = useCollageStore((s) => s.setBackground);
   const setColumnGuides = useCollageStore((s) => s.setColumnGuides);
@@ -361,8 +351,10 @@ export function CollageView() {
     const pt = useCollageStore.getState().globalHeaderPt;
     const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
     const baseFs = pt ? Math.max(1, Math.round(pt / Math.max(0.001, scale))) : null;
-    const nW = it.naturalW || 640;
-    const nH = it.naturalH || 480;
+    // STABLE device size in px (the SVG's intrinsic pixels). Never derived from
+    // the SVG viewBox (that caused a shrink-spiral); clamp out corrupt values.
+    const nW = it.naturalW && it.naturalW >= 150 ? it.naturalW : 800;
+    const nH = it.naturalH && it.naturalH >= 150 ? it.naturalH : 600;
     setRBusyItem(itemId);
     try {
       const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, baseFs, {
@@ -375,13 +367,13 @@ export function CollageView() {
         overrideRes: 150,
       });
       if (res.success && res.svg) {
-        const sz = svgSize(res.svg);
-        const aspect = sz ? sz.w / sz.h : (it.naturalW / Math.max(1, it.naturalH));
+        // Keep naturalW/H as the stable px reference (aspect = nW:nH); the SVG
+        // viewBox shares that aspect so it fills the box without distortion.
         updateItem(itemId, {
           src: svgToDataUrl(res.svg),
-          naturalW: sz ? Math.round(sz.w) : it.naturalW,
-          naturalH: sz ? Math.round(sz.h) : it.naturalH,
-          h: it.w / Math.max(0.001, aspect),
+          naturalW: nW,
+          naturalH: nH,
+          h: it.w / Math.max(0.001, nW / nH),
         });
       } else if (res.success && res.plots?.[0]) {
         // svglite missing — fall back to a raster PNG.
@@ -487,6 +479,11 @@ export function CollageView() {
     if (!it || it.kind !== "image" || !it.rCode) return;
     if (rLabelsByItem[it.id]) return;
     const isSvg = (it.src || "").startsWith("data:image/svg");
+    // Stable device px (clamp out any corrupt/tiny natural size).
+    const corrupt = !(it.naturalW && it.naturalW >= 150 && it.naturalH && it.naturalH >= 150);
+    const needsSvg = !isSvg || corrupt; // upgrade to SVG, or repair a bad aspect
+    const nW = it.naturalW && it.naturalW >= 150 ? it.naturalW : 800;
+    const nH = it.naturalH && it.naturalH >= 150 ? it.naturalH : 600;
     let cancelled = false;
     (async () => {
       try {
@@ -494,20 +491,18 @@ export function CollageView() {
         // plot becomes crisp-at-any-zoom and the dropdown shows real text.
         const res = await api.runR(it.rCode!, it.rDataCsv ?? "", it.rInterpreter ?? undefined, null, {
           emitLabels: true,
-          ...(isSvg ? {} : { renderSvg: true, renderOverride: true, overrideOnly: true,
-            overrideWidth: it.naturalW || 640, overrideHeight: it.naturalH || 480, overrideRes: 150,
-            textOverrides: (it.rTextOverrides || {}) as Record<string, unknown> }),
+          ...(needsSvg ? { renderSvg: true, renderOverride: true, overrideOnly: true,
+            overrideWidth: nW, overrideHeight: nH, overrideRes: 150,
+            textOverrides: (it.rTextOverrides || {}) as Record<string, unknown> } : {}),
         });
         if (cancelled) return;
         setRLabelsByItem((m) => ({ ...m, [it.id]: mapRLabels(res.labels || {}) }));
-        if (!isSvg && res.svg) {
-          const sz = svgSize(res.svg);
-          const aspect = sz ? sz.w / sz.h : (it.naturalW / Math.max(1, it.naturalH));
+        if (needsSvg && res.svg) {
           updateItem(it.id, {
             src: svgToDataUrl(res.svg),
-            naturalW: sz ? Math.round(sz.w) : it.naturalW,
-            naturalH: sz ? Math.round(sz.h) : it.naturalH,
-            h: it.w / Math.max(0.001, aspect),
+            naturalW: nW,
+            naturalH: nH,
+            h: it.w / Math.max(0.001, nW / nH),
           });
         }
       } catch (e) {
@@ -1313,6 +1308,27 @@ export function CollageView() {
             </>
           );
         })()}
+
+        {/* Stacking order (z-index) — shown when a single item is selected. */}
+        {selectedIds.length === 1 && (
+          <>
+            <Divider orientation="vertical" flexItem />
+            <Typography variant="caption" sx={{ color: "text.secondary" }}>Order</Typography>
+            {([
+              ["back", "⤓", "Send to back"],
+              ["backward", "▽", "Send backward"],
+              ["forward", "△", "Bring forward"],
+              ["front", "⤒", "Bring to front"],
+            ] as const).map(([dir, glyph, title]) => (
+              <Tooltip key={dir} title={title}>
+                <IconButton size="small" onClick={() => reorderItem(selectedIds[0], dir)}
+                  sx={{ p: 0.5, border: "1px solid var(--c-border)", borderRadius: 1, fontSize: "0.85rem", lineHeight: 1, width: 26, height: 26 }}>
+                  {glyph}
+                </IconButton>
+              </Tooltip>
+            ))}
+          </>
+        )}
 
         <Divider orientation="vertical" flexItem />
 

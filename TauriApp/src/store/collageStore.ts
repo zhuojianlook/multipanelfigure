@@ -318,6 +318,9 @@ export type CollageState = {
   removeItem: (id: string) => void;
   moveItem: (id: string, dx: number, dy: number) => void;
   bringToFront: (id: string) => void;
+  /** Change an item's stacking order: to the very front/back, or one step
+   *  forward/backward relative to its neighbour. */
+  reorderItem: (id: string, dir: "front" | "back" | "forward" | "backward") => void;
   setSelectedId: (id: string | null) => void;
   /** Replace the whole multi-selection. */
   setSelectedIds: (ids: string[]) => void;
@@ -402,6 +405,13 @@ function loadInitial(): Persisted {
               );
             }
             migrated.fontSizeUnit = "pt";
+          }
+          // Lines are 1-D — their box only needs to be tall enough for the end
+          // handles. Shrink any over-tall line box to a thin strip, preserving
+          // the line's vertical centre. Idempotent (24 is not > 40).
+          if (migrated.kind === "line" && typeof migrated.h === "number" && migrated.h > 40) {
+            migrated.y = (migrated.y || 0) + (migrated.h - 24) / 2;
+            migrated.h = 24;
           }
           return migrated;
         }) as CollageItem[];
@@ -541,6 +551,31 @@ export const useCollageStore = create<CollageState>()(
         const maxZ = s.items.reduce((acc, it) => Math.max(acc, it.z), 0);
         const it = s.items.find((i) => i.id === id);
         if (it) it.z = maxZ + 1;
+      });
+      persist(get());
+    },
+
+    reorderItem: (id, dir) => {
+      set((s) => {
+        // Normalise z to a dense 0..n-1 ordering first so swaps are reliable
+        // even if z values were equal or sparse.
+        const sorted = [...s.items].sort((a, b) => a.z - b.z);
+        sorted.forEach((it, i) => { const o = s.items.find((x) => x.id === it.id); if (o) o.z = i; });
+        const cur = s.items.find((x) => x.id === id);
+        if (!cur) return;
+        const n = s.items.length;
+        if (dir === "front") {
+          cur.z = n; // above everyone; renormalised next time
+        } else if (dir === "back") {
+          for (const it of s.items) it.z += 1;
+          cur.z = 0;
+        } else if (dir === "forward" && cur.z < n - 1) {
+          const above = s.items.find((x) => x.z === cur.z + 1);
+          if (above) { above.z = cur.z; cur.z += 1; }
+        } else if (dir === "backward" && cur.z > 0) {
+          const below = s.items.find((x) => x.z === cur.z - 1);
+          if (below) { below.z = cur.z; cur.z -= 1; }
+        }
       });
       persist(get());
     },
