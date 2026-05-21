@@ -5116,6 +5116,8 @@ def _r_text_override_block(ov: dict, width: int, height: int, force: bool = Fals
                 pass
         if o.get("color"):
             args.append(f'colour="{_r_escape(o["color"])}"')
+        if o.get("font"):
+            args.append(f'family="{_r_escape(o["font"])}"')
         face = _r_face(o)
         if face != "plain":
             args.append(f'face="{face}"')

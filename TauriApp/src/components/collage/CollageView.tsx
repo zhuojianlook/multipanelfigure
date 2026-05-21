@@ -185,6 +185,23 @@ const R_TEXT_SLOTS: { slot: RTextSlot; label: string }[] = [
   { slot: "caption", label: "Caption" },
 ];
 
+/** Font families offered for R text. Generic R families ("sans"/"serif"/
+ *  "mono") render on every device; the named ones work where the graphics
+ *  device resolves them (e.g. macOS quartz). "" = keep the plot's default. */
+const R_FONT_FAMILIES: { value: string; label: string }[] = [
+  { value: "", label: "Default" },
+  { value: "sans", label: "Sans (Helvetica/Arial)" },
+  { value: "serif", label: "Serif (Times)" },
+  { value: "mono", label: "Mono (Courier)" },
+  { value: "Arial", label: "Arial" },
+  { value: "Helvetica", label: "Helvetica" },
+  { value: "Times New Roman", label: "Times New Roman" },
+  { value: "Georgia", label: "Georgia" },
+  { value: "Courier", label: "Courier" },
+  { value: "Verdana", label: "Verdana" },
+  { value: "Palatino", label: "Palatino" },
+];
+
 /** Slots whose TEXT can be renamed (ggplot labs()). The rest (tick labels,
  *  legend labels) are data-driven — only their size/colour can change, so the
  *  editor hides the text field for them (renaming them does nothing). */
@@ -1834,6 +1851,20 @@ export function CollageView() {
               <ToggleButton value="italic" size="small" selected={!!rTextEditor.value.italic}
                 onChange={() => setRTextEditor((s) => s && ({ ...s, value: { ...s.value, italic: !s.value.italic } }))}
                 sx={{ p: 0.5, fontStyle: "italic", fontSize: "0.75rem", lineHeight: 1, minWidth: 26 }}>i</ToggleButton>
+            </Box>
+            <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+              <Typography variant="caption" sx={{ fontSize: "0.62rem", color: "text.secondary", width: 32 }}>Font</Typography>
+              <Box
+                component="select"
+                value={rTextEditor.value.font ?? ""}
+                onChange={(e: React.ChangeEvent<HTMLSelectElement>) =>
+                  setRTextEditor((s) => s && ({ ...s, value: { ...s.value, font: e.target.value || undefined } }))}
+                sx={{ flex: 1, minWidth: 0, fontSize: "0.7rem", height: 26, bgcolor: "var(--c-surface)", color: "var(--c-text)", border: "1px solid var(--c-border)", borderRadius: 1, px: 0.5 }}
+              >
+                {R_FONT_FAMILIES.map((f) => (
+                  <option key={f.value} value={f.value}>{f.label}</option>
+                ))}
+              </Box>
             </Box>
             <Box sx={{ display: "flex", justifyContent: "space-between", gap: 1 }}>
               <Button size="small" color="warning" sx={{ fontSize: "0.65rem", textTransform: "none" }}

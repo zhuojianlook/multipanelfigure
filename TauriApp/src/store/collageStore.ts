@@ -29,6 +29,11 @@ export type RTextOverride = {
   color?: string;
   bold?: boolean;
   italic?: boolean;
+  /** ggplot font family (element_text(family=…)). Only families R has
+   *  registered render — generic "sans"/"serif"/"mono" always work; common
+   *  system names work where the device resolves them. "" / undefined = keep
+   *  the plot's default. */
+  font?: string;
 };
 
 /** One styled run within a header (per-character styling support). */
