@@ -42,6 +42,7 @@ import {
   Button,
   IconButton,
   Select,
+  Menu,
   MenuItem,
   Tooltip,
   CircularProgress,
@@ -56,6 +57,7 @@ import {
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AddIcon from "@mui/icons-material/Add";
+import ExtensionIcon from "@mui/icons-material/Extension";
 import StarIcon from "@mui/icons-material/Star";
 import StarBorderIcon from "@mui/icons-material/StarBorder";
 import DownloadIcon from "@mui/icons-material/Download";
@@ -797,6 +799,11 @@ export type EngineKind = "python" | "matlab" | "r" | "imagej" | "cellpose";
 
 export interface InsetSource {
   key: string;
+  /** Which MPF this source comes from (doc id) + its display name, so the
+   *  Sources panel can group sources into a drawer per loaded MPF and the
+   *  project save can tell which MPF a workflow's data belongs to. */
+  mpfId?: string;
+  mpf?: string;
   row: number;
   col: number;
   inset_index: number;
@@ -834,6 +841,12 @@ export interface NodeOutput {
   /** Whether the user pinned this output (sticky in the drawer's
    *  summary view; pinned items survive node re-runs). */
   pinned?: boolean;
+  /** For R plot outputs: the self-contained R script that produced this
+   *  plot (upstream input CSVs inlined into the prelude), so the collage
+   *  can re-run it at a new font size via "Synchronize headers". */
+  rCode?: string;
+  rInterpreter?: string | null;
+  rPlotIndex?: number;
 }
 
 /** Placeholder output entry — what the code DECLARES it will produce.
@@ -3005,6 +3018,10 @@ export interface AggregatedOutput {
   name: string;
   payload: string;
   pinned?: boolean;
+  /** R plot re-run provenance (self-contained script + interpreter + index). */
+  rCode?: string;
+  rInterpreter?: string | null;
+  rPlotIndex?: number;
 }
 
 export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: Props) {
@@ -3197,6 +3214,64 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // "Install failed — see console" instead of silently reverting to
   // the idle label.  Cleared when the user clicks Retry.
   const [cellposeInstallFailed, setCellposeInstallFailed] = useState(false);
+  // Anchor for the Plugins dropdown (houses Cellpose add/install).
+  const [pluginsAnchor, setPluginsAnchor] = useState<null | HTMLElement>(null);
+
+  // Install Cellpose into the sidecar's Python (streaming pip log). Extracted
+  // so the Plugins menu can trigger it. Re-probes availability when done.
+  const installCellpose = async () => {
+    setCellposeInstalling(true);
+    setCellposeInstallFailed(false);
+    setConsoleOpen(true);
+    consoleRef.current += `\n=== Install Cellpose 3 ===\n`;
+    setConsoleOut(consoleRef.current);
+    const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
+    let lastRc: number | null = null;
+    try {
+      const resp = await fetch(`${apiBase}/api/analysis/install-cellpose-stream`, {
+        method: "POST", headers: { "Accept": "text/event-stream" },
+      });
+      if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf("\n\n")) !== -1) {
+          const frame = buf.slice(0, nl);
+          buf = buf.slice(nl + 2);
+          if (!frame.startsWith("data:")) continue;
+          try {
+            const payload = JSON.parse(frame.slice(frame.indexOf(":") + 1).trim());
+            if (payload.line) { consoleRef.current += payload.line + "\n"; setConsoleOut(consoleRef.current); }
+            if (payload.done) { lastRc = typeof payload.returncode === "number" ? payload.returncode : -1; consoleRef.current += `[done — rc=${lastRc}]\n`; setConsoleOut(consoleRef.current); }
+          } catch { /* ignore non-JSON */ }
+        }
+      }
+      const probe = await fetch(`${apiBase}/api/analysis/check-cellpose`);
+      const pd: { installed?: boolean; kind?: string } = await probe.json();
+      setCellposeKind(pd?.installed ? (pd.kind || "cellpose") : "");
+      if (pd?.installed) {
+        consoleRef.current += `[Cellpose ready: ${pd.kind}]\n`;
+        setConsoleOut(consoleRef.current);
+        setCellposeInstallFailed(false);
+      } else {
+        setCellposeInstallFailed(true);
+        consoleRef.current += `\n[Install failed${lastRc !== null ? ` (pip exit ${lastRc})` : ""} — read the lines above for the actual error]\n`;
+        setConsoleOut(consoleRef.current);
+      }
+    } catch (e) {
+      consoleRef.current += `\n[Install request failed: ${e instanceof Error ? e.message : String(e)}]\n`;
+      setConsoleOut(consoleRef.current);
+      setCellposeInstallFailed(true);
+    } finally {
+      setCellposeInstalling(false);
+    }
+  };
 
   // (Drawer Console tab + ad-hoc snippet runner removed — per-node
   // Console under the code editor is the canonical place to read
@@ -3872,6 +3947,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       let result: { success: boolean; stdout: string; stderr: string;
                     plots: string[]; tables: { name: string; csv: string }[];
                     images: { name: string; image: string }[]; };
+      // Set in the R branch to the self-contained script actually executed
+      // (prelude with inlined inputs + user code), for collage re-runs.
+      let rExecutedCode: string | null = null;
       // All four engines now go through a direct fetch so we can
       // include the user's optional `interpreter_path` in the body
       // (the api.* wrappers don't expose it).  The sidecar treats
@@ -3981,6 +4059,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           ? `inputs <- list(\n${inputsAssign}\n)\n# Convenience: \`data\` aliases the first input table.\nif (length(inputs) > 0) data <- inputs[[1]] else data <- data.frame()\n\n`
           : `inputs <- list()\ndata <- data.frame()\n\n`;
         const fullCode = prelude + (node.data.code || R_DEFAULT);
+        rExecutedCode = fullCode;
         const resp = await fetch(`${apiBase}/api/analysis/run-r`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -3994,9 +4073,18 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         result = { ...rr, images: rr.images || [] };
       }
 
+      // For R nodes the executed script (`rFullCode`) is self-contained —
+      // upstream input CSVs are inlined into its prelude — so it can be
+      // re-run standalone (e.g. by the collage to re-render a plot at a new
+      // font size). Capture it on each plot output as re-run provenance.
+      const rFullCode = engine === "r" ? rExecutedCode : null;
+      const rInterp = engine === "r" ? (enginePaths.r || null) : null;
       // Convert result into NodeOutputs.
       const newOutputs: NodeOutput[] = [
-        ...result.plots.map((b64, i) => ({ id: `out_plot_${i}`, kind: "plot" as DataKind, name: `plot_${i + 1}`, payload: b64 })),
+        ...result.plots.map((b64, i) => ({
+          id: `out_plot_${i}`, kind: "plot" as DataKind, name: `plot_${i + 1}`, payload: b64,
+          ...(rFullCode ? { rCode: rFullCode, rInterpreter: rInterp, rPlotIndex: i } : {}),
+        })),
         ...result.tables.map((t) => ({ id: `out_table_${t.name}`, kind: "table" as DataKind, name: t.name, payload: t.csv })),
         ...((result.images || []).map((im, i) => ({ id: `out_image_${i}`, kind: "image" as DataKind, name: im.name, payload: im.image }))),
       ];
@@ -4065,6 +4153,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       name: o.name,
       payload: o.payload,
       pinned: o.pinned,
+      rCode: o.rCode,
+      rInterpreter: o.rInterpreter,
+      rPlotIndex: o.rPlotIndex,
     })));
   }, [nodes]);
   // Notify parent (for save/load) — debounce by deferring to a microtask.
@@ -4183,6 +4274,16 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           h: Math.round(h * scale),
           naturalW: w,
           naturalH: h,
+          // R plot re-run provenance (self-contained script + interpreter) so
+          // the collage's "Synchronize headers" can re-render it at a new size.
+          // The data CSV just needs a header row to satisfy the run-r
+          // boilerplate's read.csv — the real inputs are inlined in rCode.
+          ...(o.rCode ? {
+            rCode: o.rCode,
+            rDataCsv: "Panel,Name,Group,Value,Unit\n",
+            rInterpreter: o.rInterpreter ?? null,
+            rPlotIndex: o.rPlotIndex ?? 0,
+          } : {}),
         });
         placed++;
       }
@@ -4567,114 +4668,37 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               </Button>
             </span>
           </Tooltip>
-          {cellposeKind ? (
-            <Tooltip placement="bottom" title={`Add a Cellpose node (detected: ${cellposeKind})`}>
-              <span>
-                <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
-                  onClick={() => addProcessNode("cellpose")}
-                  sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.cellpose, "&:hover": { bgcolor: KIND_COLOR.cellpose, filter: "brightness(0.9)" } }}>
-                  🧬 Cellpose
-                </Button>
-              </span>
-            </Tooltip>
-          ) : (
-            <Tooltip placement="bottom" title={cellposeInstalling
-              ? "Installing… (cellpose + torch download is ~500 MB, can take several minutes)"
-              : cellposeInstallFailed
-                ? "Previous install failed — see the Console panel for the pip error.  Click to retry."
-                : "Install Cellpose 3 into the sidecar's Python (runs `pip install cellpose`)"}>
-              <span>
-                <Button size="small" variant={cellposeInstallFailed ? "contained" : "outlined"}
-                  color={cellposeInstallFailed ? "error" : "primary"}
-                  startIcon={
-                    cellposeInstalling
-                      ? <CircularProgress size={12} sx={{ color: "inherit" }} />
-                      : <span style={{ fontSize: 12 }}>{cellposeInstallFailed ? "⚠" : "⤓"}</span>
-                  }
-                  disabled={cellposeInstalling}
-                  onClick={async () => {
-                    setCellposeInstalling(true);
-                    setCellposeInstallFailed(false);
-                    setConsoleOpen(true);  // surface the live log
-                    consoleRef.current += `\n=== Install Cellpose 3 ===\n`;
-                    setConsoleOut(consoleRef.current);
-                    const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
-                    // The streaming endpoint emits a final `{"done":true,"returncode":N}`
-                    // frame; we latch the exit code so the button can
-                    // stay in an error state after the request completes.
-                    let lastRc: number | null = null;
-                    try {
-                      const resp = await fetch(`${apiBase}/api/analysis/install-cellpose-stream`, {
-                        method: "POST",
-                        headers: { "Accept": "text/event-stream" },
-                      });
-                      if (!resp.ok || !resp.body) {
-                        throw new Error(`HTTP ${resp.status}`);
-                      }
-                      const reader = resp.body.getReader();
-                      const dec = new TextDecoder();
-                      let buf = "";
-                      // eslint-disable-next-line no-constant-condition
-                      while (true) {
-                        const { done, value } = await reader.read();
-                        if (done) break;
-                        buf += dec.decode(value, { stream: true });
-                        let nl: number;
-                        while ((nl = buf.indexOf("\n\n")) !== -1) {
-                          const frame = buf.slice(0, nl);
-                          buf = buf.slice(nl + 2);
-                          if (!frame.startsWith("data:")) continue;
-                          try {
-                            const payload = JSON.parse(frame.slice(frame.indexOf(":") + 1).trim());
-                            if (payload.line) {
-                              consoleRef.current += payload.line + "\n";
-                              setConsoleOut(consoleRef.current);
-                            }
-                            if (payload.done) {
-                              lastRc = typeof payload.returncode === "number" ? payload.returncode : -1;
-                              consoleRef.current += `[done — rc=${lastRc}]\n`;
-                              setConsoleOut(consoleRef.current);
-                            }
-                          } catch { /* ignore non-JSON */ }
-                        }
-                      }
-                      // Re-probe after install (success or fail).
-                      const probe = await fetch(`${apiBase}/api/analysis/check-cellpose`);
-                      const pd: { installed?: boolean; kind?: string } = await probe.json();
-                      setCellposeKind(pd?.installed ? (pd.kind || "cellpose") : "");
-                      if (pd?.installed) {
-                        consoleRef.current += `[Cellpose ready: ${pd.kind}]\n`;
-                        setConsoleOut(consoleRef.current);
-                        setCellposeInstallFailed(false);
-                      } else {
-                        // Latch the failure state until the user
-                        // explicitly retries — keeps the cause
-                        // visible instead of silently reverting.
-                        setCellposeInstallFailed(true);
-                        consoleRef.current += `\n[Install failed${lastRc !== null ? ` (pip exit ${lastRc})` : ""} — read the lines above for the actual error]\n`;
-                        setConsoleOut(consoleRef.current);
-                      }
-                    } catch (e) {
-                      consoleRef.current += `\n[Install request failed: ${e instanceof Error ? e.message : String(e)}]\n`;
-                      setConsoleOut(consoleRef.current);
-                      setCellposeInstallFailed(true);
-                    } finally {
-                      setCellposeInstalling(false);
-                    }
-                  }}
-                  sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25,
-                        ...(cellposeInstallFailed
-                          ? {}
-                          : { borderColor: KIND_BORDER.cellpose, color: KIND_COLOR.cellpose }) }}>
-                  {cellposeInstalling
-                    ? "Installing…"
-                    : cellposeInstallFailed
-                      ? "Install failed — Retry"
-                      : "🧬 Install Cellpose 3"}
-                </Button>
-              </span>
-            </Tooltip>
-          )}
+          <Tooltip placement="bottom" title="Plugins — optional analysis engines">
+            <Button size="small" variant="outlined" startIcon={<ExtensionIcon sx={{ fontSize: 14 }} />}
+              onClick={(e) => setPluginsAnchor(e.currentTarget)}
+              sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25 }}>
+              Plugins
+            </Button>
+          </Tooltip>
+          <Menu
+            anchorEl={pluginsAnchor}
+            open={Boolean(pluginsAnchor)}
+            onClose={() => setPluginsAnchor(null)}
+            MenuListProps={{ dense: true }}
+          >
+            {cellposeKind ? (
+              <MenuItem onClick={() => { addProcessNode("cellpose"); setPluginsAnchor(null); }} sx={{ fontSize: "0.72rem" }}>
+                🧬 Add Cellpose node
+                <Typography component="span" variant="caption" sx={{ ml: "auto", pl: 2, color: "text.secondary" }}>{cellposeKind}</Typography>
+              </MenuItem>
+            ) : (
+              <MenuItem disabled={cellposeInstalling}
+                onClick={() => { setPluginsAnchor(null); void installCellpose(); }}
+                sx={{ fontSize: "0.72rem", color: cellposeInstallFailed ? "error.main" : undefined }}>
+                {cellposeInstalling
+                  ? "Installing Cellpose…"
+                  : cellposeInstallFailed
+                    ? "⚠ Cellpose install failed — Retry"
+                    : "⤓ Install Cellpose 3"}
+                <Typography component="span" variant="caption" sx={{ ml: "auto", pl: 2, color: "text.secondary" }}>~500 MB</Typography>
+              </MenuItem>
+            )}
+          </Menu>
           <Box sx={{ flex: 1 }} />
           {/* Delete selected — operates on whatever React Flow has
               selected (click a node or an edge first; Shift+click for

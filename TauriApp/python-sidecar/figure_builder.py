@@ -771,7 +771,13 @@ def _inches_to_frac(inches, fig_dim):
 
 def _add_column_headers(fig, axes, header_levels: List[HeaderLevel],
                         rows: int, cols: int, has_labels: bool = False,
-                        column_labels=None):
+                        column_labels=None, draw: bool = True, collect=None):
+    """Draw column headers. When ``collect`` is a list, append a
+    geometry dict for each header (resolution-independent figure
+    fractions) so the collage can re-render headers as live overlays.
+    When ``draw`` is False, the header text + bracket artists are NOT
+    added to the figure (margin space is still reserved by the caller),
+    leaving blank space the collage overlays sit in."""
     fig_w, fig_h = fig.get_size_inches()
     ref = max(fig_w, fig_h)
 
@@ -791,7 +797,7 @@ def _add_column_headers(fig, axes, header_levels: List[HeaderLevel],
             max_offset = max(max_offset, hdr.distance)
             max_font_size = max(max_font_size, hdr.font_size)
 
-        for hdr in level.headers:
+        for gi, hdr in enumerate(level.headers):
             if not hdr.columns_or_rows:
                 continue
             group_cols = sorted(hdr.columns_or_rows)
@@ -867,18 +873,53 @@ def _add_column_headers(fig, axes, header_levels: List[HeaderLevel],
             else:
                 cy = base_y_bottom - dist_y
 
+            # Collect geometry for the collage overlay renderer. Coords
+            # are figure fractions (0..1, y from bottom) so they're
+            # resolution-independent; the frontend converts using the
+            # body image's pixel size.
+            if collect is not None:
+                collect.append({
+                    "id": f"colhdr:{len(header_levels) - 1 - level_idx}:{gi}",
+                    "orientation": "column",
+                    "position": hdr.position,           # Top | Bottom
+                    "cx_frac": float(cx),
+                    "cy_frac": float(cy),
+                    "span_x0_frac": float(bbox_l.x0),
+                    "span_x1_frac": float(bbox_r.x1),
+                    "rotation": float(hdr.rotation or 0.0),
+                    "text": hdr.text,
+                    "segments": [
+                        {"text": s.get("text", ""), "color": s.get("color"),
+                         "font_name": s.get("font_name"),
+                         "font_size": s.get("font_size"),
+                         "font_style": list(s.get("font_style") or [])}
+                        for s in (segments or [])
+                    ],
+                    "font_name": hdr.font_name,
+                    "font_size_pt": hdr.font_size,
+                    "color": hdr.default_color,
+                    "font_style": list(hdr.font_style or []),
+                    "line_color": hdr.line_color,
+                    "line_width": float(hdr.line_width or 0),
+                    "line_style": getattr(hdr, "line_style", "solid") or "solid",
+                    "line_length": float(getattr(hdr, "line_length", 1.0) or 1.0),
+                    "end_caps": bool(getattr(hdr, "end_caps", False)),
+                    "level_idx": level_idx,
+                })
+
             text_idx_before = len(fig.texts)
-            _draw_colored_text(fig, cx, cy, segments, fp,
-                               ha="center",
-                               va="bottom" if hdr.position == "Top" else "top",
-                               rotation=hdr.rotation)
+            if draw:
+                _draw_colored_text(fig, cx, cy, segments, fp,
+                                   ha="center",
+                                   va="bottom" if hdr.position == "Top" else "top",
+                                   rotation=hdr.rotation)
 
             # Draw line for ALL headers (not just spanning).
             # Position from the text's actual rendered bbox so the gap
             # is visually consistent with the row-header line gap (which
             # also reads bbox). Falls back to the cy anchor if the
             # renderer hasn't been primed.
-            if hdr.line_width > 0:
+            if draw and hdr.line_width > 0:
                 gap_inches = 0.025
                 line_gap_y = _inches_to_frac(gap_inches, fig_h)
                 y_line_from_bbox = None
@@ -945,7 +986,9 @@ def _add_column_headers(fig, axes, header_levels: List[HeaderLevel],
 
 def _add_row_headers(fig, axes, header_levels: List[HeaderLevel],
                      rows: int, cols: int, has_labels: bool = False,
-                     row_labels=None):
+                     row_labels=None, draw: bool = True, collect=None):
+    """Row-header analogue of _add_column_headers. See that function for
+    the ``draw`` / ``collect`` contract."""
     fig_w, fig_h = fig.get_size_inches()
     ref = max(fig_w, fig_h)
 
@@ -962,7 +1005,7 @@ def _add_row_headers(fig, axes, header_levels: List[HeaderLevel],
             max_offset = max(max_offset, hdr.distance)
             max_font_size = max(max_font_size, hdr.font_size)
 
-        for hdr in level.headers:
+        for gi, hdr in enumerate(level.headers):
             if not hdr.columns_or_rows:
                 continue
             group_rows = sorted(hdr.columns_or_rows)
@@ -1045,16 +1088,47 @@ def _add_row_headers(fig, axes, header_levels: List[HeaderLevel],
             else:
                 cx = base_x_right + dist_x + edge_correction
 
+            if collect is not None:
+                collect.append({
+                    "id": f"rowhdr:{len(header_levels) - 1 - level_idx}:{gi}",
+                    "orientation": "row",
+                    "position": hdr.position,           # Left | Right
+                    "cx_frac": float(cx),
+                    "cy_frac": float(cy),
+                    "span_y0_frac": float(bbox_b.y0),
+                    "span_y1_frac": float(bbox_t.y1),
+                    "rotation": float(hdr.rotation or 0.0),
+                    "text": hdr.text,
+                    "segments": [
+                        {"text": s.get("text", ""), "color": s.get("color"),
+                         "font_name": s.get("font_name"),
+                         "font_size": s.get("font_size"),
+                         "font_style": list(s.get("font_style") or [])}
+                        for s in (segments or [])
+                    ],
+                    "font_name": hdr.font_name,
+                    "font_size_pt": hdr.font_size,
+                    "color": hdr.default_color,
+                    "font_style": list(hdr.font_style or []),
+                    "line_color": hdr.line_color,
+                    "line_width": float(hdr.line_width or 0),
+                    "line_style": getattr(hdr, "line_style", "solid") or "solid",
+                    "line_length": float(getattr(hdr, "line_length", 1.0) or 1.0),
+                    "end_caps": bool(getattr(hdr, "end_caps", False)),
+                    "level_idx": level_idx,
+                })
+
             text_idx_before = len(fig.texts)
-            _draw_colored_text(fig, cx, cy, segments, fp,
-                               ha="right" if hdr.position == "Left" else "left",
-                               va="center", rotation=hdr.rotation)
+            if draw:
+                _draw_colored_text(fig, cx, cy, segments, fp,
+                                   ha="right" if hdr.position == "Left" else "left",
+                                   va="center", rotation=hdr.rotation)
 
             # Draw line for ALL headers — position from the rendered
             # text's bbox so the visual gap between text and line is
             # identical to the col-header gap (both use the same
             # gap_inches measured from the bbox edge).
-            if hdr.line_width > 0:
+            if draw and hdr.line_width > 0:
                 gap_inches = 0.025
                 line_gap_x = _inches_to_frac(gap_inches, fig_w)
                 x_line_from_bbox = None
@@ -1120,7 +1194,7 @@ def _add_row_headers(fig, axes, header_levels: List[HeaderLevel],
 
 # ── Simple column/row labels ─────────────────────────────────────────────
 
-def _add_column_labels(fig, axes, labels: List[AxisLabel], rows: int, cols: int):
+def _add_column_labels(fig, axes, labels: List[AxisLabel], rows: int, cols: int, collect=None):
     fig_w, fig_h = fig.get_size_inches()
     # Use the geometric mean so the same distance value produces
     # the same physical offset regardless of figure aspect ratio.
@@ -1145,11 +1219,18 @@ def _add_column_labels(fig, axes, labels: List[AxisLabel], rows: int, cols: int)
             ax_b = axes[-1, ci]
             cy = ax_b.get_position().y0 - dist_frac
             va = "top"
+        if collect is not None:
+            collect.append({
+                "id": f"collbl:{ci}",
+                "orientation": "column",
+                "cx_frac": float(cx), "cy_frac": float(cy),
+                "span_x0_frac": float(bbox.x0), "span_x1_frac": float(bbox.x1),
+            })
         _draw_colored_text(fig, cx, cy, segments, fp,
                            ha="center", va=va, rotation=lbl.rotation)
 
 
-def _add_row_labels(fig, axes, labels: List[AxisLabel], rows: int, cols: int):
+def _add_row_labels(fig, axes, labels: List[AxisLabel], rows: int, cols: int, collect=None):
     fig_w, fig_h = fig.get_size_inches()
     ref = (fig_w * fig_h) ** 0.5
     for ri, lbl in enumerate(labels):
@@ -1192,6 +1273,13 @@ def _add_row_labels(fig, axes, labels: List[AxisLabel], rows: int, cols: int):
             ax_r = axes[ri, -1]
             cx = ax_r.get_position().x1 + dist_frac + edge_correction
             ha = "center" if abs(rot) > 1 else "left"
+        if collect is not None:
+            collect.append({
+                "id": f"rowlbl:{ri}",
+                "orientation": "row",
+                "cx_frac": float(cx), "cy_frac": float(cy),
+                "span_y0_frac": float(bbox.y0), "span_y1_frac": float(bbox.y1),
+            })
         _draw_colored_text(fig, cx, cy, segments, fp,
                            ha=ha, va="center", rotation=rot)
 
@@ -1684,6 +1772,8 @@ def assemble_figure(cfg: FigureConfig,
                     processed_images: List[List[Image.Image]],
                     dpi: int = 300,
                     full_res_sizes: Optional[Dict] = None,
+                    draw_headers: bool = True,
+                    header_collect: Optional[list] = None,
                     ) -> bytes:
     """
     Assemble the final figure.  *processed_images* is a rows×cols list of
@@ -1691,6 +1781,13 @@ def assemble_figure(cfg: FigureConfig,
     *dpi* controls the rendering resolution for all text and vector elements
     (labels, headers, symbols) — ensures crisp output at any resolution.
     Returns PNG or TIFF bytes.
+
+    *draw_headers* — when False, column/row header text + bracket artists
+    are NOT drawn (their margin space is still reserved). Used by the
+    collage decompose path to produce a header-less body.
+    *header_collect* — when a list, each header's geometry (figure
+    fractions) + text/style is appended for the collage overlay
+    renderer.
     """
     rows, cols = cfg.rows, cfg.cols
 
@@ -1920,15 +2017,17 @@ def assemble_figure(cfg: FigureConfig,
     show_col = getattr(cfg, 'show_column_labels', True)
     show_row = getattr(cfg, 'show_row_labels', True)
     if show_col:
-        _add_column_labels(fig, axes, cfg.column_labels, rows, cols)
+        _add_column_labels(fig, axes, cfg.column_labels, rows, cols, collect=header_collect)
     if show_row:
-        _add_row_labels(fig, axes, cfg.row_labels, rows, cols)
+        _add_row_labels(fig, axes, cfg.row_labels, rows, cols, collect=header_collect)
     has_col_labels = show_col and any(lbl.text.strip() for lbl in cfg.column_labels)
     has_row_labels = show_row and any(lbl.text.strip() for lbl in cfg.row_labels)
     _add_column_headers(fig, axes, cfg.column_headers, rows, cols, has_col_labels,
-                        column_labels=cfg.column_labels if has_col_labels else None)
+                        column_labels=cfg.column_labels if has_col_labels else None,
+                        draw=draw_headers, collect=header_collect)
     _add_row_headers(fig, axes, cfg.row_headers, rows, cols, has_row_labels,
-                     row_labels=cfg.row_labels if has_row_labels else None)
+                     row_labels=cfg.row_labels if has_row_labels else None,
+                     draw=draw_headers, collect=header_collect)
 
     # Background
     if cfg.background == "Transparent":

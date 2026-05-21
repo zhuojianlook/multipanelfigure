@@ -9,10 +9,13 @@ import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
 import { Sidebar } from "./Sidebar";
 import { Toolbar } from "./Toolbar";
+import { DocumentTabs } from "./DocumentTabs";
 import { ImageStrip } from "../image-strip/ImageStrip";
 import { PanelGrid } from "../grid/PanelGrid";
 import { PreviewPane } from "../preview/PreviewPane";
 import { CollageView } from "../collage/CollageView";
+import { AnalysisView } from "../analysis/AnalysisView";
+import { hasUnsavedSnapshots } from "../../utils/projectNav";
 import { Alert } from "@mui/material";
 
 function CenterPane({
@@ -23,6 +26,13 @@ function CenterPane({
     return (
       <div className="flex flex-1 flex-col min-h-0 min-w-0">
         <CollageView />
+      </div>
+    );
+  }
+  if (mode === "analysis") {
+    return (
+      <div className="flex flex-1 flex-col min-h-0 min-w-0">
+        <AnalysisView />
       </div>
     );
   }
@@ -71,6 +81,7 @@ export function AppShell() {
   const config = useFigureStore((s) => s.config);
   const requestPreview = useFigureStore((s) => s.requestPreview);
   const apiError = useFigureStore((s) => s.apiError);
+  const mode = useCollageStore((s) => s.mode);
   // uploadImagesFromPaths used by Tauri native dialog; uploadImages for File objects
 
   useEffect(() => {
@@ -84,52 +95,64 @@ export function AppShell() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Warn on app close if analysis plots were moved into the Collage
-  // Assembly. The collage builder is still a work in progress — it does
-  // NOT save to disk, so those plots only persist in this app's local
-  // storage and could be lost. Prompt the user to download them first.
+  // Warn on app close if there are unsaved changes — the builder figure
+  // (configDirty) and/or collage content. Offers Save / Don't save /
+  // Cancel. The collage auto-persists to local storage, but analysis
+  // plots moved in only live there (no disk copy yet), so we still flag
+  // collage content as at-risk on close.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
+    const hasUnsaved = () => {
+      const dirtyBuilder = useFigureStore.getState().unsaved;
+      const collageItems = useCollageStore.getState().items.length > 0;
+      // Other open tabs may hold unsaved edits parked in in-memory snapshots.
+      return dirtyBuilder || collageItems || hasUnsavedSnapshots();
+    };
     (async () => {
       try {
         const { getCurrentWindow } = await import("@tauri-apps/api/window");
         const win = getCurrentWindow();
         const off = await win.onCloseRequested(async (event) => {
-          const hasAnalysisPlots = useCollageStore
-            .getState()
-            .items.some((it) => it.fromAnalysis);
-          if (!hasAnalysisPlots) return; // nothing at risk — allow close
+          if (!hasUnsaved()) return; // nothing at risk — allow close
           event.preventDefault();
-          const { confirm } = await import("@tauri-apps/plugin-dialog");
-          const closeAnyway = await confirm(
-            "You've moved analysis plots into the Collage Assembly.\n\n" +
-              "The collage builder is still a work in progress — it does NOT " +
-              "save to disk, so those plots only persist in this app's local " +
-              "storage and could be lost.\n\n" +
-              'Download them first via the Analysis dialog → Plots → ' +
-              '"Download all to disk".\n\nClose anyway?',
-            { title: "Unsaved analysis plots", kind: "warning" },
-          );
-          if (closeAnyway) await win.destroy();
+          const dirtyBuilder = useFigureStore.getState().unsaved;
+          const collageItems = useCollageStore.getState().items.length > 0;
+          const otherTabs = hasUnsavedSnapshots();
+          const parts: string[] = [];
+          if (dirtyBuilder) parts.push("the current figure has unsaved changes");
+          if (otherTabs) parts.push("other open tabs have unsaved changes (switch to each to save)");
+          if (collageItems) parts.push("your collage has unsaved content");
+          const { confirmThree } = await import("../shared/ConfirmDialog");
+          const { ensureProjectSaved } = await import("../../utils/projectNav");
+          const choice = await confirmThree({
+            title: "Save before closing?",
+            body: `Before you close, ${parts.join(" and ")}.\n\n`
+              + "Save the figure now? (The collage auto-saves to this app's "
+              + "local storage; export it via Save Collage if you need a file.)",
+            confirmLabel: "Save & close",
+            tertiaryLabel: "Close without saving",
+            cancelLabel: "Cancel",
+          });
+          if (choice === "cancel") return;            // stay open
+          if (choice === "confirm" && dirtyBuilder) {
+            const saved = await ensureProjectSaved();
+            if (!saved) return;                       // save cancelled → stay
+          }
+          await win.destroy();
         });
         if (cancelled) off();
         else unlisten = off;
       } catch {
-        // Not running under Tauri (e.g. browser dev preview) — fall back
-        // to the browser's generic beforeunload prompt. Skipped when
-        // an intentional reload was just requested (see
-        // `window.__mpfigAllowUnload = true;` set by the New button
-        // and similar reset paths) — otherwise the implicit prompt
-        // gets auto-cancelled in headless contexts and a programmatic
-        // `window.location.reload()` quietly turns into a no-op.
+        // Browser preview — generic beforeunload prompt. Skipped when an
+        // intentional reload was just requested (window.__mpfigAllowUnload).
         const handler = (e: BeforeUnloadEvent) => {
           const w = window as unknown as { __mpfigAllowUnload?: boolean };
           if (w.__mpfigAllowUnload) {
-            w.__mpfigAllowUnload = false; // one-shot
+            w.__mpfigAllowUnload = false;
             return;
           }
-          if (useCollageStore.getState().items.some((it) => it.fromAnalysis)) {
+          if (hasUnsaved()) {
             e.preventDefault();
             e.returnValue = "";
           }
@@ -253,22 +276,31 @@ export function AppShell() {
       )}
 
       {/* ── Sidebar ─────────────────────────────────────── */}
-      <aside
-        className="flex-none overflow-y-auto overflow-x-hidden border-r"
-        style={{
-          width: 260,
-          minWidth: 220,
-          backgroundColor: "var(--c-surface)",
-          borderColor: "var(--c-border)",
-        }}
-      >
-        <Sidebar />
-      </aside>
+      {/* Hidden in the Analysis workspace — the node-graph canvas wants
+          the full width (it was a full-screen view). */}
+      {mode !== "analysis" && (
+        <aside
+          className="flex-none overflow-y-auto overflow-x-hidden border-r"
+          style={{
+            width: 260,
+            minWidth: 220,
+            backgroundColor: "var(--c-surface)",
+            borderColor: "var(--c-border)",
+          }}
+        >
+          <Sidebar />
+        </aside>
+      )}
 
       {/* ── Center area ─────────────────────────────────── */}
       <main className="flex flex-1 flex-col min-w-0 min-h-0">
-        {/* Toolbar */}
-        <Toolbar />
+        {/* Document tabs — open .mpf files + Collage + Analysis, for
+            seamless switching. Sits above the toolbar so it reads as the
+            top-level navigation. */}
+        <DocumentTabs />
+        {/* Toolbar — builder/collage actions only; hidden in Analysis,
+            which has its own toolbar. */}
+        {mode !== "analysis" && <Toolbar />}
 
         {/* Mode-specific body. Builder = image strip + grid|preview split.
             Collage = single-pane CollageView. The Toolbar is shared so

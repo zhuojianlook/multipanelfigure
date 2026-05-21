@@ -22,18 +22,24 @@ import {
   ListItemText,
   ListItemSecondaryAction,
   CircularProgress,
+  Checkbox,
+  Collapse,
 } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import RemoveIcon from "@mui/icons-material/Remove";
 import DeleteIcon from "@mui/icons-material/Delete";
+import EditIcon from "@mui/icons-material/Edit";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import UploadFileIcon from "@mui/icons-material/UploadFile";
 import StraightenIcon from "@mui/icons-material/Straighten";
 import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
 import { api } from "../../api/client";
-import { AnalysisDialog } from "../dialogs/AnalysisDialog";
 import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 import { detectGlobalFont, describeDetectedFont } from "../../utils/detectGlobalFont";
+import { openProjectIntoTab, enterAnalysis } from "../../utils/projectNav";
+import { saveProjectDialog } from "../shared/SaveProjectDialog";
 
 /* ── tiny reusable pieces ─────────────────────────────── */
 
@@ -109,82 +115,219 @@ function Spinner({
 
 /* ── main component ───────────────────────────────────── */
 
-/* CollageSidebar — collage-specific tools. Currently:
-     • Global header point size — a single pt setting that, when
-       applied, re-renders every figure-kind item in the collage
-       with header sizes compensated for that item's collage scale,
-       so all figures show headers at the same visual size.
-   Builder-side hooks are NOT mounted here, so the builder doesn't
-   thrash the API while the user is in collage mode. */
+/* CollageSidebar — collage-specific tools: Synchronize headers.
+   A target pt size that, when applied, re-renders selected figure-kind
+   items so their chosen text elements land at the same visual size after
+   the collage scaling. Granularity:
+     • pick which figures to apply to (checkbox per figure)
+     • expand a figure to pick exactly which text elements get the size
+   Builder-side hooks are NOT mounted here, so the builder doesn't thrash
+   the API while the user is in collage mode. */
+
 function CollageSidebar() {
   const items = useCollageStore((s) => s.items);
   const globalHeaderPt = useCollageStore((s) => s.globalHeaderPt);
-  const autoRenderOnResize = useCollageStore((s) => s.autoRenderOnResize);
   const setGlobalHeaderPt = useCollageStore((s) => s.setGlobalHeaderPt);
-  const setAutoRenderOnResize = useCollageStore((s) => s.setAutoRenderOnResize);
   const updateItem = useCollageStore((s) => s.updateItem);
   const [applyBusy, setApplyBusy] = useState(false);
   const [pendingPt, setPendingPt] = useState<number>(globalHeaderPt ?? 12);
-  const figureItemCount = items.filter((it) => it.kind === "figure" && it.projectPath).length;
+  // Free-text draft for the pt field so the user can type intermediate
+  // values without the controlled-number clamp coercing every keystroke.
+  const [ptText, setPtText] = useState<string>(String(globalHeaderPt ?? 12));
+  const commitPt = () => {
+    const v = Math.max(1, Math.min(200, Math.round(Number(ptText) || pendingPt)));
+    setPendingPt(v);
+    setPtText(String(v));
+    return v;
+  };
+
+  const figureItems = items.filter((it) => it.kind === "figure" && it.projectPath);
+  // R/analysis plots can also be re-rendered at a target font size by
+  // re-running their captured R code with an injected base size.
+  const rItems = items.filter((it) => it.kind === "image" && it.fromAnalysis && it.rCode);
+  // Collage text boxes — synced by setting their font size to the same pt.
+  const textItems = items.filter((it) => it.kind === "text");
+
+  // Inclusion set (which items the sync applies to). Default = all.
+  const [excludedIds, setExcludedIds] = useState<Record<string, boolean>>({});
+  const isIncluded = (id: string) => !excludedIds[id];
+  const toggleIncluded = (id: string) => setExcludedIds((m) => ({ ...m, [id]: !m[id] }));
+  const includedCount =
+    figureItems.filter((it) => isIncluded(it.id)).length
+    + rItems.filter((it) => isIncluded(it.id)).length
+    + textItems.filter((it) => isIncluded(it.id)).length;
+  const setAllIncluded = (on: boolean) => {
+    const next: Record<string, boolean> = {};
+    if (!on) for (const it of [...figureItems, ...rItems, ...textItems]) next[it.id] = true;
+    setExcludedIds(next);
+    // Also clear / restore the per-element (header) selection so the figure
+    // hotspots match — "None" truly deselects everything (incl. headers),
+    // "All" restores the default header/axis-label selection.
+    applyAllElemSel(on ? "defaults" : "none");
+  };
+
+  // Per-element selection lives in the store so the canvas can overlay
+  // clickable hotspots in sync with these checkboxes. Expand + loading are
+  // UI-only local state.
+  const elements = useCollageStore((s) => s.elemListByItem);
+  const elemSel = useCollageStore((s) => s.elemSelByItem);
+  const setElemList = useCollageStore((s) => s.setElemList);
+  const toggleElemSel = useCollageStore((s) => s.toggleElemSel);
+  const setAllElemSel = useCollageStore((s) => s.setAllElemSel);
+  const applyAllElemSel = useCollageStore((s) => s.applyAllElemSel);
+  const setElemSyncItem = useCollageStore((s) => s.setElemSyncItem);
+  const setHoveredElem = useCollageStore((s) => s.setHoveredElem);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [elemLoading, setElemLoading] = useState<Record<string, boolean>>({});
+
+  const loadElements = async (it: typeof figureItems[number]) => {
+    if (elements[it.id] || elemLoading[it.id]) return;
+    setElemLoading((m) => ({ ...m, [it.id]: true }));
+    try {
+      const { elements: els } = await api.getFigureElements(it.projectPath!);
+      setElemList(it.id, els);
+    } catch (e) {
+      console.error("[collage] load elements failed for", it.name, e);
+      await alertDialog({
+        title: "Could not read figure",
+        body: "Failed to list this figure's text elements — its .mpf may have moved.",
+      });
+    } finally {
+      setElemLoading((m) => ({ ...m, [it.id]: false }));
+    }
+  };
+  const toggleExpand = (it: typeof figureItems[number]) => {
+    const open = !expanded[it.id];
+    setExpanded((m) => ({ ...m, [it.id]: open }));
+    // Show this figure's clickable element hotspots on the canvas while
+    // it's expanded (clear them when collapsing).
+    setElemSyncItem(open ? it.id : null);
+    if (open) void loadElements(it);
+  };
+  const toggleElem = (itemId: string, elemId: string) => toggleElemSel(itemId, elemId);
+  const setAllElems = (itemId: string, on: boolean) => setAllElemSel(itemId, on);
 
   const applyNow = async () => {
-    if (figureItemCount === 0) {
+    const targetPt = commitPt();
+    if (includedCount === 0) {
       await alertDialog({
-        title: "Nothing to re-render",
-        body: "No figure items in the collage to re-render. Add a figure with a saved .mpf path first.",
+        title: "Nothing selected",
+        body: "Select at least one figure to synchronize. Add a figure (with a saved .mpf) first if the list is empty.",
       });
       return;
     }
     setApplyBusy(true);
     let succeeded = 0;
     let failed = 0;
+    let skipped = 0;
     try {
       for (const it of useCollageStore.getState().items) {
         if (it.kind !== "figure" || !it.projectPath) continue;
+        if (!isIncluded(it.id)) continue;
+        // Element targeting: if the figure was expanded (selection known),
+        // pass the explicitly-checked element ids; otherwise null = the
+        // backend default set (column/row headers + axis labels).
+        let elementIds: string[] | null = null;
+        const sel = elemSel[it.id];
+        if (sel) {
+          const ids = Object.keys(sel).filter((k) => sel[k]);
+          if (ids.length === 0) { skipped++; continue; }
+          elementIds = ids;
+        }
         const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
+        const overrides = useCollageStore.getState().elemOverridesByItem[it.id] || null;
         try {
-          const resp = await api.renderCollageFigure(it.projectPath, pendingPt, Math.max(0.001, scale), it.w);
+          const resp = await api.renderCollageFigure(
+            it.projectPath, targetPt, Math.max(0.001, scale), it.w, elementIds,
+            overrides as Record<string, unknown> | null,
+          );
           if (resp?.image && resp.width && resp.height) {
-            // The new render's aspect ratio almost always differs
-            // from the old one because matplotlib grows fig_h to
-            // accommodate larger headers. Preserve item.w as the
-            // user's chosen footprint, and recompute item.h from the
-            // new aspect — otherwise objectFit:"fill" stretches the
-            // PNG and the headers come out distorted (this was the
-            // "headers don't end up the same size" bug).
             const newAspect = resp.width / resp.height;
-            const newH = it.w / newAspect;
             updateItem(it.id, {
               src: `data:image/png;base64,${resp.image}`,
               naturalW: resp.width,
               naturalH: resp.height,
-              h: newH,
+              h: it.w / newAspect,
             });
             succeeded++;
           } else {
             failed++;
           }
         } catch (e) {
-          console.error("[collage] render with header override failed for", it.name, e);
+          console.error("[collage] header re-render failed for", it.name, e);
           failed++;
         }
       }
-      setGlobalHeaderPt(pendingPt);
+      // R/analysis plots: re-run their captured R code with the target font
+      // size injected, then swap in the regenerated PNG. The base size is
+      // compensated for the item's collage scale (approximate for R since
+      // its text units differ from matplotlib's).
+      for (const it of useCollageStore.getState().items) {
+        if (!(it.kind === "image" && it.fromAnalysis && it.rCode)) continue;
+        if (!isIncluded(it.id)) continue;
+        const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
+        const baseFs = Math.max(1, Math.round(targetPt / Math.max(0.001, scale)));
+        try {
+          const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, baseFs);
+          const idx = it.rPlotIndex ?? 0;
+          const png = res.plots?.[idx] ?? res.plots?.[0];
+          if (res.success && png) {
+            const dataUrl = `data:image/png;base64,${png}`;
+            // Recompute height from the regenerated plot's aspect so text
+            // isn't stretched (objectFit:"fill"); keep the user's width.
+            const dims = await new Promise<{ w: number; h: number }>((resolve) => {
+              const im = new window.Image();
+              im.onload = () => resolve({ w: im.naturalWidth, h: im.naturalHeight });
+              im.onerror = () => resolve({ w: it.naturalW, h: it.naturalH });
+              im.src = dataUrl;
+            });
+            const newAspect = dims.h > 0 ? dims.w / dims.h : (it.naturalW / Math.max(1, it.naturalH));
+            updateItem(it.id, {
+              src: dataUrl,
+              naturalW: dims.w,
+              naturalH: dims.h,
+              h: it.w / Math.max(0.001, newAspect),
+            });
+            succeeded++;
+          } else {
+            console.error("[collage] R re-run failed for", it.name, res.stderr);
+            failed++;
+          }
+        } catch (e) {
+          console.error("[collage] R re-run error for", it.name, e);
+          failed++;
+        }
+      }
+      // Text boxes: set the font size to the same physical pt. The canvas is
+      // a 300-DPI virtual page, so 1 pt = 300/72 px. (Approximate for
+      // non-default canvas DPIs.)
+      const PT_TO_PX = 300 / 72;
+      for (const it of useCollageStore.getState().items) {
+        if (it.kind !== "text") continue;
+        if (!isIncluded(it.id)) continue;
+        updateItem(it.id, { fontSize: Math.round(targetPt * PT_TO_PX) });
+        succeeded++;
+      }
+      setGlobalHeaderPt(targetPt);
     } finally {
       setApplyBusy(false);
     }
-    void alertDialog({
-      title: failed > 0 ? "Re-render finished with errors" : "Re-render complete",
-      body: `Re-rendered ${succeeded} figure${succeeded === 1 ? "" : "s"} at ${pendingPt} pt header size`
-        + (failed > 0 ? ` (${failed} failed — check console; the .mpf may have been moved or the path is wrong).` : "."),
-    });
+    if (failed > 0 || skipped > 0) {
+      void alertDialog({
+        title: "Finished",
+        body: `Synchronized ${succeeded} figure${succeeded === 1 ? "" : "s"} to ${targetPt} pt`
+          + (skipped ? ` · ${skipped} skipped (no elements selected)` : "")
+          + (failed ? ` · ${failed} failed (the .mpf may have moved; check the console)` : "")
+          + ".",
+      });
+    }
   };
 
   const clearOverride = () => {
     setGlobalHeaderPt(null);
     void alertDialog({
-      title: "Override cleared",
-      body: "Global header size cleared. Existing collage items keep their last rendered preview — re-add or update individual figures to revert to their saved header sizes.",
+      title: "Lock cleared",
+      body: "Synchronized size cleared. Existing collage items keep their last rendered preview — re-synchronize or re-add figures to revert to their saved sizes.",
     });
   };
 
@@ -195,20 +338,23 @@ function CollageSidebar() {
       </Typography>
 
       <Box>
-        <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mb: 0.5, display: "block" }}>
-          Global header size (pt)
+        <Typography variant="caption" sx={{ fontSize: "0.65rem", color: "text.secondary", mb: 0.5, display: "block", fontWeight: 600 }}>
+          Synchronize headers to size (pt)
         </Typography>
         <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary", mb: 1, display: "block", lineHeight: 1.4 }}>
-          Re-renders every figure-kind item so its headers / primary labels
-          appear at this point size after the collage downscale, regardless
-          of the figure's individual scale. Run again after resizing items.
+          Arrange + scale figures first, then Synchronize. Each selected figure
+          is re-rendered so its chosen text elements land at this point size
+          after collage scaling — uniform across differently-scaled figures.
+          Expand a figure to pick exactly which text elements to apply to.
         </Typography>
         <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", mb: 1 }}>
           <TextField
             type="number"
             size="small"
-            value={pendingPt}
-            onChange={(e) => setPendingPt(Math.max(1, Math.min(200, Number(e.target.value) || 12)))}
+            value={ptText}
+            onChange={(e) => setPtText(e.target.value)}
+            onBlur={commitPt}
+            onKeyDown={(e) => { if (e.key === "Enter") { commitPt(); (e.target as HTMLInputElement).blur(); } }}
             inputProps={{ min: 1, max: 200, step: 1 }}
             sx={{
               width: 64,
@@ -221,17 +367,156 @@ function CollageSidebar() {
           <Button
             variant="contained"
             size="small"
-            disabled={applyBusy || figureItemCount === 0}
+            disabled={applyBusy || includedCount === 0}
             onClick={applyNow}
             sx={{ fontSize: "0.65rem", textTransform: "none", flex: 1 }}
           >
-            {applyBusy ? "Rendering…" : `Apply to ${figureItemCount} fig${figureItemCount === 1 ? "" : "s"}`}
+            {applyBusy ? "Synchronizing…" : `Synchronize headers${includedCount ? ` (${includedCount})` : ""}`}
           </Button>
         </Box>
-        <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary", display: "block" }}>
+
+        {/* Figure selection list */}
+        {figureItems.length === 0 ? (
+          <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary", display: "block", fontStyle: "italic" }}>
+            No figures in the collage yet. Use "Add to Collage" from the builder or "Import project".
+          </Typography>
+        ) : (
+          <>
+            <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", mb: 0.25 }}>
+              <Typography variant="caption" sx={{ fontSize: "0.58rem", color: "text.secondary" }}>
+                Figures ({includedCount}/{figureItems.length})
+              </Typography>
+              <Box>
+                <Button size="small" variant="text" onClick={() => setAllIncluded(true)} sx={{ fontSize: "0.55rem", textTransform: "none", minWidth: 0, p: "0 4px" }}>All</Button>
+                <Button size="small" variant="text" onClick={() => setAllIncluded(false)} sx={{ fontSize: "0.55rem", textTransform: "none", minWidth: 0, p: "0 4px" }}>None</Button>
+              </Box>
+            </Box>
+            <Box sx={{ border: "1px solid var(--c-border)", borderRadius: 1, maxHeight: 300, overflowY: "auto" }}>
+              {figureItems.map((it) => {
+                const els = elements[it.id];
+                const sel = elemSel[it.id];
+                const selCount = sel ? Object.values(sel).filter(Boolean).length : null;
+                return (
+                  <Box key={it.id} sx={{ borderBottom: "1px solid var(--c-border)", "&:last-child": { borderBottom: "none" } }}>
+                    <Box sx={{ display: "flex", alignItems: "center", gap: 0.25, px: 0.25 }}>
+                      <Checkbox
+                        size="small"
+                        checked={isIncluded(it.id)}
+                        onChange={() => toggleIncluded(it.id)}
+                        sx={{ p: 0.25 }}
+                      />
+                      <Box
+                        onClick={() => toggleExpand(it)}
+                        sx={{ flex: 1, display: "flex", alignItems: "center", gap: 0.25, cursor: "pointer", overflow: "hidden", py: 0.5 }}
+                      >
+                        {expanded[it.id] ? <ExpandMoreIcon sx={{ fontSize: 14 }} /> : <ChevronRightIcon sx={{ fontSize: 14 }} />}
+                        <Typography variant="caption" sx={{ fontSize: "0.62rem", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={it.name}>
+                          {it.name}
+                        </Typography>
+                        {selCount !== null && (
+                          <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", ml: "auto", pl: 0.5, flexShrink: 0 }}>
+                            {selCount} el
+                          </Typography>
+                        )}
+                      </Box>
+                    </Box>
+                    <Collapse in={!!expanded[it.id]} unmountOnExit>
+                      <Box sx={{ pl: 2.5, pr: 0.5, pb: 0.5 }}>
+                        {elemLoading[it.id] && (
+                          <Box sx={{ display: "flex", alignItems: "center", gap: 1, py: 0.5 }}>
+                            <CircularProgress size={12} />
+                            <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>Reading elements…</Typography>
+                          </Box>
+                        )}
+                        {els && els.length === 0 && (
+                          <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", fontStyle: "italic" }}>No text elements.</Typography>
+                        )}
+                        {els && els.length > 0 && (
+                          <>
+                            <Box sx={{ mb: 0.25 }}>
+                              <Button size="small" variant="text" onClick={() => setAllElems(it.id, true)} sx={{ fontSize: "0.52rem", textTransform: "none", minWidth: 0, p: "0 4px" }}>All</Button>
+                              <Button size="small" variant="text" onClick={() => setAllElems(it.id, false)} sx={{ fontSize: "0.52rem", textTransform: "none", minWidth: 0, p: "0 4px" }}>None</Button>
+                            </Box>
+                            {els.map((e) => (
+                              <Box key={e.id}
+                                onMouseEnter={() => {
+                                  if (!e.geom) return;
+                                  // Show this figure's hotspots on the canvas + highlight this one.
+                                  setElemSyncItem(it.id);
+                                  setHoveredElem({ itemId: it.id, elemId: e.id });
+                                }}
+                                onMouseLeave={() => setHoveredElem(null)}
+                                sx={{ display: "flex", alignItems: "center", gap: 0.25, borderRadius: 0.5, "&:hover": { backgroundColor: "rgba(79,195,247,0.12)" } }}>
+                                <Checkbox
+                                  size="small"
+                                  checked={!!sel?.[e.id]}
+                                  onChange={() => toggleElem(it.id, e.id)}
+                                  sx={{ p: 0.25 }}
+                                />
+                                <Typography variant="caption" sx={{ fontSize: "0.56rem", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={`${e.type}: ${e.text}`}>
+                                  <Box component="span" sx={{ color: "text.secondary" }}>{e.type}: </Box>
+                                  {e.text || "(empty)"}
+                                  {e.font_size != null && <Box component="span" sx={{ color: "text.secondary" }}> · {e.font_size}pt</Box>}
+                                </Typography>
+                              </Box>
+                            ))}
+                          </>
+                        )}
+                      </Box>
+                    </Collapse>
+                  </Box>
+                );
+              })}
+            </Box>
+          </>
+        )}
+
+        {/* R / analysis plots — re-rendered by re-running their R code with
+            the target font size injected. No per-element tree (raster). */}
+        {rItems.length > 0 && (
+          <Box sx={{ mt: 1 }}>
+            <Typography variant="caption" sx={{ fontSize: "0.58rem", color: "text.secondary", display: "block", mb: 0.25 }}>
+              R / analysis figures
+            </Typography>
+            <Box sx={{ border: "1px solid var(--c-border)", borderRadius: 1, maxHeight: 160, overflowY: "auto" }}>
+              {rItems.map((it) => (
+                <Box key={it.id} sx={{ display: "flex", alignItems: "center", gap: 0.25, px: 0.25, borderBottom: "1px solid var(--c-border)", "&:last-child": { borderBottom: "none" } }}>
+                  <Checkbox size="small" checked={isIncluded(it.id)} onChange={() => toggleIncluded(it.id)} sx={{ p: 0.25 }} />
+                  <Typography variant="caption" sx={{ fontSize: "0.62rem", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", py: 0.5 }} title={it.name}>
+                    {it.name}
+                  </Typography>
+                </Box>
+              ))}
+            </Box>
+            <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", display: "block", lineHeight: 1.3, mt: 0.25 }}>
+              R plots re-run their code with the size injected (best-effort for ggplot themes; requires R installed).
+            </Typography>
+          </Box>
+        )}
+
+        {/* Text boxes — synced by setting their font size to the same pt. */}
+        {textItems.length > 0 && (
+          <Box sx={{ mt: 1 }}>
+            <Typography variant="caption" sx={{ fontSize: "0.58rem", color: "text.secondary", display: "block", mb: 0.25 }}>
+              Text boxes
+            </Typography>
+            <Box sx={{ border: "1px solid var(--c-border)", borderRadius: 1, maxHeight: 120, overflowY: "auto" }}>
+              {textItems.map((it) => (
+                <Box key={it.id} sx={{ display: "flex", alignItems: "center", gap: 0.25, px: 0.25, borderBottom: "1px solid var(--c-border)", "&:last-child": { borderBottom: "none" } }}>
+                  <Checkbox size="small" checked={isIncluded(it.id)} onChange={() => toggleIncluded(it.id)} sx={{ p: 0.25 }} />
+                  <Typography variant="caption" sx={{ fontSize: "0.62rem", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", py: 0.5 }} title={it.text || it.name}>
+                    {it.text || it.name}
+                  </Typography>
+                </Box>
+              ))}
+            </Box>
+          </Box>
+        )}
+
+        <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary", display: "block", mt: 1 }}>
           {globalHeaderPt
-            ? `Currently locked: ${globalHeaderPt} pt`
-            : "Currently free (each figure uses its own header sizes)"}
+            ? `Last applied: ${globalHeaderPt} pt`
+            : "Not yet synchronized (each figure uses its own sizes)"}
         </Typography>
         {globalHeaderPt !== null && (
           <Button
@@ -244,32 +529,6 @@ function CollageSidebar() {
             Clear lock
           </Button>
         )}
-
-        {/* Auto-re-render toggle. Meaningful only when a header lock
-            is set; we leave it visible regardless so the user can
-            pre-configure the behaviour before locking. */}
-        <Box sx={{ display: "flex", alignItems: "center", mt: 1, gap: 0.5 }}>
-          <input
-            type="checkbox"
-            id="collage-auto-rerender"
-            checked={autoRenderOnResize}
-            onChange={(e) => setAutoRenderOnResize(e.target.checked)}
-            style={{ accentColor: "#4FC3F7", cursor: "pointer" }}
-          />
-          <Typography
-            component="label"
-            htmlFor="collage-auto-rerender"
-            variant="caption"
-            sx={{ fontSize: "0.65rem", cursor: "pointer", lineHeight: 1.3 }}
-          >
-            Re-render on resize
-          </Typography>
-        </Box>
-        <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", display: "block", lineHeight: 1.3, mt: 0.25 }}>
-          When the lock is set, dragging a figure's resize handle re-renders
-          it automatically so the global pt size keeps holding through
-          scale changes.
-        </Typography>
       </Box>
     </Box>
   );
@@ -287,7 +546,6 @@ function BuilderSidebar() {
   const setSpacing = useFigureStore((s) => s.setSpacing);
   const setConfig = useFigureStore((s) => s.setConfig);
   const saveProject = useFigureStore((s) => s.saveProject);
-  const loadProject = useFigureStore((s) => s.loadProject);
   const checkGridResizeConflict = useFigureStore((s) => s.checkGridResizeConflict);
   const fetchFonts = useFigureStore((s) => s.fetchFonts);
   const fonts = useFigureStore((s) => s.fonts);
@@ -302,8 +560,7 @@ function BuilderSidebar() {
   const [fontWarningConflicts, setFontWarningConflicts] = useState<string[]>([]);
   const [pendingGlobalFont, setPendingGlobalFont] = useState<string | null>(null);
 
-  // Save/Load project dialogs
-  const [saveDialogOpen, setSaveDialogOpen] = useState(false);
+  // Load project dialog (Save uses the shared saveProjectDialog helper)
   const [loadDialogOpen, setLoadDialogOpen] = useState(false);
   const [projectPath, setProjectPath] = useState("");
   // Project-load progress. The backend's /api/project/load can take
@@ -317,10 +574,12 @@ function BuilderSidebar() {
   const [loadError, setLoadError] = useState<string | null>(null);
 
   // Analysis dialog
-  const [analysisOpen, setAnalysisOpen] = useState(false);
   // When true, the user enters the scale-bar value as pixels per unit and we
   // invert it to units per pixel before storing.
   const [scaleInverted, setScaleInverted] = useState(false);
+  // When set, the add-scalebar form is editing an existing preset; the
+  // original key is removed on save so renames work cleanly.
+  const [editingScaleKey, setEditingScaleKey] = useState<string | null>(null);
 
   // Computed measurements from backend
   const [computedMeasurements, setComputedMeasurements] = useState<Array<{ panel: string; name: string; type: string; value: string; numeric?: number; unit?: string }>>([]);
@@ -556,7 +815,7 @@ function BuilderSidebar() {
           >
             {scaleInverted ? "px/u" : "u/px"}
           </Button>
-          <IconButton size="small" onClick={() => {
+          <IconButton size="small" title={editingScaleKey ? "Save changes to this scale bar" : "Add scale bar"} onClick={() => {
             const nameEl = document.getElementById("scale-name-input") as HTMLInputElement;
             const valEl = document.getElementById("scale-value-input") as HTMLInputElement;
             const unitEl = document.getElementById("scale-unit-input") as HTMLSelectElement;
@@ -570,15 +829,37 @@ function BuilderSidebar() {
               const conversionToUm: Record<string, number> = { km: 1e9, m: 1e6, cm: 10000, mm: 1000, um: 1, nm: 0.001, pm: 1e-6 };
               const valueInUm = valuePerPx * (conversionToUm[unit] || 1);
               const key = `${nameEl.value}|${unit}`;
-              const entries = { ...config.resolution_entries, [key]: valueInUm };
+              const entries = { ...config.resolution_entries };
+              // Editing: drop the original key first so a rename / unit
+              // change replaces the entry instead of leaving a duplicate.
+              if (editingScaleKey && editingScaleKey !== key) delete entries[editingScaleKey];
+              entries[key] = valueInUm;
               setConfig({ ...config, resolution_entries: entries });
               api.updateResolutions(entries).catch(console.error);
               nameEl.value = "";
               valEl.value = "";
+              setEditingScaleKey(null);
+              setScaleInverted(false);
             }
           }} sx={{ width: 22, height: 22 }}>
             <AddIcon sx={{ fontSize: 14 }} />
           </IconButton>
+          {editingScaleKey && (
+            <Button
+              size="small" variant="text"
+              onClick={() => {
+                setEditingScaleKey(null);
+                const nameEl = document.getElementById("scale-name-input") as HTMLInputElement;
+                const valEl = document.getElementById("scale-value-input") as HTMLInputElement;
+                if (nameEl) nameEl.value = "";
+                if (valEl) valEl.value = "";
+                setScaleInverted(false);
+              }}
+              sx={{ fontSize: "0.5rem", textTransform: "none", px: 0.5, py: 0, minWidth: 0, height: 22 }}
+            >
+              Cancel edit
+            </Button>
+          )}
         </Box>
         {/* Capped + scrollable list — long preset libraries shouldn't
             push every other sidebar section below the fold. */}
@@ -594,16 +875,34 @@ function BuilderSidebar() {
             const convFromUm: Record<string, number> = { km: 1e9, m: 1e6, cm: 10000, mm: 1000, um: 1, nm: 0.001, pm: 1e-6 };
             const displayVal = (val as number) / (convFromUm[unit] || 1);
             return (
-              <Box key={name} sx={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <Box key={name} sx={{ display: "flex", alignItems: "center", justifyContent: "space-between",
+                ...(editingScaleKey === name ? { outline: "1px solid #4FC3F7", borderRadius: 1, px: 0.5 } : {}) }}>
                 <Typography variant="caption" sx={{ fontSize: "0.65rem" }}>{displayName}: {Number(displayVal.toPrecision(6))} {unitLabel}/px</Typography>
-                <IconButton size="small" onClick={() => {
-                  const entries = { ...config.resolution_entries };
-                  delete entries[name];
-                  setConfig({ ...config, resolution_entries: entries });
-                  api.updateResolutions(entries).catch(console.error);
-                }} sx={{ width: 20, height: 20 }}>
-                  <DeleteIcon sx={{ fontSize: 12 }} />
-                </IconButton>
+                <Box sx={{ display: "flex", alignItems: "center" }}>
+                  <IconButton size="small" title="Edit this scale bar" onClick={() => {
+                    // Load this preset into the add-form for editing. Always
+                    // populate in "unit/px" mode (the stored convention).
+                    const nameEl = document.getElementById("scale-name-input") as HTMLInputElement;
+                    const valEl = document.getElementById("scale-value-input") as HTMLInputElement;
+                    const unitEl = document.getElementById("scale-unit-input") as HTMLSelectElement;
+                    if (nameEl) nameEl.value = displayName;
+                    if (valEl) valEl.value = String(Number(displayVal.toPrecision(6)));
+                    if (unitEl) unitEl.value = unit;
+                    setScaleInverted(false);
+                    setEditingScaleKey(name);
+                  }} sx={{ width: 20, height: 20 }}>
+                    <EditIcon sx={{ fontSize: 12 }} />
+                  </IconButton>
+                  <IconButton size="small" title="Delete this scale bar" onClick={() => {
+                    const entries = { ...config.resolution_entries };
+                    delete entries[name];
+                    setConfig({ ...config, resolution_entries: entries });
+                    api.updateResolutions(entries).catch(console.error);
+                    if (editingScaleKey === name) setEditingScaleKey(null);
+                  }} sx={{ width: 20, height: 20 }}>
+                    <DeleteIcon sx={{ fontSize: 12 }} />
+                  </IconButton>
+                </Box>
               </Box>
             );
           })}
@@ -625,24 +924,30 @@ function BuilderSidebar() {
             id="global-font-select"
             defaultValue={(() => {
               if (fonts.length === 0) return "";
-              // Proper detection: walk every label / header / panel
-              // and tally the most common (font_name, font_style)
-              // pair.  Fixes the "Arial Narrow Italic shows as just
-              // arial" bug — the old code just returned
-              // column_labels[0].font_name verbatim.
+              // Case-insensitive, extension-insensitive match against the
+              // available fonts list (system fonts may be listed as
+              // "Arial.ttf"/"Arial" with different casing than the stored
+              // "arial.ttf").
+              const stripExt = (f: string) => f.replace(/\.(ttf|otf|ttc)$/i, "");
+              const matchInFonts = (target?: string | null) => {
+                if (!target) return undefined;
+                const t = stripExt(target).toLowerCase();
+                return fonts.find((f) => stripExt(f).toLowerCase() === t);
+              };
+              // 1. Detected most-common font across labels/headers.
               const detected = detectGlobalFont(config);
-              if (detected && fonts.includes(detected.font_name)) {
-                return detected.font_name;
-              }
-              // Existing first-column-label fallback (kept for the
-              // brand-new-figure case where no labels carry font
-              // data yet).
-              const existing = config?.column_labels?.[0]?.font_name;
-              if (existing && fonts.includes(existing)) return existing;
-              const arial = fonts.find((f) =>
-                /^arial\b/i.test(f.replace(/\.(ttf|otf|ttc)$/i, "")),
-              );
-              if (arial) return arial;
+              const dm = matchInFonts(detected?.font_name);
+              if (dm) return dm;
+              // 2. First-column-label fallback (brand-new figure).
+              const em = matchInFonts(config?.column_labels?.[0]?.font_name);
+              if (em) return em;
+              // 3. Default to EXACT "Arial" (not "Arial Narrow"/"Arial
+              //    Black" — the old /^arial\b/ matched those because of
+              //    the word boundary after "Arial ").
+              const exactArial = fonts.find((f) => /^arial$/i.test(stripExt(f)));
+              if (exactArial) return exactArial;
+              const arialFamily = fonts.find((f) => /^arial\b/i.test(stripExt(f)));
+              if (arialFamily) return arialFamily;
               return fonts[0] || "";
             })()}
             // Key includes a fingerprint of the detected font so the
@@ -990,7 +1295,7 @@ function BuilderSidebar() {
               >Export CSV</Button>
             )}
             <Button size="small" variant="outlined" sx={{ fontSize: "0.55rem", textTransform: "none", flex: 1 }}
-              onClick={() => setAnalysisOpen(true)}
+              onClick={() => void enterAnalysis()}
             >Open Analysis</Button>
           </Box>
           </>
@@ -1009,11 +1314,11 @@ function BuilderSidebar() {
           fullWidth
           variant="contained"
           color="primary"
-          onClick={() => {
+          onClick={async () => {
             const now = new Date();
             const ts = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,"0")}${String(now.getDate()).padStart(2,"0")}_${String(now.getHours()).padStart(2,"0")}${String(now.getMinutes()).padStart(2,"0")}${String(now.getSeconds()).padStart(2,"0")}`;
-            setProjectPath(`${ts}_project.mpf`);
-            setSaveDialogOpen(true);
+            const picked = await saveProjectDialog({ defaultPath: `${ts}_project.mpf` });
+            if (picked) await saveProject(picked);
           }}
         >
           Save Project
@@ -1072,56 +1377,6 @@ function BuilderSidebar() {
           <Button onClick={() => setFontWarningOpen(false)}>Cancel</Button>
           <Button onClick={confirmGlobalFont} color="error" variant="contained">
             Apply Anyway
-          </Button>
-        </DialogActions>
-      </Dialog>
-
-      {/* ── Save Project Dialog ──────────────────────── */}
-      <Dialog open={saveDialogOpen} onClose={() => setSaveDialogOpen(false)} maxWidth="sm" fullWidth>
-        <DialogTitle>Save Project</DialogTitle>
-        <DialogContent>
-          <Box>
-            <Box sx={{ display: "flex", gap: 1, mt: 1, alignItems: "center" }}>
-              <TextField
-                autoFocus fullWidth size="small"
-                label="File path"
-                value={projectPath}
-                onChange={(e) => setProjectPath(e.target.value)}
-              />
-              <Button variant="outlined" size="small" sx={{ minWidth: 80, flexShrink: 0 }}
-                onClick={async () => {
-                  try {
-                    const { save } = await import("@tauri-apps/plugin-dialog");
-                    const selected = await save({
-                      defaultPath: projectPath || "project.mpf",
-                      filters: [{ name: "Project", extensions: ["mpf"] }],
-                    });
-                    if (selected) { setProjectPath(selected); return; }
-                  } catch { /* not in Tauri — web fallback */ }
-                  const fname = (projectPath || "project.mpf").split("/").pop() || "project.mpf";
-                  setProjectPath(`~/Documents/${fname}`);
-                }}
-              >Browse</Button>
-            </Box>
-            <Typography variant="caption" sx={{ color: "text.secondary", ml: 1.5, mt: 0.25, display: "block", fontSize: "0.65rem" }}>
-              Enter full path. In web preview, Browse pre-fills ~/Documents/.
-            </Typography>
-          </Box>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => { setSaveDialogOpen(false); setProjectPath(""); }}>Cancel</Button>
-          <Button
-            variant="contained"
-            disabled={!projectPath}
-            onClick={async () => {
-              if (projectPath) {
-                await saveProject(projectPath);
-                setSaveDialogOpen(false);
-                setProjectPath("");
-              }
-            }}
-          >
-            Save
           </Button>
         </DialogActions>
       </Dialog>
@@ -1214,7 +1469,9 @@ function BuilderSidebar() {
               setLoadError(null);
               setLoadingProject(true);
               try {
-                await loadProject(projectPath);
+                // Open into a (new or existing) document tab, guarding
+                // unsaved changes in the current builder doc first.
+                await openProjectIntoTab(projectPath);
                 setLoadDialogOpen(false);
                 setProjectPath("");
               } catch (e) {
@@ -1229,13 +1486,6 @@ function BuilderSidebar() {
           </Button>
         </DialogActions>
       </Dialog>
-
-      {/* Analysis Dialog */}
-      <AnalysisDialog
-        open={analysisOpen}
-        onClose={() => setAnalysisOpen(false)}
-        measurements={computedMeasurements}
-      />
     </Box>
   );
 }

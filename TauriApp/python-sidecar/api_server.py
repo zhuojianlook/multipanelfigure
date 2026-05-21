@@ -3945,15 +3945,13 @@ class ProjectLoadRequest(BaseModel):
     path: str
 
 
-@app.post("/api/project/load")
-def load_proj(body: ProjectLoadRequest):
+def _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict):
+    """Replace the global builder state (config + images + fonts) with a
+    freshly-deserialized project. Returns the per-image thumbnails dict.
+    Shared by the on-disk project loader (/api/project/load) and the
+    in-session snapshot restore (/api/project/restore) so both paths hydrate
+    identically."""
     global cfg, loaded_images, custom_fonts, loaded_videos, video_frames
-    path = os.path.expanduser(body.path.strip())
-    if not os.path.dirname(path):
-        path = os.path.join(os.path.expanduser("~"), "Documents", path)
-    if not os.path.isfile(path):
-        raise HTTPException(404, f"Project file not found: {path}")
-    loaded_cfg, img_bytes_dict, font_bytes_dict, analysis = load_project(path)
     cfg = loaded_cfg
     cfg.ensure_grid()
     loaded_images.clear()
@@ -3972,7 +3970,18 @@ def load_proj(body: ProjectLoadRequest):
             loaded_images[name] = Image.open(io.BytesIO(data)).convert("RGB")
     custom_fonts = font_bytes_dict or {}
     _recalc_min_dims()
-    thumbnails = {n: _thumb_b64(img) for n, img in loaded_images.items()}
+    return {n: _thumb_b64(img) for n, img in loaded_images.items()}
+
+
+@app.post("/api/project/load")
+def load_proj(body: ProjectLoadRequest):
+    path = os.path.expanduser(body.path.strip())
+    if not os.path.dirname(path):
+        path = os.path.join(os.path.expanduser("~"), "Documents", path)
+    if not os.path.isfile(path):
+        raise HTTPException(404, f"Project file not found: {path}")
+    loaded_cfg, img_bytes_dict, font_bytes_dict, analysis = load_project(path)
+    thumbnails = _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict)
 
     # Re-encode any analysis plot bytes as base64 strings for transport to the
     # frontend; tables travel as plain CSV text.
@@ -3998,6 +4007,68 @@ def load_proj(body: ProjectLoadRequest):
         "image_names": list(loaded_images.keys()),
         "thumbnails": thumbnails,
         "analysis": analysis_out,
+    }
+
+
+@app.get("/api/project/snapshot")
+def snapshot_proj():
+    """Serialize the CURRENT builder state to an in-memory .mpf blob
+    (base64). Used for seamless document-tab switching: the single global
+    backend state can hold only one document, so before swapping to another
+    tab the frontend snapshots the outgoing tab here and restores it later
+    (via /api/project/restore) without ever touching disk — so a tab's
+    unsaved edits survive being switched away from."""
+    img_bytes = {}
+    for name, img in loaded_images.items():
+        # Videos: persist the original file bytes (not the extracted frame).
+        if name in loaded_videos and os.path.isfile(loaded_videos[name]):
+            with open(loaded_videos[name], "rb") as vf:
+                img_bytes[name] = vf.read()
+        else:
+            img_bytes[name] = pil_to_bytes(img)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mpf")
+    tmp.close()
+    try:
+        save_project(cfg, img_bytes, tmp.name, custom_fonts or None, None)
+        with open(tmp.name, "rb") as f:
+            data = f.read()
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+    return {"blob": base64.b64encode(data).decode()}
+
+
+class ProjectRestoreRequest(BaseModel):
+    blob: str
+
+
+@app.post("/api/project/restore")
+def restore_proj(body: ProjectRestoreRequest):
+    """Restore a builder state previously captured by /api/project/snapshot,
+    replacing the global state with the blob's config + images + fonts.
+    Mirrors /api/project/load but reads from an in-memory blob rather than a
+    file on disk (analysis state is managed separately by the frontend)."""
+    try:
+        data = base64.b64decode(body.blob)
+    except Exception:
+        raise HTTPException(400, "Invalid snapshot blob.")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mpf")
+    tmp.write(data)
+    tmp.close()
+    try:
+        loaded_cfg, img_bytes_dict, font_bytes_dict, _analysis = load_project(tmp.name)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+    thumbnails = _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict)
+    return {
+        "config": _cfg_json(),
+        "image_names": list(loaded_images.keys()),
+        "thumbnails": thumbnails,
     }
 
 
@@ -4292,6 +4363,18 @@ class CollageFigureRenderRequest(BaseModel):
     (whose width grows with the override pt)."""
     scale: float = 1.0
     item_w: Optional[float] = None
+    """When set, the font size override is applied ONLY to these element
+    ids (from /api/collage/figure-elements). When null/empty, the legacy
+    default set (column/row headers + axis labels) is targeted."""
+    element_ids: Optional[List[str]] = None
+    """Per-element STYLE overrides (font_name / font_style / color /
+    styled_segments / font_size) keyed by element id, applied before the
+    size sync. Used by the collage's double-click text customization."""
+    element_overrides: Optional[Dict[str, dict]] = None
+
+
+class CollageFigureElementsRequest(BaseModel):
+    project_path: str
 
 
 # Per-process cache of decoded .mpf data, keyed by (absolute path, mtime).
@@ -4338,6 +4421,221 @@ def _load_collage_mpf(path: str):
     return loaded_cfg, local_images
 
 
+def _iter_text_elements(cfg):
+    """Return editable text-element descriptors for `cfg`. Each is a dict
+    { id, type, text, font_size, _obj, _size_attr, _segs_attr }. The ids
+    are stable and shared by the figure-elements list endpoint and the
+    per-element font override path in render_collage_figure, so the
+    frontend can let the user pick exactly which text elements get the
+    synchronized font size."""
+    out = []
+
+    def add(eid, etype, obj, text_attr, size_attr, segs_attr, color_attr, style_attr):
+        out.append({
+            "id": eid,
+            "type": etype,
+            "text": (getattr(obj, text_attr, "") or ""),
+            "font_size": getattr(obj, size_attr, None),
+            "font_name": getattr(obj, "font_name", None),
+            "color": getattr(obj, color_attr, None),
+            "font_style": list(getattr(obj, style_attr, []) or []),
+            "styled_segments": _segments_to_dicts(getattr(obj, segs_attr, None)),
+            "_obj": obj,
+            "_size_attr": size_attr,
+            "_segs_attr": segs_attr,
+            "_color_attr": color_attr,
+            "_style_attr": style_attr,
+        })
+
+    for li, level in enumerate(getattr(cfg, "column_headers", []) or []):
+        for gi, hdr in enumerate(level.headers):
+            add(f"colhdr:{li}:{gi}", "Column header", hdr, "text", "font_size", "styled_segments", "default_color", "font_style")
+    for li, level in enumerate(getattr(cfg, "row_headers", []) or []):
+        for gi, hdr in enumerate(level.headers):
+            add(f"rowhdr:{li}:{gi}", "Row header", hdr, "text", "font_size", "styled_segments", "default_color", "font_style")
+    for i, lbl in enumerate(getattr(cfg, "column_labels", []) or []):
+        add(f"collbl:{i}", "Column label", lbl, "text", "font_size", "styled_segments", "default_color", "font_style")
+    for i, lbl in enumerate(getattr(cfg, "row_labels", []) or []):
+        add(f"rowlbl:{i}", "Row label", lbl, "text", "font_size", "styled_segments", "default_color", "font_style")
+    for r in range(cfg.rows):
+        for c in range(cfg.cols):
+            panel = cfg.panels[r][c]
+            for i, lab in enumerate(getattr(panel, "labels", []) or []):
+                add(f"panellbl:{r}:{c}:{i}", f"Panel R{r+1}C{c+1} label", lab, "text", "font_size", "styled_segments", "color", "font_style")
+            sb = getattr(panel, "scale_bar", None)
+            if sb is not None:
+                add(f"scalebar:{r}:{c}", f"Scale bar R{r+1}C{c+1}", sb, "label", "font_size", "styled_segments", "label_color", "label_font_style")
+    return out
+
+
+def _segments_to_dicts(segs):
+    """Serialize a list of StyledSegment (or dict) objects to plain dicts
+    for the figure-elements response."""
+    if not segs:
+        return []
+    out = []
+    for s in segs:
+        if isinstance(s, dict):
+            out.append({
+                "text": s.get("text", ""), "color": s.get("color"),
+                "font_name": s.get("font_name"), "font_size": s.get("font_size"),
+                "font_style": list(s.get("font_style") or []) if s.get("font_style") else None,
+            })
+        else:
+            out.append({
+                "text": getattr(s, "text", ""), "color": getattr(s, "color", None),
+                "font_name": getattr(s, "font_name", None), "font_size": getattr(s, "font_size", None),
+                "font_style": list(getattr(s, "font_style", None) or []) if getattr(s, "font_style", None) else None,
+            })
+    return out
+
+
+def _apply_element_overrides(cfg, element_overrides):
+    """Apply per-element STYLE overrides (font_name / font_style / color /
+    styled_segments / font_size) keyed by element id. Used by the collage's
+    double-click text customization. Applied BEFORE the size sync so a
+    later font_size sync still wins on size while keeping these styles."""
+    if not element_overrides:
+        return cfg
+    by_id = {el["id"]: el for el in _iter_text_elements(cfg)}
+    for eid, ov in element_overrides.items():
+        el = by_id.get(eid)
+        if not el or not ov:
+            continue
+        obj = el["_obj"]
+        if ov.get("font_name"):
+            if hasattr(obj, "font_name"):
+                obj.font_name = ov["font_name"]
+                if hasattr(obj, "font_path"):
+                    obj.font_path = None  # let the renderer resolve by name
+        if ov.get("font_style") is not None and hasattr(obj, el["_style_attr"]):
+            setattr(obj, el["_style_attr"], list(ov["font_style"]))
+        if ov.get("color") and hasattr(obj, el["_color_attr"]):
+            setattr(obj, el["_color_attr"], ov["color"])
+        if ov.get("font_size") and hasattr(obj, el["_size_attr"]):
+            setattr(obj, el["_size_attr"], ov["font_size"])
+        if "styled_segments" in ov:
+            segs = ov.get("styled_segments") or []
+            setattr(obj, el["_segs_attr"], [
+                StyledSegment(
+                    text=s.get("text", ""),
+                    color=s.get("color", "#000000") or "#000000",
+                    font_name=s.get("font_name"),
+                    font_size=s.get("font_size"),
+                    font_style=s.get("font_style"),
+                ) for s in segs
+            ])
+    return cfg
+
+
+# Element-id prefixes that the legacy "synchronize headers" default targets
+# when no explicit element selection is supplied (column/row headers + the
+# simple column/row axis labels). Panel labels + scale bars are opt-in via
+# explicit element selection so default behaviour is unchanged.
+_DEFAULT_FONT_SYNC_PREFIXES = ("colhdr", "rowhdr", "collbl", "rowlbl")
+
+
+def _apply_font_pt(cfg, new_pt, element_ids=None):
+    """Set the font size to new_pt on the figure's text elements, clearing
+    any per-segment size overrides so the element-level size wins. When
+    element_ids is given, only those elements are changed; otherwise the
+    default header/axis-label set is changed (legacy behaviour)."""
+    ids = set(element_ids) if element_ids else None
+    for el in _iter_text_elements(cfg):
+        if ids is not None:
+            if el["id"] not in ids:
+                continue
+        else:
+            if el["id"].split(":")[0] not in _DEFAULT_FONT_SYNC_PREFIXES:
+                continue
+        obj = el["_obj"]
+        setattr(obj, el["_size_attr"], new_pt)
+        segs = getattr(obj, el["_segs_attr"], None)
+        if segs:
+            for seg in segs:
+                if hasattr(seg, "font_size"):
+                    seg.font_size = None
+    return cfg
+
+
+@app.post("/api/collage/figure-elements")
+def collage_figure_elements(body: "CollageFigureElementsRequest"):
+    """List the editable text elements of a saved .mpf so the collage UI
+    can offer per-element font synchronization. Returns id / type / text /
+    current font_size for each element."""
+    path = os.path.expanduser(body.project_path.strip())
+    if not os.path.dirname(path):
+        path = os.path.join(os.path.expanduser("~"), "Documents", path)
+    if not os.path.isfile(path):
+        raise HTTPException(404, f"Project file not found: {path}")
+    loaded_cfg, local_images = _load_collage_mpf(path)
+    elements = [
+        {"id": e["id"], "type": e["type"], "text": e["text"], "font_size": e["font_size"],
+         "font_name": e["font_name"], "color": e["color"],
+         "font_style": e["font_style"], "styled_segments": e["styled_segments"]}
+        for e in _iter_text_elements(loaded_cfg)
+    ]
+
+    # Render once to collect on-figure geometry (figure fractions, y from
+    # bottom) for column/row headers, so the collage can overlay clickable
+    # hotspots on the figure itself. Best-effort — failures just omit geom.
+    try:
+        rows, cols = loaded_cfg.rows, loaded_cfg.cols
+        if local_images:
+            ws = [im.size[0] for im in local_images.values()]
+            hs = [im.size[1] for im in local_images.values()]
+            local_min_dims = (min(ws), min(hs))
+        else:
+            local_min_dims = (100, 100)
+        proc = []
+        for r in range(rows):
+            row_imgs = []
+            for c in range(cols):
+                panel = loaded_cfg.panels[r][c]
+                if panel.image_name and panel.image_name in local_images:
+                    row_imgs.append(process_panel(local_images[panel.image_name], panel,
+                                                  local_min_dims, local_images,
+                                                  skip_labels=True, skip_symbols=True))
+                else:
+                    row_imgs.append(None)
+            proc.append(row_imgs)
+        col_max_w = [max((proc[r][c].size[0] for r in range(rows) if proc[r][c] is not None),
+                         default=local_min_dims[0]) for c in range(cols)]
+        row_max_h = [max((proc[r][c].size[1] for c in range(cols) if proc[r][c] is not None),
+                         default=local_min_dims[1]) for r in range(rows)]
+        for r in range(rows):
+            for c in range(cols):
+                if proc[r][c] is None:
+                    proc[r][c] = Image.new("RGB", (col_max_w[c], row_max_h[r]), "white")
+        geom_list: list = []
+        assemble_figure(loaded_cfg, proc, dpi=72, header_collect=geom_list)
+        geom_by_id = {}
+        for g in geom_list:
+            gid = g.get("id")
+            if not gid:
+                continue
+            if g.get("orientation") == "column":
+                geom_by_id[gid] = {
+                    "orientation": "column",
+                    "cx": g.get("cx_frac"), "cy": g.get("cy_frac"),
+                    "s0": g.get("span_x0_frac"), "s1": g.get("span_x1_frac"),
+                }
+            else:
+                geom_by_id[gid] = {
+                    "orientation": "row",
+                    "cx": g.get("cx_frac"), "cy": g.get("cy_frac"),
+                    "s0": g.get("span_y0_frac"), "s1": g.get("span_y1_frac"),
+                }
+        for e in elements:
+            if e["id"] in geom_by_id:
+                e["geom"] = geom_by_id[e["id"]]
+    except Exception as _e:
+        import sys
+        print(f"[figure-elements] geometry collect failed: {_e}", file=sys.stderr, flush=True)
+
+    return {"elements": elements}
+
+
 @app.post("/api/collage/render-figure")
 def render_collage_figure(body: CollageFigureRenderRequest):
     """Stateless render of a saved .mpf into a PNG, optionally
@@ -4365,24 +4663,8 @@ def render_collage_figure(body: CollageFigureRenderRequest):
     loaded_cfg, local_images = _load_collage_mpf(path)
 
     def _apply_header_pt(cfg, new_pt):
-        for level in cfg.column_headers:
-            for hdr in level.headers:
-                hdr.font_size = new_pt
-                for seg in (hdr.styled_segments or []):
-                    seg.font_size = None
-        for level in cfg.row_headers:
-            for hdr in level.headers:
-                hdr.font_size = new_pt
-                for seg in (hdr.styled_segments or []):
-                    seg.font_size = None
-        for lbl in cfg.column_labels:
-            lbl.font_size = new_pt
-            for seg in (lbl.styled_segments or []):
-                seg.font_size = None
-        for lbl in cfg.row_labels:
-            lbl.font_size = new_pt
-            for seg in (lbl.styled_segments or []):
-                seg.font_size = None
+        _apply_element_overrides(cfg, body.element_overrides)
+        _apply_font_pt(cfg, new_pt, body.element_ids)
 
     def _render_cfg(cfg_to_render):
         rows, cols = cfg_to_render.rows, cfg_to_render.cols
@@ -4469,26 +4751,10 @@ def render_collage_figure(body: CollageFigureRenderRequest):
     # collage's downscale: target_pt × (1 / scale) so the visible
     # size after the collage scales the figure is exactly target_pt.
     cfg2 = _copy.deepcopy(loaded_cfg)
+    _apply_element_overrides(cfg2, body.element_overrides)
     if body.header_pt and body.header_pt > 0:
         new_pt = max(1, int(round(body.header_pt / max(0.001, body.scale))))
-        for level in cfg2.column_headers:
-            for hdr in level.headers:
-                hdr.font_size = new_pt
-                for seg in (hdr.styled_segments or []):
-                    seg.font_size = None
-        for level in cfg2.row_headers:
-            for hdr in level.headers:
-                hdr.font_size = new_pt
-                for seg in (hdr.styled_segments or []):
-                    seg.font_size = None
-        for lbl in cfg2.column_labels:
-            lbl.font_size = new_pt
-            for seg in (lbl.styled_segments or []):
-                seg.font_size = None
-        for lbl in cfg2.row_labels:
-            lbl.font_size = new_pt
-            for seg in (lbl.styled_segments or []):
-                seg.font_size = None
+        _apply_font_pt(cfg2, new_pt, body.element_ids)
 
     # Mirror the /api/preview pipeline but against local_images and
     # cfg2. We deliberately don't downscale below max_preview_px so
@@ -4559,6 +4825,101 @@ def render_collage_figure(body: CollageFigureRenderRequest):
     }
 
 
+class CollageDecomposeRequest(BaseModel):
+    project_path: str
+
+
+@app.post("/api/collage/decompose")
+def decompose_collage_figure(body: CollageDecomposeRequest):
+    """Render a saved .mpf into a header-LESS body PNG plus the geometry
+    of every column/row header, so the collage can lay headers out as
+    live overlays. This is what makes the 'unify headers' button instant:
+    the body is rendered once (and cached implicitly via _load_collage_mpf),
+    and changing the unified font only re-typesets the HTML overlays —
+    no matplotlib round-trip, no per-resize re-render.
+
+    Returns:
+      image      base64 PNG of the figure WITHOUT headers (header
+                 margin space is still reserved, so the overlays have
+                 room to sit)
+      width/height  natural pixel size of the body
+      headers[]  geometry in figure FRACTIONS (0..1, y from bottom):
+                 each entry has orientation/position, anchor (cx_frac,
+                 cy_frac), span, rotation, text + styled segments, font,
+                 size_pt, colour, and bracket-line props. The frontend
+                 multiplies fractions by the displayed body size and
+                 renders the headers itself at the unified pt.
+    """
+    path = os.path.expanduser(body.project_path.strip())
+    if not os.path.dirname(path):
+        path = os.path.join(os.path.expanduser("~"), "Documents", path)
+    if not os.path.isfile(path):
+        raise HTTPException(404, f"Project file not found: {path}")
+    loaded_cfg, local_images = _load_collage_mpf(path)
+
+    rows, cols = loaded_cfg.rows, loaded_cfg.cols
+    if local_images:
+        ws = [im.size[0] for im in local_images.values()]
+        hs = [im.size[1] for im in local_images.values()]
+        local_min_dims = (min(ws), min(hs))
+    else:
+        local_min_dims = (100, 100)
+
+    processed: List[List[Optional[Image.Image]]] = []
+    for r in range(rows):
+        row_imgs: List[Optional[Image.Image]] = []
+        for c in range(cols):
+            panel = loaded_cfg.panels[r][c]
+            if panel.image_name and panel.image_name in local_images:
+                row_imgs.append(process_panel(
+                    local_images[panel.image_name], panel,
+                    local_min_dims, local_images,
+                    skip_labels=True, skip_symbols=True,
+                ))
+            else:
+                row_imgs.append(None)
+        processed.append(row_imgs)
+
+    col_max_w = [
+        max((processed[r][c].size[0] for r in range(rows) if processed[r][c] is not None),
+            default=local_min_dims[0]) for c in range(cols)
+    ]
+    row_max_h = [
+        max((processed[r][c].size[1] for c in range(cols) if processed[r][c] is not None),
+            default=local_min_dims[1]) for r in range(rows)
+    ]
+    for r in range(rows):
+        for c in range(cols):
+            if processed[r][c] is None:
+                processed[r][c] = Image.new("RGB", (col_max_w[c], row_max_h[r]), "white")
+
+    full_res_sizes2: Dict = {}
+    for r in range(rows):
+        for c in range(cols):
+            panel = loaded_cfg.panels[r][c]
+            if panel.image_name and panel.image_name in local_images:
+                orig_img = local_images[panel.image_name]
+                if panel.crop_image and panel.crop and len(panel.crop) == 4:
+                    full_res_sizes2[(r, c)] = (panel.crop[2] - panel.crop[0], panel.crop[3] - panel.crop[1])
+                else:
+                    full_res_sizes2[(r, c)] = orig_img.size
+
+    header_geom: list = []
+    fig_bytes = assemble_figure(
+        loaded_cfg, processed, dpi=150, full_res_sizes=full_res_sizes2,
+        draw_headers=False, header_collect=header_geom,
+    )
+    img_out = Image.open(io.BytesIO(fig_bytes)).convert("RGBA")
+    out_buf = io.BytesIO()
+    img_out.save(out_buf, format="PNG")
+    return {
+        "image": base64.b64encode(out_buf.getvalue()).decode("ascii"),
+        "width": img_out.width,
+        "height": img_out.height,
+        "headers": header_geom,
+    }
+
+
 @app.delete("/api/collage/stash/{item_id}")
 def delete_collage_stash(item_id: str):
     """Delete a stashed .mpf for the given collage item id. The id
@@ -4599,6 +4960,12 @@ class RAnalysisRequest(BaseModel):
     # Tolerate the node graph's `measurements_csv` alias so older
     # frontends and the new analysis canvas can share this endpoint.
     measurements_csv: Optional[str] = None
+    # When set, force a base font size (pt) on generated plots. Used by the
+    # collage's "Synchronize headers" to re-render an R plot at a target
+    # size. Best-effort: ggplot output is wrapped so the size is applied
+    # AFTER the user's own theming (so it wins even over a full theme_*),
+    # and base-graphics get par(cex) inside mpfig_plot.
+    base_font_size: Optional[int] = None
 
 
 def _find_rscript(custom_path: Optional[str] = None) -> Optional[str]:
@@ -4698,11 +5065,38 @@ def run_r_code(body: RAnalysisRequest):
         script += f'# Auto-generated data loading\ndata <- read.csv("{data_path.replace(chr(92), "/")}")\n\n'
         script += f'# Set plot output directory\n.plot_dir <- "{plot_dir.replace(chr(92), "/")}"\n'
         script += '.plot_count <- 0\n'
+        _base_fs = body.base_font_size if (body.base_font_size and body.base_font_size > 0) else None
         script += 'mpfig_plot <- function(filename=NULL, width=800, height=600, res=150) {\n'
         script += '  .plot_count <<- .plot_count + 1\n'
         script += '  if (is.null(filename)) filename <- paste0("plot_", .plot_count, ".png")\n'
         script += '  png(file.path(.plot_dir, filename), width=width, height=height, res=res)\n'
+        if _base_fs:
+            # Base-graphics best-effort: scale character expansion relative to
+            # R's default 12pt so base plots roughly track the target size.
+            script += f'  try(par(cex={_base_fs}/12, cex.axis={_base_fs}/12, cex.lab={_base_fs}/12, cex.main={_base_fs}/12, cex.sub={_base_fs}/12), silent=TRUE)\n'
         script += '}\n\n'
+        if _base_fs:
+            # ggplot2: force a base font size by (1) setting the active theme's
+            # base_size and (2) shadowing the common theme_*() constructors in
+            # the global env so unqualified calls in user code (e.g.
+            # `+ theme_classic()`, `+ theme_prism()`) inherit the size. This
+            # works at the function level, so it is robust across ggplot2
+            # versions (incl. the S7-based 4.x, where overriding print.ggplot
+            # no longer intercepts rendering).
+            script += '# ── Synchronized font size (collage) ──────────────────────\n'
+            script += f'.mpfig_base_size <- {_base_fs}\n'
+            script += 'options(mpfig_base_size = .mpfig_base_size)\n'
+            script += 'if (requireNamespace("ggplot2", quietly=TRUE)) {\n'
+            script += '  try({\n'
+            script += '    ggplot2::theme_set(ggplot2::theme_grey(base_size = .mpfig_base_size))\n'
+            script += '    .mpfig_wrap_theme <- function(fn) { force(fn); function(...) { a <- list(...); a$base_size <- .mpfig_base_size; do.call(fn, a) } }\n'
+            script += '    for (.nm in c("theme_grey","theme_gray","theme_bw","theme_classic","theme_minimal","theme_light","theme_dark","theme_void","theme_linedraw")) {\n'
+            script += '      if (exists(.nm, envir=asNamespace("ggplot2"))) assign(.nm, .mpfig_wrap_theme(get(.nm, envir=asNamespace("ggplot2"))), envir=globalenv())\n'
+            script += '    }\n'
+            script += '    if (requireNamespace("ggprism", quietly=TRUE) && exists("theme_prism", envir=asNamespace("ggprism")))\n'
+            script += '      assign("theme_prism", .mpfig_wrap_theme(get("theme_prism", envir=asNamespace("ggprism"))), envir=globalenv())\n'
+            script += '  }, silent = TRUE)\n'
+            script += '}\n\n'
         script += f'# Set table output directory\n.table_dir <- "{table_dir.replace(chr(92), "/")}"\n'
         script += 'mpfig_data <- function(df, name = "table") {\n'
         script += '  write.csv(df, file = file.path(.table_dir, paste0(name, ".csv")), row.names = FALSE)\n'
@@ -5332,6 +5726,48 @@ def list_inset_analysis_sources():
     selector — running a Python pipeline lets the user pick any of
     these regions as the input dataset."""
     return {"sources": _collect_analysis_insets()}
+
+
+# Serialises the temporary global-state swap used to collect sources from a
+# non-active .mpf (see below).
+_source_swap_lock = _threading.Lock()
+
+
+class InsetSourcesForRequest(BaseModel):
+    project_path: str
+
+
+@app.post("/api/analysis/inset-sources-for")
+def list_inset_sources_for(body: InsetSourcesForRequest):
+    """Collect analysis sources for a SPECIFIC .mpf (not the live figure), so
+    the Analysis tab can show one sources drawer per loaded MPF — including
+    figures that aren't the active builder doc. Reuses the active-figure
+    collector by briefly swapping the global figure state to the target
+    .mpf's (serialised by a lock, restored in `finally`). The Analysis tab
+    is a separate workspace, so concurrent builder ops during the short swap
+    window are not expected."""
+    global cfg, loaded_images, loaded_videos, video_frames, loaded_zstacks, channel_groups, min_dims
+    path = os.path.expanduser(body.project_path.strip())
+    if not os.path.dirname(path):
+        path = os.path.join(os.path.expanduser("~"), "Documents", path)
+    if not os.path.isfile(path):
+        raise HTTPException(404, f"Project file not found: {path}")
+    loaded_cfg, local_images = _load_collage_mpf(path)
+    with _source_swap_lock:
+        saved = (cfg, loaded_images, loaded_videos, video_frames, loaded_zstacks, channel_groups, min_dims)
+        try:
+            cfg = loaded_cfg
+            loaded_images = dict(local_images)
+            loaded_videos = {}
+            video_frames = {}
+            loaded_zstacks = {}
+            channel_groups = {}
+            _recalc_min_dims()
+            sources = _collect_analysis_insets(include_thumbnails=True)
+        finally:
+            (cfg, loaded_images, loaded_videos, video_frames,
+             loaded_zstacks, channel_groups, min_dims) = saved
+    return {"sources": sources}
 
 
 class PyAnalysisRequest(BaseModel):

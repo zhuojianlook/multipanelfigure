@@ -1,6 +1,7 @@
 import { ThemeProvider, createTheme, CssBaseline } from "@mui/material";
 import { AppShell } from "./components/layout/AppShell";
 import { ConfirmHost } from "./components/shared/ConfirmDialog";
+import { SaveProjectHost } from "./components/shared/SaveProjectDialog";
 
 const darkTheme = createTheme({
   palette: {
@@ -56,6 +57,10 @@ export default function App() {
           the root so any deeply-nested component can call confirm()
           without needing to wire a provider through the tree. */}
       <ConfirmHost />
+      {/* Singleton host for the imperative saveProjectDialog() helper —
+          the one shared "Save Project" modal used by the Sidebar button,
+          the close-tab save guard, and Add to Collage. */}
+      <SaveProjectHost />
     </ThemeProvider>
   );
 }

@@ -36,6 +36,11 @@ interface FigureState {
   previewLoading: boolean;
   apiError: string | null;
   configDirty: boolean;     // true when local changes haven't been previewed
+  /** true when there are edits not yet saved to a .mpf on disk. Unlike
+   *  `configDirty` (which resets after every preview render), this only
+   *  clears on save / load / new — so it's the correct signal for
+   *  "would lose work on close" prompts + the tab dirty marker. */
+  unsaved: boolean;
   /** Absolute path of the .mpf the user last saved or loaded. Cleared
    *  by "New". Used by the collage's Add-to-Collage / Multi-Panel
    *  Builder round-trip to remember which project a figure-kind item
@@ -145,6 +150,17 @@ interface FigureState {
 
   saveProject: (path: string) => Promise<void>;
   loadProject: (path: string) => Promise<void>;
+  /** Restore an in-session document snapshot (a base64 .mpf blob captured
+   *  by api.snapshotProject) into the builder. Used by the document-tab
+   *  switcher so a tab's unsaved edits survive being swapped out of the
+   *  single global backend state. `opts.path` is the doc's on-disk path
+   *  (null for an Untitled tab); the restored doc is always marked unsaved
+   *  since snapshots are only taken for tabs with unsaved edits. */
+  restoreDoc: (blob: string, opts: { path: string | null }) => Promise<void>;
+  /** Reset the builder to a fresh blank 2×2 figure (new document) WITHOUT
+   *  a page reload and without touching the collage. Deletes loaded
+   *  images on the backend, resets cfg, clears the project path. */
+  newBlankFigure: () => Promise<void>;
   saveFigure: (path: string, format?: string, background?: string, dpi?: number) => Promise<void>;
 
   // Check if reducing grid would lose images
@@ -421,6 +437,7 @@ export const useFigureStore = create<FigureState>()(
     previewLoading: false,
     apiError: null,
     configDirty: false,
+    unsaved: false,
     currentProjectPath: null,
     drawerPanels: [],
     drawerThumbnails: {},
@@ -522,7 +539,7 @@ export const useFigureStore = create<FigureState>()(
     setConfig: (cfg) => {
       set((s) => {
         s.config = cfg;
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       get().syncToBackend();
       get().requestPreview();
@@ -547,7 +564,7 @@ export const useFigureStore = create<FigureState>()(
         set((s) => {
           s.config = cfg;
           s.panelThumbnails = {};
-          s.configDirty = true;
+          s.configDirty = true; s.unsaved = true;
         });
         // Push renumbered cfg to backend (best-effort).
         get().syncToBackend().catch(console.error);
@@ -561,7 +578,7 @@ export const useFigureStore = create<FigureState>()(
       set((s) => {
         if (s.config) {
           s.config.spacing = spacing;
-          s.configDirty = true;
+          s.configDirty = true; s.unsaved = true;
         }
       });
       if (syncTimer) clearTimeout(syncTimer);
@@ -578,7 +595,7 @@ export const useFigureStore = create<FigureState>()(
       set((s) => {
         if (s.config) {
           s.config.background = bg;
-          s.configDirty = true;
+          s.configDirty = true; s.unsaved = true;
         }
       });
       api.patchBackground(bg).catch(console.error);
@@ -622,7 +639,7 @@ export const useFigureStore = create<FigureState>()(
           }
           // Clear processed thumbnail — will show raw until refreshed
           delete s.panelThumbnails[`${row}-${col}`];
-          s.configDirty = true;
+          s.configDirty = true; s.unsaved = true;
         }
       });
       const panel = get().config?.panels[row]?.[col];
@@ -679,7 +696,7 @@ export const useFigureStore = create<FigureState>()(
           include_in_analysis: false,
         });
         delete s.panelThumbnails[`${row}-${col}`];
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       const panel = get().config?.panels[row]?.[col];
       if (panel) {
@@ -712,7 +729,7 @@ export const useFigureStore = create<FigureState>()(
       set((s) => {
         if (s.config && s.config.panels[row] && s.config.panels[row][col]) {
           Object.assign(s.config.panels[row][col], patch);
-          s.configDirty = true;
+          s.configDirty = true; s.unsaved = true;
         }
         if (touchesZoom && s.config) {
           // Snapshot each panel's labels[0].text before the relabel so
@@ -886,7 +903,7 @@ export const useFigureStore = create<FigureState>()(
               lbl.styled_segments = [];
             }
           }
-          s.configDirty = true;
+          s.configDirty = true; s.unsaved = true;
         }
       });
       if (opts?.skipSync) { headerEditsPending = true; return; }  // typing — defer to flushHeaderEdits() on blur
@@ -915,7 +932,7 @@ export const useFigureStore = create<FigureState>()(
               lbl.styled_segments = [];
             }
           }
-          s.configDirty = true;
+          s.configDirty = true; s.unsaved = true;
         }
       });
       if (opts?.skipSync) { headerEditsPending = true; return; }  // typing — defer to flushHeaderEdits() on blur
@@ -938,7 +955,7 @@ export const useFigureStore = create<FigureState>()(
         // Create an empty lane with NO headers — outermost (furthest from panels)
         const newLevel: HeaderLevel = { headers: [] };
         s.config.column_headers.unshift(newLevel);
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       const cfg = get().config;
       if (cfg) {
@@ -951,7 +968,7 @@ export const useFigureStore = create<FigureState>()(
       set((s) => {
         if (!s.config) return;
         s.config.column_headers.splice(levelIdx, 1);
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       const cfg = get().config;
       if (cfg) {
@@ -981,7 +998,7 @@ export const useFigureStore = create<FigureState>()(
               group.styled_segments = [];
             }
           }
-          s.configDirty = true;
+          s.configDirty = true; s.unsaved = true;
         }
       });
       // While the user is actively typing (skipSync) we update the
@@ -1050,7 +1067,7 @@ export const useFigureStore = create<FigureState>()(
         // Create an empty lane with NO headers — outermost (furthest from panels)
         const newLevel: HeaderLevel = { headers: [] };
         s.config.row_headers.unshift(newLevel);
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       const cfg = get().config;
       if (cfg) {
@@ -1063,7 +1080,7 @@ export const useFigureStore = create<FigureState>()(
       set((s) => {
         if (!s.config) return;
         s.config.row_headers.splice(levelIdx, 1);
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       const cfg = get().config;
       if (cfg) {
@@ -1103,7 +1120,7 @@ export const useFigureStore = create<FigureState>()(
             group.columns_or_rows.unshift(prevIdx);
           }
         }
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       const cfg = get().config;
       if (cfg) {
@@ -1124,7 +1141,7 @@ export const useFigureStore = create<FigureState>()(
         if (headers[level].headers.length === 0) {
           headers.splice(level, 1);
         }
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       const cfg = get().config;
       if (cfg) {
@@ -1150,7 +1167,7 @@ export const useFigureStore = create<FigureState>()(
           rotation: group.rotation,
         }));
         headers[level].headers.splice(groupIdx, 1, ...newGroups);
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       const cfg = get().config;
       if (cfg) {
@@ -1173,7 +1190,7 @@ export const useFigureStore = create<FigureState>()(
           ? defaultHeaderGroup([index])
           : { ...defaultHeaderGroup([index]), position: "Left", rotation: 90 };
         headers[level].headers.push(newGroup);
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       const cfg = get().config;
       if (cfg) {
@@ -1205,7 +1222,7 @@ export const useFigureStore = create<FigureState>()(
           const bMin = Math.min(...b.columns_or_rows);
           return aMin - bMin;
         });
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       const cfg = get().config;
       if (cfg) {
@@ -1243,7 +1260,7 @@ export const useFigureStore = create<FigureState>()(
         if (sorted[0] < 0 || sorted[sorted.length - 1] > maxIdx) return;
 
         group.columns_or_rows = sorted;
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       const cfg = get().config;
       if (cfg) {
@@ -1264,7 +1281,7 @@ export const useFigureStore = create<FigureState>()(
         const tmp = h[level1];
         h[level1] = h[level2];
         h[level2] = tmp;
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       const cfg = get().config;
       if (cfg) {
@@ -1281,7 +1298,7 @@ export const useFigureStore = create<FigureState>()(
         const tmp = h[level1];
         h[level1] = h[level2];
         h[level2] = tmp;
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       const cfg = get().config;
       if (cfg) {
@@ -1314,7 +1331,7 @@ export const useFigureStore = create<FigureState>()(
               }
             }
           }
-          s.configDirty = true;
+          s.configDirty = true; s.unsaved = true;
         }
       });
       // Styling change applied via the floating toolbar (colour, font,
@@ -1361,7 +1378,7 @@ export const useFigureStore = create<FigureState>()(
               lbl.font_size = patch.font_size;
             }
           }
-          s.configDirty = true;
+          s.configDirty = true; s.unsaved = true;
         }
       });
       // See updateHeaderGroupFormatting — defer styling pushes to
@@ -1407,7 +1424,7 @@ export const useFigureStore = create<FigureState>()(
         const t2 = s.panelThumbnails[`${r2}-${c2}`];
         if (t1) s.panelThumbnails[`${r2}-${c2}`] = t1; else delete s.panelThumbnails[`${r2}-${c2}`];
         if (t2) s.panelThumbnails[`${r1}-${c1}`] = t2; else delete s.panelThumbnails[`${r1}-${c1}`];
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       const cfg = get().config;
       if (cfg) {
@@ -1439,7 +1456,7 @@ export const useFigureStore = create<FigureState>()(
           s.drawerThumbnails[drawerIdx] = s.panelThumbnails[thumbKey];
         }
         s.config.panels[r][c] = defaultPanel();
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
         delete s.panelThumbnails[thumbKey];
       });
       const cfg = get().config;
@@ -1476,7 +1493,7 @@ export const useFigureStore = create<FigureState>()(
         if (s.drawerThumbnails[drawerIdx]) {
           s.panelThumbnails[thumbKey] = s.drawerThumbnails[drawerIdx];
         }
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       const cfg = get().config;
       if (cfg) {
@@ -1694,10 +1711,37 @@ export const useFigureStore = create<FigureState>()(
         // associate the rendered figure with this on-disk project,
         // and so the collage's Multi-Panel Builder button can offer
         // to reload it.
-        set((s) => { s.currentProjectPath = path; s.configDirty = false; });
+        set((s) => { s.currentProjectPath = path; s.configDirty = false; s.unsaved = false; });
       } catch (err) {
         console.error("Save project failed", err);
       }
+    },
+
+    newBlankFigure: async () => {
+      // Delete all backend images so the fresh figure starts clean.
+      try {
+        const imgs = await api.listImages();
+        for (const n of imgs.names) await api.deleteImage(n).catch(() => {});
+      } catch { /* ignore */ }
+      // Carry the scale-bar (resolution) presets over to the new project.
+      // buildDefaultConfig() starts with an empty resolution_entries; without
+      // this the bundled microscope defaults vanish on every "New". Fall back
+      // to fetching the backend defaults if the current config has none.
+      let resolutions = get().config?.resolution_entries;
+      if (!resolutions || Object.keys(resolutions).length === 0) {
+        try { resolutions = await api.getResolutions(); } catch { /* ignore */ }
+      }
+      set((s) => {
+        s.config = buildDefaultConfig(2, 2);
+        if (s.config && resolutions) s.config.resolution_entries = resolutions;
+        s.loadedImages = {};
+        s.panelThumbnails = {};
+        s.currentProjectPath = null;
+        s.configDirty = false;
+        s.unsaved = false;
+      });
+      try { await get().syncToBackend(); } catch { /* ignore */ }
+      get().requestPreview();
     },
 
     loadProject: async (path) => {
@@ -1715,6 +1759,7 @@ export const useFigureStore = create<FigureState>()(
           }
           s.currentProjectPath = path;
           s.configDirty = false;
+          s.unsaved = false;
         });
         // Push any analysis blob into the bridge store; the dialog
         // observes `hydrate` and rebuilds its tabs/plots from it.
@@ -1753,6 +1798,39 @@ export const useFigureStore = create<FigureState>()(
       }
     },
 
+    restoreDoc: async (blob, opts) => {
+      // Mirrors loadProject but reads from an in-memory snapshot blob
+      // instead of disk, and leaves analysis state untouched (analysis is
+      // a single global, not yet per-document). The restored doc is marked
+      // unsaved because a snapshot is only ever taken for a dirty tab.
+      const resp = await api.restoreProject(blob);
+      set((s) => {
+        s.config = resp.config;
+        s.loadedImages = {};
+        s.panelThumbnails = {};
+        for (const name of resp.image_names) {
+          s.loadedImages[name] = {
+            name,
+            thumbnailB64: resp.thumbnails[name] ?? "",
+          };
+        }
+        s.currentProjectPath = opts.path;
+        s.configDirty = false;
+        s.unsaved = true;
+      });
+      get().requestPreview();
+      // Repopulate per-panel processed thumbnails (crop, levels, etc.) —
+      // same as loadProject, so cropped/processed cells render correctly.
+      const cfg = resp.config;
+      for (let r = 0; r < cfg.rows; r++) {
+        for (let c = 0; c < cfg.cols; c++) {
+          if (cfg.panels[r]?.[c]?.image_name) {
+            get().refreshPanelThumbnail(r, c).catch(console.error);
+          }
+        }
+      }
+    },
+
     saveFigure: async (path, format = "TIFF", background?: string, dpi = 300) => {
       try {
         await get().syncToBackend();
@@ -1786,7 +1864,7 @@ export const useFigureStore = create<FigureState>()(
       set((s) => {
         if (!s.config) return;
         _renumberAllAutoLetters(s.config as unknown as Parameters<typeof _renumberAllAutoLetters>[0]);
-        s.configDirty = true;
+        s.configDirty = true; s.unsaved = true;
       });
       // Push the renumbered cfg so the backend renders match.
       get().syncToBackend().catch(console.error);

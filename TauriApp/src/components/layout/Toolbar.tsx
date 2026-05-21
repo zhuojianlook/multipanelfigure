@@ -35,8 +35,6 @@ import SystemUpdateAltIcon from "@mui/icons-material/SystemUpdateAlt";
 import DownloadIcon from "@mui/icons-material/Download";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import LibraryAddIcon from "@mui/icons-material/LibraryAdd";
-import DashboardIcon from "@mui/icons-material/Dashboard";
-import ViewModuleIcon from "@mui/icons-material/ViewModule";
 import { useCollageStore } from "../../store/collageStore";
 import { api } from "../../api/client";
 import { check } from "@tauri-apps/plugin-updater";
@@ -176,6 +174,7 @@ async function fetchChangelog(): Promise<ChangelogEntry[]> {
 import { useFigureStore } from "../../store/figureStore";
 import { SaveFigureDialog } from "../dialogs/SaveFigureDialog";
 import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
+import { ensureProjectSaved } from "../../utils/projectNav";
 
 /* ── SaveCollageButton ───────────────────────────────────────
    Renders the collage canvas to PNG client-side (compositing
@@ -212,16 +211,85 @@ function SaveCollageButton() {
       });
       return;
     }
-    ctx.fillStyle = background;
-    ctx.fillRect(0, 0, canvasW, canvasH);
+    // A "transparent" background leaves the canvas unfilled so the exported
+    // PNG keeps its alpha channel; any other value fills with that color.
+    if (background !== "transparent") {
+      ctx.fillStyle = background;
+      ctx.fillRect(0, 0, canvasW, canvasH);
+    }
 
     const sorted = [...items].sort((a, b) => a.z - b.z);
+    // Wrap a draw in a rotation transform around the item's centre when the
+    // item has a rotation (matches the on-canvas CSS transform).
+    const withRotation = (it: typeof sorted[number], draw: () => void) => {
+      const rot = it.rotation || 0;
+      if (!rot) { draw(); return; }
+      const cx = it.x + it.w / 2, cy = it.y + it.h / 2;
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate((rot * Math.PI) / 180);
+      ctx.translate(-cx, -cy);
+      draw();
+      ctx.restore();
+    };
     for (const it of sorted) {
+      if (it.kind === "text") {
+        withRotation(it, () => {
+          // Text items have no raster — draw the styled text with word wrap.
+          const fs = it.fontSize ?? 28;
+          const family = it.fontFamily ?? "Arial";
+          const weight = it.fontBold ? "bold" : "normal";
+          const style = it.fontItalic ? "italic" : "normal";
+          ctx.font = `${style} ${weight} ${fs}px ${family}`;
+          ctx.fillStyle = it.fontColor ?? "#000000";
+          ctx.textBaseline = "top";
+          const align = it.align ?? "left";
+          ctx.textAlign = align === "center" ? "center" : align === "right" ? "right" : "left";
+          const xBase = align === "center" ? it.x + it.w / 2 : align === "right" ? it.x + it.w : it.x;
+          const lineHeight = fs * 1.2;
+          let y = it.y;
+          for (const para of (it.text ?? "").split("\n")) {
+            const words = para.split(" ");
+            let line = "";
+            for (const word of words) {
+              const test = line ? line + " " + word : word;
+              if (ctx.measureText(test).width > it.w && line) {
+                ctx.fillText(line, xBase, y);
+                y += lineHeight;
+                line = word;
+              } else {
+                line = test;
+              }
+            }
+            ctx.fillText(line, xBase, y);
+            y += lineHeight;
+          }
+        });
+        continue;
+      }
+      if (it.kind === "line") {
+        withRotation(it, () => {
+          ctx.save();
+          const th = it.lineThickness ?? 3;
+          ctx.strokeStyle = it.lineColor ?? "#000000";
+          ctx.lineWidth = th;
+          if (it.lineStyle === "dashed") ctx.setLineDash([th * 3, th * 2]);
+          else if (it.lineStyle === "dotted") ctx.setLineDash([th, th * 1.5]);
+          else ctx.setLineDash([]);
+          const ly = it.y + it.h / 2;
+          ctx.beginPath();
+          ctx.moveTo(it.x, ly);
+          ctx.lineTo(it.x + it.w, ly);
+          ctx.stroke();
+          ctx.restore();
+        });
+        continue;
+      }
       await new Promise<void>((resolve) => {
         const img = new window.Image();
         img.onload = () => {
           try {
-            ctx.drawImage(img, it.x, it.y, it.w, it.h);
+            withRotation(it, () => ctx.drawImage(img, it.x, it.y, it.w, it.h));
           } catch (err) {
             console.warn("[collage] drawImage failed for", it.name, err);
           }
@@ -278,50 +346,6 @@ function CollageWorkspaceControls() {
   const addItem = useCollageStore((s) => s.addItem);
   const updateItem = useCollageStore((s) => s.updateItem);
   const itemCount = useCollageStore((s) => s.items.length);
-  const selectedId = useCollageStore((s) => s.selectedId);
-  const configDirty = useFigureStore((s) => s.configDirty);
-  const currentProjectPath = useFigureStore((s) => s.currentProjectPath);
-  const saveProject = useFigureStore((s) => s.saveProject);
-  const loadProject = useFigureStore((s) => s.loadProject);
-
-  /** Make sure the current project lives at a known on-disk path before
-   *  we add it to the collage. If the user has never saved (or hit
-   *  "New" since the last save) we open the Tauri save-as dialog and
-   *  require them to commit a destination. Returns the path on
-   *  success, null if the user cancels. */
-  const ensureProjectSaved = async (): Promise<string | null> => {
-    if (currentProjectPath && !configDirty) {
-      return currentProjectPath;
-    }
-    // Either unsaved (no path yet) or modified since last save. Both
-    // get the same prompt — the user picks (or re-confirms) the
-    // destination, we save, and the path becomes the source of truth.
-    let path = currentProjectPath;
-    try {
-      const { save } = await import("@tauri-apps/plugin-dialog");
-      const picked = await save({
-        defaultPath: currentProjectPath || "project.mpf",
-        filters: [{ name: "Project", extensions: ["mpf"] }],
-      });
-      if (!picked) return null;
-      path = typeof picked === "string" ? picked : (picked as { path: string }).path;
-    } catch {
-      // Not in Tauri (browser preview) — fall back to a default path
-      // under ~/Documents so the flow is at least testable.
-      const fallback = window.prompt(
-        "Enter a path for the project (.mpf):",
-        currentProjectPath || "~/Documents/project.mpf",
-      );
-      if (!fallback) return null;
-      path = fallback;
-    }
-    if (!path) return null;
-    await saveProject(path);
-    // saveProject updates currentProjectPath in the store. Re-read it
-    // to get the canonicalised value (the backend may add .mpf).
-    const after = useFigureStore.getState().currentProjectPath || path;
-    return after;
-  };
 
   const handleAddToCollage = async () => {
     let projectPath: string | null;
@@ -343,6 +367,10 @@ function CollageWorkspaceControls() {
     const existing = useCollageStore.getState().items.find((i) => i.projectPath === projectPath);
 
     try {
+      // Capture the figure as a baked raster (headers included), exactly
+      // as the .mpf renders. Header sizing across figures is unified
+      // later via the sidebar "Update headers" button, which re-renders
+      // each figure at the right per-figure override pt.
       const resp = await api.getPreview();
       if (!resp?.image) {
         await alertDialog({
@@ -359,14 +387,11 @@ function CollageWorkspaceControls() {
         const ok = await confirmDialog({
           title: "Already in collage",
           body: `"${existing.name}" (${projectPath}) is already in the collage.\n\n`
-            + "Update it with the latest rendered preview? (Position and size "
+            + "Update it with the latest rendered figure? (Position and size "
             + "stay where you put them.)",
           confirmLabel: "Update",
         });
         if (!ok) return;
-        // Refresh the item in place. Keep x/y/w/h; update the source
-        // image bytes + natural dims so future resizes use the new
-        // aspect ratio if it changed.
         updateItem(existing.id, {
           src: `data:image/png;base64,${resp.image}`,
           naturalW,
@@ -402,62 +427,12 @@ function CollageWorkspaceControls() {
     }
   };
 
-  /** Multi-Panel Builder click in collage mode. If a figure-kind item
-   *  is selected and has a projectPath, ask whether to load that
-   *  .mpf in the builder. Otherwise just toggle the workspace. */
-  const handleBuilderClick = async () => {
-    if (mode !== "collage") {
-      setMode("collage");
-      return;
-    }
-    const selected = useCollageStore.getState().items.find((i) => i.id === selectedId);
-    if (selected && selected.kind === "figure" && selected.projectPath) {
-      const ok = await confirmDialog({
-        title: "Open in builder",
-        body: `Open "${selected.name}" in the Multi-Panel Builder?\n\n`
-          + `This will load ${selected.projectPath} into the builder, replacing `
-          + "your current builder state.",
-        confirmLabel: "Open",
-        destructive: true,
-      });
-      if (!ok) return;
-      try {
-        await loadProject(selected.projectPath);
-      } catch (e) {
-        console.error("[collage] load project failed:", e);
-        await alertDialog({
-          title: "Load failed",
-          body: "Could not load the project file. It may have been moved or "
-            + "deleted. Switching to the builder anyway — use Sidebar → Load "
-            + "Project to pick a new path.",
-        });
-      }
-    }
-    setMode("builder");
-  };
-
   return (
     <>
-      <Tooltip
-        title={
-          mode === "collage"
-            ? selectedId && useCollageStore.getState().items.find((i) => i.id === selectedId)?.kind === "figure" && useCollageStore.getState().items.find((i) => i.id === selectedId)?.projectPath
-              ? "Open this figure's project file in the Multi-Panel Builder"
-              : "Back to Multi-Panel Builder"
-            : "Open Collage Assembly"
-        }
-      >
-        <Button
-          variant={mode === "collage" ? "contained" : "outlined"}
-          color="primary"
-          size="small"
-          startIcon={mode === "collage" ? <ViewModuleIcon /> : <DashboardIcon />}
-          onClick={() => (mode === "collage" ? handleBuilderClick() : setMode("collage"))}
-          sx={{ textTransform: "none" }}
-        >
-          {mode === "collage" ? "Multi-Panel Builder" : "Collage Assembly"}
-        </Button>
-      </Tooltip>
+      {/* The Builder ↔ Collage toggle buttons were removed — navigation
+          now lives in the DocumentTabs strip (Collage tab + one tab per
+          open .mpf). "Add to Collage" stays: it renders the current
+          builder figure into the collage. */}
       {mode === "builder" && (
         <Tooltip title="Render the current figure and add it to the Collage Assembly">
           <Button

@@ -77,15 +77,34 @@ export function CollageStrip() {
               }}
               title={it.name}
             >
-              <Box
-                component="img"
-                src={it.src}
-                alt={it.name}
-                sx={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", pointerEvents: "none" }}
-                draggable={false}
-              />
+              {it.kind === "text" ? (
+                <Typography sx={{
+                  px: 0.5, fontSize: "0.6rem", textAlign: "center", lineHeight: 1.2,
+                  color: it.fontColor && it.fontColor !== "#ffffff" ? it.fontColor : "var(--c-text)",
+                  fontWeight: it.fontBold ? 700 : 400,
+                  fontStyle: it.fontItalic ? "italic" : "normal",
+                  whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "100%",
+                  pointerEvents: "none",
+                }}>
+                  {it.text || "Text"}
+                </Typography>
+              ) : it.kind === "line" ? (
+                <Box sx={{
+                  width: "70%",
+                  borderTop: `${Math.min(6, it.lineThickness ?? 3)}px ${it.lineStyle ?? "solid"} ${it.lineColor && it.lineColor !== "#ffffff" ? it.lineColor : "var(--c-text)"}`,
+                  pointerEvents: "none",
+                }} />
+              ) : (
+                <Box
+                  component="img"
+                  src={it.src}
+                  alt={it.name}
+                  sx={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", pointerEvents: "none" }}
+                  draggable={false}
+                />
+              )}
               <Chip
-                label={it.kind === "figure" ? "Fig" : "Img"}
+                label={it.kind === "figure" ? "Fig" : it.kind === "text" ? "Txt" : it.kind === "line" ? "Ln" : "Img"}
                 size="small"
                 sx={{
                   position: "absolute",
@@ -93,7 +112,7 @@ export function CollageStrip() {
                   left: 2,
                   height: 14,
                   fontSize: "0.55rem",
-                  backgroundColor: it.kind === "figure" ? "rgba(79,195,247,0.85)" : "rgba(0,0,0,0.6)",
+                  backgroundColor: it.kind === "figure" ? "rgba(79,195,247,0.85)" : it.kind === "text" ? "rgba(99,166,106,0.85)" : it.kind === "line" ? "rgba(171,124,224,0.85)" : "rgba(0,0,0,0.6)",
                   color: "#fff",
                   "& .MuiChip-label": { px: 0.5 },
                 }}

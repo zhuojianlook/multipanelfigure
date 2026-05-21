@@ -36,6 +36,9 @@ import {
   Button,
 } from "@mui/material";
 
+/** Result of a (possibly 3-way) dialog. */
+export type DialogResult = "confirm" | "tertiary" | "cancel";
+
 interface ConfirmRequest {
   title: string;
   body: string;
@@ -44,12 +47,15 @@ interface ConfirmRequest {
   /** Label for the cancel button. Set to null to hide cancel
    *  (turns this into a single-OK "alert"). */
   cancelLabel?: string | null;
+  /** Optional middle button (e.g. "Don't save"). When set, a third
+   *  button appears between cancel and confirm; choosing it resolves
+   *  the dialog with "tertiary". */
+  tertiaryLabel?: string;
   /** When true, the confirm button uses color="error" (red).
    *  Use for destructive actions — delete, overwrite, etc. */
   destructive?: boolean;
-  /** Resolver attached by the caller; receives true on confirm,
-   *  false on cancel / dialog close. */
-  resolve: (ok: boolean) => void;
+  /** Resolver attached by the caller; receives the chosen action. */
+  resolve: (result: DialogResult) => void;
 }
 
 // Module-level pub/sub for the singleton host.  We avoid a global
@@ -65,10 +71,13 @@ function dispatch(r: ConfirmRequest) {
   // is a safety net for early-startup edge cases; in normal use
   // the host is mounted before the first confirm() call.
   if (listeners.size === 0) {
-    const ok = r.cancelLabel === null
-      ? (window.alert(r.body), true)
-      : window.confirm(`${r.title}\n\n${r.body}`);
-    r.resolve(!!ok);
+    if (r.cancelLabel === null) {
+      window.alert(r.body);
+      r.resolve("confirm");
+    } else {
+      const ok = window.confirm(`${r.title}\n\n${r.body}`);
+      r.resolve(ok ? "confirm" : "cancel");
+    }
     return;
   }
   listeners.forEach((fn) => fn(r));
@@ -77,9 +86,19 @@ function dispatch(r: ConfirmRequest) {
 /** Imperative confirm — returns a promise that resolves to true on
  *  the affirmative button, false on cancel / Esc / backdrop click. */
 export function confirm(
-  opts: Omit<ConfirmRequest, "resolve">,
+  opts: Omit<ConfirmRequest, "resolve" | "tertiaryLabel">,
 ): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
+    dispatch({ ...opts, resolve: (r) => resolve(r === "confirm") });
+  });
+}
+
+/** Imperative 3-way confirm — returns the chosen action. Use for
+ *  Save / Don't save / Cancel style prompts. */
+export function confirmThree(
+  opts: Omit<ConfirmRequest, "resolve">,
+): Promise<DialogResult> {
+  return new Promise<DialogResult>((resolve) => {
     dispatch({ ...opts, resolve });
   });
 }
@@ -88,7 +107,7 @@ export function confirm(
  *  resolves to true when dismissed.  Use for info-only messages
  *  that just need acknowledgement (no choice). */
 export function alert(
-  opts: Omit<ConfirmRequest, "resolve" | "cancelLabel" | "destructive">,
+  opts: Omit<ConfirmRequest, "resolve" | "cancelLabel" | "destructive" | "tertiaryLabel">,
 ): Promise<true> {
   return new Promise<true>((resolve) => {
     dispatch({
@@ -118,7 +137,7 @@ export function ConfirmHost() {
   const current = queue[0];
   if (!current) return null;
 
-  const close = (result: boolean) => {
+  const close = (result: DialogResult) => {
     current.resolve(result);
     setQueue((q) => q.slice(1));
   };
@@ -129,7 +148,7 @@ export function ConfirmHost() {
   return (
     <Dialog
       open
-      onClose={() => close(false)}
+      onClose={() => close("cancel")}
       // Same defaults as the "New Figure" warning — small size,
       // not full-screen, click-outside cancels.
       maxWidth="xs"
@@ -141,13 +160,16 @@ export function ConfirmHost() {
       </DialogContent>
       <DialogActions>
         {cancelLabel !== null && (
-          <Button onClick={() => close(false)}>{cancelLabel}</Button>
+          <Button onClick={() => close("cancel")}>{cancelLabel}</Button>
+        )}
+        {current.tertiaryLabel && (
+          <Button onClick={() => close("tertiary")}>{current.tertiaryLabel}</Button>
         )}
         <Button
           variant="contained"
           color={current.destructive ? "error" : "primary"}
           autoFocus
-          onClick={() => close(true)}
+          onClick={() => close("confirm")}
         >
           {confirmLabel}
         </Button>

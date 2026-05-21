@@ -889,6 +889,7 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
     b64: string;
     plotType: string;
     statTest: string;
+    code: string;
     mainName?: string;
     collageId?: string;
     tables?: AnalysisTable[];
@@ -902,6 +903,7 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
       b64: p.b64,
       plotType: t.plotType,
       statTest: t.statTest,
+      code: t.code,
       mainName: p.mainName,
       collageId: p.collageId,
       tables: p.tables,
@@ -1752,6 +1754,13 @@ ggplot(data, aes(x = ${stringCol}, y = ${yCol})) +
         h: Math.round(h * scale),
         naturalW: w,
         naturalH: h,
+        // Provenance so the collage can re-render this R plot at a new
+        // font size via "Synchronize headers". Data CSV is frozen at
+        // add-time so later measurement edits don't change this plot.
+        rCode: p.code,
+        rDataCsv: buildCsv(),
+        rInterpreter: customRPath || null,
+        rPlotIndex: p.idx,
       });
       patchPlot(p.tabId, p.plotId, { collageId: newId });
       placed++;

@@ -253,6 +253,26 @@ class ApiClient {
     return apiJson<ProjectLoadResponse>("/api/project/load", "POST", JSON.stringify({ path }));
   }
 
+  // ── In-session document snapshots (for seamless tab switching) ──
+  // snapshotProject serializes the CURRENT backend builder state to a
+  // base64 .mpf blob without writing to disk; restoreProject loads such a
+  // blob back into the global state. Used by projectNav to preserve a
+  // tab's unsaved edits when the user switches to another document tab.
+
+  async snapshotProject(): Promise<{ blob: string }> {
+    return apiJson<{ blob: string }>("/api/project/snapshot", "GET");
+  }
+
+  async restoreProject(
+    blob: string,
+  ): Promise<Omit<ProjectLoadResponse, "analysis">> {
+    return apiJson<Omit<ProjectLoadResponse, "analysis">>(
+      "/api/project/restore",
+      "POST",
+      JSON.stringify({ blob }),
+    );
+  }
+
   // ── Save final figure ──────────────────────────────────
 
   async saveFigure(
@@ -379,12 +399,48 @@ class ApiClient {
     headerPt: number | null,
     scale: number,
     itemW?: number,
+    elementIds?: string[] | null,
+    elementOverrides?: Record<string, unknown> | null,
   ): Promise<{ image: string; width: number; height: number }> {
     return apiJson("/api/collage/render-figure", "POST", JSON.stringify({
       project_path: projectPath,
       header_pt: headerPt,
       scale,
       item_w: itemW ?? null,
+      element_ids: elementIds && elementIds.length ? elementIds : null,
+      element_overrides: elementOverrides && Object.keys(elementOverrides).length ? elementOverrides : null,
+    }));
+  }
+
+  /** List the editable text elements of a saved .mpf (column/row headers,
+   *  axis labels, panel labels, scale bars) so the collage UI can offer
+   *  per-element font synchronization + customization. Includes each
+   *  element's geometry (for on-figure hotspots) and current style. */
+  async getFigureElements(
+    projectPath: string,
+  ): Promise<{ elements: Array<import("../store/collageStore").CollageFigElement & {
+    font_name?: string | null; color?: string | null;
+    font_style?: string[]; styled_segments?: import("./types").StyledSegment[];
+  }> }> {
+    return apiJson("/api/collage/figure-elements", "POST", JSON.stringify({
+      project_path: projectPath,
+    }));
+  }
+
+  /** Decompose an .mpf into a header-LESS body raster + header geometry
+   *  for live overlay rendering. Headers come back in figure fractions
+   *  (0..1, y from bottom). Lets the collage place + restyle headers
+   *  instantly without re-rendering the figure through matplotlib. */
+  async decomposeCollageFigure(
+    projectPath: string,
+  ): Promise<{
+    image: string;
+    width: number;
+    height: number;
+    headers: import("../store/collageStore").CollageHeader[];
+  }> {
+    return apiJson("/api/collage/decompose", "POST", JSON.stringify({
+      project_path: projectPath,
     }));
   }
 
@@ -405,6 +461,7 @@ class ApiClient {
     code: string,
     dataCsv: string,
     rscriptPath?: string,
+    baseFontSize?: number | null,
   ): Promise<{
     success: boolean;
     stdout: string;
@@ -414,7 +471,10 @@ class ApiClient {
      *  Empty array when the script didn't call mpfig_data. */
     tables: { name: string; csv: string }[];
   }> {
-    return apiJson("/api/analysis/run-r", "POST", JSON.stringify({ code, data_csv: dataCsv, rscript_path: rscriptPath || null }));
+    return apiJson("/api/analysis/run-r", "POST", JSON.stringify({
+      code, data_csv: dataCsv, rscript_path: rscriptPath || null,
+      base_font_size: baseFontSize && baseFontSize > 0 ? Math.round(baseFontSize) : null,
+    }));
   }
 
   /** Run a raw R command (no data/plot boilerplate) — for the Analysis
@@ -445,6 +505,14 @@ class ApiClient {
     }>;
   }> {
     return apiJson("/api/analysis/inset-sources");
+  }
+
+  /** Like listInsetAnalysisSources but for a SPECIFIC .mpf (not the active
+   *  figure) — lets the Analysis tab show a sources drawer per loaded MPF. */
+  async listInsetAnalysisSourcesFor(projectPath: string): Promise<{
+    sources: Array<Record<string, unknown>>;
+  }> {
+    return apiJson("/api/analysis/inset-sources-for", "POST", JSON.stringify({ project_path: projectPath }));
   }
 
   /** Detect whether a MATLAB-compatible interpreter (Octave or MATLAB)
