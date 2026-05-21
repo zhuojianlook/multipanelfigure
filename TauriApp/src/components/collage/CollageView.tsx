@@ -334,29 +334,33 @@ export function CollageView() {
   // when the item is selected), so the dropdown shows the real text.
   const [rLabelsByItem, setRLabelsByItem] = useState<Record<string, Partial<Record<RTextSlot, string>>>>({});
 
-  // Re-render an R-plot item, applying its stored per-element text overrides
-  // (and the current synchronized base size, if any) by re-running its R code.
+  // Re-render an R-plot item at its current DISPLAY size so it stays crisp
+  // when enlarged. R plots are raster (ggplot → PNG, not SVG), so we re-run
+  // the plot at higher pixel resolution — width/height AND res scaled together
+  // (`overrideRes`) keeps the plot's proportions identical, just sharper.
+  // Uses last_plot() (render_override), applying any per-element text overrides.
   const rerenderRPlot = async (itemId: string) => {
     const it = useCollageStore.getState().items.find((i) => i.id === itemId);
     if (!it || !it.rCode) return;
     const ov = it.rTextOverrides || {};
-    const hasOv = Object.keys(ov).length > 0;
     const pt = useCollageStore.getState().globalHeaderPt;
     const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
     const baseFs = pt ? Math.max(1, Math.round(pt / Math.max(0.001, scale))) : null;
+    // Render at ≥ the display width (never below natural) so it's pixel-crisp.
+    const nW = it.naturalW || 640;
+    const nH = it.naturalH || 480;
+    const k = Math.min(8, Math.max(1, it.w / Math.max(1, nW)));
     setRBusyItem(itemId);
     try {
-      // With overrides: render only the override-applied plot. Without any
-      // overrides (e.g. after Clear): re-run normally and pick the original
-      // plot index so the plot reverts to its un-edited form.
-      const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, baseFs,
-        hasOv ? {
-          textOverrides: ov as Record<string, unknown>,
-          overrideOnly: true,
-          overrideWidth: it.naturalW || 800,
-          overrideHeight: it.naturalH || 600,
-        } : undefined);
-      const png = hasOv ? res.plots?.[0] : (res.plots?.[it.rPlotIndex ?? 0] ?? res.plots?.[0]);
+      const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, baseFs, {
+        textOverrides: ov as Record<string, unknown>,
+        renderOverride: true,
+        overrideOnly: true,
+        overrideWidth: Math.round(nW * k),
+        overrideHeight: Math.round(nH * k),
+        overrideRes: Math.round(150 * k),
+      });
+      const png = res.plots?.[0];
       if (res.success && png) {
         const dataUrl = `data:image/png;base64,${png}`;
         const dims = await new Promise<{ w: number; h: number }>((resolve) => {
@@ -794,9 +798,12 @@ export function CollageView() {
             window.removeEventListener("mouseup", onUp);
             // Decomposed figures need NO re-render on resize — the body
             // raster just scales and the header overlays re-typeset from
-            // it.w/it.h automatically. (Legacy non-decomposed figure
-            // items, which bake headers into the raster, are left as-is;
-            // they simply don't auto-unify until re-added.)
+            // it.w/it.h automatically. R plots ARE raster (PNG, not SVG),
+            // so re-render them at the new size to stay crisp when enlarged.
+            const cur = useCollageStore.getState().items.find((i) => i.id === it.id);
+            if (cur && cur.kind === "image" && cur.rCode && cur.w > (cur.naturalW || 0) * 1.05) {
+              void rerenderRPlot(cur.id);
+            }
           };
           window.addEventListener("mousemove", onMove);
           window.addEventListener("mouseup", onUp);
@@ -877,6 +884,47 @@ export function CollageView() {
         />
       </Box>
     );
+  };
+
+  // Line items resize by LENGTH only — a round handle at each end (the line's
+  // vertical centre). The west handle keeps the east end anchored and vice
+  // versa; height/aspect never change. Angle is set via the rotation handle.
+  const renderLineHandles = (it: { id: string; x: number; w: number }) => {
+    const handle = (side: "w" | "e") => (
+      <Box
+        key={side}
+        onMouseDown={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const startX = e.clientX;
+          const startW = it.w;
+          const anchorRight = it.x + it.w;
+          const onMove = (ev: MouseEvent) => {
+            const dx = (ev.clientX - startX) / displayScale;
+            if (side === "e") {
+              updateItem(it.id, { w: Math.max(8, snap(startW + dx)) });
+            } else {
+              const newW = Math.max(8, snap(startW - dx));
+              updateItem(it.id, { x: anchorRight - newW, w: newW });
+            }
+          };
+          const onUp = () => {
+            window.removeEventListener("mousemove", onMove);
+            window.removeEventListener("mouseup", onUp);
+          };
+          window.addEventListener("mousemove", onMove);
+          window.addEventListener("mouseup", onUp);
+        }}
+        sx={{
+          position: "absolute", top: "50%", transform: "translateY(-50%)",
+          width: 12, height: 12, borderRadius: "50%",
+          backgroundColor: "#4FC3F7", border: "1px solid #fff",
+          cursor: "ew-resize", zIndex: 4,
+          ...(side === "w" ? { left: -6 } : { right: -6 }),
+        }}
+      />
+    );
+    return <>{handle("w")}{handle("e")}</>;
   };
 
   // Crop overlay (item-local coords): dark mask + draggable/resizable crop
@@ -1671,11 +1719,12 @@ export function CollageView() {
                     />
                   )}
                   {/* Resize handles only when exactly one item is selected and
-                      not mid-crop (group resize isn't supported — only move). */}
+                      not mid-crop (group resize isn't supported — only move).
+                      Lines get length-only side handles (no aspect box). */}
                   {isSelected && selectedIds.length === 1 && cropItemId !== it.id && (
-                    <>
-                      {(["nw", "ne", "sw", "se"] as const).map((c) => renderResizeHandle(it, c))}
-                    </>
+                    it.kind === "line"
+                      ? renderLineHandles(it)
+                      : <>{(["nw", "ne", "sw", "se"] as const).map((c) => renderResizeHandle(it, c))}</>
                   )}
                   {/* On-canvas rotation handle for text + line items. */}
                   {isSelected && selectedIds.length === 1 && cropItemId !== it.id

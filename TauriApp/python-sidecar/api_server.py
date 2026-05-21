@@ -5056,6 +5056,11 @@ class RAnalysisRequest(BaseModel):
     # mpfig_plot's default so point sizes map consistently.
     override_width: int = 800
     override_height: int = 600
+    # PNG device res (dpi) for the override re-render. Scaling width/height AND
+    # res together scales the whole plot uniformly (text + geometry), so the
+    # collage can render an R plot at higher resolution without changing its
+    # proportions — used for crisp enlargement + export.
+    override_res: int = 150
     # When True, also extract the current ggplot text labels (title/subtitle/
     # x/y/caption + legend title from the mapped aesthetic) from last_plot()
     # and return them under "labels" — so the collage can show the ACTUAL
@@ -5140,7 +5145,7 @@ def _r_face(o: dict) -> str:
     return "plain"
 
 
-def _r_text_override_block(ov: dict, width: int, height: int, force: bool = False) -> str:
+def _r_text_override_block(ov: dict, width: int, height: int, force: bool = False, res: int = 150) -> str:
     """Build an R snippet that takes ggplot2::last_plot(), applies per-slot
     text/size/color/face overrides via labs()+theme(), and writes it to
     zz_mpfig_override.png. When `force` is set, the plot is re-rendered at the
@@ -5227,7 +5232,7 @@ def _r_text_override_block(ov: dict, width: int, height: int, force: bool = Fals
         "    .mpfig_p <- tryCatch(ggplot2::last_plot(), error=function(e) NULL)\n"
         '    if (!is.null(.mpfig_p) && inherits(.mpfig_p, "ggplot")) {\n'
         f"{apply_line}"
-        f'      png(file.path(.plot_dir, "zz_mpfig_override.png"), width={int(width)}, height={int(height)}, res=150)\n'
+        f'      png(file.path(.plot_dir, "zz_mpfig_override.png"), width={int(width)}, height={int(height)}, res={max(72, int(res))})\n'
         "      print(.mpfig_p)\n"
         "      while (dev.cur() > 1) dev.off()\n"
         "    }\n"
@@ -5320,7 +5325,7 @@ def run_r_code(body: RAnalysisRequest):
         if body.text_overrides or body.render_override:
             script += _r_text_override_block(
                 body.text_overrides or {}, body.override_width, body.override_height,
-                force=bool(body.render_override),
+                force=bool(body.render_override), res=body.override_res,
             )
         if body.emit_labels:
             script += (

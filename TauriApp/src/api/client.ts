@@ -490,6 +490,9 @@ class ApiClient {
       /** Pixel size for the override plot (match the collage item). */
       overrideWidth?: number;
       overrideHeight?: number;
+      /** PNG device res for the override plot; scale together with width/height
+       *  to enlarge the whole plot uniformly (crisp, same proportions). */
+      overrideRes?: number;
       /** Force the last_plot() re-render even without text overrides (used to
        *  re-render an R plot at a higher resolution for high-DPI export). */
       renderOverride?: boolean;
@@ -516,6 +519,7 @@ class ApiClient {
       override_only: !!opts?.overrideOnly,
       override_width: opts?.overrideWidth && opts.overrideWidth > 0 ? Math.round(opts.overrideWidth) : 800,
       override_height: opts?.overrideHeight && opts.overrideHeight > 0 ? Math.round(opts.overrideHeight) : 600,
+      override_res: opts?.overrideRes && opts.overrideRes > 0 ? Math.round(opts.overrideRes) : 150,
       render_override: !!opts?.renderOverride,
       emit_labels: !!opts?.emitLabels,
     }));

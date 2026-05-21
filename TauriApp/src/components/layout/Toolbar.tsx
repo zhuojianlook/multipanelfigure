@@ -254,6 +254,7 @@ function SaveCollageButton() {
   const exportFormat = useCollageStore((s) => s.exportFormat);
   const setExportFormat = useCollageStore((s) => s.setExportFormat);
   const [exporting, setExporting] = useState(false);
+  const [modalOpen, setModalOpen] = useState(false);
 
   const handleSave = async () => {
     if (items.length === 0) {
@@ -263,6 +264,25 @@ function SaveCollageButton() {
       });
       return;
     }
+    const fmt = (exportFormat || "png").toLowerCase();
+    const dlgExt = fmt === "jpeg" ? "jpg" : fmt;
+    // Ask WHERE to save first, so the native dialog appears immediately — the
+    // high-DPI render below can take several seconds and we don't want the user
+    // to think nothing happened.
+    let savePath: string | null = null;
+    let inTauri = false;
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      savePath = await save({
+        defaultPath: `collage.${dlgExt}`,
+        filters: [{ name: dlgExt.toUpperCase(), extensions: [dlgExt] }],
+      });
+      inTauri = true;
+      if (savePath === null) return; // user cancelled the dialog
+    } catch {
+      inTauri = false; // not running in Tauri — fall back to a browser download
+    }
+
     // Output scale: the canvas is a 300-DPI page, so factor = DPI/300.
     const factor = Math.max(0.25, Math.min(4, exportDpi / 300));
     setExporting(true);
@@ -283,8 +303,12 @@ function SaveCollageButton() {
           const sel = useCollageStore.getState().elemSelByItem[it.id];
           const elementIds = sel ? Object.keys(sel).filter((k) => sel[k]) : null;
           const overrides = useCollageStore.getState().elemOverridesByItem[it.id] || null;
-          // DPI that makes the figure raster ≈ its export footprint (it.w×factor px).
-          const dpi = Math.max(150, Math.min(1200, Math.round(150 * (it.w * factor) / Math.max(1, it.naturalW))));
+          // Supersample (2×) the figure render so raster text is as crisp as
+          // the vector elements: target 2× the export footprint (it.w×factor),
+          // then drawImage downsamples it. (Without this, figures render near
+          // ~150 dpi while the page is 300 dpi, so MPF text looked soft.)
+          const SS = 2;
+          const dpi = Math.max(200, Math.min(1200, Math.round(150 * (it.w * factor * SS) / Math.max(1, it.naturalW))));
           const resp = await api.renderCollageFigure(
             it.projectPath, pt ?? null, Math.max(0.001, scale), it.w, elementIds,
             overrides as Record<string, unknown> | null, dpi,
@@ -299,12 +323,17 @@ function SaveCollageButton() {
           const pt = useCollageStore.getState().globalHeaderPt;
           const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
           const baseFs = pt ? Math.max(1, Math.round(pt / Math.max(0.001, scale))) : null;
+          // R is raster — render at 2× the export footprint with res scaled in
+          // lock-step (uniform supersample), then drawImage downsamples → crisp.
+          const nW = it.naturalW || 640, nH = it.naturalH || 480;
+          const k = Math.min(12, Math.max(1, (it.w * factor * 2) / nW));
           const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, baseFs, {
             textOverrides: ov as Record<string, unknown>,
             renderOverride: true,
             overrideOnly: true,
-            overrideWidth: Math.round((it.naturalW || 640) * factor),
-            overrideHeight: Math.round((it.naturalH || 480) * factor),
+            overrideWidth: Math.round(nW * k),
+            overrideHeight: Math.round(nH * k),
+            overrideRes: Math.round(150 * k),
           });
           const png = res.plots?.[0];
           if (res.success && png) hiRes.set(it.id, `data:image/png;base64,${png}`);
@@ -330,6 +359,9 @@ function SaveCollageButton() {
       return;
     }
     ctx.scale(factor, factor);
+    // High-quality downsampling for the supersampled figure/R rasters.
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
     // A "transparent" background leaves the canvas unfilled so the exported
     // PNG keeps its alpha channel; any other value fills with that color.
     if (background !== "transparent") {
@@ -516,7 +548,6 @@ function SaveCollageButton() {
 
     // Compose to a DPI-tagged PNG. For non-PNG formats, hand that PNG to the
     // backend to convert (JPEG/TIFF/PDF) with the DPI embedded.
-    const fmt = (exportFormat || "png").toLowerCase();
     const pngDataUrl = pngWithDpi(canvas.toDataURL("image/png"), exportDpi);
     let b64 = pngDataUrl.split(",")[1] ?? "";
     let ext = "png";
@@ -536,21 +567,18 @@ function SaveCollageButton() {
       }
     }
 
-    // Try Tauri save flow first.
-    try {
-      const { save } = await import("@tauri-apps/plugin-dialog");
-      const { invoke } = await import("@tauri-apps/api/core");
-      const path = await save({
-        defaultPath: `collage.${ext}`,
-        filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
-      });
-      if (!path) return;
-      await invoke("save_base64_to_path", { path, dataB64: b64 });
-      await alertDialog({ title: "Collage saved", body: `Collage saved to ${path}\n${Math.round(canvasW * factor)}×${Math.round(canvasH * factor)} px @ ${exportDpi} DPI` });
+    if (inTauri && savePath) {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("save_base64_to_path", { path: savePath, dataB64: b64 });
+        await alertDialog({ title: "Collage saved", body: `Collage saved to ${savePath}\n${Math.round(canvasW * factor)}×${Math.round(canvasH * factor)} px @ ${exportDpi} DPI` });
+      } catch (e) {
+        console.error("[collage] save failed", e);
+        await alertDialog({ title: "Save failed", body: `Could not write the file. ${e instanceof Error ? e.message : String(e)}` });
+      }
       return;
-    } catch {
-      /* Not running inside Tauri — fall back to browser download. */
     }
+    // Browser preview — download.
     const a = document.createElement("a");
     a.href = `data:${mime};base64,${b64}`;
     a.download = `collage.${ext}`;
@@ -560,50 +588,59 @@ function SaveCollageButton() {
     }
   };
 
+  const selectSx = {
+    fontSize: "0.8rem", height: 34, borderRadius: 1, px: 0.75, width: "100%",
+    bgcolor: "var(--c-surface)", color: "var(--c-text)",
+    border: "1px solid var(--c-border)", cursor: "pointer",
+  } as const;
+
   return (
-    <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-      <Tooltip title="Output file format. PNG keeps transparency; JPEG/PDF flatten onto the background. All embed the chosen DPI.">
-        <Box
-          component="select"
-          value={exportFormat}
-          onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setExportFormat(e.target.value)}
-          sx={{
-            fontSize: "0.7rem", height: 30, borderRadius: 1, px: 0.5,
-            bgcolor: "var(--c-surface)", color: "var(--c-text)",
-            border: "1px solid var(--c-border)", cursor: "pointer",
-          }}
-        >
-          {[["png", "PNG"], ["jpeg", "JPEG"], ["tiff", "TIFF"], ["pdf", "PDF"]].map(([v, l]) => (
-            <option key={v} value={v}>{l}</option>
-          ))}
-        </Box>
-      </Tooltip>
-      <Tooltip title="Export resolution. The canvas is sized at 300 DPI; higher DPI re-renders figures + R plots at more pixels and embeds the DPI so it imports at the right physical size.">
-        <Box
-          component="select"
-          value={String(exportDpi)}
-          onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setExportDpi(Number(e.target.value))}
-          sx={{
-            fontSize: "0.7rem", height: 30, borderRadius: 1, px: 0.5,
-            bgcolor: "var(--c-surface)", color: "var(--c-text)",
-            border: "1px solid var(--c-border)", cursor: "pointer",
-          }}
-        >
-          {[150, 300, 600, 1200].map((d) => (
-            <option key={d} value={d}>{d} DPI</option>
-          ))}
-        </Box>
-      </Tooltip>
+    <>
       <Button
         variant="contained"
         color="secondary"
         startIcon={<SaveIcon />}
-        onClick={handleSave}
+        onClick={() => setModalOpen(true)}
         disabled={exporting}
       >
         {exporting ? "Saving…" : "Save Collage"}
       </Button>
-    </Box>
+
+      <Dialog open={modalOpen} onClose={() => !exporting && setModalOpen(false)} maxWidth="xs" fullWidth>
+        <DialogTitle sx={{ pb: 1 }}>Save Collage</DialogTitle>
+        <DialogContent sx={{ display: "flex", flexDirection: "column", gap: 2, pt: 1 }}>
+          <Box>
+            <Typography variant="caption" sx={{ color: "text.secondary", mb: 0.5, display: "block" }}>Output format</Typography>
+            <Box component="select" value={exportFormat}
+              onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setExportFormat(e.target.value)} sx={selectSx}>
+              {[["png", "PNG (lossless, supports transparency)"], ["jpeg", "JPEG (smaller, flattened)"], ["tiff", "TIFF (lossless, journals)"], ["pdf", "PDF (raster page)"]].map(([v, l]) => (
+                <option key={v} value={v}>{l}</option>
+              ))}
+            </Box>
+          </Box>
+          <Box>
+            <Typography variant="caption" sx={{ color: "text.secondary", mb: 0.5, display: "block" }}>Resolution</Typography>
+            <Box component="select" value={String(exportDpi)}
+              onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setExportDpi(Number(e.target.value))} sx={selectSx}>
+              {[[150, "150 DPI (draft)"], [300, "300 DPI (standard)"], [600, "600 DPI (high)"], [1200, "1200 DPI (max)"]].map(([d, l]) => (
+                <option key={d} value={d}>{l}</option>
+              ))}
+            </Box>
+          </Box>
+          <Typography variant="caption" sx={{ color: "text.secondary", lineHeight: 1.4 }}>
+            Output: {Math.round(canvasW * Math.max(0.25, Math.min(4, exportDpi / 300)))}×{Math.round(canvasH * Math.max(0.25, Math.min(4, exportDpi / 300)))} px.
+            Figures and R plots are re-rendered at this resolution; higher DPI takes longer.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setModalOpen(false)} disabled={exporting}>Cancel</Button>
+          <Button variant="contained" color="secondary" startIcon={<SaveIcon />} disabled={exporting}
+            onClick={async () => { setModalOpen(false); await handleSave(); }}>
+            {exporting ? "Saving…" : "Choose file & save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </>
   );
 }
 
