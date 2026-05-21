@@ -21,6 +21,26 @@ export type RTextSlot =
   | "title" | "subtitle" | "xaxis" | "yaxis" | "caption"
   | "legend_title" | "xticks" | "yticks" | "legend_text";
 
+/** The editable text slots of an R/ggplot figure, in display order. Shared by
+ *  the canvas "Edit text" dropdown and the Synchronize panel's nested tree. */
+export const R_TEXT_SLOTS: { slot: RTextSlot; label: string }[] = [
+  { slot: "title", label: "Title" },
+  { slot: "subtitle", label: "Subtitle" },
+  { slot: "xaxis", label: "X axis title" },
+  { slot: "yaxis", label: "Y axis title" },
+  { slot: "xticks", label: "X tick labels" },
+  { slot: "yticks", label: "Y tick labels" },
+  { slot: "legend_title", label: "Legend title" },
+  { slot: "legend_text", label: "Legend labels" },
+  { slot: "caption", label: "Caption" },
+];
+
+/** Slots whose TEXT can be renamed (ggplot labs()). The rest (tick labels,
+ *  legend labels) are data-driven — only size/colour/font apply. */
+export const R_TEXT_BEARING: Set<RTextSlot> = new Set<RTextSlot>([
+  "title", "subtitle", "xaxis", "yaxis", "caption", "legend_title",
+]);
+
 /** A single R text-element override (text content + style). All fields
  *  optional — only set ones are applied. Sizes are in points. */
 export type RTextOverride = {

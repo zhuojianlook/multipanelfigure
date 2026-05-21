@@ -43,6 +43,8 @@ import {
   DEFAULT_CANVAS_H,
   PT_TO_PX,
   DEFAULT_TEXT_PT,
+  R_TEXT_SLOTS,
+  R_TEXT_BEARING,
 } from "../../store/collageStore";
 import type { CollageItem, RTextSlot, RTextOverride } from "../../store/collageStore";
 import { useFigureStore } from "../../store/figureStore";
@@ -50,6 +52,7 @@ import { CollageStrip } from "./CollageStrip";
 import { RichTextEditor } from "../dialogs/RichTextEditor";
 import type { StyledSegment } from "../../api/types";
 import { api } from "../../api/client";
+import { sortFontList, pickDefaultFont } from "../../utils/fontList";
 import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 
 type Corner = "nw" | "ne" | "sw" | "se";
@@ -170,44 +173,24 @@ const CANVAS_PRESET_GROUPS: PresetGroup[] = [
   },
 ];
 
-/** Editable text slots of an R/ggplot figure. ggplot exposes no element
- *  geometry, so rather than guess on-plot positions we present these as a
- *  dropdown list (the "exact text pieces") the user can pick from. */
-const R_TEXT_SLOTS: { slot: RTextSlot; label: string }[] = [
-  { slot: "title", label: "Title" },
-  { slot: "subtitle", label: "Subtitle" },
-  { slot: "xaxis", label: "X axis title" },
-  { slot: "yaxis", label: "Y axis title" },
-  { slot: "xticks", label: "X tick labels" },
-  { slot: "yticks", label: "Y tick labels" },
-  { slot: "legend_title", label: "Legend title" },
-  { slot: "legend_text", label: "Legend labels" },
-  { slot: "caption", label: "Caption" },
-];
-
 /** Font families offered for R text. Generic R families ("sans"/"serif"/
  *  "mono") render on every device; the named ones work where the graphics
  *  device resolves them (e.g. macOS quartz). "" = keep the plot's default. */
 const R_FONT_FAMILIES: { value: string; label: string }[] = [
-  { value: "", label: "Default" },
+  { value: "Arial", label: "Arial" },
+  { value: "Courier", label: "Courier" },
+  { value: "Georgia", label: "Georgia" },
+  { value: "Helvetica", label: "Helvetica" },
+  { value: "mono", label: "Mono (Courier)" },
+  { value: "Palatino", label: "Palatino" },
   { value: "sans", label: "Sans (Helvetica/Arial)" },
   { value: "serif", label: "Serif (Times)" },
-  { value: "mono", label: "Mono (Courier)" },
-  { value: "Arial", label: "Arial" },
-  { value: "Helvetica", label: "Helvetica" },
   { value: "Times New Roman", label: "Times New Roman" },
-  { value: "Georgia", label: "Georgia" },
-  { value: "Courier", label: "Courier" },
   { value: "Verdana", label: "Verdana" },
-  { value: "Palatino", label: "Palatino" },
+  { value: "", label: "Default (keep plot font)" },
 ];
-
-/** Slots whose TEXT can be renamed (ggplot labs()). The rest (tick labels,
- *  legend labels) are data-driven — only their size/colour can change, so the
- *  editor hides the text field for them (renaming them does nothing). */
-const R_TEXT_BEARING = new Set<RTextSlot>([
-  "title", "subtitle", "xaxis", "yaxis", "caption", "legend_title",
-]);
+/** Default R font when a slot has none set yet. */
+const R_DEFAULT_FONT = "Arial";
 
 /** Map ggplot's label keys (from last_plot()$labels) to our slot ids so the
  *  dropdown can show each element's ACTUAL current text. The legend title is
@@ -407,6 +390,7 @@ export function CollageView() {
     const actual = rLabelsByItem[it.id]?.[slot];
     const value: RTextOverride = { ...cur };
     if (textBearing && value.text === undefined && actual !== undefined) value.text = actual;
+    if (value.font === undefined) value.font = R_DEFAULT_FONT;
     setRTextEditor({ itemId: it.id, slot, label, anchorEl, value, textBearing });
   };
 
@@ -500,7 +484,7 @@ export function CollageView() {
       y: Math.round(canvasH / 2 - 30),
       w: 320, h: 90, naturalW: 320, naturalH: 90,
       fontSize: DEFAULT_TEXT_PT, fontSizeUnit: "pt",
-      fontColor: "#000000", fontFamily: (fonts[0] ?? "arial.ttf"),
+      fontColor: "#000000", fontFamily: pickDefaultFont(fonts),
       fontBold: false, fontItalic: false, align: "left",
     });
     setSelectedId(id);
@@ -1165,11 +1149,11 @@ export function CollageView() {
                     sx={{ p: 0.5, border: "1px solid var(--c-border)", fontStyle: "italic", fontSize: "0.75rem", lineHeight: 1, minWidth: 26 }}>i</ToggleButton>
                   <ToggleButton value="underline" selected={!!t.fontUnderline} size="small" onChange={() => updateItem(t.id, { fontUnderline: !t.fontUnderline })}
                     sx={{ p: 0.5, border: "1px solid var(--c-border)", textDecoration: "underline", fontSize: "0.75rem", lineHeight: 1, minWidth: 26 }}>U</ToggleButton>
-                  <Box component="select" value={t.fontFamily ?? "arial.ttf"}
+                  <Box component="select" value={t.fontFamily ?? pickDefaultFont(fonts)}
                     onChange={(e: React.ChangeEvent<HTMLSelectElement>) => updateItem(t.id, { fontFamily: e.target.value })}
                     title="Font family"
                     sx={{ fontSize: "0.7rem", height: 26, maxWidth: 150, bgcolor: "var(--c-surface)", color: "var(--c-text)", border: "1px solid var(--c-border)", borderRadius: 1, px: 0.5 }}>
-                    {(fonts.length > 0 ? fonts : ["arial.ttf"]).map((f) => (
+                    {(fonts.length > 0 ? sortFontList(fonts) : ["arial.ttf"]).map((f) => (
                       <option key={f} value={f}>{f.replace(/\.(ttf|otf|ttc|woff2?)$/i, "")}</option>
                     ))}
                   </Box>

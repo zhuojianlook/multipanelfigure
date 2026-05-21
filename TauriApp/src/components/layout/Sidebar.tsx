@@ -3,7 +3,7 @@
    Sections: GRID, SPACING, PROJECT.
    ────────────────────────────────────────────────────────── */
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import {
   Typography,
   Button,
@@ -34,8 +34,9 @@ import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import UploadFileIcon from "@mui/icons-material/UploadFile";
 import StraightenIcon from "@mui/icons-material/Straighten";
 import { useFigureStore } from "../../store/figureStore";
-import { useCollageStore } from "../../store/collageStore";
-import type { CollageItem } from "../../store/collageStore";
+import { useCollageStore, R_TEXT_SLOTS, R_TEXT_BEARING } from "../../store/collageStore";
+import type { CollageItem, RTextSlot } from "../../store/collageStore";
+import { sortFontList, pickDefaultFont } from "../../utils/fontList";
 import { api } from "../../api/client";
 import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 import { detectGlobalFont, describeDetectedFont } from "../../utils/detectGlobalFont";
@@ -154,6 +155,49 @@ function CollageSidebar() {
   // Element-id prefixes the default (un-expanded) sync targets, mirroring the
   // backend's _DEFAULT_FONT_SYNC_PREFIXES.
   const DEFAULT_SYNC_PREFIXES = ["colhdr", "rowhdr", "collbl", "rowlbl"];
+  const sortedFonts = useMemo(() => sortFontList(fonts), [fonts]);
+  const defaultFont = useMemo(() => pickDefaultFont(fonts), [fonts]);
+
+  // R-plot per-slot sync state: which text slots of each R plot the sync
+  // applies to (nested checkboxes, like figures), plus the plot's actual
+  // current label text (fetched on expand) to show in the tree.
+  const [rExpanded, setRExpanded] = useState<Record<string, boolean>>({});
+  const [rSlotSel, setRSlotSel] = useState<Record<string, Record<string, boolean>>>({});
+  const [rLabels, setRLabels] = useState<Record<string, Partial<Record<RTextSlot, string>>>>({});
+  const [rLabelsLoading, setRLabelsLoading] = useState<Record<string, boolean>>({});
+  /** Default = every slot selected, so an un-touched R plot syncs all its text. */
+  const rSelOf = (id: string): Record<string, boolean> =>
+    rSlotSel[id] ?? Object.fromEntries(R_TEXT_SLOTS.map((s) => [s.slot, true]));
+  const toggleRSlot = (id: string, slot: string) =>
+    setRSlotSel((m) => { const cur = rSelOf(id); return { ...m, [id]: { ...cur, [slot]: !cur[slot] } }; });
+  const setAllRSlots = (id: string, on: boolean) =>
+    setRSlotSel((m) => ({ ...m, [id]: Object.fromEntries(R_TEXT_SLOTS.map((s) => [s.slot, on])) }));
+  const loadRLabels = async (it: CollageItem) => {
+    if (rLabels[it.id] || rLabelsLoading[it.id] || !it.rCode) return;
+    setRLabelsLoading((m) => ({ ...m, [it.id]: true }));
+    try {
+      const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, null, { emitLabels: true });
+      const lab = res.labels || {};
+      const mapped: Partial<Record<RTextSlot, string>> = {};
+      if (lab.title != null) mapped.title = lab.title;
+      if (lab.subtitle != null) mapped.subtitle = lab.subtitle;
+      if (lab.x != null) mapped.xaxis = lab.x;
+      if (lab.y != null) mapped.yaxis = lab.y;
+      if (lab.caption != null) mapped.caption = lab.caption;
+      const lg = lab.colour ?? lab.color ?? lab.fill ?? lab.shape ?? lab.linetype ?? lab.size ?? lab.alpha;
+      if (lg != null) mapped.legend_title = lg;
+      setRLabels((m) => ({ ...m, [it.id]: mapped }));
+    } catch (e) {
+      console.warn("[collage] R labels (sidebar) failed", e);
+    } finally {
+      setRLabelsLoading((m) => ({ ...m, [it.id]: false }));
+    }
+  };
+  const toggleRExpand = (it: CollageItem) => {
+    const open = !rExpanded[it.id];
+    setRExpanded((m) => ({ ...m, [it.id]: open }));
+    if (open) void loadRLabels(it);
+  };
 
   const figureItems = items.filter((it) => it.kind === "figure" && it.projectPath);
   // R/analysis plots can also be re-rendered at a target font size by
@@ -237,7 +281,7 @@ function CollageSidebar() {
       });
       return;
     }
-    const font = syncFont || fonts[0] || "arial.ttf";
+    const font = syncFont || defaultFont;
     setApplyBusy(true);
     let succeeded = 0;
     let failed = 0;
@@ -304,26 +348,34 @@ function CollageSidebar() {
           failed++;
         }
       }
-      // R/analysis plots: SIZE (re-injected base font size) and COLOR (applied
-      // to all ggplot text via a global theme element) can be synced. Font
-      // FAMILY can't — R needs the typeface registered separately. Runs when
-      // size and/or color is being synced.
+      // R/analysis plots: SIZE + COLOR are synced per selected text slot (the
+      // nested checkboxes), via per-slot ggplot theme overrides. Font FAMILY
+      // isn't synced — R needs the typeface registered (use the plot's "Edit
+      // text" menu, which offers R-safe families). Runs when size/colour sync.
       if (applySize || applyColor) {
         for (const it of useCollageStore.getState().items) {
           if (!(it.kind === "image" && it.fromAnalysis && it.rCode)) continue;
           if (!isIncluded(it.id)) continue;
           const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
-          const baseFs = applySize ? Math.max(1, Math.round(targetPt / Math.max(0.001, scale))) : null;
-          // Preserve any per-element text overrides the user set via the plot's
-          // "Edit text" menu; layer a global colour on top when syncing colour.
+          // R renders at 150 DPI but the canvas is a 300-DPI page, so double
+          // the compensated pt (same fix as figures) to match text boxes.
+          const rSize = applySize ? Math.max(1, Math.round(2 * targetPt / Math.max(0.001, scale))) : undefined;
+          // Apply only to the selected slots (default: all). Merge onto any
+          // existing per-slot overrides so the user's text edits are kept.
+          const sel = rSelOf(it.id);
           const rOv: Record<string, unknown> = { ...(it.rTextOverrides || {}) };
-          if (applyColor) {
-            rOv._global = { ...((rOv._global as Record<string, unknown>) || {}), color: syncColor };
-            updateItem(it.id, { rTextOverrides: rOv as CollageItem["rTextOverrides"] });
+          for (const { slot } of R_TEXT_SLOTS) {
+            if (!sel[slot]) continue;
+            const prev = (rOv[slot] as Record<string, unknown>) || {};
+            const next = { ...prev };
+            if (applySize) next.size = rSize;
+            if (applyColor) next.color = syncColor;
+            rOv[slot] = next;
           }
+          updateItem(it.id, { rTextOverrides: rOv as CollageItem["rTextOverrides"] });
           const hasOv = Object.keys(rOv).length > 0;
           try {
-            const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, baseFs,
+            const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, null,
               hasOv ? {
                 textOverrides: rOv,
                 overrideOnly: true,
@@ -461,12 +513,12 @@ function CollageSidebar() {
             <Typography variant="caption" sx={{ fontSize: "0.62rem", width: 40 }}>Font</Typography>
             <Box
               component="select"
-              value={syncFont || fonts[0] || "arial.ttf"}
+              value={syncFont || defaultFont}
               disabled={!applyFont}
               onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setSyncFont(e.target.value)}
               sx={{ flex: 1, minWidth: 0, fontSize: "0.65rem", height: 24, bgcolor: "var(--c-surface)", color: "var(--c-text)", border: "1px solid var(--c-border)", borderRadius: 1, px: 0.5, opacity: applyFont ? 1 : 0.4 }}
             >
-              {(fonts.length > 0 ? fonts : ["arial.ttf"]).map((f) => (
+              {(sortedFonts.length > 0 ? sortedFonts : ["arial.ttf"]).map((f) => (
                 <option key={f} value={f}>{f.replace(/\.(ttf|otf|ttc|woff2?)$/i, "")}</option>
               ))}
             </Box>
@@ -578,25 +630,64 @@ function CollageSidebar() {
           </>
         )}
 
-        {/* R / analysis plots — re-rendered by re-running their R code with
-            the target font size injected. No per-element tree (raster). */}
+        {/* R / analysis plots — expandable like figures: pick which text
+            slots (title/axis/legend/…) the sync applies to. */}
         {rItems.length > 0 && (
           <Box sx={{ mt: 1 }}>
             <Typography variant="caption" sx={{ fontSize: "0.58rem", color: "text.secondary", display: "block", mb: 0.25 }}>
               R / analysis figures
             </Typography>
-            <Box sx={{ border: "1px solid var(--c-border)", borderRadius: 1, maxHeight: 160, overflowY: "auto" }}>
-              {rItems.map((it) => (
-                <Box key={it.id} sx={{ display: "flex", alignItems: "center", gap: 0.25, px: 0.25, borderBottom: "1px solid var(--c-border)", "&:last-child": { borderBottom: "none" } }}>
-                  <Checkbox size="small" checked={isIncluded(it.id)} onChange={() => toggleIncluded(it.id)} sx={{ p: 0.25 }} />
-                  <Typography variant="caption" sx={{ fontSize: "0.62rem", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", py: 0.5 }} title={it.name}>
-                    {it.name}
-                  </Typography>
-                </Box>
-              ))}
+            <Box sx={{ border: "1px solid var(--c-border)", borderRadius: 1, maxHeight: 260, overflowY: "auto" }}>
+              {rItems.map((it) => {
+                const sel = rSelOf(it.id);
+                const selCount = R_TEXT_SLOTS.filter((s) => sel[s.slot]).length;
+                const labels = rLabels[it.id] || {};
+                return (
+                  <Box key={it.id} sx={{ borderBottom: "1px solid var(--c-border)", "&:last-child": { borderBottom: "none" } }}>
+                    <Box sx={{ display: "flex", alignItems: "center", gap: 0.25, px: 0.25 }}>
+                      <Checkbox size="small" checked={isIncluded(it.id)} onChange={() => toggleIncluded(it.id)} sx={{ p: 0.25 }} />
+                      <Box onClick={() => toggleRExpand(it)} sx={{ flex: 1, display: "flex", alignItems: "center", gap: 0.25, cursor: "pointer", overflow: "hidden", py: 0.5 }}>
+                        {rExpanded[it.id] ? <ExpandMoreIcon sx={{ fontSize: 14 }} /> : <ChevronRightIcon sx={{ fontSize: 14 }} />}
+                        <Typography variant="caption" sx={{ fontSize: "0.62rem", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={it.name}>
+                          {it.name}
+                        </Typography>
+                        <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", ml: "auto", pl: 0.5, flexShrink: 0 }}>
+                          {selCount} el
+                        </Typography>
+                      </Box>
+                    </Box>
+                    <Collapse in={!!rExpanded[it.id]} unmountOnExit>
+                      <Box sx={{ pl: 2.5, pr: 0.5, pb: 0.5 }}>
+                        {rLabelsLoading[it.id] && (
+                          <Box sx={{ display: "flex", alignItems: "center", gap: 1, py: 0.5 }}>
+                            <CircularProgress size={12} />
+                            <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>Reading plot text…</Typography>
+                          </Box>
+                        )}
+                        <Box sx={{ mb: 0.25 }}>
+                          <Button size="small" variant="text" onClick={() => setAllRSlots(it.id, true)} sx={{ fontSize: "0.52rem", textTransform: "none", minWidth: 0, p: "0 4px" }}>All</Button>
+                          <Button size="small" variant="text" onClick={() => setAllRSlots(it.id, false)} sx={{ fontSize: "0.52rem", textTransform: "none", minWidth: 0, p: "0 4px" }}>None</Button>
+                        </Box>
+                        {R_TEXT_SLOTS.map(({ slot, label }) => {
+                          const actual = R_TEXT_BEARING.has(slot) ? labels[slot] : undefined;
+                          return (
+                            <Box key={slot} sx={{ display: "flex", alignItems: "center", gap: 0.25, borderRadius: 0.5, "&:hover": { backgroundColor: "rgba(79,195,247,0.12)" } }}>
+                              <Checkbox size="small" checked={!!sel[slot]} onChange={() => toggleRSlot(it.id, slot)} sx={{ p: 0.25 }} />
+                              <Typography variant="caption" sx={{ fontSize: "0.56rem", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={`${label}${actual ? `: ${actual}` : ""}`}>
+                                <Box component="span" sx={{ color: "text.secondary" }}>{label}</Box>
+                                {actual ? `: ${actual}` : ""}
+                              </Typography>
+                            </Box>
+                          );
+                        })}
+                      </Box>
+                    </Collapse>
+                  </Box>
+                );
+              })}
             </Box>
             <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", display: "block", lineHeight: 1.3, mt: 0.25 }}>
-              R plots re-run their code with the size injected (best-effort for ggplot themes; requires R installed).
+              Size + colour sync to the ticked slots (requires R). Font family isn't synced — set it per slot via the plot's "Edit text" menu.
             </Typography>
           </Box>
         )}
