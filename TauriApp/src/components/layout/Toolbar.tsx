@@ -36,6 +36,7 @@ import DownloadIcon from "@mui/icons-material/Download";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import LibraryAddIcon from "@mui/icons-material/LibraryAdd";
 import { useCollageStore, PT_TO_PX, DEFAULT_TEXT_PT } from "../../store/collageStore";
+import type { CollageItem } from "../../store/collageStore";
 import { api } from "../../api/client";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -232,6 +233,159 @@ function pngWithDpi(dataUrl: string, dpi: number): string {
   }
 }
 
+/** One drawable text run, positioned by the browser's own layout engine.
+ *  Coordinates are in page px RELATIVE to the item's top-left (it.x/it.y). */
+type TextRun = {
+  text: string;
+  x: number;        // left edge of the run (page px, relative to it.x)
+  baseline: number; // alphabetic baseline (page px, relative to it.y)
+  font: string;     // canvas font shorthand
+  sizePx: number;   // run font size in px (for underline/strike thickness)
+  color: string;
+  underline: boolean;
+  strike: boolean;
+  width: number;    // measured run width (for underline/strike length)
+};
+
+/** Custom fonts register under their file-name-without-extension. */
+function _famCss(n?: string): string {
+  return `"${(n ?? "Arial").replace(/\.(ttf|otf|ttc|woff2?)$/i, "")}", Arial, sans-serif`;
+}
+
+/** Lay a text item out OFF-SCREEN at 1:1 with the EXACT same CSS the canvas
+ *  uses (CollageView), then read each word's real baseline + x straight from
+ *  the browser. Drawing those measured positions makes the export positionally
+ *  identical to the on-screen text — no analytical baseline approximation, so
+ *  zero drift (wrap, alignment, per-segment fonts and super/subscript all come
+ *  from the same layout engine). Returns [] if anything goes wrong so the
+ *  caller can fall back to the analytical renderer. */
+function layoutTextRuns(it: CollageItem): TextRun[] {
+  const align = it.align ?? "left";
+  const baseColor = it.fontColor ?? "#000000";
+  const basePt = it.fontSize ?? DEFAULT_TEXT_PT;
+
+  // Per-segment definition (plain text = a single synthetic segment).
+  type SegDef = {
+    text: string; fontFamily: string; sizePx: number; bold: boolean;
+    italic: boolean; sup: boolean; sub: boolean; color: string;
+    underline: boolean; strike: boolean; font: string;
+  };
+  const segs: SegDef[] = [];
+  const makeFont = (italic: boolean, bold: boolean, px: number, fam: string) =>
+    `${italic ? "italic" : "normal"} ${bold ? "bold" : "normal"} ${px}px ${fam}`;
+
+  if (it.styledSegments?.length) {
+    for (const s of it.styledSegments) {
+      const st = s.font_style ?? [];
+      const sup = st.includes("Superscript");
+      const sub = st.includes("Subscript");
+      const fam = _famCss(s.font_name);
+      const px = (s.font_size ?? basePt) * (sup || sub ? 0.7 : 1) * PT_TO_PX;
+      const bold = st.includes("Bold");
+      const italic = st.includes("Italic");
+      segs.push({
+        text: s.text ?? "", fontFamily: fam, sizePx: px, bold, italic, sup, sub,
+        color: s.color || baseColor,
+        underline: st.includes("Underline"), strike: st.includes("Strikethrough"),
+        font: makeFont(italic, bold, px, fam),
+      });
+    }
+  } else {
+    const fam = _famCss(it.fontFamily);
+    const px = basePt * PT_TO_PX;
+    segs.push({
+      text: it.text ?? "", fontFamily: fam, sizePx: px,
+      bold: !!it.fontBold, italic: !!it.fontItalic, sup: false, sub: false,
+      color: baseColor, underline: !!it.fontUnderline, strike: false,
+      font: makeFont(!!it.fontItalic, !!it.fontBold, px, fam),
+    });
+  }
+
+  const container = document.createElement("div");
+  Object.assign(container.style, {
+    position: "absolute", left: "-99999px", top: "0px", width: `${it.w}px`,
+    boxSizing: "border-box", margin: "0", padding: "0",
+    lineHeight: "1.2", whiteSpace: "pre-wrap", wordBreak: "break-word",
+    textAlign: align, visibility: "hidden",
+  } as Partial<CSSStyleDeclaration>);
+
+  // Tokenize each segment into word / space / newline tokens, each wrapped in
+  // its own inline span (inline spans are transparent to layout, so wrap +
+  // metrics match the real div exactly).
+  const toks: { el: HTMLSpanElement; seg: SegDef; text: string }[] = [];
+  for (const seg of segs) {
+    const segSpan = document.createElement("span");
+    Object.assign(segSpan.style, {
+      fontFamily: seg.fontFamily, fontSize: `${seg.sizePx}px`,
+      fontWeight: seg.bold ? "700" : "400", fontStyle: seg.italic ? "italic" : "normal",
+      verticalAlign: seg.sup ? "super" : seg.sub ? "sub" : "baseline",
+      whiteSpace: "pre-wrap",
+    } as Partial<CSSStyleDeclaration>);
+    for (const part of seg.text.split(/(\n| +)/)) {
+      if (part === "") continue;
+      const tk = document.createElement("span");
+      tk.textContent = part;
+      segSpan.appendChild(tk);
+      toks.push({ el: tk, seg, text: part });
+    }
+    container.appendChild(segSpan);
+  }
+
+  document.body.appendChild(container);
+  try {
+    const c = container.getBoundingClientRect();
+    const runs: TextRun[] = [];
+    // A zero-size inline-block probe inherits the run's baseline (including any
+    // super/sub shift); its top edge sits exactly on that baseline.
+    const baselineOf = (host: HTMLElement): number => {
+      const p = document.createElement("span");
+      Object.assign(p.style, {
+        display: "inline-block", width: "0", height: "0",
+        overflow: "hidden", verticalAlign: "baseline",
+      } as Partial<CSSStyleDeclaration>);
+      host.appendChild(p);
+      const top = p.getBoundingClientRect().top;
+      host.removeChild(p);
+      return top - c.top;
+    };
+    for (const { el, seg, text } of toks) {
+      if (text === "\n" || /^\s+$/.test(text)) continue; // whitespace: layout only
+      const rects = el.getClientRects();
+      if (!rects.length) continue;
+      if (rects.length === 1) {
+        const r = rects[0];
+        runs.push({
+          text, x: r.left - c.left, baseline: baselineOf(el), font: seg.font,
+          sizePx: seg.sizePx, color: seg.color, underline: seg.underline,
+          strike: seg.strike, width: r.width,
+        });
+      } else {
+        // A single token wrapped across lines (break-word on a long string):
+        // measure each character so every fragment lands exactly.
+        el.textContent = "";
+        const chars: HTMLSpanElement[] = [];
+        for (const ch of text) {
+          const cs = document.createElement("span");
+          cs.textContent = ch;
+          el.appendChild(cs);
+          chars.push(cs);
+        }
+        for (let i = 0; i < chars.length; i++) {
+          const cr = chars[i].getBoundingClientRect();
+          runs.push({
+            text: text[i], x: cr.left - c.left, baseline: baselineOf(chars[i]),
+            font: seg.font, sizePx: seg.sizePx, color: seg.color,
+            underline: seg.underline, strike: seg.strike, width: cr.width,
+          });
+        }
+      }
+    }
+    return runs;
+  } finally {
+    document.body.removeChild(container);
+  }
+}
+
 /* ── SaveCollageButton ───────────────────────────────────────
    Renders the collage canvas to PNG client-side (compositing
    each item at its x/y/w/h on a single offscreen <canvas>),
@@ -381,9 +535,39 @@ function SaveCollageButton() {
       draw();
       ctx.restore();
     };
+    // Make sure custom fonts are loaded before measuring/drawing text, so the
+    // off-screen layout uses the same glyph metrics as the on-screen canvas.
+    try { await (document as Document & { fonts?: FontFaceSet }).fonts?.ready; } catch { /* no-op */ }
     for (const it of sorted) {
       if (it.kind === "text") {
         withRotation(it, () => {
+          // PRIMARY: lay the text out with the browser's own engine off-screen
+          // at 1:1 and draw each word at its measured baseline/x, so the export
+          // is positionally identical to the on-screen text (zero drift).
+          let runs: TextRun[] = [];
+          try { runs = layoutTextRuns(it); }
+          catch (e) { console.warn("[collage] DOM text layout failed; using analytical fallback", e); }
+          if (runs.length) {
+            ctx.textBaseline = "alphabetic";
+            ctx.textAlign = "left";
+            for (const r of runs) {
+              const dx = it.x + r.x;
+              const by = it.y + r.baseline;
+              ctx.font = r.font;
+              ctx.fillStyle = r.color;
+              ctx.fillText(r.text, dx, by);
+              if (r.underline || r.strike) {
+                ctx.save();
+                ctx.strokeStyle = r.color;
+                ctx.lineWidth = Math.max(1, r.sizePx / 14);
+                if (r.underline) { ctx.beginPath(); ctx.moveTo(dx, by + r.sizePx * 0.16); ctx.lineTo(dx + r.width, by + r.sizePx * 0.16); ctx.stroke(); }
+                if (r.strike) { ctx.beginPath(); ctx.moveTo(dx, by - r.sizePx * 0.3); ctx.lineTo(dx + r.width, by - r.sizePx * 0.3); ctx.stroke(); }
+                ctx.restore();
+              }
+            }
+            return;
+          }
+          // FALLBACK (analytical) — only if the DOM layout produced nothing.
           // Text font sizes are stored in POINTS; the canvas is a 300-DPI
           // page, so multiply by PT_TO_PX to get device pixels.
           const baseSizePx = (it.fontSize ?? DEFAULT_TEXT_PT) * PT_TO_PX;
