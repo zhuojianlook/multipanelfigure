@@ -101,6 +101,9 @@ function segmentStyle(
    typical maximum figure height (or full page for paper sizes) so a
    plate composed to a preset will fit the page. */
 const MM = (mm: number) => Math.round((mm / 25.4) * 300);
+/** Inches → px @ 300 DPI (used for presentation slide sizes, which are
+ *  specified in inches). */
+const IN = (inch: number) => Math.round(inch * 300);
 /** Standard inter-column gutter for column guide overlays (px @ 300 DPI). */
 const GUIDE_GUTTER_PX = MM(4);
 // `cols` = number of journal columns this preset implies; drives the column
@@ -144,6 +147,15 @@ const CANVAS_PRESET_GROUPS: PresetGroup[] = [
     presets: [
       { label: "eLife full width (175 mm)", w: MM(175), h: MM(240), cols: 2 },
       { label: "Square (180 mm)", w: MM(180), h: MM(180), cols: 0 },
+    ],
+  },
+  {
+    group: "PowerPoint slide",
+    presets: [
+      { label: "Widescreen 16:9 (13.33 × 7.5 in)", w: IN(13.333), h: IN(7.5), cols: 0 },
+      { label: "Standard 4:3 (10 × 7.5 in)", w: IN(10), h: IN(7.5), cols: 0 },
+      { label: "On-screen 16:10 (10 × 6.25 in)", w: IN(10), h: IN(6.25), cols: 0 },
+      { label: "A4 on-screen (10.83 × 7.5 in)", w: IN(10.83), h: IN(7.5), cols: 0 },
     ],
   },
   {
@@ -439,9 +451,11 @@ export function CollageView() {
   };
   const applyCanvasPreset = (w: number, h: number, cols: number) => {
     setCanvasSize(w, h);
-    // Set column guides for multi-column presets; clear them otherwise.
+    // Record the preset's column count (so the "Guides" button knows how many
+    // dividers to draw) but DON'T auto-show them — column guides are opt-in
+    // via the toolbar button, not forced on by choosing a multi-column preset.
     setColumnGuides(cols >= 2 ? cols : 0, cols >= 2 ? GUIDE_GUTTER_PX : 0);
-    if (cols >= 2) setGuidesVisible(true);
+    setGuidesVisible(false);
     resetView();
     setPresetAnchor(null);
   };
