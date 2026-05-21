@@ -443,14 +443,17 @@ function SaveCollageButton() {
               const lineW = widths.reduce((a, b) => a + b, 0);
               const maxSize = Math.max(baseSizePx, ...line.map((t) => sizeOf(t.seg)));
               const lineH = maxSize * 1.2;
-              // Baseline = line-box top + half-leading + the tallest run's true
-              // font ascent (measured), so styled text matches the browser's
-              // baseline-aligned inline flow exactly.
+              // Baseline via the CSS line-box model: leading = lineH − the
+              // tallest run's content box (measured ascent+descent), split evenly
+              // above/below, then drop by the ascent. Using asc+desc (not the em
+              // size) matches the browser's inline flow — the em-size form left
+              // text ~(asc+desc−size)/2 px too low.
               const tallest = line.reduce((a, b) => (sizeOf(b.seg) >= sizeOf(a.seg) ? b : a), line[0]);
               ctx.font = fontOf(tallest.seg);
               const fm = ctx.measureText("Mg");
               const ascent = fm.fontBoundingBoxAscent || (maxSize * 0.8);
-              const baselineY = y + (lineH - maxSize) / 2 + ascent;
+              const descent = fm.fontBoundingBoxDescent || (maxSize * 0.2);
+              const baselineY = y + (lineH - (ascent + descent)) / 2 + ascent;
               let x = align === "center" ? it.x + (it.w - lineW) / 2 : align === "right" ? it.x + (it.w - lineW) : it.x;
               line.forEach((tk, i) => {
                 const st = tk.seg.font_style ?? [];
@@ -481,14 +484,19 @@ function SaveCollageButton() {
           const style = it.fontItalic ? "italic" : "normal";
           ctx.font = `${style} ${weight} ${fs}px ${fam(it.fontFamily)}`;
           ctx.fillStyle = baseColor;
-          ctx.textBaseline = "top";
+          ctx.textBaseline = "alphabetic";
           ctx.textAlign = align === "center" ? "center" : align === "right" ? "right" : "left";
           const xBase = align === "center" ? it.x + it.w / 2 : align === "right" ? it.x + it.w : it.x;
           const lineHeight = fs * 1.2;
-          // Match the on-screen HTML box: line-height 1.2 puts half its leading
-          // (0.1×fs) above the glyph, so offset textBaseline="top" by that to
-          // align the export with the working view exactly.
-          let y = it.y + (lineHeight - fs) / 2;
+          // Baseline via the CSS line-box model (matches the on-screen HTML box):
+          // leading = lineHeight − the font's content box (measured ascent+
+          // descent), split evenly above/below, then drop by the ascent. Using
+          // asc+desc instead of the em size removes the ~(asc+desc−fs)/2 px
+          // downward drift the old "top"-baseline offset produced.
+          const pfm = ctx.measureText("Mg");
+          const pAsc = pfm.fontBoundingBoxAscent || fs * 0.8;
+          const pDesc = pfm.fontBoundingBoxDescent || fs * 0.2;
+          let y = it.y + (lineHeight - (pAsc + pDesc)) / 2 + pAsc;
           for (const para of (it.text ?? "").split("\n")) {
             const words = para.split(" ");
             let line = "";
@@ -500,7 +508,7 @@ function SaveCollageButton() {
                 ctx.save();
                 ctx.strokeStyle = baseColor;
                 ctx.lineWidth = Math.max(1, fs / 14);
-                ctx.beginPath(); ctx.moveTo(x0, y + fs); ctx.lineTo(x0 + w, y + fs); ctx.stroke();
+                ctx.beginPath(); ctx.moveTo(x0, y + fs * 0.16); ctx.lineTo(x0 + w, y + fs * 0.16); ctx.stroke();
                 ctx.restore();
               }
               y += lineHeight;

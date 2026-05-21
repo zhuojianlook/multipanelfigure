@@ -449,6 +449,42 @@ export function CollageView() {
       console.error("[collage] re-render figure failed", e);
     }
   };
+
+  // Canonicalize a figure's raster ONCE through the SAME render-figure pipeline
+  // the export uses. "Add to Collage" bakes the figure via the builder preview,
+  // whose layout aspect can differ a few % from render-figure; if left as-is,
+  // the export draws a (say) 1.092-aspect image into the canvas's 1.056-aspect
+  // box and stretches it vertically — shifting/squashing the headers. By
+  // re-rendering on first select and adopting the true aspect (updating h), the
+  // canvas box matches the export so there's no stretch. Runs at most once per
+  // figure (guarded by figCanon).
+  const canonicalizeFigure = async (itemId: string) => {
+    const it = useCollageStore.getState().items.find((i) => i.id === itemId);
+    if (!it || it.kind !== "figure" || !it.projectPath || it.figCanon) return;
+    const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
+    const pt = useCollageStore.getState().globalHeaderPt;
+    const sel = useCollageStore.getState().elemSelByItem[itemId];
+    const elementIds = sel ? Object.keys(sel).filter((k) => sel[k]) : null;
+    const overrides = useCollageStore.getState().elemOverridesByItem[itemId] || null;
+    try {
+      const resp = await api.renderCollageFigure(
+        it.projectPath, pt ?? null, Math.max(0.001, scale), it.w, elementIds,
+        overrides as Record<string, unknown> | null, 150,
+      );
+      if (resp?.image && resp.width && resp.height) {
+        updateItem(itemId, {
+          src: `data:image/png;base64,${resp.image}`,
+          naturalW: resp.width, naturalH: resp.height,
+          h: it.w / (resp.width / resp.height),
+          figCanon: true,
+        });
+      } else {
+        updateItem(itemId, { figCanon: true });
+      }
+    } catch (e) {
+      console.error("[collage] canonicalize figure failed", e);
+    }
+  };
   // Crop mode: the image item being cropped + the crop rect in the item's
   // displayed pixel coordinates (0..it.w, 0..it.h).
   const [cropItemId, setCropItemId] = useState<string | null>(null);
@@ -466,6 +502,9 @@ export function CollageView() {
           .then(({ elements }) => setElemList(it.id, elements))
           .catch((e) => console.error("[collage] load elements (select) failed", e));
       }
+      // First time this figure is selected, re-render it through the export
+      // pipeline so the canvas aspect == export aspect (no stretch on save).
+      if (!it.figCanon) void canonicalizeFigure(it.id);
     } else if (!it) {
       setElemSyncItem(null);
     }

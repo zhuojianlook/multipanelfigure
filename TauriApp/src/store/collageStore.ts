@@ -180,6 +180,12 @@ export type CollageItem = {
   headers?: CollageHeader[];
   bodyNaturalW?: number;
   bodyNaturalH?: number;
+  /** True once a figure-kind item's raster has been (re)rendered through the
+   *  collage render pipeline (render-figure) — the SAME pipeline the export
+   *  uses. "Add to Collage" bakes via the builder preview, whose layout aspect
+   *  can differ ~few %, so on first select we re-render to canonicalise the
+   *  aspect; otherwise the export would stretch the figure vs the canvas. */
+  figCanon?: boolean;
 };
 
 /** A text element of an mpf figure, for per-element font sync. `geom`
