@@ -180,17 +180,78 @@ import { SaveFigureDialog } from "../dialogs/SaveFigureDialog";
 import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 import { ensureProjectSaved } from "../../utils/projectNav";
 
+/** CRC-32 (PNG polynomial) over a byte array — used to checksum the pHYs
+ *  chunk we splice into the exported PNG. */
+function _crc32(buf: Uint8Array): number {
+  let c = ~0;
+  for (let i = 0; i < buf.length; i++) {
+    c ^= buf[i];
+    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xEDB88320 & -(c & 1));
+  }
+  return (~c) >>> 0;
+}
+
+/** Splice a `pHYs` chunk (physical pixel dimensions) into a PNG data-URL so
+ *  the exported image reports the chosen DPI — downstream tools (Word,
+ *  Illustrator, journal portals) then place it at the correct physical size.
+ *  The chunk goes right after IHDR. Returns the original URL on any error. */
+function pngWithDpi(dataUrl: string, dpi: number): string {
+  try {
+    const b64 = dataUrl.split(",")[1];
+    if (!b64) return dataUrl;
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    // 8-byte signature, then IHDR: len(4)+type(4)+data(13)+crc(4) = 25 bytes.
+    const ihdrEnd = 8 + 25;
+    const ppu = Math.round(dpi / 0.0254); // pixels per metre
+    const type = new Uint8Array([0x70, 0x48, 0x59, 0x73]); // "pHYs"
+    const typeAndData = new Uint8Array(4 + 9);
+    typeAndData.set(type, 0);
+    const tdv = new DataView(typeAndData.buffer);
+    tdv.setUint32(4, ppu); tdv.setUint32(8, ppu); typeAndData[12] = 1; // unit = metre
+    const crc = _crc32(typeAndData);
+    const chunk = new Uint8Array(4 + 4 + 9 + 4);
+    const cv = new DataView(chunk.buffer);
+    cv.setUint32(0, 9);            // data length
+    chunk.set(typeAndData, 4);     // type + data
+    cv.setUint32(17, crc);         // crc
+    const out = new Uint8Array(bytes.length + chunk.length);
+    out.set(bytes.subarray(0, ihdrEnd), 0);
+    out.set(chunk, ihdrEnd);
+    out.set(bytes.subarray(ihdrEnd), ihdrEnd + chunk.length);
+    let s = "";
+    const CH = 0x8000;
+    for (let i = 0; i < out.length; i += CH) {
+      s += String.fromCharCode.apply(null, Array.from(out.subarray(i, i + CH)));
+    }
+    return "data:image/png;base64," + btoa(s);
+  } catch (e) {
+    console.warn("[collage] pHYs inject failed", e);
+    return dataUrl;
+  }
+}
+
 /* ── SaveCollageButton ───────────────────────────────────────
    Renders the collage canvas to PNG client-side (compositing
    each item at its x/y/w/h on a single offscreen <canvas>),
    then writes the bytes to a user-chosen path via the
    existing save_base64_to_path Tauri command. In a non-Tauri
-   browser preview, falls back to a download anchor. */
+   browser preview, falls back to a download anchor.
+
+   Export DPI: the canvas is a 300-DPI virtual page, so factor =
+   exportDpi/300 scales the output pixels. Figures (.mpf) and R
+   plots are re-rendered at the higher resolution first so they
+   carry real detail; text/lines/guides re-rasterize crisply via
+   the scaled context. The PNG is tagged with the chosen DPI. */
 function SaveCollageButton() {
   const items = useCollageStore((s) => s.items);
   const canvasW = useCollageStore((s) => s.canvasW);
   const canvasH = useCollageStore((s) => s.canvasH);
   const background = useCollageStore((s) => s.background);
+  const exportDpi = useCollageStore((s) => s.exportDpi);
+  const setExportDpi = useCollageStore((s) => s.setExportDpi);
+  const [exporting, setExporting] = useState(false);
 
   const handleSave = async () => {
     if (items.length === 0) {
@@ -200,13 +261,64 @@ function SaveCollageButton() {
       });
       return;
     }
-    // Compose items onto an offscreen canvas at full virtual resolution.
-    // We load each <img> first (they may already be cached from the data
-    // URL paint, but Image() resolves the decode lifecycle cleanly) so
-    // ctx.drawImage doesn't draw blank tiles for any straggler.
+    // Output scale: the canvas is a 300-DPI page, so factor = DPI/300.
+    const factor = Math.max(0.25, Math.min(4, exportDpi / 300));
+    setExporting(true);
+    try {
+    const sorted = [...items].sort((a, b) => a.z - b.z);
+
+    // ── Pre-render figures + R plots at the export resolution ──
+    // Build a map of item-id → high-res data-URL. Figures re-render via
+    // matplotlib at a DPI that targets the item's export pixel footprint;
+    // R plots re-run ggplot at factor× their natural size. Best-effort:
+    // any failure falls back to the existing (display-res) raster.
+    const hiRes = new Map<string, string>();
+    for (const it of sorted) {
+      if (it.kind === "figure" && it.projectPath) {
+        try {
+          const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
+          const pt = useCollageStore.getState().globalHeaderPt;
+          const sel = useCollageStore.getState().elemSelByItem[it.id];
+          const elementIds = sel ? Object.keys(sel).filter((k) => sel[k]) : null;
+          const overrides = useCollageStore.getState().elemOverridesByItem[it.id] || null;
+          // DPI that makes the figure raster ≈ its export footprint (it.w×factor px).
+          const dpi = Math.max(150, Math.min(1200, Math.round(150 * (it.w * factor) / Math.max(1, it.naturalW))));
+          const resp = await api.renderCollageFigure(
+            it.projectPath, pt ?? null, Math.max(0.001, scale), it.w, elementIds,
+            overrides as Record<string, unknown> | null, dpi,
+          );
+          if (resp?.image) hiRes.set(it.id, `data:image/png;base64,${resp.image}`);
+        } catch (e) {
+          console.warn("[collage] hi-res figure render failed for", it.name, e);
+        }
+      } else if (it.kind === "image" && it.rCode) {
+        try {
+          const ov = it.rTextOverrides || {};
+          const pt = useCollageStore.getState().globalHeaderPt;
+          const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
+          const baseFs = pt ? Math.max(1, Math.round(pt / Math.max(0.001, scale))) : null;
+          const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, baseFs, {
+            textOverrides: ov as Record<string, unknown>,
+            renderOverride: true,
+            overrideOnly: true,
+            overrideWidth: Math.round((it.naturalW || 640) * factor),
+            overrideHeight: Math.round((it.naturalH || 480) * factor),
+          });
+          const png = res.plots?.[0];
+          if (res.success && png) hiRes.set(it.id, `data:image/png;base64,${png}`);
+        } catch (e) {
+          console.warn("[collage] hi-res R render failed for", it.name, e);
+        }
+      }
+    }
+
+    // Compose items onto an offscreen canvas at factor× virtual resolution.
+    // The context is scaled by `factor` so all the existing draw math stays
+    // in canvas-pixel space; text/lines re-rasterize crisply, and the
+    // high-res figure/R rasters map ~1:1.
     const canvas = document.createElement("canvas");
-    canvas.width = canvasW;
-    canvas.height = canvasH;
+    canvas.width = Math.round(canvasW * factor);
+    canvas.height = Math.round(canvasH * factor);
     const ctx = canvas.getContext("2d");
     if (!ctx) {
       await alertDialog({
@@ -215,14 +327,13 @@ function SaveCollageButton() {
       });
       return;
     }
+    ctx.scale(factor, factor);
     // A "transparent" background leaves the canvas unfilled so the exported
     // PNG keeps its alpha channel; any other value fills with that color.
     if (background !== "transparent") {
       ctx.fillStyle = background;
       ctx.fillRect(0, 0, canvasW, canvasH);
     }
-
-    const sorted = [...items].sort((a, b) => a.z - b.z);
     // Wrap a draw in a rotation transform around the item's centre when the
     // item has a rotation (matches the on-canvas CSS transform).
     const withRotation = (it: typeof sorted[number], draw: () => void) => {
@@ -387,11 +498,13 @@ function SaveCollageButton() {
           resolve();
         };
         img.onerror = () => resolve();
-        img.src = it.src;
+        // Prefer the high-res raster rendered for export; fall back to display.
+        img.src = hiRes.get(it.id) ?? it.src;
       });
     }
 
-    const dataUrl = canvas.toDataURL("image/png");
+    // Tag the PNG with the chosen DPI so it imports at the correct physical size.
+    const dataUrl = pngWithDpi(canvas.toDataURL("image/png"), exportDpi);
     const b64 = dataUrl.split(",")[1] ?? "";
 
     // Try Tauri save flow first.
@@ -404,7 +517,7 @@ function SaveCollageButton() {
       });
       if (!path) return;
       await invoke("save_base64_to_path", { path, dataB64: b64 });
-      await alertDialog({ title: "Collage saved", body: `Collage saved to ${path}` });
+      await alertDialog({ title: "Collage saved", body: `Collage saved to ${path}\n${Math.round(canvasW * factor)}×${Math.round(canvasH * factor)} px @ ${exportDpi} DPI` });
       return;
     } catch {
       /* Not running inside Tauri — fall back to browser download. */
@@ -413,17 +526,39 @@ function SaveCollageButton() {
     a.href = dataUrl;
     a.download = "collage.png";
     a.click();
+    } finally {
+      setExporting(false);
+    }
   };
 
   return (
-    <Button
-      variant="contained"
-      color="secondary"
-      startIcon={<SaveIcon />}
-      onClick={handleSave}
-    >
-      Save Collage
-    </Button>
+    <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+      <Tooltip title="Export resolution. The canvas is sized at 300 DPI; higher DPI re-renders figures + R plots at more pixels and tags the PNG so it imports at the right physical size.">
+        <Box
+          component="select"
+          value={String(exportDpi)}
+          onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setExportDpi(Number(e.target.value))}
+          sx={{
+            fontSize: "0.7rem", height: 30, borderRadius: 1, px: 0.5,
+            bgcolor: "var(--c-surface)", color: "var(--c-text)",
+            border: "1px solid var(--c-border)", cursor: "pointer",
+          }}
+        >
+          {[150, 300, 600, 1200].map((d) => (
+            <option key={d} value={d}>{d} DPI</option>
+          ))}
+        </Box>
+      </Tooltip>
+      <Button
+        variant="contained"
+        color="secondary"
+        startIcon={<SaveIcon />}
+        onClick={handleSave}
+        disabled={exporting}
+      >
+        {exporting ? "Saving…" : "Save Collage"}
+      </Button>
+    </Box>
   );
 }
 

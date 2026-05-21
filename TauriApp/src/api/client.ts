@@ -401,6 +401,7 @@ class ApiClient {
     itemW?: number,
     elementIds?: string[] | null,
     elementOverrides?: Record<string, unknown> | null,
+    dpi?: number,
   ): Promise<{ image: string; width: number; height: number }> {
     return apiJson("/api/collage/render-figure", "POST", JSON.stringify({
       project_path: projectPath,
@@ -409,6 +410,7 @@ class ApiClient {
       item_w: itemW ?? null,
       element_ids: elementIds && elementIds.length ? elementIds : null,
       element_overrides: elementOverrides && Object.keys(elementOverrides).length ? elementOverrides : null,
+      dpi: dpi && dpi > 0 ? Math.round(dpi) : 150,
     }));
   }
 
@@ -471,6 +473,9 @@ class ApiClient {
       /** Pixel size for the override plot (match the collage item). */
       overrideWidth?: number;
       overrideHeight?: number;
+      /** Force the last_plot() re-render even without text overrides (used to
+       *  re-render an R plot at a higher resolution for high-DPI export). */
+      renderOverride?: boolean;
     },
   ): Promise<{
     success: boolean;
@@ -488,6 +493,7 @@ class ApiClient {
       override_only: !!opts?.overrideOnly,
       override_width: opts?.overrideWidth && opts.overrideWidth > 0 ? Math.round(opts.overrideWidth) : 800,
       override_height: opts?.overrideHeight && opts.overrideHeight > 0 ? Math.round(opts.overrideHeight) : 600,
+      render_override: !!opts?.renderOverride,
     }));
   }
 

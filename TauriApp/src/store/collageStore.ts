@@ -239,6 +239,10 @@ export type CollageState = {
   guideColumns: number;
   guideGutter: number;
   guidesVisible: boolean;
+  /** Export resolution (DPI) for Save Collage. The canvas is a 300-DPI
+   *  virtual page, so factor = exportDpi/300 scales the output pixels; the
+   *  exported PNG is also tagged with this DPI (pHYs). Default 300. */
+  exportDpi: number;
   /** Target visual point size for ALL figure-kind item headers /
    *  primary labels in the collage. Null = no normalisation (each
    *  item shows headers at its own pt × its collage scale). When
@@ -295,6 +299,7 @@ export type CollageState = {
   /** Set the column guide overlay (columns, gutter px). columns=0 clears it. */
   setColumnGuides: (columns: number, gutter: number) => void;
   setGuidesVisible: (v: boolean) => void;
+  setExportDpi: (dpi: number) => void;
   clear: () => void;
 
   // ── Document tabs ──
@@ -335,7 +340,7 @@ export type CollageState = {
 
 const STORAGE_KEY = "mpfig_collage_v1";
 
-type Persisted = Pick<CollageState, "items" | "canvasW" | "canvasH" | "background" | "gridVisible" | "snapEnabled" | "gridStep" | "globalHeaderPt" | "guideColumns" | "guideGutter" | "guidesVisible" | "elemOverridesByItem">;
+type Persisted = Pick<CollageState, "items" | "canvasW" | "canvasH" | "background" | "gridVisible" | "snapEnabled" | "gridStep" | "globalHeaderPt" | "guideColumns" | "guideGutter" | "guidesVisible" | "exportDpi" | "elemOverridesByItem">;
 
 function loadInitial(): Persisted {
   try {
@@ -382,6 +387,7 @@ function loadInitial(): Persisted {
           guideColumns: typeof data.guideColumns === "number" ? data.guideColumns : 0,
           guideGutter: typeof data.guideGutter === "number" ? data.guideGutter : 0,
           guidesVisible: data.guidesVisible ?? true,
+          exportDpi: typeof data.exportDpi === "number" && data.exportDpi > 0 ? data.exportDpi : 300,
           elemOverridesByItem: (data.elemOverridesByItem && typeof data.elemOverridesByItem === "object") ? data.elemOverridesByItem : {},
         };
       }
@@ -401,6 +407,7 @@ function loadInitial(): Persisted {
     guideColumns: 0,
     guideGutter: 0,
     guidesVisible: true,
+    exportDpi: 300,
     elemOverridesByItem: {},
   };
 }
@@ -419,6 +426,7 @@ function persist(s: Persisted) {
       guideColumns: s.guideColumns,
       guideGutter: s.guideGutter,
       guidesVisible: s.guidesVisible,
+      exportDpi: s.exportDpi,
       elemOverridesByItem: s.elemOverridesByItem,
     }));
   } catch {
@@ -537,6 +545,11 @@ export const useCollageStore = create<CollageState>()(
 
     setGuidesVisible: (v) => {
       set((s) => { s.guidesVisible = v; });
+      persist(get());
+    },
+
+    setExportDpi: (dpi) => {
+      set((s) => { s.exportDpi = Math.max(72, Math.min(1200, Math.round(dpi))); });
       persist(get());
     },
 

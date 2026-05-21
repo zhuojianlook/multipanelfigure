@@ -4371,6 +4371,12 @@ class CollageFigureRenderRequest(BaseModel):
     styled_segments / font_size) keyed by element id, applied before the
     size sync. Used by the collage's double-click text customization."""
     element_overrides: Optional[Dict[str, dict]] = None
+    """matplotlib render DPI for the OUTPUT raster. Defaults to 150 (fast,
+    crisp enough for the collage's aggressive display scaling). The Save
+    Collage path requests a higher DPI (e.g. 300/600) so exported figures
+    carry real detail. Header sizing is always measured at 150 first, so
+    raising this only adds pixels — the layout/appearance is identical."""
+    dpi: int = 150
 
 
 class CollageFigureElementsRequest(BaseModel):
@@ -4662,11 +4668,15 @@ def render_collage_figure(body: CollageFigureRenderRequest):
         raise HTTPException(404, f"Project file not found: {path}")
     loaded_cfg, local_images = _load_collage_mpf(path)
 
+    # Output DPI for the final raster (measurement passes stay at 150 so
+    # header sizing is unchanged; raising this only adds pixels).
+    _out_dpi = max(72, min(1200, int(body.dpi or 150)))
+
     def _apply_header_pt(cfg, new_pt):
         _apply_element_overrides(cfg, body.element_overrides)
         _apply_font_pt(cfg, new_pt, body.element_ids)
 
-    def _render_cfg(cfg_to_render):
+    def _render_cfg(cfg_to_render, dpi=150):
         rows, cols = cfg_to_render.rows, cfg_to_render.cols
         if local_images:
             ws = [im.size[0] for im in local_images.values()]
@@ -4710,7 +4720,7 @@ def render_collage_figure(body: CollageFigureRenderRequest):
                         full_res_sizes_local[(r, c)] = (panel.crop[2] - panel.crop[0], panel.crop[3] - panel.crop[1])
                     else:
                         full_res_sizes_local[(r, c)] = orig_img.size
-        fig_bytes = assemble_figure(cfg_to_render, proc, dpi=150, full_res_sizes=full_res_sizes_local)
+        fig_bytes = assemble_figure(cfg_to_render, proc, dpi=dpi, full_res_sizes=full_res_sizes_local)
         img_obj = Image.open(io.BytesIO(fig_bytes)).convert("RGBA")
         return img_obj
 
@@ -4738,7 +4748,7 @@ def render_collage_figure(body: CollageFigureRenderRequest):
         # rendered output that matches their target pt visually.
         cfg_p2 = _copy.deepcopy(loaded_cfg)
         _apply_header_pt(cfg_p2, new_pt)
-        img_p2 = _render_cfg(cfg_p2)
+        img_p2 = _render_cfg(cfg_p2, dpi=_out_dpi)
         out_buf = io.BytesIO()
         img_p2.save(out_buf, format="PNG")
         return {
@@ -4814,7 +4824,7 @@ def render_collage_figure(body: CollageFigureRenderRequest):
     # Reduced DPI (vs the default 300) — the collage display-scales
     # every figure aggressively, so 150 keeps headers/text crisp while
     # cutting matplotlib's render time roughly in half.
-    fig_bytes = assemble_figure(cfg2, processed, dpi=150, full_res_sizes=full_res_sizes2)
+    fig_bytes = assemble_figure(cfg2, processed, dpi=_out_dpi, full_res_sizes=full_res_sizes2)
     img_out = Image.open(io.BytesIO(fig_bytes)).convert("RGBA")
     out_buf = io.BytesIO()
     img_out.save(out_buf, format="PNG")
@@ -4976,6 +4986,10 @@ class RAnalysisRequest(BaseModel):
     # When True (with text_overrides), return ONLY the override-applied plot
     # (named zz_mpfig_override.png) instead of all of the script's plots.
     override_only: bool = False
+    # Force the last_plot() re-render to zz_mpfig_override.png even when there
+    # are no text_overrides — used by Save Collage to re-render an R plot at a
+    # higher resolution (override_width/height) for high-DPI export.
+    render_override: bool = False
     # Pixel dimensions for the override-applied plot (match the collage item's
     # natural size so the aspect ratio is preserved). res stays 150 to match
     # mpfig_plot's default so point sizes map consistently.
@@ -5060,11 +5074,14 @@ def _r_face(o: dict) -> str:
     return "plain"
 
 
-def _r_text_override_block(ov: dict, width: int, height: int) -> str:
+def _r_text_override_block(ov: dict, width: int, height: int, force: bool = False) -> str:
     """Build an R snippet that takes ggplot2::last_plot(), applies per-slot
     text/size/color/face overrides via labs()+theme(), and writes it to
-    zz_mpfig_override.png. Returns "" when nothing to apply."""
-    if not ov or not isinstance(ov, dict):
+    zz_mpfig_override.png. When `force` is set, the plot is re-rendered at the
+    given size even with no overrides (used for high-DPI export). Returns ""
+    only when there is nothing to do (no overrides and not forced)."""
+    ov = ov if isinstance(ov, dict) else {}
+    if not ov and not force:
         return ""
 
     def elem_text(o: dict):
@@ -5121,16 +5138,16 @@ def _r_text_override_block(ov: dict, width: int, height: int) -> str:
         add.append("ggplot2::labs(" + ", ".join(labs_parts) + ")")
     if theme_parts:
         add.append("ggplot2::theme(" + ", ".join(theme_parts) + ")")
-    if not add:
+    if not add and not force:
         return ""
-    additions = " + ".join(add)
+    apply_line = (f"      .mpfig_p <- .mpfig_p + {' + '.join(add)}\n") if add else ""
     return (
         "\n# ── mpfig R text overrides (collage) ──\n"
         "try({\n"
         '  if (requireNamespace("ggplot2", quietly=TRUE)) {\n'
         "    .mpfig_p <- tryCatch(ggplot2::last_plot(), error=function(e) NULL)\n"
         '    if (!is.null(.mpfig_p) && inherits(.mpfig_p, "ggplot")) {\n'
-        f"      .mpfig_p <- .mpfig_p + {additions}\n"
+        f"{apply_line}"
         f'      png(file.path(.plot_dir, "zz_mpfig_override.png"), width={int(width)}, height={int(height)}, res=150)\n'
         "      print(.mpfig_p)\n"
         "      while (dev.cur() > 1) dev.off()\n"
@@ -5219,8 +5236,13 @@ def run_r_code(body: RAnalysisRequest):
         script += '\n\n# Close any open graphics devices\nwhile (dev.cur() > 1) dev.off()\n'
         # Per-element text overrides (collage R-plot text editing): re-render
         # last_plot() with title/axis/legend overrides into zz_mpfig_override.png.
-        if body.text_overrides:
-            script += _r_text_override_block(body.text_overrides, body.override_width, body.override_height)
+        # `render_override` forces this re-render even with no overrides (used by
+        # Save Collage to re-render at higher resolution for high-DPI export).
+        if body.text_overrides or body.render_override:
+            script += _r_text_override_block(
+                body.text_overrides or {}, body.override_width, body.override_height,
+                force=bool(body.render_override),
+            )
 
         script_path = os.path.join(tmpdir, "analysis.R")
         with open(script_path, "w") as f:
@@ -5239,7 +5261,7 @@ def run_r_code(body: RAnalysisRequest):
 
         plot_files = sorted(glob_mod.glob(os.path.join(plot_dir, "*.png")))
         # When the caller only wants the override-applied plot, drop the rest.
-        if body.text_overrides and body.override_only:
+        if body.override_only and (body.text_overrides or body.render_override):
             plot_files = [p for p in plot_files if os.path.basename(p) == "zz_mpfig_override.png"]
         plots_b64 = []
         for png_path in plot_files:
