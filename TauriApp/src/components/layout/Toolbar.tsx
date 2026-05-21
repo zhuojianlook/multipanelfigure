@@ -1422,11 +1422,37 @@ function RecordAppButton() {
       });
       if (!path) return;
       const idx = await getScreenDeviceIndex();
+      // Crop the screen capture down to JUST this app window. avfoundation can
+      // only grab a whole display, so we compute the window's rectangle as
+      // fractions of its monitor (scale-independent — works on Retina/scaled
+      // modes) and let ffmpeg's crop filter resolve them against the real
+      // capture resolution at runtime. Falls back to full-screen if the
+      // window/monitor geometry can't be read.
+      let cropVf: string | null = null;
+      try {
+        const { getCurrentWindow, currentMonitor } = await import("@tauri-apps/api/window");
+        const win = getCurrentWindow();
+        const [pos, size, mon] = await Promise.all([win.outerPosition(), win.outerSize(), currentMonitor()]);
+        if (mon && mon.size.width > 0 && mon.size.height > 0) {
+          const fx = (pos.x - mon.position.x) / mon.size.width;
+          const fy = (pos.y - mon.position.y) / mon.size.height;
+          const fw = size.width / mon.size.width;
+          const fh = size.height / mon.size.height;
+          const cx = Math.max(0, Math.min(1, fx));
+          const cy = Math.max(0, Math.min(1, fy));
+          const cw = Math.max(0.02, Math.min(1 - cx, fw));
+          const ch = Math.max(0.02, Math.min(1 - cy, fh));
+          cropVf = `crop=floor(iw*${cw.toFixed(5)}/2)*2:floor(ih*${ch.toFixed(5)}/2)*2:floor(iw*${cx.toFixed(5)}/2)*2:floor(ih*${cy.toFixed(5)}/2)*2`;
+        }
+      } catch (e) {
+        console.warn("[record] window geometry unavailable — recording full screen", e);
+      }
       const { Command } = await import("@tauri-apps/plugin-shell");
       const cmd = Command.sidecar("binaries/ffmpeg", [
         "-hide_banner", "-y",
         "-f", "avfoundation", "-capture_cursor", "1", "-framerate", "30",
         "-i", `${idx}:none`,
+        ...(cropVf ? ["-vf", cropVf] : []),
         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
         path,
       ]);
