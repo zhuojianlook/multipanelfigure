@@ -5013,6 +5013,11 @@ class RAnalysisRequest(BaseModel):
     # mpfig_plot's default so point sizes map consistently.
     override_width: int = 800
     override_height: int = 600
+    # When True, also extract the current ggplot text labels (title/subtitle/
+    # x/y/caption + legend title from the mapped aesthetic) from last_plot()
+    # and return them under "labels" — so the collage can show the ACTUAL
+    # text of each editable element instead of generic slot names.
+    emit_labels: bool = False
 
 
 def _find_rscript(custom_path: Optional[str] = None) -> Optional[str]:
@@ -5272,6 +5277,29 @@ def run_r_code(body: RAnalysisRequest):
                 body.text_overrides or {}, body.override_width, body.override_height,
                 force=bool(body.render_override),
             )
+        if body.emit_labels:
+            script += (
+                "\n# ── mpfig: emit current ggplot text labels ──\n"
+                "try({\n"
+                '  if (requireNamespace("ggplot2", quietly=TRUE)) {\n'
+                "    .mpfig_lp <- tryCatch(ggplot2::last_plot(), error=function(e) NULL)\n"
+                "    if (!is.null(.mpfig_lp)) {\n"
+                # get_labs() (ggplot2 >= 3.5) resolves auto aesthetic labels
+                # (e.g. legend titles from aes(fill=...)); fall back to $labels.
+                "      .mpfig_lab <- tryCatch(ggplot2::get_labs(.mpfig_lp), error=function(e) .mpfig_lp$labels)\n"
+                "      if (is.null(.mpfig_lab)) .mpfig_lab <- .mpfig_lp$labels\n"
+                '      cat("__MPFIG_LABELS_START__\\n")\n'
+                "      for (.mpfig_k in names(.mpfig_lab)) {\n"
+                "        .mpfig_v <- .mpfig_lab[[.mpfig_k]]\n"
+                "        if (is.null(.mpfig_v)) next\n"
+                "        .mpfig_sv <- tryCatch(if (is.character(.mpfig_v)) .mpfig_v[1] else paste(deparse(.mpfig_v), collapse=' '), error=function(e) '')\n"
+                '        cat(.mpfig_k, "\\t", .mpfig_sv, "\\n", sep="")\n'
+                "      }\n"
+                '      cat("__MPFIG_LABELS_END__\\n")\n'
+                "    }\n"
+                "  }\n"
+                "}, silent=TRUE)\n"
+            )
 
         script_path = os.path.join(tmpdir, "analysis.R")
         with open(script_path, "w") as f:
@@ -5309,12 +5337,26 @@ def run_r_code(body: RAnalysisRequest):
                 import sys
                 print(f"[run-r] failed to read table {csv_path}: {_e}", file=sys.stderr, flush=True)
 
+        # Parse emitted ggplot labels (between the markers) when requested.
+        labels: Dict[str, str] = {}
+        if body.emit_labels:
+            so = result.stdout or ""
+            if "__MPFIG_LABELS_START__" in so and "__MPFIG_LABELS_END__" in so:
+                seg = so.split("__MPFIG_LABELS_START__", 1)[1].split("__MPFIG_LABELS_END__", 1)[0]
+                for line in seg.splitlines():
+                    if "\t" in line:
+                        k, v = line.split("\t", 1)
+                        k = k.strip()
+                        if k:
+                            labels[k] = v.strip()
+
         return {
             "success": result.returncode == 0,
             "stdout": result.stdout,
             "stderr": result.stderr,
             "plots": plots_b64,
             "tables": tables_out,
+            "labels": labels,
         }
 
 

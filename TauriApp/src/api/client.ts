@@ -476,6 +476,8 @@ class ApiClient {
       /** Force the last_plot() re-render even without text overrides (used to
        *  re-render an R plot at a higher resolution for high-DPI export). */
       renderOverride?: boolean;
+      /** Also return the plot's current ggplot text labels under `labels`. */
+      emitLabels?: boolean;
     },
   ): Promise<{
     success: boolean;
@@ -485,6 +487,10 @@ class ApiClient {
     /** CSV-encoded data.frames the R script wrote out via mpfig_data(df, name).
      *  Empty array when the script didn't call mpfig_data. */
     tables: { name: string; csv: string }[];
+    /** Current ggplot text labels (only when emitLabels was set). Keys are
+     *  ggplot label names: title/subtitle/x/y/caption + mapped aesthetics
+     *  (colour/fill/…) for the legend title. */
+    labels?: Record<string, string>;
   }> {
     return apiJson("/api/analysis/run-r", "POST", JSON.stringify({
       code, data_csv: dataCsv, rscript_path: rscriptPath || null,
@@ -494,6 +500,7 @@ class ApiClient {
       override_width: opts?.overrideWidth && opts.overrideWidth > 0 ? Math.round(opts.overrideWidth) : 800,
       override_height: opts?.overrideHeight && opts.overrideHeight > 0 ? Math.round(opts.overrideHeight) : 600,
       render_override: !!opts?.renderOverride,
+      emit_labels: !!opts?.emitLabels,
     }));
   }
 

@@ -185,6 +185,28 @@ const R_TEXT_SLOTS: { slot: RTextSlot; label: string }[] = [
   { slot: "caption", label: "Caption" },
 ];
 
+/** Slots whose TEXT can be renamed (ggplot labs()). The rest (tick labels,
+ *  legend labels) are data-driven — only their size/colour can change, so the
+ *  editor hides the text field for them (renaming them does nothing). */
+const R_TEXT_BEARING = new Set<RTextSlot>([
+  "title", "subtitle", "xaxis", "yaxis", "caption", "legend_title",
+]);
+
+/** Map ggplot's label keys (from last_plot()$labels) to our slot ids so the
+ *  dropdown can show each element's ACTUAL current text. The legend title is
+ *  whichever mapped aesthetic carries it. */
+function mapRLabels(lab: Record<string, string>): Partial<Record<RTextSlot, string>> {
+  const out: Partial<Record<RTextSlot, string>> = {};
+  if (lab.title != null) out.title = lab.title;
+  if (lab.subtitle != null) out.subtitle = lab.subtitle;
+  if (lab.x != null) out.xaxis = lab.x;
+  if (lab.y != null) out.yaxis = lab.y;
+  if (lab.caption != null) out.caption = lab.caption;
+  const legend = lab.colour ?? lab.color ?? lab.fill ?? lab.shape ?? lab.linetype ?? lab.size ?? lab.alpha;
+  if (legend != null) out.legend_title = legend;
+  return out;
+}
+
 export function CollageView() {
   const items = useCollageStore((s) => s.items);
   const canvasW = useCollageStore((s) => s.canvasW);
@@ -302,12 +324,15 @@ export function CollageView() {
   >(null);
   // R-plot text-element editor (click a ggplot title/axis/legend hotspot).
   const [rTextEditor, setRTextEditor] = useState<
-    { itemId: string; slot: RTextSlot; label: string; anchorEl: HTMLElement; value: RTextOverride } | null
+    { itemId: string; slot: RTextSlot; label: string; anchorEl: HTMLElement; value: RTextOverride; textBearing: boolean } | null
   >(null);
   // Dropdown listing an R plot's editable text slots (anchored to the
   // "Edit text" button overlaid on the selected R plot).
   const [rMenu, setRMenu] = useState<{ item: CollageItem; anchorEl: HTMLElement } | null>(null);
   const [rBusyItem, setRBusyItem] = useState<string | null>(null);
+  // Cache of each R plot's ACTUAL current ggplot text labels (fetched from R
+  // when the item is selected), so the dropdown shows the real text.
+  const [rLabelsByItem, setRLabelsByItem] = useState<Record<string, Partial<Record<RTextSlot, string>>>>({});
 
   // Re-render an R-plot item, applying its stored per-element text overrides
   // (and the current synchronized base size, if any) by re-running its R code.
@@ -357,10 +382,15 @@ export function CollageView() {
     }
   };
 
-  // Open the R text-slot editor seeded from the item's current override.
+  // Open the R text-slot editor seeded from the item's current override (or
+  // the element's actual current text when there's no override yet).
   const openRTextEditor = (it: CollageItem, slot: RTextSlot, label: string, anchorEl: HTMLElement) => {
     const cur = (it.rTextOverrides || {})[slot] || {};
-    setRTextEditor({ itemId: it.id, slot, label, anchorEl, value: { ...cur } });
+    const textBearing = R_TEXT_BEARING.has(slot);
+    const actual = rLabelsByItem[it.id]?.[slot];
+    const value: RTextOverride = { ...cur };
+    if (textBearing && value.text === undefined && actual !== undefined) value.text = actual;
+    setRTextEditor({ itemId: it.id, slot, label, anchorEl, value, textBearing });
   };
 
   const applyRText = () => {
@@ -419,6 +449,26 @@ export function CollageView() {
     } else if (!it) {
       setElemSyncItem(null);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId]);
+
+  // When an R plot is selected, fetch its actual ggplot text labels once so
+  // the "Edit text" dropdown can show the real text of each element.
+  useEffect(() => {
+    const it = items.find((i) => i.id === selectedId);
+    if (!it || it.kind !== "image" || !it.rCode) return;
+    if (rLabelsByItem[it.id]) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api.runR(it.rCode!, it.rDataCsv ?? "", it.rInterpreter ?? undefined, null, { emitLabels: true });
+        if (cancelled) return;
+        setRLabelsByItem((m) => ({ ...m, [it.id]: mapRLabels(res.labels || {}) }));
+      } catch (e) {
+        console.warn("[collage] R labels fetch failed", e);
+      }
+    })();
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
 
@@ -1704,24 +1754,38 @@ export function CollageView() {
           onClose={() => setRMenu(null)}
           MenuListProps={{ dense: true }}
         >
-          {R_TEXT_SLOTS.map(({ slot, label }) => {
-            const has = !!(rMenu.item.rTextOverrides || {})[slot];
-            return (
-              <MenuItem
-                key={slot}
-                onClick={(e) => {
-                  const it = rMenu.item;
-                  const anchor = rMenu.anchorEl;
-                  setRMenu(null);
-                  openRTextEditor(it, slot, label, anchor || (e.currentTarget as HTMLElement));
-                }}
-                sx={{ fontSize: "0.78rem" }}
-              >
-                {label}
-                {has && <Box component="span" sx={{ ml: "auto", pl: 2, color: "primary.main", fontSize: "0.7rem" }}>edited</Box>}
-              </MenuItem>
-            );
-          })}
+          {(() => {
+            const labels = rLabelsByItem[rMenu.item.id] || {};
+            const ov = rMenu.item.rTextOverrides || {};
+            return R_TEXT_SLOTS.map(({ slot, label }) => {
+              const textBearing = R_TEXT_BEARING.has(slot);
+              const ovSlot = ov[slot];
+              const has = !!ovSlot;
+              const actual = textBearing ? (ovSlot?.text ?? labels[slot]) : undefined;
+              const primary = textBearing
+                ? (actual && actual.length ? actual : `(add ${label.toLowerCase()})`)
+                : label;
+              const secondary = textBearing ? label : "size · colour only";
+              return (
+                <MenuItem
+                  key={slot}
+                  onClick={(e) => {
+                    const it = rMenu.item;
+                    const anchor = rMenu.anchorEl;
+                    setRMenu(null);
+                    openRTextEditor(it, slot, label, anchor || (e.currentTarget as HTMLElement));
+                  }}
+                  sx={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 0, py: 0.5 }}
+                >
+                  <Box component="span" sx={{ fontSize: "0.78rem", fontWeight: 500, maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {primary}
+                    {has && <Box component="span" sx={{ color: "primary.main", ml: 1, fontSize: "0.62rem" }}>· edited</Box>}
+                  </Box>
+                  <Box component="span" sx={{ fontSize: "0.6rem", color: "text.secondary" }}>{secondary}</Box>
+                </MenuItem>
+              );
+            });
+          })()}
         </Menu>
       )}
 
@@ -1736,14 +1800,20 @@ export function CollageView() {
         >
           <Box sx={{ p: 1.5, width: 260, display: "flex", flexDirection: "column", gap: 1 }}>
             <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary" }}>
-              {rTextEditor.label} text
+              {rTextEditor.label}{rTextEditor.textBearing ? " text" : " — size / colour"}
             </Typography>
-            <TextField
-              size="small" autoFocus placeholder="(leave blank to keep)"
-              value={rTextEditor.value.text ?? ""}
-              onChange={(e) => setRTextEditor((s) => s && ({ ...s, value: { ...s.value, text: e.target.value } }))}
-              sx={{ "& input": { fontSize: "0.78rem" } }}
-            />
+            {rTextEditor.textBearing ? (
+              <TextField
+                size="small" autoFocus placeholder="(text)"
+                value={rTextEditor.value.text ?? ""}
+                onChange={(e) => setRTextEditor((s) => s && ({ ...s, value: { ...s.value, text: e.target.value } }))}
+                sx={{ "& input": { fontSize: "0.78rem" } }}
+              />
+            ) : (
+              <Typography variant="caption" sx={{ fontSize: "0.62rem", color: "text.secondary", fontStyle: "italic" }}>
+                These labels come from your data and can't be renamed — adjust size / colour below.
+              </Typography>
+            )}
             <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
               <TextField
                 type="number" size="small" label="Size (pt)"
