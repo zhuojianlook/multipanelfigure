@@ -8,7 +8,7 @@
    changes are guarded (Save / Don't save / Cancel).
    ────────────────────────────────────────────────────────── */
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Box, Tooltip } from "@mui/material";
 import ViewModuleIcon from "@mui/icons-material/ViewModule";
 import DescriptionIcon from "@mui/icons-material/Description";
@@ -24,7 +24,16 @@ export function DocumentTabs() {
   const openDocs = useCollageStore((s) => s.openDocs);
   const activeDocId = useCollageStore((s) => s.activeDocId);
   const snapshotDirtyDocIds = useCollageStore((s) => s.snapshotDirtyDocIds);
+  const docRename = useCollageStore((s) => s.docRename);
   const unsaved = useFigureStore((s) => s.unsaved);
+
+  // Inline tab rename: id of the tab being renamed + its draft text.
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState("");
+  const commitRename = () => {
+    if (editingId) docRename(editingId, editValue);
+    setEditingId(null);
+  };
 
   // Seed tabs once from persisted collage figure items, so figures that
   // survived a reload still appear as openable document tabs. Only adds
@@ -102,13 +111,40 @@ export function DocumentTabs() {
         // switched away from it without saving).
         const dirty = (activeDocId === doc.id && unsaved)
           || snapshotDirtyDocIds.includes(doc.id);
+        const editing = editingId === doc.id;
         return (
-          <Tooltip key={doc.id} title={doc.path || "Unsaved document"}>
-            <Box sx={tabSx(active)} onClick={() => void switchToDocument(doc.id)}>
+          <Tooltip key={doc.id} title={editing ? "" : `${doc.path || "Unsaved document"} — double-click to rename`}>
+            <Box sx={tabSx(active)} onClick={() => { if (!editing) void switchToDocument(doc.id); }}>
               <DescriptionIcon sx={{ fontSize: 14 }} />
-              <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis", maxWidth: 130 }}>
-                {doc.name}
-              </Box>
+              {editing ? (
+                <Box
+                  component="input"
+                  autoFocus
+                  value={editValue}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setEditValue(e.target.value)}
+                  onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
+                  onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                  onFocus={(e: React.FocusEvent<HTMLInputElement>) => e.target.select()}
+                  onBlur={commitRename}
+                  onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
+                    if (e.key === "Enter") { e.preventDefault(); commitRename(); }
+                    else if (e.key === "Escape") { e.preventDefault(); setEditingId(null); }
+                  }}
+                  sx={{
+                    width: 110, fontSize: "0.72rem", lineHeight: 1.2, px: 0.25, py: 0,
+                    color: "var(--c-text)", backgroundColor: "var(--c-bg)",
+                    border: "1px solid #4FC3F7", borderRadius: "3px", outline: "none",
+                  }}
+                />
+              ) : (
+                <Box
+                  component="span"
+                  sx={{ overflow: "hidden", textOverflow: "ellipsis", maxWidth: 130 }}
+                  onDoubleClick={(e) => { e.stopPropagation(); setEditValue(doc.name); setEditingId(doc.id); }}
+                >
+                  {doc.name}
+                </Box>
+              )}
               {dirty && (
                 <Box component="span" sx={{ color: "#FFB74D" }} title="Unsaved changes">●</Box>
               )}

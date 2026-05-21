@@ -465,6 +465,9 @@ export type CollageState = {
   /** Update a doc's path + name (e.g. after an Untitled is saved, or a
    *  tab is loaded from disk). */
   docSetPath: (id: string, path: string, name?: string) => void;
+  /** Rename a doc tab's display label (user-editable). For an unsaved doc this
+   *  also seeds the Save Project modal's filename. */
+  docRename: (id: string, name: string) => void;
   /** Ensure a tab exists for `path`; returns its id (existing or new). */
   docEnsure: (path: string, name?: string) => string;
   /** Replace the set of docs that have unsaved in-memory snapshots. */
@@ -831,6 +834,12 @@ export const useCollageStore = create<CollageState>()(
         d.path = path;
         d.name = name ?? (path.split(/[\\/]/).pop()?.replace(/\.mpf$/i, "") || path);
       }
+    }),
+
+    docRename: (id, name) => set((s) => {
+      const d = s.openDocs.find((x) => x.id === id);
+      const trimmed = name.trim();
+      if (d && trimmed) d.name = trimmed;
     }),
 
     docEnsure: (path, name) => {

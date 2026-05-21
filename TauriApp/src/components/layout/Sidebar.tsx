@@ -40,7 +40,7 @@ import { sortFontList, pickDefaultFont } from "../../utils/fontList";
 import { api } from "../../api/client";
 import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 import { detectGlobalFont, describeDetectedFont } from "../../utils/detectGlobalFont";
-import { openProjectIntoTab, enterAnalysis } from "../../utils/projectNav";
+import { openProjectIntoTab, enterAnalysis, defaultProjectName } from "../../utils/projectNav";
 import { saveProjectDialog } from "../shared/SaveProjectDialog";
 
 /* ── tiny reusable pieces ─────────────────────────────── */
@@ -744,6 +744,7 @@ function BuilderSidebar() {
   const setSpacing = useFigureStore((s) => s.setSpacing);
   const setConfig = useFigureStore((s) => s.setConfig);
   const saveProject = useFigureStore((s) => s.saveProject);
+  const currentProjectPath = useFigureStore((s) => s.currentProjectPath);
   const checkGridResizeConflict = useFigureStore((s) => s.checkGridResizeConflict);
   const fetchFonts = useFigureStore((s) => s.fetchFonts);
   const fonts = useFigureStore((s) => s.fonts);
@@ -1513,9 +1514,11 @@ function BuilderSidebar() {
           variant="contained"
           color="primary"
           onClick={async () => {
-            const now = new Date();
-            const ts = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,"0")}${String(now.getDate()).padStart(2,"0")}_${String(now.getHours()).padStart(2,"0")}${String(now.getMinutes()).padStart(2,"0")}${String(now.getSeconds()).padStart(2,"0")}`;
-            const picked = await saveProjectDialog({ defaultPath: `${ts}_project.mpf` });
+            // Seed the filename from the (renamed) active tab when unsaved, else
+            // the current path, else a timestamp — matching ensureProjectSaved.
+            const picked = await saveProjectDialog({
+              defaultPath: currentProjectPath || defaultProjectName(),
+            });
             if (picked) await saveProject(picked);
           }}
         >

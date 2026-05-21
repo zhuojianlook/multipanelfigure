@@ -108,9 +108,19 @@ export async function ensureProjectSaved(): Promise<string | null> {
   return useFigureStore.getState().currentProjectPath || picked;
 }
 
-/** Timestamped default project filename, matching the Sidebar's
- *  Save Project button so an Untitled doc gets a sensible name. */
-function defaultProjectName(): string {
+/** Default project filename for the Save Project modal. If the user has
+ *  renamed the active (unsaved) tab, that name seeds the filename; otherwise
+ *  fall back to a timestamped name. Sanitizes path-illegal characters and
+ *  ensures a .mpf extension. Exported so the Sidebar's Save Project button
+ *  uses the identical default. */
+export function defaultProjectName(): string {
+  const cs = useCollageStore.getState();
+  const doc = cs.openDocs.find((d) => d.id === cs.activeDocId);
+  const custom = doc?.name?.trim();
+  if (custom && custom.toLowerCase() !== "untitled") {
+    const safe = custom.replace(/[\\/:*?"<>|]+/g, "_").replace(/\.mpf$/i, "");
+    if (safe) return `${safe}.mpf`;
+  }
   const now = new Date();
   const p = (n: number) => String(n).padStart(2, "0");
   const ts = `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}`
