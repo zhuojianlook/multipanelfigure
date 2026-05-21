@@ -105,7 +105,14 @@ export type CollageItem = {
   fontFamily?: string;
   fontBold?: boolean;
   fontItalic?: boolean;
+  fontUnderline?: boolean;
   align?: "left" | "center" | "right";
+  /** Per-character rich styling for a text item. When present (non-empty)
+   *  it supersedes the whole-box font* props on render/export, enabling
+   *  mixed fonts, colours, bold/italic/underline/strikethrough and
+   *  super/subscript within a single text box (edited via RichTextEditor).
+   *  `text` is kept in sync as the plain concatenation for search/snapshot. */
+  styledSegments?: import("../api/types").StyledSegment[];
   /** For image-kind items: the ORIGINAL (un-cropped) data URL, kept so the
    *  user can re-crop from the full image. Set on first crop. */
   cropOrigSrc?: string;

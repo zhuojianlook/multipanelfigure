@@ -49,6 +49,10 @@ interface ChangelogEntry {
 }
 
 let _changelogCache: ChangelogEntry[] | null = null;
+// The About dialog auto-opens once per app session. Tracked at module scope
+// so the Toolbar remounting (e.g. switching out of and back into the
+// Analysis tab, which unmounts the toolbar) does NOT re-open it.
+let _aboutAutoShown = false;
 
 /** Fetch a URL via Rust proxy (bypasses WebView CORS), fallback to browser fetch */
 async function proxyFetch(url: string): Promise<string> {
@@ -235,15 +239,88 @@ function SaveCollageButton() {
     for (const it of sorted) {
       if (it.kind === "text") {
         withRotation(it, () => {
-          // Text items have no raster — draw the styled text with word wrap.
-          const fs = it.fontSize ?? 28;
-          const family = it.fontFamily ?? "Arial";
+          const baseSize = it.fontSize ?? 28;
+          const baseColor = it.fontColor ?? "#000000";
+          const align = it.align ?? "left";
+          // Custom fonts register under their file-name-without-extension.
+          const fam = (n?: string) => `"${(n ?? "Arial").replace(/\.(ttf|otf|ttc|woff2?)$/i, "")}", Arial, sans-serif`;
+
+          if (it.styledSegments?.length) {
+            // Rich text: lay out per-character segments with word wrap,
+            // per-segment font/size/colour and bold/italic/underline/
+            // strikethrough/super-subscript. Two passes: wrap into lines,
+            // then draw each line with its alignment offset.
+            type Tok = { text: string; seg: typeof it.styledSegments[number]; space: boolean };
+            const sizeOf = (seg: Tok["seg"]) => {
+              const st = seg.font_style ?? [];
+              const sub = st.includes("Superscript") || st.includes("Subscript");
+              return (seg.font_size ?? baseSize) * (sub ? 0.7 : 1);
+            };
+            const fontOf = (seg: Tok["seg"]) => {
+              const st = seg.font_style ?? [];
+              const weight = st.includes("Bold") ? "bold" : "normal";
+              const ital = st.includes("Italic") ? "italic" : "normal";
+              return `${ital} ${weight} ${sizeOf(seg)}px ${fam(seg.font_name)}`;
+            };
+            const measure = (t: Tok) => { ctx.font = fontOf(t.seg); return ctx.measureText(t.text).width; };
+            // Tokenize: words, runs of spaces, and explicit newlines.
+            const tokens: Tok[] = [];
+            for (const seg of it.styledSegments) {
+              for (const part of (seg.text ?? "").split(/(\n| +)/)) {
+                if (part === "") continue;
+                tokens.push({ text: part, seg, space: part === "\n" || /^ +$/.test(part) });
+              }
+            }
+            // Pass 1: wrap.
+            const lines: Tok[][] = [];
+            let cur: Tok[] = [];
+            let curW = 0;
+            for (const tk of tokens) {
+              if (tk.text === "\n") { lines.push(cur); cur = []; curW = 0; continue; }
+              if (tk.space && cur.length === 0) continue; // drop leading spaces
+              const w = measure(tk);
+              if (!tk.space && curW + w > it.w && cur.length > 0) { lines.push(cur); cur = []; curW = 0; }
+              cur.push(tk); curW += w;
+            }
+            if (cur.length) lines.push(cur);
+            // Pass 2: draw.
+            ctx.textBaseline = "top";
+            ctx.textAlign = "left";
+            let y = it.y;
+            for (const line of lines) {
+              const widths = line.map(measure);
+              const lineW = widths.reduce((a, b) => a + b, 0);
+              const lineH = Math.max(baseSize, ...line.map((t) => sizeOf(t.seg))) * 1.2;
+              let x = align === "center" ? it.x + (it.w - lineW) / 2 : align === "right" ? it.x + (it.w - lineW) : it.x;
+              line.forEach((tk, i) => {
+                const st = tk.seg.font_style ?? [];
+                const sz = sizeOf(tk.seg);
+                const dy = st.includes("Superscript") ? -sz * 0.35 : st.includes("Subscript") ? sz * 0.35 : 0;
+                ctx.font = fontOf(tk.seg);
+                ctx.fillStyle = tk.seg.color || baseColor;
+                ctx.fillText(tk.text, x, y + dy);
+                if (st.includes("Underline") || st.includes("Strikethrough")) {
+                  ctx.save();
+                  ctx.strokeStyle = tk.seg.color || baseColor;
+                  ctx.lineWidth = Math.max(1, sz / 14);
+                  if (st.includes("Underline")) { ctx.beginPath(); ctx.moveTo(x, y + dy + sz); ctx.lineTo(x + widths[i], y + dy + sz); ctx.stroke(); }
+                  if (st.includes("Strikethrough")) { ctx.beginPath(); ctx.moveTo(x, y + dy + sz * 0.55); ctx.lineTo(x + widths[i], y + dy + sz * 0.55); ctx.stroke(); }
+                  ctx.restore();
+                }
+                x += widths[i];
+              });
+              y += lineH;
+            }
+            return;
+          }
+
+          // Plain text box (whole-box font props, incl. underline).
+          const fs = baseSize;
           const weight = it.fontBold ? "bold" : "normal";
           const style = it.fontItalic ? "italic" : "normal";
-          ctx.font = `${style} ${weight} ${fs}px ${family}`;
-          ctx.fillStyle = it.fontColor ?? "#000000";
+          ctx.font = `${style} ${weight} ${fs}px ${fam(it.fontFamily)}`;
+          ctx.fillStyle = baseColor;
           ctx.textBaseline = "top";
-          const align = it.align ?? "left";
           ctx.textAlign = align === "center" ? "center" : align === "right" ? "right" : "left";
           const xBase = align === "center" ? it.x + it.w / 2 : align === "right" ? it.x + it.w : it.x;
           const lineHeight = fs * 1.2;
@@ -251,18 +328,29 @@ function SaveCollageButton() {
           for (const para of (it.text ?? "").split("\n")) {
             const words = para.split(" ");
             let line = "";
+            const flush = (ln: string) => {
+              ctx.fillText(ln, xBase, y);
+              if (it.fontUnderline && ln) {
+                const w = ctx.measureText(ln).width;
+                const x0 = align === "center" ? xBase - w / 2 : align === "right" ? xBase - w : xBase;
+                ctx.save();
+                ctx.strokeStyle = baseColor;
+                ctx.lineWidth = Math.max(1, fs / 14);
+                ctx.beginPath(); ctx.moveTo(x0, y + fs); ctx.lineTo(x0 + w, y + fs); ctx.stroke();
+                ctx.restore();
+              }
+              y += lineHeight;
+            };
             for (const word of words) {
               const test = line ? line + " " + word : word;
               if (ctx.measureText(test).width > it.w && line) {
-                ctx.fillText(line, xBase, y);
-                y += lineHeight;
+                flush(line);
                 line = word;
               } else {
                 line = test;
               }
             }
-            ctx.fillText(line, xBase, y);
-            y += lineHeight;
+            flush(line);
           }
         });
         continue;
@@ -459,7 +547,12 @@ export function Toolbar() {
   const fileRef = useRef<HTMLInputElement>(null);
   const [saveDlgOpen, setSaveDlgOpen] = useState(false);
   const [newConfirmOpen, setNewConfirmOpen] = useState(false);
-  const [aboutOpen, setAboutOpen] = useState(true);
+  const [aboutOpen, setAboutOpen] = useState(() => {
+    // Auto-open only the first time the toolbar mounts this session.
+    if (_aboutAutoShown) return false;
+    _aboutAutoShown = true;
+    return true;
+  });
   const [helpMenuAnchor, setHelpMenuAnchor] = useState<null | HTMLElement>(null);
   // Developer-options toggle lives in the Help menu (not inside
   // the About dialog).  Persisted in localStorage and broadcast

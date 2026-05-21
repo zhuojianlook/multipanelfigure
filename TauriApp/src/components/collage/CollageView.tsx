@@ -41,6 +41,7 @@ import {
   DEFAULT_CANVAS_W,
   DEFAULT_CANVAS_H,
 } from "../../store/collageStore";
+import type { CollageItem } from "../../store/collageStore";
 import { useFigureStore } from "../../store/figureStore";
 import { CollageStrip } from "./CollageStrip";
 import { RichTextEditor } from "../dialogs/RichTextEditor";
@@ -49,6 +50,47 @@ import { api } from "../../api/client";
 import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 
 type Corner = "nw" | "ne" | "sw" | "se";
+
+/** Map a stored font value to a CSS font-family. Custom fonts are
+ *  registered (loadCustomFonts.ts) under a family equal to the file name
+ *  without its extension, so `arial.ttf` → `"arial", Arial, sans-serif`.
+ *  Legacy values that are already plain family names (e.g. "Arial") pass
+ *  through unchanged. */
+function cssFamily(name?: string): string {
+  if (!name) return "Arial, sans-serif";
+  const stripped = name.replace(/\.(ttf|otf|ttc|woff2?|TTF|OTF|TTC)$/i, "");
+  return `"${stripped}", Arial, sans-serif`;
+}
+
+/** Build the React inline style for one rich-text segment (per-character
+ *  styling), inheriting the text box's base size/colour where the segment
+ *  doesn't override them. Used for live preview AND export parity. */
+function segmentStyle(
+  seg: StyledSegment,
+  baseSize: number,
+  baseColor: string,
+): React.CSSProperties {
+  const styles = seg.font_style ?? [];
+  const isSuper = styles.includes("Superscript");
+  const isSub = styles.includes("Subscript");
+  const baseSeg = seg.font_size ?? baseSize;
+  return {
+    fontFamily: cssFamily(seg.font_name),
+    fontSize: `${isSuper || isSub ? baseSeg * 0.7 : baseSeg}px`,
+    color: seg.color || baseColor,
+    fontWeight: styles.includes("Bold") ? 700 : 400,
+    fontStyle: styles.includes("Italic") ? "italic" : "normal",
+    textDecoration:
+      [
+        styles.includes("Underline") ? "underline" : "",
+        styles.includes("Strikethrough") ? "line-through" : "",
+      ]
+        .filter(Boolean)
+        .join(" ") || "none",
+    verticalAlign: isSuper ? "super" : isSub ? "sub" : "baseline",
+    whiteSpace: "pre-wrap",
+  };
+}
 
 /* Canvas size presets for common journals + paper sizes. Dimensions are
    in pixels at 300 DPI (px = mm / 25.4 × 300). Widths follow each
@@ -154,6 +196,7 @@ export function CollageView() {
   const setMode = useCollageStore((s) => s.setMode);
 
   const containerRef = useRef<HTMLDivElement>(null);
+  const pageRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const projectInputRef = useRef<HTMLInputElement>(null);
   // Pan + user-zoom state. The display scale that gets applied to the
@@ -193,6 +236,34 @@ export function CollageView() {
 
   // Inline text editing: id of the text item currently being edited.
   const [editingTextId, setEditingTextId] = useState<string | null>(null);
+  // Rich-text editor for a whole text box (double-click). Gives all fonts,
+  // bold/italic/underline/strikethrough/super/subscript and per-character
+  // styling. Anchored to the text box's DOM node.
+  const [textEditor, setTextEditor] = useState<
+    { itemId: string; anchorEl: HTMLElement; segments: StyledSegment[]; plainText: string } | null
+  >(null);
+
+  /** Open the rich-text editor for a text item, seeding it with the item's
+   *  existing styled segments (or a single segment built from its whole-box
+   *  font props so nothing is lost on first open). */
+  const openTextEditor = (it: CollageItem, anchorEl: HTMLElement) => {
+    const seed: StyledSegment[] = it.styledSegments?.length
+      ? it.styledSegments
+      : [
+          {
+            text: it.text || "",
+            color: it.fontColor || "#000000",
+            font_name: it.fontFamily || "arial.ttf",
+            font_size: it.fontSize || 28,
+            font_style: [
+              ...(it.fontBold ? ["Bold"] : []),
+              ...(it.fontItalic ? ["Italic"] : []),
+              ...(it.fontUnderline ? ["Underline"] : []),
+            ],
+          },
+        ];
+    setTextEditor({ itemId: it.id, anchorEl, segments: seed, plainText: it.text || "" });
+  };
   // Per-element rich-text customization editor (opened by double-clicking a
   // hotspot). Anchored to the clicked hotspot.
   const [elemEditor, setElemEditor] = useState<
@@ -588,6 +659,69 @@ export function CollageView() {
     );
   };
 
+  /** On-canvas rotation handle: a small circle on a stalk above the item's
+   *  top-centre. Dragging it rotates the item about its centre — the angle
+   *  is computed from the item-centre→cursor vector in screen space, so it's
+   *  immune to zoom/pan. Hold Shift to snap to 15° steps. The handle lives
+   *  inside the (CSS-rotated) item box, so it visually tracks the rotation. */
+  const renderRotationHandle = (
+    it: { id: string; x: number; y: number; w: number; h: number },
+  ) => {
+    const STALK = 26; // px above the box top edge (item-local)
+    return (
+      <Box
+        onMouseDown={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const pageRect = pageRef.current?.getBoundingClientRect();
+          if (!pageRect) return;
+          const cx = pageRect.left + (it.x + it.w / 2) * displayScale;
+          const cy = pageRect.top + (it.y + it.h / 2) * displayScale;
+          const onMove = (ev: MouseEvent) => {
+            const ang = (Math.atan2(ev.clientY - cy, ev.clientX - cx) * 180) / Math.PI + 90;
+            let deg = ((ang % 360) + 360) % 360;
+            if (ev.shiftKey) deg = (Math.round(deg / 15) * 15) % 360;
+            updateItem(it.id, { rotation: deg });
+          };
+          const onUp = () => {
+            window.removeEventListener("mousemove", onMove);
+            window.removeEventListener("mouseup", onUp);
+          };
+          window.addEventListener("mousemove", onMove);
+          window.addEventListener("mouseup", onUp);
+        }}
+        title="Drag to rotate · hold Shift for 15° steps"
+        sx={{
+          position: "absolute",
+          left: it.w / 2 - 7,
+          top: -(STALK + 14),
+          width: 14,
+          height: 14,
+          borderRadius: "50%",
+          backgroundColor: "#4FC3F7",
+          border: "2px solid #fff",
+          cursor: "grab",
+          zIndex: 4,
+          boxShadow: "0 1px 4px rgba(0,0,0,0.45)",
+        }}
+      >
+        {/* Stalk connecting the handle down to the box top edge. */}
+        <Box
+          sx={{
+            position: "absolute",
+            left: "50%",
+            top: 14,
+            width: 0,
+            height: STALK,
+            transform: "translateX(-50%)",
+            borderLeft: "1.5px solid #4FC3F7",
+            pointerEvents: "none",
+          }}
+        />
+      </Box>
+    );
+  };
+
   // Crop overlay (item-local coords): dark mask + draggable/resizable crop
   // rect + Apply/Cancel. Mouse deltas are divided by displayScale because
   // the whole page is scaled by the parent transform.
@@ -787,38 +921,66 @@ export function CollageView() {
           </span>
         </Tooltip>
 
-        {/* Text styling controls — shown when a single text item is selected. */}
+        {/* Text styling controls — shown when a single text item is selected.
+            Plain text boxes get quick whole-box controls; once a box carries
+            per-character rich styling we show a compact summary + the editor
+            button instead (so the simple controls can't silently flatten it). */}
         {selectedIds.length === 1 && selectedItem?.kind === "text" && (() => {
           const t = selectedItem;
+          const isRich = !!t.styledSegments?.length;
           return (
             <>
               <Divider orientation="vertical" flexItem />
-              <TextField
-                type="number" size="small" title="Font size (pt)"
-                value={t.fontSize ?? 28}
-                onChange={(e) => updateItem(t.id, { fontSize: Math.max(4, Math.min(400, Number(e.target.value) || 28)) })}
-                inputProps={{ min: 4, max: 400, step: 1 }}
-                sx={{ width: 64, "& input": { fontSize: "0.75rem", py: 0.5, textAlign: "center", colorScheme: "dark" },
-                  "& input[type=number]::-webkit-inner-spin-button, & input[type=number]::-webkit-outer-spin-button": { filter: "invert(1)", opacity: 1 } }}
-              />
-              <Tooltip title="Text color">
-                <Box component="input" type="color" value={t.fontColor ?? "#000000"}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => updateItem(t.id, { fontColor: e.target.value })}
-                  sx={{ width: 28, height: 28, p: 0, border: "none", bgcolor: "transparent", cursor: "pointer" }} />
+              {isRich ? (
+                <>
+                  <Typography variant="caption" sx={{ color: "text.secondary", fontStyle: "italic" }}>
+                    Rich text
+                  </Typography>
+                  <Button size="small" variant="outlined"
+                    onClick={() => updateItem(t.id, { styledSegments: undefined })}
+                    sx={{ fontSize: "0.65rem", textTransform: "none", py: 0, minWidth: 0, px: 0.75 }}>
+                    Reset style
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <TextField
+                    type="number" size="small" title="Font size (px)"
+                    value={t.fontSize ?? 28}
+                    onChange={(e) => updateItem(t.id, { fontSize: Math.max(4, Math.min(400, Number(e.target.value) || 28)) })}
+                    inputProps={{ min: 4, max: 400, step: 1 }}
+                    sx={{ width: 64, "& input": { fontSize: "0.75rem", py: 0.5, textAlign: "center", colorScheme: "dark" },
+                      "& input[type=number]::-webkit-inner-spin-button, & input[type=number]::-webkit-outer-spin-button": { filter: "invert(1)", opacity: 1 } }}
+                  />
+                  <Tooltip title="Text color">
+                    <Box component="input" type="color" value={t.fontColor ?? "#000000"}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => updateItem(t.id, { fontColor: e.target.value })}
+                      sx={{ width: 28, height: 28, p: 0, border: "none", bgcolor: "transparent", cursor: "pointer" }} />
+                  </Tooltip>
+                  <ToggleButton value="bold" selected={!!t.fontBold} size="small" onChange={() => updateItem(t.id, { fontBold: !t.fontBold })}
+                    sx={{ p: 0.5, border: "1px solid var(--c-border)", fontWeight: 700, fontSize: "0.75rem", lineHeight: 1, minWidth: 26 }}>B</ToggleButton>
+                  <ToggleButton value="italic" selected={!!t.fontItalic} size="small" onChange={() => updateItem(t.id, { fontItalic: !t.fontItalic })}
+                    sx={{ p: 0.5, border: "1px solid var(--c-border)", fontStyle: "italic", fontSize: "0.75rem", lineHeight: 1, minWidth: 26 }}>i</ToggleButton>
+                  <ToggleButton value="underline" selected={!!t.fontUnderline} size="small" onChange={() => updateItem(t.id, { fontUnderline: !t.fontUnderline })}
+                    sx={{ p: 0.5, border: "1px solid var(--c-border)", textDecoration: "underline", fontSize: "0.75rem", lineHeight: 1, minWidth: 26 }}>U</ToggleButton>
+                  <Box component="select" value={t.fontFamily ?? "arial.ttf"}
+                    onChange={(e: React.ChangeEvent<HTMLSelectElement>) => updateItem(t.id, { fontFamily: e.target.value })}
+                    title="Font family"
+                    sx={{ fontSize: "0.7rem", height: 26, maxWidth: 150, bgcolor: "var(--c-surface)", color: "var(--c-text)", border: "1px solid var(--c-border)", borderRadius: 1, px: 0.5 }}>
+                    {(fonts.length > 0 ? fonts : ["arial.ttf"]).map((f) => (
+                      <option key={f} value={f}>{f.replace(/\.(ttf|otf|ttc|woff2?)$/i, "")}</option>
+                    ))}
+                  </Box>
+                </>
+              )}
+              <Tooltip title="Bold/italic/underline, super/subscript, per-character fonts & colours">
+                <Button size="small" variant="outlined"
+                  onClick={(e) => openTextEditor(t, e.currentTarget)}
+                  sx={{ fontSize: "0.65rem", textTransform: "none", py: 0, minWidth: 0, px: 0.75 }}>
+                  Style…
+                </Button>
               </Tooltip>
-              <ToggleButton value="bold" selected={!!t.fontBold} size="small" onChange={() => updateItem(t.id, { fontBold: !t.fontBold })}
-                sx={{ p: 0.5, border: "1px solid var(--c-border)", fontWeight: 700, fontSize: "0.75rem", lineHeight: 1, minWidth: 26 }}>B</ToggleButton>
-              <ToggleButton value="italic" selected={!!t.fontItalic} size="small" onChange={() => updateItem(t.id, { fontItalic: !t.fontItalic })}
-                sx={{ p: 0.5, border: "1px solid var(--c-border)", fontStyle: "italic", fontSize: "0.75rem", lineHeight: 1, minWidth: 26 }}>i</ToggleButton>
-              <Box component="select" value={t.fontFamily ?? "Arial"}
-                onChange={(e: React.ChangeEvent<HTMLSelectElement>) => updateItem(t.id, { fontFamily: e.target.value })}
-                title="Font family"
-                sx={{ fontSize: "0.7rem", height: 26, bgcolor: "var(--c-surface)", color: "var(--c-text)", border: "1px solid var(--c-border)", borderRadius: 1, px: 0.5 }}>
-                {["Arial", "Helvetica", "Times New Roman", "Georgia", "Courier New", "Verdana"].map((f) => (
-                  <option key={f} value={f}>{f}</option>
-                ))}
-              </Box>
-              <Tooltip title="Rotation (°)">
+              <Tooltip title="Rotation (°) — or drag the round handle above the box">
                 <TextField
                   type="number" size="small"
                   value={Math.round(t.rotation ?? 0)}
@@ -857,7 +1019,7 @@ export function CollageView() {
                 sx={{ fontSize: "0.7rem", height: 26, bgcolor: "var(--c-surface)", color: "var(--c-text)", border: "1px solid var(--c-border)", borderRadius: 1, px: 0.5 }}>
                 {["solid", "dashed", "dotted"].map((s) => (<option key={s} value={s}>{s}</option>))}
               </Box>
-              <Tooltip title="Rotation (°)">
+              <Tooltip title="Rotation (°) — or drag the round handle above the line">
                 <TextField type="number" size="small" value={Math.round(t.rotation ?? 0)}
                   onChange={(e) => updateItem(t.id, { rotation: ((Number(e.target.value) || 0) % 360 + 360) % 360 })}
                   inputProps={{ min: 0, max: 359, step: 5 }}
@@ -1080,6 +1242,7 @@ export function CollageView() {
         >
           {/* The "page" — solid color or a checkerboard for transparent. */}
           <Box
+            ref={pageRef}
             sx={{
               position: "relative",
               width: canvasW,
@@ -1224,7 +1387,14 @@ export function CollageView() {
                     window.addEventListener("mousemove", onMove);
                     window.addEventListener("mouseup", onUp);
                   }}
-                  onDoubleClick={() => { if (it.kind === "text") setEditingTextId(it.id); }}
+                  onDoubleClick={(e) => {
+                    if (it.kind !== "text") return;
+                    // Rich-styled boxes open the full editor (so inline editing
+                    // can't flatten their per-character styling); plain boxes
+                    // get the quick inline textarea for fast content edits.
+                    if (it.styledSegments?.length) openTextEditor(it, e.currentTarget as HTMLElement);
+                    else setEditingTextId(it.id);
+                  }}
                   sx={{
                     position: "absolute",
                     left: it.x,
@@ -1251,21 +1421,36 @@ export function CollageView() {
                           border: "none", outline: "none", resize: "none", background: "transparent",
                           padding: 0, lineHeight: 1.2, overflow: "hidden",
                           fontSize: it.fontSize ?? 28, color: it.fontColor ?? "#000000",
-                          fontFamily: it.fontFamily ?? "Arial",
+                          fontFamily: cssFamily(it.fontFamily),
                           fontWeight: it.fontBold ? "bold" : "normal",
                           fontStyle: it.fontItalic ? "italic" : "normal",
+                          textDecoration: it.fontUnderline ? "underline" : "none",
                           textAlign: it.align ?? "left",
                         }}
                       />
+                    ) : it.styledSegments?.length ? (
+                      <div style={{
+                        width: "100%", height: "100%", overflow: "hidden",
+                        whiteSpace: "pre-wrap", wordBreak: "break-word", lineHeight: 1.2,
+                        pointerEvents: "none", userSelect: "none",
+                        textAlign: it.align ?? "left",
+                      }}>
+                        {it.styledSegments.map((seg, i) => (
+                          <span key={`${i}-${seg.text.slice(0, 6)}`} style={segmentStyle(seg, it.fontSize ?? 28, it.fontColor ?? "#000000")}>
+                            {seg.text}
+                          </span>
+                        ))}
+                      </div>
                     ) : (
                       <div style={{
                         width: "100%", height: "100%", overflow: "hidden",
                         whiteSpace: "pre-wrap", wordBreak: "break-word", lineHeight: 1.2,
                         pointerEvents: "none", userSelect: "none",
                         fontSize: it.fontSize ?? 28, color: it.fontColor ?? "#000000",
-                        fontFamily: it.fontFamily ?? "Arial",
+                        fontFamily: cssFamily(it.fontFamily),
                         fontWeight: it.fontBold ? "bold" : "normal",
                         fontStyle: it.fontItalic ? "italic" : "normal",
+                        textDecoration: it.fontUnderline ? "underline" : "none",
                         textAlign: it.align ?? "left",
                       }}>
                         {it.text || "Text"}
@@ -1298,6 +1483,10 @@ export function CollageView() {
                       {(["nw", "ne", "sw", "se"] as const).map((c) => renderResizeHandle(it, c))}
                     </>
                   )}
+                  {/* On-canvas rotation handle for text + line items. */}
+                  {isSelected && selectedIds.length === 1 && cropItemId !== it.id
+                    && (it.kind === "text" || it.kind === "line")
+                    && renderRotationHandle(it)}
                   {/* Crop overlay for image items in crop mode. */}
                   {cropItemId === it.id && cropRect && renderCropOverlay(it)}
                   {/* Per-element font-sync hotspots while this figure is
@@ -1323,6 +1512,24 @@ export function CollageView() {
       </Box>
 
       <CollageStrip />
+
+      {/* Whole text-box rich editor (double-click a styled box, or the
+          "Style…" toolbar button). Saves per-character segments + plain text. */}
+      {textEditor && (
+        <RichTextEditor
+          open
+          anchorEl={textEditor.anchorEl}
+          segments={textEditor.segments}
+          plainText={textEditor.plainText}
+          fonts={fonts}
+          onClose={() => setTextEditor(null)}
+          onSave={(segments, plainText) => {
+            const ed = textEditor;
+            updateItem(ed.itemId, { styledSegments: segments, text: plainText });
+            setTextEditor(null);
+          }}
+        />
+      )}
 
       {/* Per-element rich-text customization (double-click a hotspot). On
           save we store the style override and re-render that figure. */}
