@@ -5051,6 +5051,9 @@ class RAnalysisRequest(BaseModel):
     # are no text_overrides — used by Save Collage to re-render an R plot at a
     # higher resolution (override_width/height) for high-DPI export.
     render_override: bool = False
+    # Render the override plot as SVG (svglite) instead of PNG and return it as
+    # `svg` — used by the collage so R plots are vector-crisp at any zoom.
+    render_svg: bool = False
     # Pixel dimensions for the override-applied plot (match the collage item's
     # natural size so the aspect ratio is preserved). res stays 150 to match
     # mpfig_plot's default so point sizes map consistently.
@@ -5145,7 +5148,7 @@ def _r_face(o: dict) -> str:
     return "plain"
 
 
-def _r_text_override_block(ov: dict, width: int, height: int, force: bool = False, res: int = 150) -> str:
+def _r_text_override_block(ov: dict, width: int, height: int, force: bool = False, res: int = 150, svg: bool = False) -> str:
     """Build an R snippet that takes ggplot2::last_plot(), applies per-slot
     text/size/color/face overrides via labs()+theme(), and writes it to
     zz_mpfig_override.png. When `force` is set, the plot is re-rendered at the
@@ -5225,6 +5228,21 @@ def _r_text_override_block(ov: dict, width: int, height: int, force: bool = Fals
     if not add and not force:
         return ""
     apply_line = (f"      .mpfig_p <- .mpfig_p + {' + '.join(add)}\n") if add else ""
+    _res = max(72, int(res))
+    if svg:
+        # svglite width/height are in INCHES; derive from the px size + res so
+        # the SVG reproduces the same text-to-plot proportions as the PNG path.
+        w_in = max(1.0, float(width) / _res)
+        h_in = max(1.0, float(height) / _res)
+        device = (
+            '      if (requireNamespace("svglite", quietly=TRUE)) {\n'
+            f'        svglite::svglite(file.path(.plot_dir, "zz_mpfig_override.svg"), width={w_in:.4f}, height={h_in:.4f})\n'
+            "      } else {\n"
+            f'        png(file.path(.plot_dir, "zz_mpfig_override.png"), width={int(width)}, height={int(height)}, res={_res})\n'
+            "      }\n"
+        )
+    else:
+        device = f'      png(file.path(.plot_dir, "zz_mpfig_override.png"), width={int(width)}, height={int(height)}, res={_res})\n'
     return (
         "\n# ── mpfig R text overrides (collage) ──\n"
         "try({\n"
@@ -5232,7 +5250,7 @@ def _r_text_override_block(ov: dict, width: int, height: int, force: bool = Fals
         "    .mpfig_p <- tryCatch(ggplot2::last_plot(), error=function(e) NULL)\n"
         '    if (!is.null(.mpfig_p) && inherits(.mpfig_p, "ggplot")) {\n'
         f"{apply_line}"
-        f'      png(file.path(.plot_dir, "zz_mpfig_override.png"), width={int(width)}, height={int(height)}, res={max(72, int(res))})\n'
+        f"{device}"
         "      print(.mpfig_p)\n"
         "      while (dev.cur() > 1) dev.off()\n"
         "    }\n"
@@ -5272,7 +5290,12 @@ def run_r_code(body: RAnalysisRequest):
         script += '#   ggprism  — GraphPad Prism-style theme + palettes, add_pvalue()\n'
         script += '#   rstatix  — t-test / Wilcoxon / ANOVA / Kruskal-Wallis stats\n'
         script += '#   dplyr    — the %>% pipe used by the stats block\n'
-        script += 'for (.pkg in c("ggplot2", "ggprism", "rstatix", "dplyr")) {\n'
+        _pkgs = '"ggplot2", "ggprism", "rstatix", "dplyr"'
+        if body.render_svg:
+            # svglite gives clean vector SVG so the collage can show R plots
+            # crisp at any zoom with no re-render.
+            _pkgs += ', "svglite"'
+        script += f'for (.pkg in c({_pkgs})) {{\n'
         script += '  if (!requireNamespace(.pkg, quietly=TRUE)) install.packages(.pkg, repos="https://cloud.r-project.org", quiet=TRUE)\n'
         script += '}\n\n'
         script += f'# Auto-generated data loading\ndata <- read.csv("{data_path.replace(chr(92), "/")}")\n\n'
@@ -5322,10 +5345,11 @@ def run_r_code(body: RAnalysisRequest):
         # last_plot() with title/axis/legend overrides into zz_mpfig_override.png.
         # `render_override` forces this re-render even with no overrides (used by
         # Save Collage to re-render at higher resolution for high-DPI export).
-        if body.text_overrides or body.render_override:
+        if body.text_overrides or body.render_override or body.render_svg:
             script += _r_text_override_block(
                 body.text_overrides or {}, body.override_width, body.override_height,
-                force=bool(body.render_override), res=body.override_res,
+                force=bool(body.render_override or body.render_svg), res=body.override_res,
+                svg=bool(body.render_svg),
             )
         if body.emit_labels:
             script += (
@@ -5368,7 +5392,7 @@ def run_r_code(body: RAnalysisRequest):
 
         plot_files = sorted(glob_mod.glob(os.path.join(plot_dir, "*.png")))
         # When the caller only wants the override-applied plot, drop the rest.
-        if body.override_only and (body.text_overrides or body.render_override):
+        if body.override_only and (body.text_overrides or body.render_override or body.render_svg):
             plot_files = [p for p in plot_files if os.path.basename(p) == "zz_mpfig_override.png"]
         plots_b64 = []
         for png_path in plot_files:
@@ -5386,6 +5410,18 @@ def run_r_code(body: RAnalysisRequest):
             except Exception as _e:
                 import sys
                 print(f"[run-r] failed to read table {csv_path}: {_e}", file=sys.stderr, flush=True)
+
+        # Read the override SVG (vector R plot) when requested.
+        svg_text = None
+        if body.render_svg:
+            svg_path = os.path.join(plot_dir, "zz_mpfig_override.svg")
+            if os.path.isfile(svg_path):
+                try:
+                    with open(svg_path, "r", encoding="utf-8") as sf:
+                        svg_text = sf.read()
+                except Exception as _e:
+                    import sys as _sys
+                    print(f"[run-r] failed to read svg: {_e}", file=_sys.stderr, flush=True)
 
         # Parse emitted ggplot labels (between the markers) when requested.
         labels: Dict[str, str] = {}
@@ -5407,6 +5443,7 @@ def run_r_code(body: RAnalysisRequest):
             "plots": plots_b64,
             "tables": tables_out,
             "labels": labels,
+            "svg": svg_text,
         }
 
 

@@ -57,6 +57,22 @@ import { confirm as confirmDialog, alert as alertDialog } from "../shared/Confir
 
 type Corner = "nw" | "ne" | "sw" | "se";
 
+/** Encode an SVG string as a data URL (UTF-8 safe). */
+function svgToDataUrl(svg: string): string {
+  return `data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(svg)))}`;
+}
+
+/** Parse an SVG's intrinsic size from its viewBox (preferred) or width/height
+ *  so the collage item can keep the right aspect ratio. */
+function svgSize(svg: string): { w: number; h: number } | null {
+  const vb = svg.match(/viewBox=["']\s*[-\d.]+\s+[-\d.]+\s+([\d.]+)\s+([\d.]+)/);
+  if (vb) { const w = parseFloat(vb[1]), h = parseFloat(vb[2]); if (w > 0 && h > 0) return { w, h }; }
+  const wm = svg.match(/\bwidth=["']([\d.]+)/);
+  const hm = svg.match(/\bheight=["']([\d.]+)/);
+  if (wm && hm) { const w = parseFloat(wm[1]), h = parseFloat(hm[1]); if (w > 0 && h > 0) return { w, h }; }
+  return null;
+}
+
 /** Map a stored font value to a CSS font-family. Custom fonts are
  *  registered (loadCustomFonts.ts) under a family equal to the file name
  *  without its extension, so `arial.ttf` → `"arial", Arial, sans-serif`.
@@ -334,11 +350,10 @@ export function CollageView() {
   // when the item is selected), so the dropdown shows the real text.
   const [rLabelsByItem, setRLabelsByItem] = useState<Record<string, Partial<Record<RTextSlot, string>>>>({});
 
-  // Re-render an R-plot item at its current DISPLAY size so it stays crisp
-  // when enlarged. R plots are raster (ggplot → PNG, not SVG), so we re-run
-  // the plot at higher pixel resolution — width/height AND res scaled together
-  // (`overrideRes`) keeps the plot's proportions identical, just sharper.
-  // Uses last_plot() (render_override), applying any per-element text overrides.
+  // Re-render an R-plot item as VECTOR SVG (svglite) so it stays crisp at any
+  // zoom/size with no further re-render. Uses last_plot() (render_override),
+  // applying any per-element text overrides. Falls back to a PNG if svglite
+  // isn't available in the user's R.
   const rerenderRPlot = async (itemId: string) => {
     const it = useCollageStore.getState().items.find((i) => i.id === itemId);
     if (!it || !it.rCode) return;
@@ -346,23 +361,31 @@ export function CollageView() {
     const pt = useCollageStore.getState().globalHeaderPt;
     const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
     const baseFs = pt ? Math.max(1, Math.round(pt / Math.max(0.001, scale))) : null;
-    // Render at ≥ the display width (never below natural) so it's pixel-crisp.
     const nW = it.naturalW || 640;
     const nH = it.naturalH || 480;
-    const k = Math.min(8, Math.max(1, it.w / Math.max(1, nW)));
     setRBusyItem(itemId);
     try {
       const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, baseFs, {
         textOverrides: ov as Record<string, unknown>,
         renderOverride: true,
+        renderSvg: true,
         overrideOnly: true,
-        overrideWidth: Math.round(nW * k),
-        overrideHeight: Math.round(nH * k),
-        overrideRes: Math.round(150 * k),
+        overrideWidth: nW,
+        overrideHeight: nH,
+        overrideRes: 150,
       });
-      const png = res.plots?.[0];
-      if (res.success && png) {
-        const dataUrl = `data:image/png;base64,${png}`;
+      if (res.success && res.svg) {
+        const sz = svgSize(res.svg);
+        const aspect = sz ? sz.w / sz.h : (it.naturalW / Math.max(1, it.naturalH));
+        updateItem(itemId, {
+          src: svgToDataUrl(res.svg),
+          naturalW: sz ? Math.round(sz.w) : it.naturalW,
+          naturalH: sz ? Math.round(sz.h) : it.naturalH,
+          h: it.w / Math.max(0.001, aspect),
+        });
+      } else if (res.success && res.plots?.[0]) {
+        // svglite missing — fall back to a raster PNG.
+        const dataUrl = `data:image/png;base64,${res.plots[0]}`;
         const dims = await new Promise<{ w: number; h: number }>((resolve) => {
           const im = new window.Image();
           im.onload = () => resolve({ w: im.naturalWidth, h: im.naturalHeight });
@@ -373,9 +396,9 @@ export function CollageView() {
         updateItem(itemId, { src: dataUrl, naturalW: dims.w, naturalH: dims.h, h: it.w / Math.max(0.001, aspect) });
       } else {
         await alertDialog({
-          title: "Couldn't update R text",
+          title: "Couldn't update R plot",
           body: res.stderr?.slice(0, 500)
-            || "No ggplot output was produced. R text editing works on ggplot plots (the editor styles last_plot()). Make sure R is installed.",
+            || "No ggplot output was produced. R editing works on ggplot plots (it styles last_plot()). Make sure R is installed.",
         });
       }
     } catch (e) {
@@ -463,14 +486,32 @@ export function CollageView() {
     const it = items.find((i) => i.id === selectedId);
     if (!it || it.kind !== "image" || !it.rCode) return;
     if (rLabelsByItem[it.id]) return;
+    const isSvg = (it.src || "").startsWith("data:image/svg");
     let cancelled = false;
     (async () => {
       try {
-        const res = await api.runR(it.rCode!, it.rDataCsv ?? "", it.rInterpreter ?? undefined, null, { emitLabels: true });
+        // One R run that returns the current labels AND a vector SVG, so the
+        // plot becomes crisp-at-any-zoom and the dropdown shows real text.
+        const res = await api.runR(it.rCode!, it.rDataCsv ?? "", it.rInterpreter ?? undefined, null, {
+          emitLabels: true,
+          ...(isSvg ? {} : { renderSvg: true, renderOverride: true, overrideOnly: true,
+            overrideWidth: it.naturalW || 640, overrideHeight: it.naturalH || 480, overrideRes: 150,
+            textOverrides: (it.rTextOverrides || {}) as Record<string, unknown> }),
+        });
         if (cancelled) return;
         setRLabelsByItem((m) => ({ ...m, [it.id]: mapRLabels(res.labels || {}) }));
+        if (!isSvg && res.svg) {
+          const sz = svgSize(res.svg);
+          const aspect = sz ? sz.w / sz.h : (it.naturalW / Math.max(1, it.naturalH));
+          updateItem(it.id, {
+            src: svgToDataUrl(res.svg),
+            naturalW: sz ? Math.round(sz.w) : it.naturalW,
+            naturalH: sz ? Math.round(sz.h) : it.naturalH,
+            h: it.w / Math.max(0.001, aspect),
+          });
+        }
       } catch (e) {
-        console.warn("[collage] R labels fetch failed", e);
+        console.warn("[collage] R labels/svg fetch failed", e);
       }
     })();
     return () => { cancelled = true; };
@@ -798,10 +839,10 @@ export function CollageView() {
             window.removeEventListener("mouseup", onUp);
             // Decomposed figures need NO re-render on resize — the body
             // raster just scales and the header overlays re-typeset from
-            // it.w/it.h automatically. R plots ARE raster (PNG, not SVG),
-            // so re-render them at the new size to stay crisp when enlarged.
+            // it.w/it.h automatically. SVG R plots also scale crisply with no
+            // re-render; only a still-PNG R plot is upgraded to SVG here.
             const cur = useCollageStore.getState().items.find((i) => i.id === it.id);
-            if (cur && cur.kind === "image" && cur.rCode && cur.w > (cur.naturalW || 0) * 1.05) {
+            if (cur && cur.kind === "image" && cur.rCode && !(cur.src || "").startsWith("data:image/svg")) {
               void rerenderRPlot(cur.id);
             }
           };

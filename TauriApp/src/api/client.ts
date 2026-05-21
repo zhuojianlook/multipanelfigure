@@ -498,6 +498,9 @@ class ApiClient {
       renderOverride?: boolean;
       /** Also return the plot's current ggplot text labels under `labels`. */
       emitLabels?: boolean;
+      /** Render the override plot as SVG (vector) and return it under `svg` —
+       *  used so collage R plots are crisp at any zoom. */
+      renderSvg?: boolean;
     },
   ): Promise<{
     success: boolean;
@@ -511,6 +514,8 @@ class ApiClient {
      *  ggplot label names: title/subtitle/x/y/caption + mapped aesthetics
      *  (colour/fill/…) for the legend title. */
     labels?: Record<string, string>;
+    /** Vector SVG of the override plot (only when renderSvg was set). */
+    svg?: string | null;
   }> {
     return apiJson("/api/analysis/run-r", "POST", JSON.stringify({
       code, data_csv: dataCsv, rscript_path: rscriptPath || null,
@@ -522,6 +527,7 @@ class ApiClient {
       override_res: opts?.overrideRes && opts.overrideRes > 0 ? Math.round(opts.overrideRes) : 150,
       render_override: !!opts?.renderOverride,
       emit_labels: !!opts?.emitLabels,
+      render_svg: !!opts?.renderSvg,
     }));
   }
 

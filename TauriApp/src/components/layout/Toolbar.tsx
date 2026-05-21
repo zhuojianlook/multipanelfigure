@@ -438,12 +438,19 @@ function SaveCollageButton() {
             ctx.textAlign = "left";
             let y = it.y;
             for (const line of lines) {
+              if (line.length === 0) { y += baseSizePx * 1.2; continue; } // blank line
               const widths = line.map(measure);
               const lineW = widths.reduce((a, b) => a + b, 0);
               const maxSize = Math.max(baseSizePx, ...line.map((t) => sizeOf(t.seg)));
               const lineH = maxSize * 1.2;
-              // baseline = box top + half-leading + ascent (~0.8×fontSize).
-              const baselineY = y + (lineH - maxSize) / 2 + maxSize * 0.8;
+              // Baseline = line-box top + half-leading + the tallest run's true
+              // font ascent (measured), so styled text matches the browser's
+              // baseline-aligned inline flow exactly.
+              const tallest = line.reduce((a, b) => (sizeOf(b.seg) >= sizeOf(a.seg) ? b : a), line[0]);
+              ctx.font = fontOf(tallest.seg);
+              const fm = ctx.measureText("Mg");
+              const ascent = fm.fontBoundingBoxAscent || (maxSize * 0.8);
+              const baselineY = y + (lineH - maxSize) / 2 + ascent;
               let x = align === "center" ? it.x + (it.w - lineW) / 2 : align === "right" ? it.x + (it.w - lineW) : it.x;
               line.forEach((tk, i) => {
                 const st = tk.seg.font_style ?? [];
