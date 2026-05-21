@@ -43,8 +43,11 @@ import {
   DEFAULT_CANVAS_H,
   PT_TO_PX,
   DEFAULT_TEXT_PT,
+  PANEL_LABEL_DEFAULT_PT,
   R_TEXT_SLOTS,
   R_TEXT_BEARING,
+  isLabelable,
+  panelLabelTextMap,
 } from "../../store/collageStore";
 import type { CollageItem, RTextSlot, RTextOverride } from "../../store/collageStore";
 import { useFigureStore } from "../../store/figureStore";
@@ -253,6 +256,16 @@ export function CollageView() {
   const addItem = useCollageStore((s) => s.addItem);
   const loadProject = useFigureStore((s) => s.loadProject);
   const setMode = useCollageStore((s) => s.setMode);
+  const panelLabelsOn = useCollageStore((s) => s.panelLabelsOn);
+  const panelLabelUpper = useCollageStore((s) => s.panelLabelUpper);
+  const panelLabelParen = useCollageStore((s) => s.panelLabelParen);
+  const setPanelLabel = useCollageStore((s) => s.setPanelLabel);
+  const removePanelLabel = useCollageStore((s) => s.removePanelLabel);
+  const movePanelLabel = useCollageStore((s) => s.movePanelLabel);
+  const addPanelLabels = useCollageStore((s) => s.addPanelLabels);
+  const clearPanelLabels = useCollageStore((s) => s.clearPanelLabels);
+  const setPanelLabelUpper = useCollageStore((s) => s.setPanelLabelUpper);
+  const setPanelLabelParen = useCollageStore((s) => s.setPanelLabelParen);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const pageRef = useRef<HTMLDivElement>(null);
@@ -295,6 +308,13 @@ export function CollageView() {
 
   // Inline text editing: id of the text item currently being edited.
   const [editingTextId, setEditingTextId] = useState<string | null>(null);
+  // Inline panel-label editing: id of the item whose (a,b,c…) label is being
+  // edited. Maps each labeled item to its displayed letter in reading order.
+  const [editingLabelId, setEditingLabelId] = useState<string | null>(null);
+  const labelTextMap = useMemo(
+    () => panelLabelTextMap(items, panelLabelUpper, panelLabelParen),
+    [items, panelLabelUpper, panelLabelParen],
+  );
   // Rich-text editor for a whole text box (double-click). Gives all fonts,
   // bold/italic/underline/strikethrough/super/subscript and per-character
   // styling. Anchored to the text box's DOM node.
@@ -1002,6 +1022,88 @@ export function CollageView() {
     return <>{handle("w")}{handle("e")}</>;
   };
 
+  // Auto panel label (a, b, c…) overlaid on a figure/image item. It lives
+  // INSIDE the item Box so it moves + rotates with the element. Draggable to
+  // reposition (offset is stored relative to the item's top-left), double-click
+  // to edit the text, and a × (when the item is selected) removes it — exactly
+  // like deleting a textbox. Labels never appear in the items timeline.
+  const renderPanelLabel = (it: CollageItem) => {
+    const lbl = it.panelLabel;
+    if (!lbl) return null;
+    const text = labelTextMap[it.id] ?? "";
+    const fsPx = (lbl.fontSize ?? PANEL_LABEL_DEFAULT_PT) * PT_TO_PX;
+    const color = lbl.color ?? "#000000";
+    const weight = lbl.bold === false ? 400 : 700;
+    const fontFamily = cssFamily(lbl.fontFamily);
+    const showChrome = selectedIds.length === 1 && selectedId === it.id && cropItemId !== it.id;
+
+    if (editingLabelId === it.id) {
+      return (
+        <input
+          autoFocus
+          defaultValue={lbl.text ?? text}
+          onMouseDown={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => e.stopPropagation()}
+          onBlur={(e) => { setPanelLabel(it.id, { text: e.target.value }); setEditingLabelId(null); }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+            else if (e.key === "Escape") setEditingLabelId(null);
+          }}
+          style={{
+            position: "absolute", left: lbl.offsetX, top: lbl.offsetY,
+            fontSize: fsPx, fontWeight: weight, color, fontFamily, lineHeight: 1.2,
+            background: "rgba(255,255,255,0.9)", border: "1px solid #4FC3F7",
+            outline: "none", padding: 0, margin: 0, width: Math.max(fsPx * 3, 80), zIndex: 6,
+          }}
+        />
+      );
+    }
+
+    return (
+      <Box
+        onMouseDown={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const startX = e.clientX, startY = e.clientY;
+          const sx = lbl.offsetX, sy = lbl.offsetY;
+          const onMove = (ev: MouseEvent) => {
+            const dx = (ev.clientX - startX) / displayScale;
+            const dy = (ev.clientY - startY) / displayScale;
+            const cur = useCollageStore.getState().items.find((i) => i.id === it.id)?.panelLabel;
+            if (cur) movePanelLabel(it.id, (sx + dx) - cur.offsetX, (sy + dy) - cur.offsetY);
+          };
+          const onUp = () => {
+            window.removeEventListener("mousemove", onMove);
+            window.removeEventListener("mouseup", onUp);
+          };
+          window.addEventListener("mousemove", onMove);
+          window.addEventListener("mouseup", onUp);
+        }}
+        onDoubleClick={(e) => { e.stopPropagation(); setEditingLabelId(it.id); }}
+        sx={{
+          position: "absolute", left: lbl.offsetX, top: lbl.offsetY,
+          cursor: "move", zIndex: 5, lineHeight: 1.2, whiteSpace: "nowrap", userSelect: "none",
+          ...(showChrome ? { outline: "1px dashed rgba(79,195,247,0.9)", outlineOffset: 2 } : {}),
+        }}
+        title="Drag to move · double-click to edit"
+      >
+        <span style={{ fontSize: fsPx, fontWeight: weight, color, fontFamily }}>{text}</span>
+        {showChrome && (
+          <Box
+            onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); removePanelLabel(it.id); }}
+            sx={{
+              position: "absolute", top: -10, right: -10, width: 16, height: 16,
+              borderRadius: "50%", backgroundColor: "#e53935", color: "#fff",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 12, lineHeight: 1, cursor: "pointer", zIndex: 7, border: "1px solid #fff",
+            }}
+            title="Remove label"
+          >×</Box>
+        )}
+      </Box>
+    );
+  };
+
   // Crop overlay (item-local coords): dark mask + draggable/resizable crop
   // rect + Apply/Cancel. Mouse deltas are divided by displayScale because
   // the whole page is scaled by the parent transform.
@@ -1237,6 +1339,38 @@ export function CollageView() {
             </Button>
           </span>
         </Tooltip>
+
+        {/* Panel labels (a, b, c…). Toggle adds/removes auto labels on every
+            figure/MPF/image; once on, new elements are labeled automatically.
+            Each label is a draggable, editable, removable textbox on its
+            element (top-right by default) and never shows in the timeline. */}
+        <Divider orientation="vertical" flexItem />
+        <Tooltip title={panelLabelsOn ? "Remove all panel labels" : "Auto-label panels a, b, c… (top-right, drag to move, double-click to edit)"}>
+          <Button
+            size="small"
+            variant={panelLabelsOn ? "contained" : "outlined"}
+            onClick={() => (panelLabelsOn ? clearPanelLabels() : addPanelLabels())}
+            sx={{ textTransform: "none", whiteSpace: "nowrap" }}
+          >
+            {panelLabelsOn ? "Labels: on" : "Label panels"}
+          </Button>
+        </Tooltip>
+        {panelLabelsOn && (
+          <Tooltip title="Toggle letter case (a vs A)">
+            <Button size="small" variant="outlined" onClick={() => setPanelLabelUpper(!panelLabelUpper)}
+              sx={{ minWidth: 0, px: 1, fontWeight: 700 }}>
+              {panelLabelUpper ? "A" : "a"}
+            </Button>
+          </Tooltip>
+        )}
+        {panelLabelsOn && (
+          <Tooltip title="Toggle parentheses, e.g. (a)">
+            <Button size="small" variant={panelLabelParen ? "contained" : "outlined"} onClick={() => setPanelLabelParen(!panelLabelParen)}
+              sx={{ minWidth: 0, px: 1 }}>
+              (a)
+            </Button>
+          </Tooltip>
+        )}
 
         {/* Text styling controls — shown when a single text item is selected.
             Plain text boxes get quick whole-box controls; once a box carries
@@ -1826,6 +1960,8 @@ export function CollageView() {
                   {isSelected && selectedIds.length === 1 && cropItemId !== it.id
                     && (it.kind === "text" || it.kind === "line")
                     && renderRotationHandle(it)}
+                  {/* Auto panel label (a, b, c…) — figures/MPFs + images only. */}
+                  {isLabelable(it) && it.panelLabel && cropItemId !== it.id && renderPanelLabel(it)}
                   {/* Crop overlay for image items in crop mode. */}
                   {cropItemId === it.id && cropRect && renderCropOverlay(it)}
                   {/* Per-element font-sync hotspots while this figure is

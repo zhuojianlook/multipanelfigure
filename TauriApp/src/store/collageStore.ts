@@ -186,7 +186,99 @@ export type CollageItem = {
    *  can differ ~few %, so on first select we re-render to canonicalise the
    *  aspect; otherwise the export would stretch the figure vs the canvas. */
   figCanon?: boolean;
+  /** Auto panel label (a, b, c…) overlaid on a figure/image item. Present =
+   *  this element is labeled. offsetX/offsetY place the label's top-left
+   *  relative to the item's top-left in canvas (page) px (default: top-right
+   *  corner). `text` overrides the auto letter when the user edits it. The
+   *  label lives ON the item (moves + rotates with it) and never appears in the
+   *  items timeline. */
+  panelLabel?: PanelLabel;
 };
+
+export type PanelLabel = {
+  offsetX: number;
+  offsetY: number;
+  /** Explicit text override; undefined = use the auto reading-order letter. */
+  text?: string;
+  /** Font in POINTS; sensible bold defaults applied at creation. */
+  fontSize?: number;
+  color?: string;
+  bold?: boolean;
+  fontFamily?: string;
+};
+
+/** Default panel-label appearance (journal style: bold, ~16pt). */
+export const PANEL_LABEL_DEFAULT_PT = 16;
+export const PANEL_LABEL_DEFAULT_COLOR = "#000000";
+
+/** Items that can carry a panel label: visual content (figures/MPFs + images,
+ *  including R/analysis plots). Text boxes and divider lines are excluded. */
+export function isLabelable(it: CollageItem): boolean {
+  return it.kind === "figure" || it.kind === "image";
+}
+
+/** A fresh top-right panel label for an item of the given display width. */
+function _defaultPanelLabel(itemW: number): PanelLabel {
+  const px = PANEL_LABEL_DEFAULT_PT * PT_TO_PX;
+  const inset = Math.max(8, Math.round(px * 0.35));
+  return {
+    offsetX: Math.max(0, Math.round(itemW - px * 1.4 - inset)),
+    offsetY: inset,
+    fontSize: PANEL_LABEL_DEFAULT_PT,
+    color: PANEL_LABEL_DEFAULT_COLOR,
+    bold: true,
+  };
+}
+
+/** Render labeled items in figure reading order (top-to-bottom, left-to-right),
+ *  clustering items into rows by vertical overlap so a slightly-misaligned row
+ *  still reads left→right. Only items that HAVE a panelLabel participate. */
+export function panelReadingOrder(items: CollageItem[]): CollageItem[] {
+  const labeled = items.filter((it) => it.panelLabel && isLabelable(it));
+  const byTop = [...labeled].sort((a, b) => a.y - b.y);
+  const rows: CollageItem[][] = [];
+  for (const it of byTop) {
+    const cy = it.y + it.h / 2;
+    const row = rows.find((r) => {
+      const rcy = r[0].y + r[0].h / 2;
+      const tol = Math.min(it.h, r[0].h) * 0.5;
+      return Math.abs(cy - rcy) <= tol;
+    });
+    if (row) row.push(it);
+    else rows.push([it]);
+  }
+  rows.sort((a, b) => Math.min(...a.map((i) => i.y)) - Math.min(...b.map((i) => i.y)));
+  for (const r of rows) r.sort((a, b) => a.x - b.x);
+  return rows.flat();
+}
+
+/** Spreadsheet-style letter for a 0-based index: a,b,…,z,aa,ab,… */
+function _indexToLetter(i: number): string {
+  let n = i, s = "";
+  do { s = String.fromCharCode(97 + (n % 26)) + s; n = Math.floor(n / 26) - 1; } while (n >= 0);
+  return s;
+}
+
+/** Format an auto letter per the global case/paren options. */
+export function formatPanelLetter(index: number, upper: boolean, paren: boolean): string {
+  let s = _indexToLetter(index);
+  if (upper) s = s.toUpperCase();
+  return paren ? `(${s})` : s;
+}
+
+/** Map of itemId → displayed label text, honoring per-label text overrides and
+ *  the global case/paren format, computed in reading order. */
+export function panelLabelTextMap(
+  items: CollageItem[], upper: boolean, paren: boolean,
+): Record<string, string> {
+  const order = panelReadingOrder(items);
+  const out: Record<string, string> = {};
+  order.forEach((it, i) => {
+    const ov = it.panelLabel?.text;
+    out[it.id] = (ov !== undefined && ov !== "") ? ov : formatPanelLetter(i, upper, paren);
+  });
+  return out;
+}
 
 /** A text element of an mpf figure, for per-element font sync. `geom`
  *  (when present) is the element's on-figure bbox in figure fractions
@@ -278,6 +370,13 @@ export type CollageState = {
    *  PNG is composed client-side; the rest are converted by the backend
    *  (PIL) with the chosen DPI embedded. Default "png". */
   exportFormat: string;
+  /** Panel-label auto-letter format (global). upper: A,B,C vs a,b,c.
+   *  paren: (a) vs a. Persisted. */
+  panelLabelUpper: boolean;
+  panelLabelParen: boolean;
+  /** When on, every labelable item (incl. newly added ones) carries a panel
+   *  label. Set by "Label panels" / cleared by "Clear labels". Persisted. */
+  panelLabelsOn: boolean;
   /** Target visual point size for ALL figure-kind item headers /
    *  primary labels in the collage. Null = no normalisation (each
    *  item shows headers at its own pt × its collage scale). When
@@ -341,6 +440,21 @@ export type CollageState = {
   setExportFormat: (fmt: string) => void;
   clear: () => void;
 
+  // ── Panel labels (a, b, c…) ──
+  /** Add a default top-right panel label to every labelable item that lacks
+   *  one (figures/MPFs + images). */
+  addPanelLabels: () => void;
+  /** Remove the panel label from every item. */
+  clearPanelLabels: () => void;
+  /** Merge a patch into one item's panel label (creates it if missing). */
+  setPanelLabel: (id: string, patch: Partial<PanelLabel>) => void;
+  /** Remove one item's panel label. */
+  removePanelLabel: (id: string) => void;
+  /** Nudge one label's offset by (dx, dy) in canvas px. */
+  movePanelLabel: (id: string, dx: number, dy: number) => void;
+  setPanelLabelUpper: (v: boolean) => void;
+  setPanelLabelParen: (v: boolean) => void;
+
   // ── Document tabs ──
   /** Append a new doc tab (stable order). Returns its id. */
   docAdd: (doc: { path?: string | null; name?: string }) => string;
@@ -379,7 +493,7 @@ export type CollageState = {
 
 const STORAGE_KEY = "mpfig_collage_v1";
 
-type Persisted = Pick<CollageState, "items" | "canvasW" | "canvasH" | "background" | "gridVisible" | "snapEnabled" | "gridStep" | "globalHeaderPt" | "guideColumns" | "guideGutter" | "guidesVisible" | "exportDpi" | "exportFormat" | "elemOverridesByItem">;
+type Persisted = Pick<CollageState, "items" | "canvasW" | "canvasH" | "background" | "gridVisible" | "snapEnabled" | "gridStep" | "globalHeaderPt" | "guideColumns" | "guideGutter" | "guidesVisible" | "exportDpi" | "exportFormat" | "elemOverridesByItem" | "panelLabelUpper" | "panelLabelParen" | "panelLabelsOn">;
 
 function loadInitial(): Persisted {
   try {
@@ -436,6 +550,9 @@ function loadInitial(): Persisted {
           exportDpi: typeof data.exportDpi === "number" && data.exportDpi > 0 ? data.exportDpi : 300,
           exportFormat: typeof data.exportFormat === "string" ? data.exportFormat : "png",
           elemOverridesByItem: (data.elemOverridesByItem && typeof data.elemOverridesByItem === "object") ? data.elemOverridesByItem : {},
+          panelLabelUpper: !!data.panelLabelUpper,
+          panelLabelParen: !!data.panelLabelParen,
+          panelLabelsOn: !!data.panelLabelsOn,
         };
       }
     }
@@ -457,6 +574,9 @@ function loadInitial(): Persisted {
     exportDpi: 300,
     exportFormat: "png",
     elemOverridesByItem: {},
+    panelLabelUpper: false,
+    panelLabelParen: false,
+    panelLabelsOn: false,
   };
 }
 
@@ -477,6 +597,8 @@ function persist(s: Persisted) {
       exportDpi: s.exportDpi,
       exportFormat: s.exportFormat,
       elemOverridesByItem: s.elemOverridesByItem,
+      panelLabelUpper: s.panelLabelUpper,
+      panelLabelParen: s.panelLabelParen,
     }));
   } catch {
     /* quota — ignore */
@@ -511,14 +633,19 @@ export const useCollageStore = create<CollageState>()(
       const id = `item_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       set((s) => {
         const maxZ = s.items.reduce((acc, it) => Math.max(acc, it.z), 0);
-        s.items.push({
+        const created = {
           ...item,
           id,
           z: maxZ + 1,
           rotation: item.rotation ?? 0,
           kind: item.kind ?? "image",
           projectPath: item.projectPath ?? null,
-        } as CollageItem);
+        } as CollageItem;
+        // Auto-label new visual content when panel labelling is on.
+        if (s.panelLabelsOn && (created.kind === "figure" || created.kind === "image") && !created.panelLabel) {
+          created.panelLabel = _defaultPanelLabel(created.w);
+        }
+        s.items.push(created);
         s.selectedId = id;
         s.selectedIds = [id];
       });
@@ -636,6 +763,49 @@ export const useCollageStore = create<CollageState>()(
       set((s) => { s.items = []; s.selectedId = null; s.selectedIds = []; });
       persist(get());
     },
+
+    // ── Panel labels (a, b, c…) ──
+    addPanelLabels: () => {
+      set((s) => {
+        s.panelLabelsOn = true;
+        for (const it of s.items) {
+          if ((it.kind === "figure" || it.kind === "image") && !it.panelLabel) {
+            it.panelLabel = _defaultPanelLabel(it.w);
+          }
+        }
+      });
+      persist(get());
+    },
+
+    clearPanelLabels: () => {
+      set((s) => { s.panelLabelsOn = false; for (const it of s.items) delete it.panelLabel; });
+      persist(get());
+    },
+
+    setPanelLabel: (id, patch) => {
+      set((s) => {
+        const it = s.items.find((i) => i.id === id);
+        if (!it) return;
+        it.panelLabel = { ...(it.panelLabel ?? _defaultPanelLabel(it.w)), ...patch };
+      });
+      persist(get());
+    },
+
+    removePanelLabel: (id) => {
+      set((s) => { const it = s.items.find((i) => i.id === id); if (it) delete it.panelLabel; });
+      persist(get());
+    },
+
+    movePanelLabel: (id, dx, dy) => {
+      set((s) => {
+        const it = s.items.find((i) => i.id === id);
+        if (it?.panelLabel) { it.panelLabel.offsetX += dx; it.panelLabel.offsetY += dy; }
+      });
+      persist(get());
+    },
+
+    setPanelLabelUpper: (v) => { set((s) => { s.panelLabelUpper = v; }); persist(get()); },
+    setPanelLabelParen: (v) => { set((s) => { s.panelLabelParen = v; }); persist(get()); },
 
     // ── Document tabs (session-only, not persisted) ──
     docAdd: (doc) => {

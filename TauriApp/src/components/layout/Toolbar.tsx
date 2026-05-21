@@ -35,7 +35,7 @@ import SystemUpdateAltIcon from "@mui/icons-material/SystemUpdateAlt";
 import DownloadIcon from "@mui/icons-material/Download";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import LibraryAddIcon from "@mui/icons-material/LibraryAdd";
-import { useCollageStore, PT_TO_PX, DEFAULT_TEXT_PT } from "../../store/collageStore";
+import { useCollageStore, PT_TO_PX, DEFAULT_TEXT_PT, PANEL_LABEL_DEFAULT_PT, panelLabelTextMap } from "../../store/collageStore";
 import type { CollageItem } from "../../store/collageStore";
 import { api } from "../../api/client";
 import { check } from "@tauri-apps/plugin-updater";
@@ -407,6 +407,8 @@ function SaveCollageButton() {
   const setExportDpi = useCollageStore((s) => s.setExportDpi);
   const exportFormat = useCollageStore((s) => s.exportFormat);
   const setExportFormat = useCollageStore((s) => s.setExportFormat);
+  const panelLabelUpper = useCollageStore((s) => s.panelLabelUpper);
+  const panelLabelParen = useCollageStore((s) => s.panelLabelParen);
   const [exporting, setExporting] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
 
@@ -538,6 +540,29 @@ function SaveCollageButton() {
     // Make sure custom fonts are loaded before measuring/drawing text, so the
     // off-screen layout uses the same glyph metrics as the on-screen canvas.
     try { await (document as Document & { fonts?: FontFaceSet }).fonts?.ready; } catch { /* no-op */ }
+    // Draw browser-measured text runs at (baseX, baseY) — used for both text
+    // items and panel labels so they share the same zero-drift positioning.
+    const drawRuns = (runs: TextRun[], baseX: number, baseY: number) => {
+      ctx.textBaseline = "alphabetic";
+      ctx.textAlign = "left";
+      for (const r of runs) {
+        const dx = baseX + r.x;
+        const by = baseY + r.baseline;
+        ctx.font = r.font;
+        ctx.fillStyle = r.color;
+        ctx.fillText(r.text, dx, by);
+        if (r.underline || r.strike) {
+          ctx.save();
+          ctx.strokeStyle = r.color;
+          ctx.lineWidth = Math.max(1, r.sizePx / 14);
+          if (r.underline) { ctx.beginPath(); ctx.moveTo(dx, by + r.sizePx * 0.16); ctx.lineTo(dx + r.width, by + r.sizePx * 0.16); ctx.stroke(); }
+          if (r.strike) { ctx.beginPath(); ctx.moveTo(dx, by - r.sizePx * 0.3); ctx.lineTo(dx + r.width, by - r.sizePx * 0.3); ctx.stroke(); }
+          ctx.restore();
+        }
+      }
+    };
+    // Precompute each labeled item's letter (reading order + global format).
+    const labelTextById = panelLabelTextMap(sorted, panelLabelUpper, panelLabelParen);
     for (const it of sorted) {
       if (it.kind === "text") {
         withRotation(it, () => {
@@ -548,23 +573,7 @@ function SaveCollageButton() {
           try { runs = layoutTextRuns(it); }
           catch (e) { console.warn("[collage] DOM text layout failed; using analytical fallback", e); }
           if (runs.length) {
-            ctx.textBaseline = "alphabetic";
-            ctx.textAlign = "left";
-            for (const r of runs) {
-              const dx = it.x + r.x;
-              const by = it.y + r.baseline;
-              ctx.font = r.font;
-              ctx.fillStyle = r.color;
-              ctx.fillText(r.text, dx, by);
-              if (r.underline || r.strike) {
-                ctx.save();
-                ctx.strokeStyle = r.color;
-                ctx.lineWidth = Math.max(1, r.sizePx / 14);
-                if (r.underline) { ctx.beginPath(); ctx.moveTo(dx, by + r.sizePx * 0.16); ctx.lineTo(dx + r.width, by + r.sizePx * 0.16); ctx.stroke(); }
-                if (r.strike) { ctx.beginPath(); ctx.moveTo(dx, by - r.sizePx * 0.3); ctx.lineTo(dx + r.width, by - r.sizePx * 0.3); ctx.stroke(); }
-                ctx.restore();
-              }
-            }
+            drawRuns(runs, it.x, it.y);
             return;
           }
           // FALLBACK (analytical) — only if the DOM layout produced nothing.
@@ -733,7 +742,27 @@ function SaveCollageButton() {
         const img = new window.Image();
         img.onload = () => {
           try {
-            withRotation(it, () => ctx.drawImage(img, it.x, it.y, it.w, it.h));
+            withRotation(it, () => {
+              ctx.drawImage(img, it.x, it.y, it.w, it.h);
+              // Panel label (a, b, c…) drawn ON the item so it rotates with it,
+              // using the same zero-drift browser-measured text layout.
+              const lt = labelTextById[it.id];
+              if (it.panelLabel && lt) {
+                const lbl = it.panelLabel;
+                const synth = {
+                  ...it, kind: "text", text: lt, styledSegments: undefined,
+                  w: 100000, align: "left",
+                  fontSize: lbl.fontSize ?? PANEL_LABEL_DEFAULT_PT,
+                  fontColor: lbl.color ?? "#000000",
+                  fontBold: lbl.bold !== false, fontItalic: false, fontUnderline: false,
+                  fontFamily: lbl.fontFamily,
+                } as CollageItem;
+                try {
+                  const runs = layoutTextRuns(synth);
+                  if (runs.length) drawRuns(runs, it.x + lbl.offsetX, it.y + lbl.offsetY);
+                } catch (e) { console.warn("[collage] panel label draw failed", e); }
+              }
+            });
           } catch (err) {
             console.warn("[collage] drawImage failed for", it.name, err);
           }
