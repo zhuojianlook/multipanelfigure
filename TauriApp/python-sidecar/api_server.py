@@ -4516,8 +4516,20 @@ def _apply_element_overrides(cfg, element_overrides):
                     obj.font_path = None  # let the renderer resolve by name
         if ov.get("font_style") is not None and hasattr(obj, el["_style_attr"]):
             setattr(obj, el["_style_attr"], list(ov["font_style"]))
-        if ov.get("color") and hasattr(obj, el["_color_attr"]):
-            setattr(obj, el["_color_attr"], ov["color"])
+        if ov.get("color"):
+            if hasattr(obj, el["_color_attr"]):
+                setattr(obj, el["_color_attr"], ov["color"])
+            # Recolour any existing per-segment styling too, otherwise an
+            # element whose text carries styled_segments would keep the old
+            # per-segment colours and the sync would appear to do nothing.
+            if "styled_segments" not in ov:
+                segs = getattr(obj, el["_segs_attr"], None)
+                if segs:
+                    for s in segs:
+                        if isinstance(s, dict):
+                            s["color"] = ov["color"]
+                        elif hasattr(s, "color"):
+                            s.color = ov["color"]
         if ov.get("font_size") and hasattr(obj, el["_size_attr"]):
             setattr(obj, el["_size_attr"], ov["font_size"])
         if "styled_segments" in ov:
@@ -4671,6 +4683,12 @@ def render_collage_figure(body: CollageFigureRenderRequest):
     # Output DPI for the final raster (measurement passes stay at 150 so
     # header sizing is unchanged; raising this only adds pixels).
     _out_dpi = max(72, min(1200, int(body.dpi or 150)))
+    # The collage canvas is a 300-DPI page (PT_TO_PX = 300/72 for text boxes),
+    # but figures are measured/assembled at 150 DPI. Without compensation a
+    # header synced to N pt lands at N×150/72 px while a text box at N pt lands
+    # at N×300/72 px — text appears 2× larger. Scale the synced pt by
+    # page_dpi/base_dpi so figure headers match text boxes at the same pt.
+    _PAGE_PT_FACTOR = 300.0 / 150.0
 
     def _apply_header_pt(cfg, new_pt):
         _apply_element_overrides(cfg, body.element_overrides)
@@ -4739,7 +4757,7 @@ def render_collage_figure(body: CollageFigureRenderRequest):
         _apply_header_pt(cfg_p1, body.header_pt)
         img_p1 = _render_cfg(cfg_p1)
         scale_p1 = body.item_w / max(1, img_p1.width)
-        new_pt = max(1, int(round(body.header_pt / max(0.001, scale_p1))))
+        new_pt = max(1, int(round(body.header_pt * _PAGE_PT_FACTOR / max(0.001, scale_p1))))
         # Pass 2: render at the corrected pt. The corrected pt's
         # render width will be very close to but not always
         # identical to img_p1.width — typically within a few percent
@@ -4763,7 +4781,7 @@ def render_collage_figure(body: CollageFigureRenderRequest):
     cfg2 = _copy.deepcopy(loaded_cfg)
     _apply_element_overrides(cfg2, body.element_overrides)
     if body.header_pt and body.header_pt > 0:
-        new_pt = max(1, int(round(body.header_pt / max(0.001, body.scale))))
+        new_pt = max(1, int(round(body.header_pt * _PAGE_PT_FACTOR / max(0.001, body.scale))))
         _apply_font_pt(cfg2, new_pt, body.element_ids)
 
     # Mirror the /api/preview pipeline but against local_images and
@@ -5110,7 +5128,18 @@ def _r_text_override_block(ov: dict, width: int, height: int, force: bool = Fals
         "legend_text": ("legend.text", None),
     }
     labs_parts, theme_parts = [], []
+    # `_global` applies size/colour/face to ALL plot text via theme(text=...).
+    # Per-slot overrides are emitted after and so win for their specific slot
+    # (within one theme() call, slot elements inherit from `text`). Used by the
+    # collage Synchronize button to recolour/resize a whole R plot at once.
+    glob = ov.get("_global")
+    if isinstance(glob, dict):
+        gt = elem_text(glob)
+        if gt:
+            theme_parts.append(f"text={gt}")
     for slot, o in ov.items():
+        if slot == "_global":
+            continue
         if not isinstance(o, dict):
             continue
         if slot == "legend_title":

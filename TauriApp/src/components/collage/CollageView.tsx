@@ -170,14 +170,19 @@ const CANVAS_PRESET_GROUPS: PresetGroup[] = [
   },
 ];
 
-/** Heuristic on-plot positions (item-local fractions: left, top, w, h) for the
- *  editable text slots of an R/ggplot figure. ggplot doesn't expose element
- *  geometry, so these are fixed regions matching ggplot's default layout. */
-const R_TEXT_SLOTS: { slot: RTextSlot; label: string; rect: [number, number, number, number] }[] = [
-  { slot: "title", label: "Title", rect: [0.12, 0.0, 0.76, 0.085] },
-  { slot: "xaxis", label: "X axis", rect: [0.12, 0.915, 0.76, 0.085] },
-  { slot: "yaxis", label: "Y axis", rect: [0.0, 0.18, 0.065, 0.64] },
-  { slot: "legend_title", label: "Legend", rect: [0.80, 0.05, 0.20, 0.14] },
+/** Editable text slots of an R/ggplot figure. ggplot exposes no element
+ *  geometry, so rather than guess on-plot positions we present these as a
+ *  dropdown list (the "exact text pieces") the user can pick from. */
+const R_TEXT_SLOTS: { slot: RTextSlot; label: string }[] = [
+  { slot: "title", label: "Title" },
+  { slot: "subtitle", label: "Subtitle" },
+  { slot: "xaxis", label: "X axis title" },
+  { slot: "yaxis", label: "Y axis title" },
+  { slot: "xticks", label: "X tick labels" },
+  { slot: "yticks", label: "Y tick labels" },
+  { slot: "legend_title", label: "Legend title" },
+  { slot: "legend_text", label: "Legend labels" },
+  { slot: "caption", label: "Caption" },
 ];
 
 export function CollageView() {
@@ -299,6 +304,9 @@ export function CollageView() {
   const [rTextEditor, setRTextEditor] = useState<
     { itemId: string; slot: RTextSlot; label: string; anchorEl: HTMLElement; value: RTextOverride } | null
   >(null);
+  // Dropdown listing an R plot's editable text slots (anchored to the
+  // "Edit text" button overlaid on the selected R plot).
+  const [rMenu, setRMenu] = useState<{ item: CollageItem; anchorEl: HTMLElement } | null>(null);
   const [rBusyItem, setRBusyItem] = useState<string | null>(null);
 
   // Re-render an R-plot item, applying its stored per-element text overrides
@@ -955,42 +963,32 @@ export function CollageView() {
     );
   };
 
-  // Clickable text-slot hotspots for an R/ggplot item (title, axis titles,
-  // legend). ggplot exposes no element geometry, so positions are heuristic
-  // (R_TEXT_SLOTS). Clicking opens the R text editor for that slot.
-  const renderRTextHotspots = (it: CollageItem) => {
+  // R/ggplot text editing: ggplot exposes no element geometry, so instead of
+  // guessing on-plot boxes we overlay a single "Edit text" dropdown button on
+  // the selected R plot that lists the exact text pieces (title/axis/legend…).
+  const renderRTextMenuButton = (it: CollageItem) => {
     const ov = it.rTextOverrides || {};
+    const count = Object.keys(ov).filter((k) => k !== "_global").length;
+    // Keep the button a constant on-screen size despite the canvas zoom.
+    const inv = 1 / Math.max(0.0001, displayScale);
     return (
-      <>
-        {R_TEXT_SLOTS.map(({ slot, label, rect }) => {
-          const [lf, tf, wf, hf] = rect;
-          const set = !!ov[slot] && (ov[slot]!.text !== undefined || ov[slot]!.size !== undefined || ov[slot]!.color !== undefined || ov[slot]!.bold !== undefined || ov[slot]!.italic !== undefined);
-          return (
-            <Box
-              key={slot}
-              onMouseDown={(ev) => { ev.preventDefault(); ev.stopPropagation(); }}
-              onClick={(ev) => { ev.stopPropagation(); openRTextEditor(it, slot, label, ev.currentTarget as HTMLElement); }}
-              title={`Edit ${label} text · click to set content / size / color`}
-              sx={{
-                position: "absolute",
-                left: lf * it.w, top: tf * it.h, width: wf * it.w, height: hf * it.h,
-                cursor: "pointer", borderRadius: "4px", boxSizing: "border-box",
-                display: "flex", alignItems: "center", justifyContent: "center",
-                border: set ? "1.5px solid #4FC3F7" : "1px dashed rgba(79,195,247,0.55)",
-                backgroundColor: set ? "rgba(79,195,247,0.18)" : "rgba(79,195,247,0.05)",
-                transition: "background-color 120ms, border-color 120ms",
-                "&:hover": { backgroundColor: "rgba(255,213,79,0.30)", borderColor: "#FFD54F", borderStyle: "solid" },
-              }}
-            >
-              <Box component="span" sx={{
-                fontSize: Math.max(9, Math.min(13, it.w * 0.018)), color: "#0b3a4a",
-                backgroundColor: "rgba(255,255,255,0.75)", px: 0.5, borderRadius: "3px",
-                fontWeight: 600, whiteSpace: "nowrap", pointerEvents: "none",
-              }}>{label}</Box>
-            </Box>
-          );
-        })}
-      </>
+      <Box
+        onMouseDown={(ev) => { ev.preventDefault(); ev.stopPropagation(); }}
+        onClick={(ev) => { ev.stopPropagation(); setRMenu({ item: it, anchorEl: ev.currentTarget as HTMLElement }); }}
+        title="Edit this plot's text elements (title, axes, legend…)"
+        sx={{
+          position: "absolute", left: 6 * inv, top: 6 * inv,
+          transform: `scale(${inv})`, transformOrigin: "top left",
+          display: "flex", alignItems: "center", gap: "4px",
+          px: "8px", height: 24, borderRadius: "5px", cursor: "pointer",
+          backgroundColor: "rgba(13,58,74,0.92)", color: "#fff",
+          fontSize: 12, fontWeight: 600, whiteSpace: "nowrap",
+          boxShadow: "0 1px 4px rgba(0,0,0,0.4)",
+          "&:hover": { backgroundColor: "#4FC3F7", color: "#06222c" },
+        }}
+      >
+        Edit text{count ? ` (${count})` : ""} ▾
+      </Box>
     );
   };
 
@@ -1629,9 +1627,9 @@ export function CollageView() {
                   {/* Per-element font-sync hotspots while this figure is
                       expanded in the sidebar. */}
                   {elemSyncItemId === it.id && it.kind === "figure" && renderElementHotspots(it)}
-                  {/* R/ggplot text-element hotspots when an R plot is selected. */}
+                  {/* R/ggplot text-edit dropdown when an R plot is selected. */}
                   {isSelected && selectedIds.length === 1 && cropItemId !== it.id
-                    && it.kind === "image" && it.rCode && renderRTextHotspots(it)}
+                    && it.kind === "image" && it.rCode && renderRTextMenuButton(it)}
                   {/* Busy overlay while an R plot re-renders. */}
                   {rBusyItem === it.id && (
                     <Box sx={{
@@ -1698,7 +1696,36 @@ export function CollageView() {
         />
       )}
 
-      {/* R-plot text-slot editor (click a ggplot title/axis/legend hotspot). */}
+      {/* R-plot text-slot dropdown — the "exact text pieces" of a ggplot. */}
+      {rMenu && (
+        <Menu
+          anchorEl={rMenu.anchorEl}
+          open
+          onClose={() => setRMenu(null)}
+          MenuListProps={{ dense: true }}
+        >
+          {R_TEXT_SLOTS.map(({ slot, label }) => {
+            const has = !!(rMenu.item.rTextOverrides || {})[slot];
+            return (
+              <MenuItem
+                key={slot}
+                onClick={(e) => {
+                  const it = rMenu.item;
+                  const anchor = rMenu.anchorEl;
+                  setRMenu(null);
+                  openRTextEditor(it, slot, label, anchor || (e.currentTarget as HTMLElement));
+                }}
+                sx={{ fontSize: "0.78rem" }}
+              >
+                {label}
+                {has && <Box component="span" sx={{ ml: "auto", pl: 2, color: "primary.main", fontSize: "0.7rem" }}>edited</Box>}
+              </MenuItem>
+            );
+          })}
+        </Menu>
+      )}
+
+      {/* R-plot text-slot editor (opened from the dropdown above). */}
       {rTextEditor && (
         <Popover
           open

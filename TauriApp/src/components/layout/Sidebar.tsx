@@ -304,23 +304,28 @@ function CollageSidebar() {
           failed++;
         }
       }
-      // R/analysis plots: only the font SIZE can be re-injected by re-running
-      // the R code (colour/font family aren't generically extractable). Skip
-      // entirely when size isn't being synced.
-      if (applySize) {
+      // R/analysis plots: SIZE (re-injected base font size) and COLOR (applied
+      // to all ggplot text via a global theme element) can be synced. Font
+      // FAMILY can't — R needs the typeface registered separately. Runs when
+      // size and/or color is being synced.
+      if (applySize || applyColor) {
         for (const it of useCollageStore.getState().items) {
           if (!(it.kind === "image" && it.fromAnalysis && it.rCode)) continue;
           if (!isIncluded(it.id)) continue;
           const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
-          const baseFs = Math.max(1, Math.round(targetPt / Math.max(0.001, scale)));
-          // Preserve any per-element text overrides the user set by clicking
-          // the plot's title/axis/legend hotspots — re-apply them on the size
-          // re-run so they don't get lost.
-          const hasOv = !!(it.rTextOverrides && Object.keys(it.rTextOverrides).length);
+          const baseFs = applySize ? Math.max(1, Math.round(targetPt / Math.max(0.001, scale))) : null;
+          // Preserve any per-element text overrides the user set via the plot's
+          // "Edit text" menu; layer a global colour on top when syncing colour.
+          const rOv: Record<string, unknown> = { ...(it.rTextOverrides || {}) };
+          if (applyColor) {
+            rOv._global = { ...((rOv._global as Record<string, unknown>) || {}), color: syncColor };
+            updateItem(it.id, { rTextOverrides: rOv as CollageItem["rTextOverrides"] });
+          }
+          const hasOv = Object.keys(rOv).length > 0;
           try {
             const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, baseFs,
               hasOv ? {
-                textOverrides: it.rTextOverrides as Record<string, unknown>,
+                textOverrides: rOv,
                 overrideOnly: true,
                 overrideWidth: it.naturalW || 800,
                 overrideHeight: it.naturalH || 600,
