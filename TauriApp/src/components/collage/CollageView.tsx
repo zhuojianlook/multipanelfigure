@@ -1024,9 +1024,9 @@ export function CollageView() {
 
   // Auto panel label (a, b, c…) overlaid on a figure/image item. It lives
   // INSIDE the item Box so it moves + rotates with the element. Draggable to
-  // reposition (offset is stored relative to the item's top-left), double-click
-  // to edit the text, and a × (when the item is selected) removes it — exactly
-  // like deleting a textbox. Labels never appear in the items timeline.
+  // reposition (offset is stored relative to the item's top-left; default is the
+  // top-left corner), double-click to edit the text, and a × (when the item is
+  // selected) removes it — like deleting a textbox. Never shown in the timeline.
   const renderPanelLabel = (it: CollageItem) => {
     const lbl = it.panelLabel;
     if (!lbl) return null;
@@ -1345,7 +1345,7 @@ export function CollageView() {
             Each label is a draggable, editable, removable textbox on its
             element (top-right by default) and never shows in the timeline. */}
         <Divider orientation="vertical" flexItem />
-        <Tooltip title={panelLabelsOn ? "Remove all panel labels" : "Auto-label panels a, b, c… (top-right, drag to move, double-click to edit)"}>
+        <Tooltip title={panelLabelsOn ? "Remove all panel labels" : "Auto-label panels a, b, c… (top-left, drag to move, double-click to edit)"}>
           <Button
             size="small"
             variant={panelLabelsOn ? "contained" : "outlined"}

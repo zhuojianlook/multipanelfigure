@@ -188,7 +188,7 @@ export type CollageItem = {
   figCanon?: boolean;
   /** Auto panel label (a, b, c…) overlaid on a figure/image item. Present =
    *  this element is labeled. offsetX/offsetY place the label's top-left
-   *  relative to the item's top-left in canvas (page) px (default: top-right
+   *  relative to the item's top-left in canvas (page) px (default: top-left
    *  corner). `text` overrides the auto letter when the user edits it. The
    *  label lives ON the item (moves + rotates with it) and never appears in the
    *  items timeline. */
@@ -217,12 +217,12 @@ export function isLabelable(it: CollageItem): boolean {
   return it.kind === "figure" || it.kind === "image";
 }
 
-/** A fresh top-right panel label for an item of the given display width. */
-function _defaultPanelLabel(itemW: number): PanelLabel {
+/** A fresh top-left panel label for an item of the given display width. */
+function _defaultPanelLabel(_itemW: number): PanelLabel {
   const px = PANEL_LABEL_DEFAULT_PT * PT_TO_PX;
   const inset = Math.max(8, Math.round(px * 0.35));
   return {
-    offsetX: Math.max(0, Math.round(itemW - px * 1.4 - inset)),
+    offsetX: inset,
     offsetY: inset,
     fontSize: PANEL_LABEL_DEFAULT_PT,
     color: PANEL_LABEL_DEFAULT_COLOR,
@@ -602,6 +602,7 @@ function persist(s: Persisted) {
       elemOverridesByItem: s.elemOverridesByItem,
       panelLabelUpper: s.panelLabelUpper,
       panelLabelParen: s.panelLabelParen,
+      panelLabelsOn: s.panelLabelsOn,
     }));
   } catch {
     /* quota — ignore */
@@ -767,7 +768,7 @@ export const useCollageStore = create<CollageState>()(
       persist(get());
     },
 
-    // ── Panel labels (a, b, c…) ──
+    // ── Panel labels (a, b, c…) ── (default placement: top-left corner)
     addPanelLabels: () => {
       set((s) => {
         s.panelLabelsOn = true;
