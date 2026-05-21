@@ -251,6 +251,8 @@ function SaveCollageButton() {
   const background = useCollageStore((s) => s.background);
   const exportDpi = useCollageStore((s) => s.exportDpi);
   const setExportDpi = useCollageStore((s) => s.setExportDpi);
+  const exportFormat = useCollageStore((s) => s.exportFormat);
+  const setExportFormat = useCollageStore((s) => s.setExportFormat);
   const [exporting, setExporting] = useState(false);
 
   const handleSave = async () => {
@@ -397,28 +399,34 @@ function SaveCollageButton() {
               cur.push(tk); curW += w;
             }
             if (cur.length) lines.push(cur);
-            // Pass 2: draw.
-            ctx.textBaseline = "top";
+            // Pass 2: draw. Match the on-screen HTML inline flow — segments are
+            // baseline-aligned (not top-aligned), and the line box adds half its
+            // leading above. So we draw on the shared baseline of each line.
+            ctx.textBaseline = "alphabetic";
             ctx.textAlign = "left";
             let y = it.y;
             for (const line of lines) {
               const widths = line.map(measure);
               const lineW = widths.reduce((a, b) => a + b, 0);
-              const lineH = Math.max(baseSizePx, ...line.map((t) => sizeOf(t.seg))) * 1.2;
+              const maxSize = Math.max(baseSizePx, ...line.map((t) => sizeOf(t.seg)));
+              const lineH = maxSize * 1.2;
+              // baseline = box top + half-leading + ascent (~0.8×fontSize).
+              const baselineY = y + (lineH - maxSize) / 2 + maxSize * 0.8;
               let x = align === "center" ? it.x + (it.w - lineW) / 2 : align === "right" ? it.x + (it.w - lineW) : it.x;
               line.forEach((tk, i) => {
                 const st = tk.seg.font_style ?? [];
                 const sz = sizeOf(tk.seg);
-                const dy = st.includes("Superscript") ? -sz * 0.35 : st.includes("Subscript") ? sz * 0.35 : 0;
+                // super/sub shift relative to the line baseline (em of the run).
+                const dy = st.includes("Superscript") ? -sz * 0.45 : st.includes("Subscript") ? sz * 0.2 : 0;
                 ctx.font = fontOf(tk.seg);
                 ctx.fillStyle = tk.seg.color || baseColor;
-                ctx.fillText(tk.text, x, y + dy);
+                ctx.fillText(tk.text, x, baselineY + dy);
                 if (st.includes("Underline") || st.includes("Strikethrough")) {
                   ctx.save();
                   ctx.strokeStyle = tk.seg.color || baseColor;
                   ctx.lineWidth = Math.max(1, sz / 14);
-                  if (st.includes("Underline")) { ctx.beginPath(); ctx.moveTo(x, y + dy + sz); ctx.lineTo(x + widths[i], y + dy + sz); ctx.stroke(); }
-                  if (st.includes("Strikethrough")) { ctx.beginPath(); ctx.moveTo(x, y + dy + sz * 0.55); ctx.lineTo(x + widths[i], y + dy + sz * 0.55); ctx.stroke(); }
+                  if (st.includes("Underline")) { ctx.beginPath(); ctx.moveTo(x, baselineY + dy + sz * 0.16); ctx.lineTo(x + widths[i], baselineY + dy + sz * 0.16); ctx.stroke(); }
+                  if (st.includes("Strikethrough")) { ctx.beginPath(); ctx.moveTo(x, baselineY + dy - sz * 0.3); ctx.lineTo(x + widths[i], baselineY + dy - sz * 0.3); ctx.stroke(); }
                   ctx.restore();
                 }
                 x += widths[i];
@@ -438,7 +446,10 @@ function SaveCollageButton() {
           ctx.textAlign = align === "center" ? "center" : align === "right" ? "right" : "left";
           const xBase = align === "center" ? it.x + it.w / 2 : align === "right" ? it.x + it.w : it.x;
           const lineHeight = fs * 1.2;
-          let y = it.y;
+          // Match the on-screen HTML box: line-height 1.2 puts half its leading
+          // (0.1×fs) above the glyph, so offset textBaseline="top" by that to
+          // align the export with the working view exactly.
+          let y = it.y + (lineHeight - fs) / 2;
           for (const para of (it.text ?? "").split("\n")) {
             const words = para.split(" ");
             let line = "";
@@ -503,17 +514,35 @@ function SaveCollageButton() {
       });
     }
 
-    // Tag the PNG with the chosen DPI so it imports at the correct physical size.
-    const dataUrl = pngWithDpi(canvas.toDataURL("image/png"), exportDpi);
-    const b64 = dataUrl.split(",")[1] ?? "";
+    // Compose to a DPI-tagged PNG. For non-PNG formats, hand that PNG to the
+    // backend to convert (JPEG/TIFF/PDF) with the DPI embedded.
+    const fmt = (exportFormat || "png").toLowerCase();
+    const pngDataUrl = pngWithDpi(canvas.toDataURL("image/png"), exportDpi);
+    let b64 = pngDataUrl.split(",")[1] ?? "";
+    let ext = "png";
+    let mime = "image/png";
+    if (fmt !== "png") {
+      try {
+        const conv = await api.convertCollage(
+          canvas.toDataURL("image/png").split(",")[1] ?? "",
+          fmt, exportDpi, background === "transparent" ? "#FFFFFF" : background,
+        );
+        b64 = conv.image;
+        ext = conv.ext || fmt;
+        mime = ext === "pdf" ? "application/pdf" : ext === "tiff" ? "image/tiff" : ext === "jpg" ? "image/jpeg" : "image/png";
+      } catch (e) {
+        console.error("[collage] format convert failed", e);
+        await alertDialog({ title: "Convert failed", body: `Could not export as ${fmt.toUpperCase()} (is the backend running?). Saved as PNG instead.` });
+      }
+    }
 
     // Try Tauri save flow first.
     try {
       const { save } = await import("@tauri-apps/plugin-dialog");
       const { invoke } = await import("@tauri-apps/api/core");
       const path = await save({
-        defaultPath: "collage.png",
-        filters: [{ name: "PNG image", extensions: ["png"] }],
+        defaultPath: `collage.${ext}`,
+        filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
       });
       if (!path) return;
       await invoke("save_base64_to_path", { path, dataB64: b64 });
@@ -523,8 +552,8 @@ function SaveCollageButton() {
       /* Not running inside Tauri — fall back to browser download. */
     }
     const a = document.createElement("a");
-    a.href = dataUrl;
-    a.download = "collage.png";
+    a.href = `data:${mime};base64,${b64}`;
+    a.download = `collage.${ext}`;
     a.click();
     } finally {
       setExporting(false);
@@ -533,7 +562,23 @@ function SaveCollageButton() {
 
   return (
     <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-      <Tooltip title="Export resolution. The canvas is sized at 300 DPI; higher DPI re-renders figures + R plots at more pixels and tags the PNG so it imports at the right physical size.">
+      <Tooltip title="Output file format. PNG keeps transparency; JPEG/PDF flatten onto the background. All embed the chosen DPI.">
+        <Box
+          component="select"
+          value={exportFormat}
+          onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setExportFormat(e.target.value)}
+          sx={{
+            fontSize: "0.7rem", height: 30, borderRadius: 1, px: 0.5,
+            bgcolor: "var(--c-surface)", color: "var(--c-text)",
+            border: "1px solid var(--c-border)", cursor: "pointer",
+          }}
+        >
+          {[["png", "PNG"], ["jpeg", "JPEG"], ["tiff", "TIFF"], ["pdf", "PDF"]].map(([v, l]) => (
+            <option key={v} value={v}>{l}</option>
+          ))}
+        </Box>
+      </Tooltip>
+      <Tooltip title="Export resolution. The canvas is sized at 300 DPI; higher DPI re-renders figures + R plots at more pixels and embeds the DPI so it imports at the right physical size.">
         <Box
           component="select"
           value={String(exportDpi)}

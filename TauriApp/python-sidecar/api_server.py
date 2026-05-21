@@ -4853,6 +4853,49 @@ def render_collage_figure(body: CollageFigureRenderRequest):
     }
 
 
+class CollageConvertRequest(BaseModel):
+    """Convert a composed collage PNG (base64) to another output format with
+    the chosen DPI embedded. PNG is handled client-side; this serves JPEG /
+    TIFF / PDF via PIL."""
+    image_b64: str
+    format: str = "png"          # jpeg | tiff | pdf
+    dpi: int = 300
+    background: str = "#FFFFFF"  # flatten transparency onto this for jpeg/pdf
+
+
+@app.post("/api/collage/convert")
+def convert_collage(body: CollageConvertRequest):
+    fmt = (body.format or "png").lower().lstrip(".")
+    if fmt == "jpg":
+        fmt = "jpeg"
+    raw = base64.b64decode(body.image_b64.split(",")[-1])
+    img = Image.open(io.BytesIO(raw))
+    dpi = max(72, min(1200, int(body.dpi or 300)))
+    # JPEG and PDF can't carry alpha — flatten onto the background colour.
+    if fmt in ("jpeg", "pdf"):
+        if img.mode in ("RGBA", "LA", "P"):
+            rgba = img.convert("RGBA")
+            bg = Image.new("RGB", rgba.size, body.background or "#FFFFFF")
+            bg.paste(rgba, mask=rgba.split()[-1])
+            img = bg
+        else:
+            img = img.convert("RGB")
+    out = io.BytesIO()
+    if fmt == "jpeg":
+        img.save(out, format="JPEG", quality=95, dpi=(dpi, dpi))
+        ext = "jpg"
+    elif fmt == "tiff":
+        img.save(out, format="TIFF", dpi=(dpi, dpi), compression="tiff_lzw")
+        ext = "tiff"
+    elif fmt == "pdf":
+        img.save(out, format="PDF", resolution=float(dpi))
+        ext = "pdf"
+    else:  # png fallback
+        img.save(out, format="PNG", dpi=(dpi, dpi))
+        ext = "png"
+    return {"image": base64.b64encode(out.getvalue()).decode("ascii"), "ext": ext}
+
+
 class CollageDecomposeRequest(BaseModel):
     project_path: str
 

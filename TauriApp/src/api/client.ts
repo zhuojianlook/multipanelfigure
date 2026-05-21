@@ -414,6 +414,23 @@ class ApiClient {
     }));
   }
 
+  /** Convert a composed collage PNG (base64) to JPEG / TIFF / PDF with the
+   *  given DPI embedded (PNG is handled client-side). Returns the converted
+   *  bytes as base64 + the file extension. */
+  async convertCollage(
+    imageB64: string,
+    format: string,
+    dpi: number,
+    background: string,
+  ): Promise<{ image: string; ext: string }> {
+    return apiJson("/api/collage/convert", "POST", JSON.stringify({
+      image_b64: imageB64,
+      format,
+      dpi: dpi && dpi > 0 ? Math.round(dpi) : 300,
+      background: background || "#FFFFFF",
+    }));
+  }
+
   /** List the editable text elements of a saved .mpf (column/row headers,
    *  axis labels, panel labels, scale bars) so the collage UI can offer
    *  per-element font synchronization + customization. Includes each

@@ -4575,7 +4575,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           <Controls
             position="top-right"
             orientation="horizontal"
-            showInteractive
+            // The interactivity "lock" is hidden: `elementsSelectable` is a
+            // controlled prop here, so the lock couldn't actually toggle it and
+            // appeared to do nothing. Keep just zoom in/out + fit-view.
+            showInteractive={false}
             style={{
               // MiniMap is 110 px tall with margin: 8 → ends at 126.
               // Sit just below it (small 4 px gap looks deliberate).

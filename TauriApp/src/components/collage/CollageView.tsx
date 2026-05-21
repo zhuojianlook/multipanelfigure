@@ -1050,7 +1050,15 @@ export function CollageView() {
         direction="row"
         spacing={1}
         alignItems="center"
-        sx={{ px: 1.5, py: 1, borderBottom: "1px solid var(--c-border)", flexShrink: 0, flexWrap: "wrap" }}
+        sx={{
+          px: 1.5, py: 1, borderBottom: "1px solid var(--c-border)", flexShrink: 0,
+          // Single row that scrolls horizontally on narrow windows instead of
+          // wrapping into an ugly second row. Children must not shrink.
+          flexWrap: "nowrap", overflowX: "auto", overflowY: "hidden",
+          "& > *": { flexShrink: 0 },
+          "&::-webkit-scrollbar": { height: 6 },
+          "&::-webkit-scrollbar-thumb": { backgroundColor: "rgba(255,255,255,0.2)", borderRadius: 3 },
+        }}
       >
         <Tooltip title="Import an arbitrary image into the collage">
           <Button

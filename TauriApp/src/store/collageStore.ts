@@ -268,6 +268,10 @@ export type CollageState = {
    *  virtual page, so factor = exportDpi/300 scales the output pixels; the
    *  exported PNG is also tagged with this DPI (pHYs). Default 300. */
   exportDpi: number;
+  /** Output file format for Save Collage: "png" | "jpeg" | "tiff" | "pdf".
+   *  PNG is composed client-side; the rest are converted by the backend
+   *  (PIL) with the chosen DPI embedded. Default "png". */
+  exportFormat: string;
   /** Target visual point size for ALL figure-kind item headers /
    *  primary labels in the collage. Null = no normalisation (each
    *  item shows headers at its own pt × its collage scale). When
@@ -325,6 +329,7 @@ export type CollageState = {
   setColumnGuides: (columns: number, gutter: number) => void;
   setGuidesVisible: (v: boolean) => void;
   setExportDpi: (dpi: number) => void;
+  setExportFormat: (fmt: string) => void;
   clear: () => void;
 
   // ── Document tabs ──
@@ -365,7 +370,7 @@ export type CollageState = {
 
 const STORAGE_KEY = "mpfig_collage_v1";
 
-type Persisted = Pick<CollageState, "items" | "canvasW" | "canvasH" | "background" | "gridVisible" | "snapEnabled" | "gridStep" | "globalHeaderPt" | "guideColumns" | "guideGutter" | "guidesVisible" | "exportDpi" | "elemOverridesByItem">;
+type Persisted = Pick<CollageState, "items" | "canvasW" | "canvasH" | "background" | "gridVisible" | "snapEnabled" | "gridStep" | "globalHeaderPt" | "guideColumns" | "guideGutter" | "guidesVisible" | "exportDpi" | "exportFormat" | "elemOverridesByItem">;
 
 function loadInitial(): Persisted {
   try {
@@ -413,6 +418,7 @@ function loadInitial(): Persisted {
           guideGutter: typeof data.guideGutter === "number" ? data.guideGutter : 0,
           guidesVisible: data.guidesVisible ?? true,
           exportDpi: typeof data.exportDpi === "number" && data.exportDpi > 0 ? data.exportDpi : 300,
+          exportFormat: typeof data.exportFormat === "string" ? data.exportFormat : "png",
           elemOverridesByItem: (data.elemOverridesByItem && typeof data.elemOverridesByItem === "object") ? data.elemOverridesByItem : {},
         };
       }
@@ -433,6 +439,7 @@ function loadInitial(): Persisted {
     guideGutter: 0,
     guidesVisible: true,
     exportDpi: 300,
+    exportFormat: "png",
     elemOverridesByItem: {},
   };
 }
@@ -452,6 +459,7 @@ function persist(s: Persisted) {
       guideGutter: s.guideGutter,
       guidesVisible: s.guidesVisible,
       exportDpi: s.exportDpi,
+      exportFormat: s.exportFormat,
       elemOverridesByItem: s.elemOverridesByItem,
     }));
   } catch {
@@ -575,6 +583,11 @@ export const useCollageStore = create<CollageState>()(
 
     setExportDpi: (dpi) => {
       set((s) => { s.exportDpi = Math.max(72, Math.min(1200, Math.round(dpi))); });
+      persist(get());
+    },
+
+    setExportFormat: (fmt) => {
+      set((s) => { s.exportFormat = fmt; });
       persist(get());
     },
 
