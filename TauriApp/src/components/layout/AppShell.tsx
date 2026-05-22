@@ -264,7 +264,7 @@ export function AppShell() {
 
   return (
     <div
-      className="flex h-screen w-screen overflow-hidden select-none"
+      className="flex flex-col h-screen w-screen overflow-hidden select-none"
       onMouseMove={onMouseMove}
       onMouseUp={onMouseUp}
       onMouseLeave={onMouseUp}
@@ -289,42 +289,47 @@ export function AppShell() {
         </Alert>
       )}
 
-      {/* ── Sidebar ─────────────────────────────────────── */}
-      {/* Hidden in the Analysis workspace — the node-graph canvas wants
-          the full width (it was a full-screen view). */}
-      {mode !== "analysis" && (
-        <aside
-          className="flex-none overflow-y-auto overflow-x-hidden border-r"
-          style={{
-            width: 260,
-            minWidth: 220,
-            backgroundColor: "var(--c-surface)",
-            borderColor: "var(--c-border)",
-          }}
-        >
-          <Sidebar />
-        </aside>
-      )}
+      {/* ── Document tabs ───────────────────────────────── */}
+      {/* Full-width top bar so the tabs (Collage / Analysis / open .mpf) keep
+          a fixed position across every mode — switching tabs never shifts the
+          navigation, even when the left tools column changes. */}
+      <DocumentTabs />
 
-      {/* ── Center area ─────────────────────────────────── */}
-      <main className="flex flex-1 flex-col min-w-0 min-h-0">
-        {/* Document tabs — open .mpf files + Collage + Analysis, for
-            seamless switching. Sits above the toolbar so it reads as the
-            top-level navigation. */}
-        <DocumentTabs />
-        {/* Toolbar — builder/collage actions only; hidden in Analysis,
-            which has its own toolbar. */}
-        {mode !== "analysis" && <Toolbar />}
+      {/* ── Workspace row: left tools column | center area ── */}
+      <div className="flex flex-1 min-h-0 min-w-0">
+        {/* Left tools column. Builder + Collage render their tools here; the
+            Analysis workspace provides its own equivalent column (Sources)
+            inside its canvas, kept at the same width + styling so the left
+            column reads consistently and never collapses. */}
+        {mode !== "analysis" && (
+          <aside
+            className="flex-none overflow-y-auto overflow-x-hidden border-r"
+            style={{
+              width: 260,
+              minWidth: 220,
+              backgroundColor: "var(--c-surface)",
+              borderColor: "var(--c-border)",
+            }}
+          >
+            <Sidebar />
+          </aside>
+        )}
 
-        {/* Mode-specific body. Builder = image strip + grid|preview split.
-            Collage = single-pane CollageView. The Toolbar is shared so
-            users can flip between modes from one place. */}
-        <CenterPane
-          splitPct={splitPct}
-          dragging={dragging}
-          onSplitterDown={onMouseDown}
-        />
-      </main>
+        {/* ── Center area ─────────────────────────────────── */}
+        <main className="flex flex-1 flex-col min-w-0 min-h-0">
+          {/* Toolbar — builder/collage actions only; hidden in Analysis,
+              which has its own toolbar. */}
+          {mode !== "analysis" && <Toolbar />}
+
+          {/* Mode-specific body. Builder = image strip + grid|preview split.
+              Collage = single-pane CollageView. Analysis = node-graph. */}
+          <CenterPane
+            splitPct={splitPct}
+            dragging={dragging}
+            onSplitterDown={onMouseDown}
+          />
+        </main>
+      </div>
     </div>
   );
 }

@@ -4400,9 +4400,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           node on the canvas to attach. "+ Source" spawns an empty
           source container so users can partition insets across
           parallel pipelines on the same canvas. */}
-      <Box sx={{ width: 168, flexShrink: 0, borderRight: "1px solid", borderColor: "divider", display: "flex", flexDirection: "column", bgcolor: "background.paper" }}>
-        <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, px: 1, py: 0.5, borderBottom: "1px solid", borderColor: "divider" }}>
-          <Typography variant="caption" sx={{ fontSize: "0.6rem", fontWeight: 700, color: "text.secondary", letterSpacing: 0.5, textTransform: "uppercase", flex: 1 }}>
+      <Box sx={{ width: 260, flexShrink: 0, borderRight: "1px solid", borderColor: "divider", display: "flex", flexDirection: "column", bgcolor: "var(--c-surface)" }}>
+        <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, px: 2, py: 1.25, borderBottom: "1px solid", borderColor: "divider" }}>
+          <Typography variant="caption" sx={{ display: "block", letterSpacing: 1.2, fontSize: "0.6rem", textTransform: "uppercase", color: "text.secondary", fontWeight: 700, flex: 1 }}>
             Sources ({insetSources.length})
           </Typography>
           <Tooltip placement="right" title="Create a custom group — drag insets onto it to organise them">
