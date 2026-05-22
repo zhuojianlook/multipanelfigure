@@ -6612,117 +6612,51 @@ def check_imagej_installed(path: Optional[str] = None):
 
 
 # ── Cellpose 3 module ─────────────────────────────────────────
+import cellpose_plugin  # noqa: E402  (isolated-venv Cellpose host)
+from fastapi.responses import StreamingResponse  # noqa: E402
+
+
 @app.get("/api/analysis/check-cellpose")
 def check_cellpose_installed():
-    """Tell the frontend whether Cellpose is importable in the sidecar's
-    Python environment.  Returns the package version when available so
-    the UI tooltip can show e.g. "cellpose 3.0.10"."""
+    """Whether Cellpose is installed in the dedicated plugin virtualenv
+    (a real Python kept in a persistent user-data dir, survives app
+    updates). Returns the version for the UI tooltip when present."""
     try:
-        import importlib
-        m = importlib.import_module("cellpose")
-        ver = getattr(m, "version", None) or getattr(m, "__version__", None) or ""
-        return {"installed": True, "kind": f"cellpose {ver}".strip(), "path": getattr(m, "__file__", "")}
+        return cellpose_plugin.check()
     except Exception as e:
         return {"installed": False, "kind": "", "path": "", "error": str(e)[:200]}
 
 
-def _pip_supports_break_system(exe) -> bool:
-    """True iff this interpreter's pip understands --break-system-packages
-    (pip >= 23.0). Older pips — e.g. macOS Xcode's Python 3.9 — abort with
-    'no such option: --break-system-packages' (exit 2), so the flag must be
-    omitted for them. They also predate PEP-668 enforcement, so they don't
-    need it anyway."""
-    import subprocess as _sp, re as _re
-    try:
-        out = _sp.run([exe, "-m", "pip", "--version"],
-                      capture_output=True, text=True, timeout=30)
-        m = _re.search(r"pip\s+(\d+)\.(\d+)", f"{out.stdout or ''}{out.stderr or ''}")
-        return bool(m) and int(m.group(1)) >= 23
-    except Exception:
-        return False
-
-
 @app.post("/api/analysis/install-cellpose")
 def install_cellpose():
-    """Run `pip install --upgrade cellpose` against the sidecar's own
-    Python interpreter.  Returns a structured result so the frontend
-    can surface stdout/stderr inline.  The download is large (~500 MB
-    with torch); the timeout is generous.  Idempotent — re-running
-    upgrades to the latest version.
-
-    For LIVE progress, the streaming endpoint
-    `/api/analysis/install-cellpose-stream` returns text/event-stream
-    chunks as pip writes them.  This non-streaming version is kept
-    for callers that just want a final pass/fail summary."""
-    import sys as _sys
-    import subprocess as _sp
+    """Non-streaming install: build/refresh the plugin venv + install
+    Cellpose into it. Drains the streaming installer for a final summary.
+    Most callers should use the streaming endpoint for live progress."""
+    lines: List[str] = []
+    rc = -1
     try:
-        proc = _sp.run(
-            [_sys.executable, "-m", "pip", "install", "--upgrade", "cellpose"],
-            capture_output=True, text=True, timeout=900,
-        )
-        ok = proc.returncode == 0
-        return {
-            "success": ok,
-            "stdout": proc.stdout[-4000:],
-            "stderr": proc.stderr[-4000:],
-            "returncode": proc.returncode,
-        }
-    except _sp.TimeoutExpired:
-        return {"success": False, "stdout": "", "stderr": "pip install cellpose timed out (>15 min). "
-                "Try running it manually in a terminal: "
-                f"`{_sys.executable} -m pip install --upgrade cellpose`."}
+        import json as _json
+        for chunk in cellpose_plugin.install_stream():
+            payload = chunk[len("data: "):].strip() if chunk.startswith("data: ") else chunk.strip()
+            try:
+                obj = _json.loads(payload)
+            except Exception:
+                continue
+            if "line" in obj:
+                lines.append(obj["line"])
+            if obj.get("done"):
+                rc = int(obj.get("returncode", -1))
     except Exception as e:
-        return {"success": False, "stdout": "", "stderr": f"pip launch failed: {e}"}
+        return {"success": False, "stdout": "\n".join(lines), "stderr": f"install failed: {e}", "returncode": -1}
+    return {"success": rc == 0, "stdout": "\n".join(lines), "stderr": "", "returncode": rc}
 
-
-from fastapi.responses import StreamingResponse  # noqa: E402
 
 @app.post("/api/analysis/install-cellpose-stream")
 def install_cellpose_stream():
-    """Streaming variant: pipes pip's stdout/stderr line-by-line via
-    Server-Sent Events so the frontend's Console panel can show
-    real-time progress (download bars, "Collecting torch…", etc.).
-    Ends with a final event containing the exit code.
-    """
-    import sys as _sys
-    import subprocess as _sp
-
-    def gen():
-        # Use unbuffered output so pip's progress lines flush as they
-        # arrive (PYTHONUNBUFFERED + --no-input + --progress-bar).
-        env = dict(os.environ)
-        env["PYTHONUNBUFFERED"] = "1"
-        env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
-        # `--break-system-packages` bypasses PEP-668's externally-managed
-        # guard on pip 23+, but OLDER pips (e.g. Xcode's Python 3.9) don't
-        # know the flag and abort with 'no such option' (exit 2). Only add
-        # it when this interpreter's pip actually supports it.
-        cmd = [_sys.executable, "-u", "-m", "pip", "install",
-               "--upgrade", "--no-input",
-               "--progress-bar", "on"]
-        if _pip_supports_break_system(_sys.executable):
-            cmd.append("--break-system-packages")
-        cmd.append("cellpose")
-        try:
-            proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
-                             text=True, bufsize=1, env=env)
-        except Exception as e:
-            yield f"data: {{\"line\":\"pip launch failed: {e}\"}}\n\n"
-            yield "data: {\"done\":true,\"returncode\":-1}\n\n"
-            return
-        yield f'data: {{"line":"using interpreter: {_sys.executable}"}}\n\n'
-        yield 'data: {"line":"pip install --upgrade cellpose (may take 5-15 min, ~500 MB download)"}\n\n'
-        assert proc.stdout is not None
-        for raw in iter(proc.stdout.readline, ""):
-            line = raw.rstrip("\n")
-            # Escape for JSON-ish event payload.
-            esc = line.replace("\\", "\\\\").replace('"', '\\"')
-            yield f'data: {{"line":"{esc}"}}\n\n'
-        proc.wait()
-        yield f'data: {{"done":true,"returncode":{proc.returncode}}}\n\n'
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    """Streaming install: builds the plugin venv from a real system Python
+    and installs Cellpose into it, piping pip output line-by-line via SSE.
+    Works in the packaged app (the frozen sidecar can't pip into itself)."""
+    return StreamingResponse(cellpose_plugin.install_stream(), media_type="text/event-stream")
 
 
 class CellposeAnalysisRequest(BaseModel):
@@ -6768,23 +6702,6 @@ def run_cellpose_pipeline(body: CellposeAnalysisRequest):
         return {"success": False, "stdout": "", "stderr": f"Cellpose config is not valid JSON: {e}",
                 "plots": [], "tables": [], "images": []}
 
-    model_name        = str(cfg_dict.get("model", "cyto3"))
-    diameter          = cfg_dict.get("diameter")  # None or number
-    channels          = cfg_dict.get("channels", [0, 0])
-    flow_threshold    = float(cfg_dict.get("flow_threshold", 0.4))
-    cellprob_threshold = float(cfg_dict.get("cellprob_threshold", 0.0))
-    min_size          = int(cfg_dict.get("min_size", 15))
-    use_gpu           = bool(cfg_dict.get("use_gpu", False))
-
-    # 2) Try to import cellpose.  Give a clear "install hint" on miss.
-    try:
-        from cellpose import models as cp_models, utils as cp_utils  # type: ignore
-    except Exception as e:
-        return {"success": False, "stdout": "",
-                "stderr": ("Cellpose isn't installed in the sidecar's Python environment. "
-                           f"Run `pip install cellpose` and restart the app.  Import error: {e}"),
-                "plots": [], "tables": [], "images": []}
-
     # 3) Materialise every image input (sources + extras) into a
     #    common [(label, np.ndarray)] list.  Source insets are
     #    re-extracted at full resolution; extras arrive base64 PNG.
@@ -6811,183 +6728,9 @@ def run_cellpose_pipeline(body: CellposeAnalysisRequest):
                 "stderr": "No image inputs — wire source insets or upstream image outputs into this node.",
                 "plots": [], "tables": [], "images": []}
 
-    stdout_lines: List[str] = []
-    images_out: List[Dict[str, str]] = []
-    rows: List[Dict[str, object]] = []
-    try:
-        # 4) Detect Cellpose API surface and instantiate the model.
-        # Behaviour confirmed against an installed cellpose 4.1.1
-        # (the latest as of writing):
-        #   v3:  cellpose.models.Cellpose(gpu, model_type=NAME)
-        #        .eval(img, channels=, diameter=, …) → 4-tuple
-        #   v4:  cellpose.models.CellposeModel(gpu, pretrained_model=NAME)
-        #        .eval(img, channels=, diameter=, …) → 3-tuple
-        #        Only 'cpsam' is a built-in name; anything else falls
-        #        back to cpsam after a noisy download.  channels= is
-        #        deprecated but still accepted (just emits a warning).
-        import importlib as _il
-        _cp_mod = _il.import_module("cellpose")
-        # Version string for diagnostics.  v3 used ``__version__``;
-        # v4 dropped that in favour of a plain ``version`` attribute
-        # plus a multi-line ``version_str`` banner.  Take whichever
-        # exists, and trim to the first line so we don't bury the log.
-        cp_ver = (getattr(_cp_mod, "version", None)
-                  or getattr(_cp_mod, "__version__", None)
-                  or "").strip().splitlines()[0] if (
-                    getattr(_cp_mod, "version", None)
-                    or getattr(_cp_mod, "__version__", None)
-                  ) else ""
-        # v4 reliably signals itself by removing the ``Cellpose`` (size
-        # model + seg model) wrapper class.  Anything that still has
-        # cp_models.Cellpose is treated as the v3 API.
-        is_v4 = not hasattr(cp_models, "Cellpose")
-
-        # In v4 only "cpsam" is a built-in pretrained model.  If the
-        # user's config still names a v3 cyto/nuclei model, accept it
-        # but log a clear warning — cellpose will silently download &
-        # use cpsam instead, which produces confusingly different
-        # results from what the preset name implies.
-        V4_BUILTIN = {"cpsam"}
-        if is_v4 and model_name not in V4_BUILTIN:
-            stdout_lines.append(
-                f"WARNING: cellpose 4.x only ships the 'cpsam' model — "
-                f"your requested {model_name!r} will fall back to cpsam. "
-                f"Update your config's \"model\" field to \"cpsam\" to silence."
-            )
-            model_name = "cpsam"
-
-        if is_v4:
-            # v4 path — CellposeModel only.
-            model = cp_models.CellposeModel(gpu=use_gpu, pretrained_model=model_name)
-        else:
-            # v3 path — combined wrapper (does size estimation + seg).
-            model = cp_models.Cellpose(gpu=use_gpu, model_type=model_name)
-        load_line = (
-            f"loaded cellpose {cp_ver or '(version unknown)'} model={model_name!r} "
-            f"gpu={use_gpu} api={'v4' if is_v4 else 'v3'}"
-        )
-        stdout_lines.append(load_line)
-        # Real-time flush to the sidecar terminal so the user can
-        # watch progress while the run is happening.  (The frontend
-        # Console pane only sees stdout after the response returns
-        # — a full SSE refactor is a separate change.)
-        print(f"[run-cellpose] {load_line}", flush=True)
-
-        import time as _time
-        t_total_start = _time.monotonic()
-        for img_idx, (label, img) in enumerate(images_in, start=1):
-            seg_line = (
-                f"[{img_idx}/{len(images_in)}] segmenting {label!r} "
-                f"shape={img.shape} dtype={img.dtype}"
-            )
-            stdout_lines.append(seg_line)
-            print(f"[run-cellpose] {seg_line}", flush=True)
-            t_img_start = _time.monotonic()
-            eval_kwargs: Dict[str, object] = dict(
-                diameter=diameter,
-                flow_threshold=flow_threshold,
-                cellprob_threshold=cellprob_threshold,
-                min_size=min_size,
-            )
-            # channels=: required in v3; deprecated-but-accepted in v4.
-            # Pass it always for compatibility; both paths handle it.
-            try:
-                result = model.eval(img, channels=channels, **eval_kwargs)
-            except TypeError:
-                # Future v5 may drop channels entirely — fall back.
-                result = model.eval(img, **eval_kwargs)
-            # v3: (masks, flows, styles, diams).  v4: (masks, flows, styles).
-            if isinstance(result, tuple) and len(result) >= 4:
-                masks, flows, styles, diams = result[0], result[1], result[2], result[3]
-            else:
-                masks, flows, styles = result[0], result[1], result[2]
-                diams = None
-            # Mask → coloured palette PNG for output.
-            from PIL import Image as _Im
-            n_cells = int(masks.max())
-            mask_rgb = _np.zeros((*masks.shape, 3), dtype=_np.uint8)
-            if n_cells > 0:
-                rng = _np.random.default_rng(42)
-                palette = rng.integers(64, 255, size=(n_cells + 1, 3), dtype=_np.uint8)
-                palette[0] = (0, 0, 0)  # background
-                mask_rgb = palette[masks]
-            buf = _io.BytesIO(); _Im.fromarray(mask_rgb).save(buf, format="PNG")
-            images_out.append({"name": f"{label}_mask", "image": _b64.b64encode(buf.getvalue()).decode()})
-
-            # Labels image — 8-bit grayscale where pixel value = cell
-            # label ID.  This is the format ImageJ macros can iterate
-            # over directly (threshold to label==N → measure).  If
-            # n_cells > 255 we re-pack labels modulo 255 + 1 so the
-            # image still fits in 8-bit (rare edge case — typical
-            # microscopy fields have <200 cells).
-            labels8 = masks.astype(_np.int64)
-            if n_cells > 255:
-                # Map to 1..255 cyclically; cells with the same packed
-                # value won't be separable but the user gets a warning.
-                labels8 = ((labels8 - 1) % 255 + 1) * (labels8 > 0)
-                stdout_lines.append(
-                    f"WARNING: {label!r} has {n_cells} cells (>255) — "
-                    "packed label image cyclically; downstream ImageJ "
-                    "analysis may merge cells with the same packed ID."
-                )
-            labels8 = labels8.astype(_np.uint8)
-            buf_lbl = _io.BytesIO()
-            _Im.fromarray(labels8, mode="L").save(buf_lbl, format="PNG")
-            images_out.append({
-                "name": f"{label}_labels",
-                "image": _b64.b64encode(buf_lbl.getvalue()).decode(),
-            })
-
-            # Outlines overlay on the original image.
-            outline_img = img.copy()
-            if outline_img.ndim == 2:
-                outline_img = _np.stack([outline_img]*3, axis=-1)
-            try:
-                outlines = cp_utils.outlines_list(masks)
-                for o in outlines:
-                    for (xx, yy) in o.astype(int):
-                        if 0 <= yy < outline_img.shape[0] and 0 <= xx < outline_img.shape[1]:
-                            outline_img[yy, xx] = (255, 80, 80)
-            except Exception:
-                pass
-            buf2 = _io.BytesIO(); _Im.fromarray(outline_img).save(buf2, format="PNG")
-            images_out.append({"name": f"{label}_outlines", "image": _b64.b64encode(buf2.getvalue()).decode()})
-
-            # Per-cell stats for the counts table.
-            sizes = _np.bincount(masks.ravel())[1:] if n_cells > 0 else _np.array([0])
-            rows.append({
-                "source": label,
-                "n_cells": n_cells,
-                "mean_area_px": float(sizes.mean()) if n_cells > 0 else 0.0,
-                "median_area_px": float(_np.median(sizes)) if n_cells > 0 else 0.0,
-                "model": model_name,
-            })
-            # Per-image timing so the post-run log makes the cost
-            # visible (cellpose 4 / cpsam is heavy on first inference).
-            elapsed = _time.monotonic() - t_img_start
-            done_line = (
-                f"[{img_idx}/{len(images_in)}] {label!r}: {n_cells} cell(s) "
-                f"in {elapsed:.1f}s"
-            )
-            stdout_lines.append(done_line)
-            print(f"[run-cellpose] {done_line}", flush=True)
-        total_elapsed = _time.monotonic() - t_total_start
-        total_line = f"total: {len(images_in)} image(s) in {total_elapsed:.1f}s"
-        stdout_lines.append(total_line)
-        print(f"[run-cellpose] {total_line}", flush=True)
-    except Exception as e:
-        return {"success": False, "stdout": "\n".join(stdout_lines),
-                "stderr": f"Cellpose run failed: {e}",
-                "plots": [], "tables": [], "images": images_out}
-
-    # 5) Pack the per-image counts table.
-    csv_lines = ["source,n_cells,mean_area_px,median_area_px,model"]
-    for r in rows:
-        csv_lines.append(",".join(str(r[k]) for k in ("source", "n_cells", "mean_area_px", "median_area_px", "model")))
-    tables = [{"name": "cellpose_counts", "csv": "\n".join(csv_lines) + "\n"}]
-    return {"success": True, "kind": "cellpose",
-            "stdout": "\n".join(stdout_lines), "stderr": "",
-            "plots": [], "tables": tables, "images": images_out}
+    # 4) Run cellpose in the isolated plugin venv (real Python, separate
+    #    process) — the frozen sidecar can't import cellpose/torch itself.
+    return cellpose_plugin.run(images_in, cfg_dict, body.timeout_sec)
 
 
 class ImageJAnalysisRequest(BaseModel):
