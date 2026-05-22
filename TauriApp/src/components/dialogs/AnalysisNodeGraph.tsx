@@ -4633,8 +4633,15 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
             nodeIds={nodes.map((n) => n.id)}
           />
         </ReactFlow>
-        {/* Toolbar overlay */}
-        <Box sx={{ position: "absolute", top: 8, left: 8, display: "flex", gap: 0.5, zIndex: 5 }}>
+        {/* Toolbar overlay. Bounded to the canvas (left+right:8) so it can
+            never spill over the code-editor panel on the right; buttons keep
+            their size (flexShrink:0) and the row scrolls horizontally when the
+            canvas is too narrow to fit them, instead of shrinking/overrunning. */}
+        <Box sx={{
+          position: "absolute", top: 8, left: 8, right: 8, display: "flex",
+          flexWrap: "nowrap", overflowX: "auto", overflowY: "hidden",
+          gap: 0.5, zIndex: 5, "& > *": { flexShrink: 0 },
+        }}>
           <Tooltip placement="bottom" title="Add a Python node">
             <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
               onClick={() => addProcessNode("python")}
