@@ -11,8 +11,18 @@
     "dialog:allow-save",
     "dialog:allow-open",
     "shell:default",
-    "shell:allow-spawn",
-    "shell:allow-execute",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        { "name": "binaries/ffmpeg", "sidecar": true, "args": true }
+      ]
+    },
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        { "name": "binaries/ffmpeg", "sidecar": true, "args": true }
+      ]
+    },
     "updater:default",
     "process:default"
   ]

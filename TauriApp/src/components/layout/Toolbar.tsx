@@ -1704,21 +1704,25 @@ function RecordAppButton() {
 
   // ── Native (ffmpeg) screen capture for macOS WKWebView ──
 
-  /** Query ffmpeg for the avfoundation index of the main screen capture
-   *  device. Falls back to "1" (0 is usually the camera). */
+  /** Query ffmpeg for the avfoundation index of the screen-capture device.
+   *  Prefers "Capture screen 0" (the main display); else the first "Capture
+   *  screen N". THROWS if none is found instead of guessing a numeric index —
+   *  a wrong guess can land on a camera (e.g. a Continuity Camera at [1]) and
+   *  silently record the wrong thing. */
   const getScreenDeviceIndex = async (): Promise<string> => {
-    try {
-      const { Command } = await import("@tauri-apps/plugin-shell");
-      const out = await Command.sidecar("binaries/ffmpeg", [
-        "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", "",
-      ]).execute();
-      const text = `${out.stderr || ""}\n${out.stdout || ""}`;
-      const m = text.match(/\[(\d+)\]\s+Capture screen 0/) || text.match(/\[(\d+)\]\s+Capture screen/);
-      if (m) return m[1];
-    } catch (e) {
-      console.warn("[record] avfoundation device list failed", e);
-    }
-    return "1";
+    const { Command } = await import("@tauri-apps/plugin-shell");
+    const out = await Command.sidecar("binaries/ffmpeg", [
+      "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", "",
+    ]).execute();
+    const text = `${out.stderr || ""}\n${out.stdout || ""}`;
+    const m = text.match(/\[(\d+)\]\s+Capture screen 0\b/)
+      || text.match(/\[(\d+)\]\s+Capture screen\b/);
+    if (m) return m[1];
+    throw new Error(
+      "No screen-capture device was found by ffmpeg. Make sure macOS Screen "
+      + "Recording permission is enabled for this app (System Settings → "
+      + "Privacy & Security → Screen Recording), then fully quit and reopen it.",
+    );
   };
 
   const startNative = async () => {
@@ -1805,7 +1809,12 @@ function RecordAppButton() {
       setRecording(true);
     } catch (e) {
       setRecording(false);
-      setRecError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      setRecError(msg);
+      // Surface the failure in a dialog — previously it only set the tooltip,
+      // so a blocked spawn / missing device looked like "the save dialog did
+      // nothing".
+      await alertDialog({ title: "Couldn't start recording", body: msg });
     }
   };
 
