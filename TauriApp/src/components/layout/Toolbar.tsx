@@ -1778,14 +1778,20 @@ function RecordAppButton() {
         nativeChildRef.current = null;
         setRecording(false);
         if (!stoppingRef.current) {
-          // Process exited on its own — almost always a missing macOS Screen
-          // Recording permission. Surface a clear, actionable message.
+          // Process exited on its own almost immediately — almost always the
+          // missing macOS Screen Recording permission (ffmpeg opens the output
+          // file, fails to grab the screen, and quits, so the user just sees an
+          // empty file appear). Surface a clear, actionable dialog — the
+          // tooltip-only message was easy to miss.
           const perm = /denied|not authorized|permission|abort|Operation not permitted/i.test(stderrTail);
-          setRecError(
-            perm
-              ? "Screen Recording permission needed: System Settings → Privacy & Security → Screen Recording → enable this app, then restart it and try again."
-              : `Recording stopped unexpectedly. ${stderrTail.slice(-300)}`,
-          );
+          const msg = perm
+            ? "macOS hasn't granted this app Screen Recording permission yet, so the "
+              + "recording couldn't capture anything (an empty file was written).\n\n"
+              + "Fix: System Settings → Privacy & Security → Screen Recording → enable "
+              + "Multi-Panel Figure Builder, then fully quit and reopen the app and try again."
+            : `Recording stopped unexpectedly.\n\n${stderrTail.slice(-400) || "No ffmpeg output."}`;
+          setRecError(perm ? "Screen Recording permission needed — see the dialog." : "Recording stopped unexpectedly.");
+          await alertDialog({ title: perm ? "Screen Recording permission needed" : "Recording failed", body: msg });
         } else {
           await alertDialog({ title: "Recording saved", body: `Screen recording saved to ${nativePathRef.current}` });
         }

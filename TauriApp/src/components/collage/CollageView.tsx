@@ -56,7 +56,8 @@ import { RichTextEditor } from "../dialogs/RichTextEditor";
 import type { StyledSegment } from "../../api/types";
 import { api } from "../../api/client";
 import { sortFontList, pickDefaultFont } from "../../utils/fontList";
-import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
+import { alert as alertDialog } from "../shared/ConfirmDialog";
+import { openProjectIntoTab } from "../../utils/projectNav";
 
 type Corner = "nw" | "ne" | "sw" | "se";
 
@@ -254,8 +255,6 @@ export function CollageView() {
   const setSnapEnabled = useCollageStore((s) => s.setSnapEnabled);
   const setGridStep = useCollageStore((s) => s.setGridStep);
   const addItem = useCollageStore((s) => s.addItem);
-  const loadProject = useFigureStore((s) => s.loadProject);
-  const setMode = useCollageStore((s) => s.setMode);
   const panelLabelsOn = useCollageStore((s) => s.panelLabelsOn);
   const panelLabelUpper = useCollageStore((s) => s.panelLabelUpper);
   const panelLabelParen = useCollageStore((s) => s.panelLabelParen);
@@ -270,7 +269,6 @@ export function CollageView() {
   const containerRef = useRef<HTMLDivElement>(null);
   const pageRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const projectInputRef = useRef<HTMLInputElement>(null);
   // Pan + user-zoom state. The display scale that gets applied to the
   // canvas wrapper is fitScale × userZoom, where fitScale is the
   // automatically-computed scale that makes the page fit the viewport
@@ -315,6 +313,22 @@ export function CollageView() {
     () => panelLabelTextMap(items, panelLabelUpper, panelLabelParen),
     [items, panelLabelUpper, panelLabelParen],
   );
+  // Panel labels are ON by default — seed labels once for a collage that
+  // predates the feature (or was just opened) so figures/images get a, b, c…
+  // without a manual click. Newly added items are auto-labeled by addItem.
+  // Skips if the user has already curated labels (so per-item removals stick).
+  const labelsSeeded = useRef(false);
+  useEffect(() => {
+    if (labelsSeeded.current) return;
+    labelsSeeded.current = true;
+    const st = useCollageStore.getState();
+    if (!st.panelLabelsOn) return;
+    const labelable = st.items.filter(isLabelable);
+    if (labelable.length > 0 && !labelable.some((i) => i.panelLabel)) {
+      st.addPanelLabels();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // Rich-text editor for a whole text box (double-click). Gives all fonts,
   // bold/italic/underline/strikethrough/super/subscript and per-character
   // styling. Anchored to the text box's DOM node.
@@ -470,41 +484,6 @@ export function CollageView() {
     }
   };
 
-  // Canonicalize a figure's raster ONCE through the SAME render-figure pipeline
-  // the export uses. "Add to Collage" bakes the figure via the builder preview,
-  // whose layout aspect can differ a few % from render-figure; if left as-is,
-  // the export draws a (say) 1.092-aspect image into the canvas's 1.056-aspect
-  // box and stretches it vertically — shifting/squashing the headers. By
-  // re-rendering on first select and adopting the true aspect (updating h), the
-  // canvas box matches the export so there's no stretch. Runs at most once per
-  // figure (guarded by figCanon).
-  const canonicalizeFigure = async (itemId: string) => {
-    const it = useCollageStore.getState().items.find((i) => i.id === itemId);
-    if (!it || it.kind !== "figure" || !it.projectPath || it.figCanon) return;
-    const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
-    const pt = useCollageStore.getState().globalHeaderPt;
-    const sel = useCollageStore.getState().elemSelByItem[itemId];
-    const elementIds = sel ? Object.keys(sel).filter((k) => sel[k]) : null;
-    const overrides = useCollageStore.getState().elemOverridesByItem[itemId] || null;
-    try {
-      const resp = await api.renderCollageFigure(
-        it.projectPath, pt ?? null, Math.max(0.001, scale), it.w, elementIds,
-        overrides as Record<string, unknown> | null, 150,
-      );
-      if (resp?.image && resp.width && resp.height) {
-        updateItem(itemId, {
-          src: `data:image/png;base64,${resp.image}`,
-          naturalW: resp.width, naturalH: resp.height,
-          h: it.w / (resp.width / resp.height),
-          figCanon: true,
-        });
-      } else {
-        updateItem(itemId, { figCanon: true });
-      }
-    } catch (e) {
-      console.error("[collage] canonicalize figure failed", e);
-    }
-  };
   // Crop mode: the image item being cropped + the crop rect in the item's
   // displayed pixel coordinates (0..it.w, 0..it.h).
   const [cropItemId, setCropItemId] = useState<string | null>(null);
@@ -522,9 +501,6 @@ export function CollageView() {
           .then(({ elements }) => setElemList(it.id, elements))
           .catch((e) => console.error("[collage] load elements (select) failed", e));
       }
-      // First time this figure is selected, re-render it through the export
-      // pipeline so the canvas aspect == export aspect (no stretch on save).
-      if (!it.figCanon) void canonicalizeFigure(it.id);
     } else if (!it) {
       setElemSyncItem(null);
     }
@@ -774,53 +750,39 @@ export function CollageView() {
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
-  const handleImportProjectPick = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (projectInputRef.current) projectInputRef.current.value = "";
-    if (!file) return;
-    if (!file.name.toLowerCase().endsWith(".mpf")) {
+  // "Load project" — identical to the builder's Load Project: open a saved
+  // .mpf into a (new or existing) document tab in the Multi-Panel Builder
+  // (guarding unsaved changes), then the user can Add to Collage.
+  const [loadingProject, setLoadingProject] = useState(false);
+  const handleLoadProject = async () => {
+    let picked: string | null = null;
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const sel = await open({
+        multiple: false,
+        filters: [{ name: "Project", extensions: ["mpf"] }],
+      });
+      picked = typeof sel === "string" ? sel : (sel && typeof sel === "object" && "path" in sel ? (sel as { path: string }).path : null);
+    } catch {
       await alertDialog({
-        title: "Wrong file type",
-        body: "Please choose a .mpf project file.",
+        title: "Use the desktop app",
+        body: "Loading a project needs the desktop app's native file dialog. "
+          + "In the web preview, use Sidebar → Load Project in the builder.",
       });
       return;
     }
-    const ok = await confirmDialog({
-      title: "Load project into builder",
-      body: `Load "${file.name}" into the Multi-Panel Builder?\n\n`
-        + "Your current builder state will be replaced. Then you can review "
-        + 'the figure and click "Add to Collage" to insert it.',
-      confirmLabel: "Load",
-      destructive: true,
-    });
-    if (!ok) return;
+    if (!picked) return; // cancelled
+    setLoadingProject(true);
     try {
-      try {
-        const { open } = await import("@tauri-apps/plugin-dialog");
-        const picked = await open({
-          multiple: false,
-          filters: [{ name: "Project", extensions: ["mpf"] }],
-        });
-        if (picked && typeof picked === "string") {
-          await loadProject(picked);
-          setMode("builder");
-          return;
-        }
-      } catch {
-        /* not in Tauri — fall through */
-      }
-      await alertDialog({
-        title: "Use desktop file picker",
-        body: "Project import currently requires the desktop app's native file "
-          + "dialog. Use Sidebar → Load Project from the Multi-Panel Builder, "
-          + "then return here and click Add to Collage.",
-      });
+      await openProjectIntoTab(picked);
     } catch (err) {
-      console.error(err);
+      console.error("[collage] load project failed", err);
       await alertDialog({
         title: "Load failed",
-        body: "Could not load project. Check the console for details.",
+        body: "Could not load that project file — it may have been moved or deleted.",
       });
+    } finally {
+      setLoadingProject(false);
     }
   };
 
@@ -1304,23 +1266,19 @@ export function CollageView() {
           onChange={handleFileChange}
         />
 
-        <Tooltip title="Open a saved .mpf project in the Multi-Panel Builder so you can render and add it to the collage">
-          <Button
-            size="small"
-            variant="outlined"
-            startIcon={<FolderOpenIcon />}
-            onClick={() => projectInputRef.current?.click()}
-          >
-            Import project
-          </Button>
+        <Tooltip title="Open a saved .mpf project in the Multi-Panel Builder (same as the builder's Load Project) so you can render it and Add to Collage">
+          <span>
+            <Button
+              size="small"
+              variant="outlined"
+              startIcon={<FolderOpenIcon />}
+              disabled={loadingProject}
+              onClick={handleLoadProject}
+            >
+              {loadingProject ? "Loading…" : "Load project"}
+            </Button>
+          </span>
         </Tooltip>
-        <input
-          ref={projectInputRef}
-          type="file"
-          accept=".mpf"
-          style={{ display: "none" }}
-          onChange={handleImportProjectPick}
-        />
 
         <Tooltip title="Insert a text box">
           <Button size="small" variant="outlined" startIcon={<TextFieldsIcon />} onClick={insertText}>

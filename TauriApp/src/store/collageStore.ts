@@ -180,12 +180,6 @@ export type CollageItem = {
   headers?: CollageHeader[];
   bodyNaturalW?: number;
   bodyNaturalH?: number;
-  /** True once a figure-kind item's raster has been (re)rendered through the
-   *  collage render pipeline (render-figure) — the SAME pipeline the export
-   *  uses. "Add to Collage" bakes via the builder preview, whose layout aspect
-   *  can differ ~few %, so on first select we re-render to canonicalise the
-   *  aspect; otherwise the export would stretch the figure vs the canvas. */
-  figCanon?: boolean;
   /** Auto panel label (a, b, c…) overlaid on a figure/image item. Present =
    *  this element is labeled. offsetX/offsetY place the label's top-left
    *  relative to the item's top-left in canvas (page) px (default: top-left
@@ -375,8 +369,13 @@ export type CollageState = {
   panelLabelUpper: boolean;
   panelLabelParen: boolean;
   /** When on, every labelable item (incl. newly added ones) carries a panel
-   *  label. Set by "Label panels" / cleared by "Clear labels". Persisted. */
+   *  label. Set by "Label panels" / cleared by "Clear labels". Persisted.
+   *  Default ON. */
   panelLabelsOn: boolean;
+  /** One-time marker: once true, panelLabelsOn reflects the user's explicit
+   *  choice. Before it's set (legacy/older data), panelLabelsOn is forced ON so
+   *  the new "labels on by default" applies to existing collages too. */
+  panelLabelsDefaultedOn: boolean;
   /** Target visual point size for ALL figure-kind item headers /
    *  primary labels in the collage. Null = no normalisation (each
    *  item shows headers at its own pt × its collage scale). When
@@ -496,7 +495,7 @@ export type CollageState = {
 
 const STORAGE_KEY = "mpfig_collage_v1";
 
-type Persisted = Pick<CollageState, "items" | "canvasW" | "canvasH" | "background" | "gridVisible" | "snapEnabled" | "gridStep" | "globalHeaderPt" | "guideColumns" | "guideGutter" | "guidesVisible" | "exportDpi" | "exportFormat" | "elemOverridesByItem" | "panelLabelUpper" | "panelLabelParen" | "panelLabelsOn">;
+type Persisted = Pick<CollageState, "items" | "canvasW" | "canvasH" | "background" | "gridVisible" | "snapEnabled" | "gridStep" | "globalHeaderPt" | "guideColumns" | "guideGutter" | "guidesVisible" | "exportDpi" | "exportFormat" | "elemOverridesByItem" | "panelLabelUpper" | "panelLabelParen" | "panelLabelsOn" | "panelLabelsDefaultedOn">;
 
 function loadInitial(): Persisted {
   try {
@@ -555,7 +554,12 @@ function loadInitial(): Persisted {
           elemOverridesByItem: (data.elemOverridesByItem && typeof data.elemOverridesByItem === "object") ? data.elemOverridesByItem : {},
           panelLabelUpper: !!data.panelLabelUpper,
           panelLabelParen: !!data.panelLabelParen,
-          panelLabelsOn: !!data.panelLabelsOn,
+          // On by default. Until the one-time default has been applied (legacy
+          // data, or data saved before labels-on-by-default), force ON so it
+          // also turns on for existing collages; after that, respect the
+          // user's explicit choice so they can turn it off persistently.
+          panelLabelsOn: data.panelLabelsDefaultedOn ? !!data.panelLabelsOn : true,
+          panelLabelsDefaultedOn: true,
         };
       }
     }
@@ -579,7 +583,8 @@ function loadInitial(): Persisted {
     elemOverridesByItem: {},
     panelLabelUpper: false,
     panelLabelParen: false,
-    panelLabelsOn: false,
+    panelLabelsOn: true,
+    panelLabelsDefaultedOn: true,
   };
 }
 
@@ -603,6 +608,7 @@ function persist(s: Persisted) {
       panelLabelUpper: s.panelLabelUpper,
       panelLabelParen: s.panelLabelParen,
       panelLabelsOn: s.panelLabelsOn,
+      panelLabelsDefaultedOn: s.panelLabelsDefaultedOn,
     }));
   } catch {
     /* quota — ignore */
