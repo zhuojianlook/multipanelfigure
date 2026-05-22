@@ -19,6 +19,7 @@ import SaveIcon from "@mui/icons-material/Save";
 import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
 import { enterCollage, enterAnalysis, switchToDocument, newBlankDoc, closeDoc, saveDocument } from "../../utils/projectNav";
+import { RecordAppButton } from "./Toolbar";
 
 export function DocumentTabs() {
   const mode = useCollageStore((s) => s.mode);
@@ -82,13 +83,23 @@ export function DocumentTabs() {
         alignItems: "stretch",
         height: 30,
         flexShrink: 0,
-        overflowX: "auto",
-        overflowY: "hidden",
         backgroundColor: "var(--c-surface)",
         borderBottom: "1px solid var(--c-border)",
-        "&::-webkit-scrollbar": { height: 4 },
       }}
     >
+     {/* Scrollable tabs region (tabs can overflow without pushing the
+         pinned controls off-screen). */}
+     <Box
+      sx={{
+        display: "flex",
+        alignItems: "stretch",
+        flex: 1,
+        minWidth: 0,
+        overflowX: "auto",
+        overflowY: "hidden",
+        "&::-webkit-scrollbar": { height: 4 },
+      }}
+     >
       {/* Collage tab — always present, leftmost. */}
       <Tooltip title="Collage Assembly — arrange figures on a shared canvas">
         <Box sx={{ ...tabSx(mode === "collage"), pr: 1.25 }} onClick={() => void enterCollage()}>
@@ -206,6 +217,15 @@ export function DocumentTabs() {
           <AddIcon sx={{ fontSize: 16 }} />
         </Box>
       </Tooltip>
+     </Box>{/* end scrollable tabs region */}
+
+     {/* Record button — pinned right, never scrolls off, and present in
+         every mode (builder / analysis / collage) so a full workflow can
+         be filmed continuously across tab switches. Only renders when dev
+         options are enabled (handled inside RecordAppButton). */}
+     <Box sx={{ display: "flex", alignItems: "center", px: 0.5, flexShrink: 0 }}>
+       <RecordAppButton />
+     </Box>
     </Box>
   );
 }

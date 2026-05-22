@@ -1213,11 +1213,9 @@ export function Toolbar() {
         <SaveCollageButton />
       )}
 
-      {/* Record app — only renders when developer options are enabled
-          (toggled in the Help menu).  Sits alongside Save Figure
-          so users can start a tutorial recording at the same level
-          they save their output. */}
-      <RecordAppButton />
+      {/* Record app moved to the DocumentTabs bar so it's available — and a
+          recording keeps running — across every mode (builder / analysis /
+          collage). */}
 
       {/* Help menu */}
       <Tooltip title="Help">
@@ -1582,12 +1580,13 @@ export function Toolbar() {
 // ── Developer options + screen recorder ──────────────────────
 const DEV_OPTIONS_KEY = "mpfig.dev_options_enabled";
 
-/** Lives in the main toolbar (next to Save Figure) whenever the
- *  user has turned on developer options via the Help menu.  Manages
- *  a getDisplayMedia + MediaRecorder session and writes the
- *  resulting Blob to disk via the same Tauri save pathway used by
- *  the Save Collage button. */
-function RecordAppButton() {
+/** Mounted ONCE in the always-present DocumentTabs bar (so the button — and an
+ *  in-progress recording — persists across every mode/tab; the recorder used to
+ *  live in the mode-gated Toolbar, which unmounted it when switching to
+ *  Analysis and killed the capture). Shown only when developer options are on.
+ *  Manages a getDisplayMedia + MediaRecorder (or native ffmpeg) session and
+ *  writes the result to disk. */
+export function RecordAppButton() {
   // Drive visibility from the persisted flag PLUS the in-window
   // event the Help menu fires so the button flips on/off without
   // a remount of the host shell.
