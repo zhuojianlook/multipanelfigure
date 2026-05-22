@@ -4436,13 +4436,14 @@ def _iter_text_elements(cfg):
     synchronized font size."""
     out = []
 
-    def add(eid, etype, obj, text_attr, size_attr, segs_attr, color_attr, style_attr):
+    def add(eid, etype, obj, text_attr, size_attr, segs_attr, color_attr, style_attr,
+            font_attr="font_name"):
         out.append({
             "id": eid,
             "type": etype,
             "text": (getattr(obj, text_attr, "") or ""),
             "font_size": getattr(obj, size_attr, None),
-            "font_name": getattr(obj, "font_name", None),
+            "font_name": getattr(obj, font_attr, None),
             "color": getattr(obj, color_attr, None),
             "font_style": list(getattr(obj, style_attr, []) or []),
             "styled_segments": _segments_to_dicts(getattr(obj, segs_attr, None)),
@@ -4451,6 +4452,7 @@ def _iter_text_elements(cfg):
             "_segs_attr": segs_attr,
             "_color_attr": color_attr,
             "_style_attr": style_attr,
+            "_font_attr": font_attr,
         })
 
     for li, level in enumerate(getattr(cfg, "column_headers", []) or []):
@@ -4471,6 +4473,25 @@ def _iter_text_elements(cfg):
             sb = getattr(panel, "scale_bar", None)
             if sb is not None:
                 add(f"scalebar:{r}:{c}", f"Scale bar R{r+1}C{c+1}", sb, "label", "font_size", "styled_segments", "label_color", "label_font_style")
+            # Annotation text — symbol labels + line/area measurement labels.
+            # These render on the panel image and were previously invisible to
+            # the synchronize/per-element-font feature, so their font couldn't
+            # be unified with the rest of the figure.
+            for i, sym in enumerate(getattr(panel, "symbols", []) or []):
+                if (getattr(sym, "label_text", "") or "").strip():
+                    add(f"symbollbl:{r}:{c}:{i}", f"Annotation R{r+1}C{c+1} (symbol)", sym,
+                        "label_text", "label_font_size", "label_styled_segments",
+                        "label_color", "label_font_style", font_attr="label_font_name")
+            for i, ln in enumerate(getattr(panel, "lines", []) or []):
+                if getattr(ln, "show_measure", False):
+                    add(f"linemeas:{r}:{c}:{i}", f"Annotation R{r+1}C{c+1} (line)", ln,
+                        "measure_text", "measure_font_size", "measure_styled_segments",
+                        "measure_color", "measure_font_style", font_attr="measure_font_name")
+            for i, ar in enumerate(getattr(panel, "areas", []) or []):
+                if getattr(ar, "show_measure", False):
+                    add(f"areameas:{r}:{c}:{i}", f"Annotation R{r+1}C{c+1} (area)", ar,
+                        "measure_text", "measure_font_size", "measure_styled_segments",
+                        "measure_color", "measure_font_style", font_attr="measure_font_name")
     return out
 
 
@@ -4510,10 +4531,14 @@ def _apply_element_overrides(cfg, element_overrides):
             continue
         obj = el["_obj"]
         if ov.get("font_name"):
-            if hasattr(obj, "font_name"):
-                obj.font_name = ov["font_name"]
-                if hasattr(obj, "font_path"):
-                    obj.font_path = None  # let the renderer resolve by name
+            fattr = el.get("_font_attr", "font_name")
+            if hasattr(obj, fattr):
+                setattr(obj, fattr, ov["font_name"])
+                # Clear the matching resolved-path attr so the renderer resolves
+                # by name (font_path / label_font_path / measure_font_path).
+                pattr = fattr.replace("font_name", "font_path")
+                if hasattr(obj, pattr):
+                    setattr(obj, pattr, None)
         if ov.get("font_style") is not None and hasattr(obj, el["_style_attr"]):
             setattr(obj, el["_style_attr"], list(ov["font_style"]))
         if ov.get("color"):
