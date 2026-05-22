@@ -325,6 +325,9 @@ export interface FigureConfig {
   normalize_mode?: string;        // "width" or "height"
   scale_definitions?: Array<{ name: string; unit: string; value_per_pixel: number }>;
   parked_panels?: Array<{ original_row: number; original_col: number; panel: PanelInfo; image_name: string }>;
+  /** User-defined image groups (source library organization). Persisted with
+   *  the project so group membership survives save / load. */
+  image_groups?: ImageGroup[];
   show_column_labels?: boolean;
   show_row_labels?: boolean;
 }

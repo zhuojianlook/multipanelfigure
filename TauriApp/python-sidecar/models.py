@@ -468,6 +468,12 @@ class FigureConfig:
     # Parked panels (for parking drawer)
     parked_panels: List[ParkedPanel] = field(default_factory=list)
 
+    # User-defined image groups for the source library / image strip. Stored
+    # opaquely as the frontend's shape {id, name, imageNames:[...]} so group
+    # membership survives save / load (and document-tab snapshots). Older .mpf
+    # files without this default to no groups.
+    image_groups: List[dict] = field(default_factory=list)
+
     # Show primary labels toggle
     show_column_labels: bool = True
     show_row_labels: bool = True
@@ -717,6 +723,7 @@ _FIELD_TYPE_MAP = {
     'label_font_style': ('plain', None),
     'scale_definitions': ('list', ScaleDefinition),
     'parked_panels': ('list', ParkedPanel),
+    'image_groups': ('plain', None),  # opaque list of {id,name,imageNames}
     'panel': ('dataclass', PanelInfo),
     'measure_font_style': ('plain', None),
     'label_font_path': ('plain', None),

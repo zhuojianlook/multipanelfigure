@@ -1604,20 +1604,26 @@ export const useFigureStore = create<FigureState>()(
           name,
           imageNames: [],
         });
+        s.unsaved = true;
       });
+      void get().syncToBackend();
     },
 
     renameImageGroup: (groupId, name) => {
       set((s) => {
         const group = s.imageGroups.find(g => g.id === groupId);
         if (group) group.name = name;
+        s.unsaved = true;
       });
+      void get().syncToBackend();
     },
 
     deleteImageGroup: (groupId) => {
       set((s) => {
         s.imageGroups = s.imageGroups.filter(g => g.id !== groupId);
+        s.unsaved = true;
       });
+      void get().syncToBackend();
     },
 
     moveImageToGroup: (imageName, groupId) => {
@@ -1629,7 +1635,9 @@ export const useFigureStore = create<FigureState>()(
         // Add to target group
         const target = s.imageGroups.find(g => g.id === groupId);
         if (target) target.imageNames.push(imageName);
+        s.unsaved = true;
       });
+      void get().syncToBackend();
     },
 
     moveImageToTimeline: (imageName) => {
@@ -1637,7 +1645,9 @@ export const useFigureStore = create<FigureState>()(
         s.imageGroups.forEach(g => {
           g.imageNames = g.imageNames.filter(n => n !== imageName);
         });
+        s.unsaved = true;
       });
+      void get().syncToBackend();
     },
 
     // ── Preview ───────────────────────────────────────────
@@ -1691,7 +1701,9 @@ export const useFigureStore = create<FigureState>()(
       const cfg = get().config;
       if (!cfg) return;
       try {
-        await api.updateConfig(cfg);
+        // Carry the user-defined image groups along with the config so they're
+        // serialized into the .mpf on save and captured in tab snapshots.
+        await api.updateConfig({ ...cfg, image_groups: get().imageGroups });
       } catch (err) {
         console.error("Sync failed", err);
       }
@@ -1736,6 +1748,7 @@ export const useFigureStore = create<FigureState>()(
         if (s.config && resolutions) s.config.resolution_entries = resolutions;
         s.loadedImages = {};
         s.panelThumbnails = {};
+        s.imageGroups = [];
         s.currentProjectPath = null;
         s.configDirty = false;
         s.unsaved = false;
@@ -1757,6 +1770,13 @@ export const useFigureStore = create<FigureState>()(
               thumbnailB64: resp.thumbnails[name] ?? "",
             };
           }
+          // Restore this project's image groups (and reset to []' for projects
+          // saved before groups were persisted) so groups don't leak between
+          // documents. Drop names whose images aren't in the project.
+          const valid = new Set(resp.image_names);
+          s.imageGroups = (resp.config.image_groups ?? []).map((g) => ({
+            ...g, imageNames: (g.imageNames ?? []).filter((n) => valid.has(n)),
+          }));
           s.currentProjectPath = path;
           s.configDirty = false;
           s.unsaved = false;
@@ -1814,6 +1834,10 @@ export const useFigureStore = create<FigureState>()(
             thumbnailB64: resp.thumbnails[name] ?? "",
           };
         }
+        const valid = new Set(resp.image_names);
+        s.imageGroups = (resp.config.image_groups ?? []).map((g) => ({
+          ...g, imageNames: (g.imageNames ?? []).filter((n) => valid.has(n)),
+        }));
         s.currentProjectPath = opts.path;
         s.configDirty = false;
         s.unsaved = true;
