@@ -9,15 +9,16 @@
    ────────────────────────────────────────────────────────── */
 
 import { useEffect, useRef, useState } from "react";
-import { Box, Tooltip } from "@mui/material";
+import { Box, Tooltip, CircularProgress } from "@mui/material";
 import ViewModuleIcon from "@mui/icons-material/ViewModule";
 import DescriptionIcon from "@mui/icons-material/Description";
 import InsightsIcon from "@mui/icons-material/Insights";
 import AddIcon from "@mui/icons-material/Add";
 import CloseIcon from "@mui/icons-material/Close";
+import SaveIcon from "@mui/icons-material/Save";
 import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
-import { enterCollage, enterAnalysis, switchToDocument, newBlankDoc, closeDoc } from "../../utils/projectNav";
+import { enterCollage, enterAnalysis, switchToDocument, newBlankDoc, closeDoc, saveDocument } from "../../utils/projectNav";
 
 export function DocumentTabs() {
   const mode = useCollageStore((s) => s.mode);
@@ -30,6 +31,8 @@ export function DocumentTabs() {
   // Inline tab rename: id of the tab being renamed + its draft text.
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
+  // id of the tab currently being saved (shows a spinner on its save button).
+  const [savingId, setSavingId] = useState<string | null>(null);
   const commitRename = () => {
     if (editingId) docRename(editingId, editValue);
     setEditingId(null);
@@ -145,8 +148,32 @@ export function DocumentTabs() {
                   {doc.name}
                 </Box>
               )}
+              {/* Unsaved indicator + Save button in one: amber save icon means
+                  "unsaved — click to save". Saved tabs show nothing here.
+                  Overwrites the file in place if the tab has one; an Untitled
+                  tab prompts for a location (defaulting to the tab's name). */}
               {dirty && (
-                <Box component="span" sx={{ color: "#FFB74D" }} title="Unsaved changes">●</Box>
+                <Box
+                  component="span"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (savingId) return;
+                    setSavingId(doc.id);
+                    void saveDocument(doc.id).finally(() => setSavingId(null));
+                  }}
+                  title={doc.path
+                    ? `Save changes — overwrites ${doc.path.split(/[\\/]/).pop()}`
+                    : "Save… — choose a location for this new project"}
+                  sx={{
+                    display: "flex", alignItems: "center", borderRadius: "50%",
+                    ml: 0.25, p: "1px", color: "#FFB74D", cursor: "pointer",
+                    "&:hover": { backgroundColor: "rgba(255,183,77,0.22)" },
+                  }}
+                >
+                  {savingId === doc.id
+                    ? <CircularProgress size={11} sx={{ color: "#FFB74D" }} />
+                    : <SaveIcon sx={{ fontSize: 13 }} />}
+                </Box>
               )}
               {/* Close button */}
               <Box

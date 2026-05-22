@@ -108,6 +108,43 @@ export async function ensureProjectSaved(): Promise<string | null> {
   return useFigureStore.getState().currentProjectPath || picked;
 }
 
+/** Save a document tab from its in-tab Save button. Contextual, like ⌘S:
+ *  - a tab that already has a file → overwrites that .mpf in place (no dialog).
+ *  - an Untitled tab (never saved) → prompts for a path (defaulting to the
+ *    tab's name), then attaches that path to the tab.
+ *  Switches to the tab first when it isn't the active one, since its unsaved
+ *  edits live in an in-memory snapshot until then. Returns true on success. */
+export async function saveDocument(docId: string): Promise<boolean> {
+  const cs = useCollageStore.getState();
+  const doc = cs.openDocs.find((d) => d.id === docId);
+  if (!doc) return false;
+  // Bring this tab's live state into the backend so saveProject captures it.
+  if (cs.activeDocId !== docId) {
+    try {
+      await switchToDocument(docId);
+    } catch (e) {
+      console.error("[projectNav] saveDocument: switch failed", e);
+      return false;
+    }
+  }
+  const fs = useFigureStore.getState();
+  const existingPath = doc.path || fs.currentProjectPath;
+  let path = existingPath;
+  if (!path) {
+    path = await saveProjectDialog({ defaultPath: defaultProjectName() });
+    if (!path) return false; // user cancelled
+  }
+  await fs.saveProject(path);
+  // Newly-saved Untitled → adopt the chosen path + name on the tab. For an
+  // overwrite (path unchanged) leave the tab name alone so a custom rename
+  // sticks. saveProject already cleared `unsaved`, so the dirty dot/active
+  // marker disappears; also drop any parked snapshot.
+  if (!doc.path) useCollageStore.getState().docSetPath(docId, path);
+  docSnapshots.delete(docId);
+  syncSnapshotDirty();
+  return true;
+}
+
 /** Default project filename for the Save Project modal. If the user has
  *  renamed the active (unsaved) tab, that name seeds the filename; otherwise
  *  fall back to a timestamped name. Sanitizes path-illegal characters and
