@@ -113,33 +113,47 @@ export function AppShell() {
       try {
         const { getCurrentWindow } = await import("@tauri-apps/api/window");
         const win = getCurrentWindow();
-        const off = await win.onCloseRequested(async (event) => {
-          if (!hasUnsaved()) return; // nothing at risk — allow close
-          event.preventDefault();
-          const dirtyBuilder = useFigureStore.getState().unsaved;
-          const collageItems = useCollageStore.getState().items.length > 0;
-          const otherTabs = hasUnsavedSnapshots();
-          const parts: string[] = [];
-          if (dirtyBuilder) parts.push("the current figure has unsaved changes");
-          if (otherTabs) parts.push("other open tabs have unsaved changes (switch to each to save)");
-          if (collageItems) parts.push("your collage has unsaved content");
-          const { confirmThree } = await import("../shared/ConfirmDialog");
-          const { ensureProjectSaved } = await import("../../utils/projectNav");
-          const choice = await confirmThree({
-            title: "Save before closing?",
-            body: `Before you close, ${parts.join(" and ")}.\n\n`
-              + "Save the figure now? (The collage auto-saves to this app's "
-              + "local storage; export it via Save Collage if you need a file.)",
-            confirmLabel: "Save & close",
-            tertiaryLabel: "Close without saving",
-            cancelLabel: "Cancel",
-          });
-          if (choice === "cancel") return;            // stay open
-          if (choice === "confirm" && dirtyBuilder) {
-            const saved = await ensureProjectSaved();
-            if (!saved) return;                       // save cancelled → stay
+        // Quit the whole app. On macOS, destroying the last window does NOT
+        // terminate the process (it lingers windowless), so the red × would
+        // appear to "not exit". Exit the process explicitly instead; that also
+        // fires Rust's RunEvent::Exit which kills the Python sidecar.
+        const quit = async () => {
+          try {
+            const { exit } = await import("@tauri-apps/plugin-process");
+            await exit(0);
+          } catch {
+            await win.destroy();
           }
-          await win.destroy();
+        };
+        const off = await win.onCloseRequested(async (event) => {
+          // Always take control of the close so we can guarantee a real quit.
+          event.preventDefault();
+          if (hasUnsaved()) {
+            const dirtyBuilder = useFigureStore.getState().unsaved;
+            const collageItems = useCollageStore.getState().items.length > 0;
+            const otherTabs = hasUnsavedSnapshots();
+            const parts: string[] = [];
+            if (dirtyBuilder) parts.push("the current figure has unsaved changes");
+            if (otherTabs) parts.push("other open tabs have unsaved changes (switch to each to save)");
+            if (collageItems) parts.push("your collage has unsaved content");
+            const { confirmThree } = await import("../shared/ConfirmDialog");
+            const { ensureProjectSaved } = await import("../../utils/projectNav");
+            const choice = await confirmThree({
+              title: "Save before closing?",
+              body: `Before you close, ${parts.join(" and ")}.\n\n`
+                + "Save the figure now? (The collage auto-saves to this app's "
+                + "local storage; export it via Save Collage if you need a file.)",
+              confirmLabel: "Save & close",
+              tertiaryLabel: "Close without saving",
+              cancelLabel: "Cancel",
+            });
+            if (choice === "cancel") return;            // stay open
+            if (choice === "confirm" && dirtyBuilder) {
+              const saved = await ensureProjectSaved();
+              if (!saved) return;                       // save cancelled → stay
+            }
+          }
+          await quit();
         });
         if (cancelled) off();
         else unlisten = off;
