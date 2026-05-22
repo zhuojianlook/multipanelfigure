@@ -4072,6 +4072,92 @@ def restore_proj(body: ProjectRestoreRequest):
     }
 
 
+# ── Fast in-memory document-tab state cache ────────────────────────────────
+#
+# Switching builder tabs previously round-tripped EVERY image through a temp
+# .mpf (PNG-encode + zip on stash, unzip + decode on restore) — multi-second on
+# image-heavy figures. This cache holds REFERENCES to the live globals keyed by
+# the frontend's doc id, so a tab switch becomes a pointer swap (no re-encode).
+# It is in-memory only (lost if the sidecar restarts) — by design, with the
+# in-tab Save button as the save-prompt mitigation. The blob snapshot/restore
+# endpoints above remain as a durable fallback.
+_doc_state_cache: Dict[str, dict] = {}
+
+
+def _capture_doc_state() -> dict:
+    """Snapshot the live builder globals by reference / shallow copy (no image
+    re-encode). Shallow dict copies isolate later .clear()/reassignment of the
+    live globals from the cached entry while sharing the (effectively immutable)
+    image objects."""
+    import copy as _copy
+    return {
+        "cfg": _copy.deepcopy(cfg),
+        "loaded_images": dict(loaded_images),
+        "hidden_images": set(hidden_images),
+        "min_dims": min_dims,
+        "custom_fonts": dict(custom_fonts),
+        "loaded_videos": dict(loaded_videos),
+        "video_frames": dict(video_frames),
+        "loaded_zstacks": dict(loaded_zstacks),
+        "zstack_frames": dict(zstack_frames),
+        "zstack_counts": dict(zstack_counts),
+        "channel_groups": dict(channel_groups),
+    }
+
+
+def _apply_doc_state(st: dict):
+    """Make a previously-captured state the live builder state."""
+    global cfg, loaded_images, hidden_images, min_dims, custom_fonts
+    global loaded_videos, video_frames, loaded_zstacks, zstack_frames
+    global zstack_counts, channel_groups
+    cfg = st["cfg"]
+    cfg.ensure_grid()
+    loaded_images = st["loaded_images"]
+    hidden_images = st["hidden_images"]
+    min_dims = st["min_dims"]
+    custom_fonts = st["custom_fonts"]
+    loaded_videos = st["loaded_videos"]
+    video_frames = st["video_frames"]
+    loaded_zstacks = st["loaded_zstacks"]
+    zstack_frames = st["zstack_frames"]
+    zstack_counts = st["zstack_counts"]
+    channel_groups = st["channel_groups"]
+
+
+class DocStateRequest(BaseModel):
+    doc_id: str
+
+
+@app.post("/api/project/stash-state")
+def stash_state(body: DocStateRequest):
+    """Cache the current builder state under `doc_id` (fast, in-memory)."""
+    _doc_state_cache[body.doc_id] = _capture_doc_state()
+    return {"ok": True, "doc_id": body.doc_id}
+
+
+@app.post("/api/project/activate-state")
+def activate_state(body: DocStateRequest):
+    """Restore a previously stashed state as the live builder state. 404 if it
+    isn't cached (e.g. the sidecar restarted) so the frontend can fall back to
+    the on-disk project."""
+    st = _doc_state_cache.pop(body.doc_id, None)
+    if st is None:
+        raise HTTPException(404, "No cached state for that document.")
+    _apply_doc_state(st)
+    return {
+        "config": _cfg_json(),
+        "image_names": list(loaded_images.keys()),
+        "thumbnails": {n: _thumb_b64(img) for n, img in loaded_images.items()},
+    }
+
+
+@app.post("/api/project/drop-state")
+def drop_state(body: DocStateRequest):
+    """Forget a cached document state (e.g. when its tab is closed)."""
+    _doc_state_cache.pop(body.doc_id, None)
+    return {"ok": True}
+
+
 # ── Font Endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/api/fonts")

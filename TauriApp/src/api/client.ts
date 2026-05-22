@@ -273,6 +273,28 @@ class ApiClient {
     );
   }
 
+  // Fast in-memory document-tab state cache (no image re-encode). stashState
+  // caches the live builder state under a doc id; activateState restores it
+  // (rejects with 404 if the cache was lost, e.g. sidecar restart, so the
+  // caller can fall back to disk); dropState forgets a closed tab's cache.
+  async stashState(docId: string): Promise<{ ok: boolean }> {
+    return apiJson<{ ok: boolean }>("/api/project/stash-state", "POST", JSON.stringify({ doc_id: docId }));
+  }
+
+  async activateState(
+    docId: string,
+  ): Promise<Omit<ProjectLoadResponse, "analysis">> {
+    return apiJson<Omit<ProjectLoadResponse, "analysis">>(
+      "/api/project/activate-state",
+      "POST",
+      JSON.stringify({ doc_id: docId }),
+    );
+  }
+
+  async dropState(docId: string): Promise<{ ok: boolean }> {
+    return apiJson<{ ok: boolean }>("/api/project/drop-state", "POST", JSON.stringify({ doc_id: docId }));
+  }
+
   // ── Save final figure ──────────────────────────────────
 
   async saveFigure(

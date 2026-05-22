@@ -15,31 +15,34 @@ import { api } from "../api/client";
 import { confirmThree, alert as alertDialog } from "../components/shared/ConfirmDialog";
 import { saveProjectDialog } from "../components/shared/SaveProjectDialog";
 
-/* ── Per-document in-memory snapshots ───────────────────────────────────
+/* ── Per-document in-memory state cache ──────────────────────────────────
    The Python backend holds exactly ONE builder document's state (config +
    images + fonts) at a time — loading a project clears the previous one. To
    make switching between document tabs SEAMLESS without losing a tab's
-   unsaved edits, we snapshot the outgoing tab to an in-memory .mpf blob
-   (api.snapshotProject) before swapping, and restore it (figureStore
-   .restoreDoc) when the user returns. Clean tabs (already on disk, or
-   blank) need no snapshot — they reload from disk / reset to blank.
-   Session-only; never persisted. */
-const docSnapshots = new Map<string, string>();
+   unsaved edits AND without the multi-second cost of re-encoding every image,
+   we ask the backend to STASH the outgoing tab's live state in memory
+   (api.stashState — a reference swap, no encode) before swapping, and
+   ACTIVATE it (figureStore.restoreDocState) when the user returns. Clean tabs
+   (already on disk, or blank) need no stash — they reload from disk / reset.
 
-/** Push the current snapshot doc-id set into the collage store so the tab
- *  strip can show an unsaved dot on tabs whose edits aren't live. */
+   In-memory only: if the sidecar restarts the stash is lost (saved docs fall
+   back to disk; unsaved-only docs are lost — mitigated by the in-tab Save
+   button / save guards). `backendStashed` tracks which doc ids have a stash. */
+const backendStashed = new Set<string>();
+
+/** Push the stashed doc-id set into the collage store so the tab strip can
+ *  show the unsaved/save indicator on tabs whose edits aren't live. */
 function syncSnapshotDirty() {
-  useCollageStore.getState().setSnapshotDirtyDocIds(Array.from(docSnapshots.keys()));
+  useCollageStore.getState().setSnapshotDirtyDocIds(Array.from(backendStashed));
 }
 
-/** True if any open document has unsaved in-memory edits (a snapshot).
- *  Used by the app-close guard to warn about tabs whose edits would be
- *  lost on quit. */
+/** True if any open document has unsaved in-memory edits (a stash). Used by
+ *  the app-close guard to warn about tabs whose edits would be lost on quit. */
 export function hasUnsavedSnapshots(): boolean {
-  return docSnapshots.size > 0;
+  return backendStashed.size > 0;
 }
 
-/** Snapshot the currently-active builder doc to memory IF it has unsaved
+/** Stash the currently-active builder doc in the backend IF it has unsaved
  *  edits, so switching away doesn't lose work. No-op for clean docs (they
  *  reload from disk / reset to blank on return) and for an active doc that
  *  was already removed (e.g. mid-close). */
@@ -49,29 +52,33 @@ async function stashCurrentDoc(): Promise<void> {
   const activeId = cs.activeDocId;
   if (!activeId) return;
   if (!cs.openDocs.some((d) => d.id === activeId)) return; // already removed
-  if (!fs.unsaved) { docSnapshots.delete(activeId); syncSnapshotDirty(); return; }
+  if (!fs.unsaved) {
+    if (backendStashed.has(activeId)) { void api.dropState(activeId).catch(() => {}); backendStashed.delete(activeId); }
+    syncSnapshotDirty();
+    return;
+  }
   try {
-    const { blob } = await api.snapshotProject();
-    docSnapshots.set(activeId, blob);
+    await api.stashState(activeId);
+    backendStashed.add(activeId);
   } catch (e) {
-    console.error("[projectNav] snapshot failed for", activeId, e);
+    console.error("[projectNav] stash failed for", activeId, e);
   }
   syncSnapshotDirty();
 }
 
-/** Load a document's state into the backend builder: prefer an in-memory
- *  snapshot (preserves unsaved edits), else the on-disk .mpf, else blank. */
+/** Load a document's state into the backend builder: prefer its in-memory
+ *  stash (preserves unsaved edits, fast), else the on-disk .mpf, else blank. */
 async function activateDoc(doc: { id: string; path: string | null }): Promise<void> {
-  const snap = docSnapshots.get(doc.id);
-  if (snap) {
+  if (backendStashed.has(doc.id)) {
     try {
-      await useFigureStore.getState().restoreDoc(snap, { path: doc.path });
-      docSnapshots.delete(doc.id); // now live in the backend
+      await useFigureStore.getState().restoreDocState(doc.id, { path: doc.path });
+      backendStashed.delete(doc.id); // now live in the backend
       syncSnapshotDirty();
       return;
     } catch (e) {
-      console.error("[projectNav] restore failed; falling back to disk/blank", e);
-      docSnapshots.delete(doc.id);
+      // Cache miss (e.g. sidecar restarted) — drop it and fall back to disk.
+      console.error("[projectNav] activate-state failed; falling back to disk/blank", e);
+      backendStashed.delete(doc.id);
       syncSnapshotDirty();
     }
   }
@@ -140,7 +147,7 @@ export async function saveDocument(docId: string): Promise<boolean> {
   // sticks. saveProject already cleared `unsaved`, so the dirty dot/active
   // marker disappears; also drop any parked snapshot.
   if (!doc.path) useCollageStore.getState().docSetPath(docId, path);
-  docSnapshots.delete(docId);
+  if (backendStashed.has(docId)) { void api.dropState(docId).catch(() => {}); backendStashed.delete(docId); }
   syncSnapshotDirty();
   return true;
 }
@@ -260,8 +267,8 @@ export async function openProjectIntoTab(path: string): Promise<void> {
     return;
   }
   const id = useCollageStore.getState().docEnsure(path);
-  // Freshly loaded from disk — drop any stale in-memory snapshot for it.
-  docSnapshots.delete(id);
+  // Freshly loaded from disk — drop any stale in-memory stash for it.
+  if (backendStashed.has(id)) { void api.dropState(id).catch(() => {}); backendStashed.delete(id); }
   syncSnapshotDirty();
   useCollageStore.getState().docSetActive(id);
   useCollageStore.getState().setMode("builder");
@@ -303,9 +310,9 @@ export async function closeDoc(docId: string): Promise<boolean> {
     // what name).
     const ok = await maybeSaveBeforeLeavingBuilder();
     if (!ok) return false;
-  } else if (!isActiveDoc && docSnapshots.has(docId)) {
+  } else if (!isActiveDoc && backendStashed.has(docId)) {
     // A non-active tab with unsaved edits held only as an in-memory
-    // snapshot. We can't save it without making it active first, so offer
+    // stash. We can't save it without making it active first, so offer
     // a plain discard / cancel.
     const choice = await confirmThree({
       title: "Discard unsaved changes?",
@@ -318,8 +325,8 @@ export async function closeDoc(docId: string): Promise<boolean> {
     if (choice !== "confirm") return false;
   }
 
-  // Drop any in-memory snapshot for the closed doc.
-  docSnapshots.delete(docId);
+  // Drop any in-memory stash for the closed doc.
+  if (backendStashed.has(docId)) { void api.dropState(docId).catch(() => {}); backendStashed.delete(docId); }
   syncSnapshotDirty();
 
   const remaining = useCollageStore.getState().openDocs.filter((d) => d.id !== docId);

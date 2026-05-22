@@ -157,6 +157,10 @@ interface FigureState {
    *  (null for an Untitled tab); the restored doc is always marked unsaved
    *  since snapshots are only taken for tabs with unsaved edits. */
   restoreDoc: (blob: string, opts: { path: string | null }) => Promise<void>;
+  /** Fast restore via the backend's in-memory doc-state cache (no blob /
+   *  image decode). Mirrors restoreDoc's apply. Rejects if the cache entry is
+   *  gone (e.g. the sidecar restarted) so the caller can fall back to disk. */
+  restoreDocState: (docId: string, opts: { path: string | null }) => Promise<void>;
   /** Reset the builder to a fresh blank 2×2 figure (new document) WITHOUT
    *  a page reload and without touching the collage. Deletes loaded
    *  images on the backend, resets cfg, clears the project path. */
@@ -1845,6 +1849,37 @@ export const useFigureStore = create<FigureState>()(
       get().requestPreview();
       // Repopulate per-panel processed thumbnails (crop, levels, etc.) —
       // same as loadProject, so cropped/processed cells render correctly.
+      const cfg = resp.config;
+      for (let r = 0; r < cfg.rows; r++) {
+        for (let c = 0; c < cfg.cols; c++) {
+          if (cfg.panels[r]?.[c]?.image_name) {
+            get().refreshPanelThumbnail(r, c).catch(console.error);
+          }
+        }
+      }
+    },
+
+    restoreDocState: async (docId, opts) => {
+      // Fast path: the backend swapped its globals to this doc's cached state
+      // (no image re-encode/decode). Apply the returned config + thumbnails
+      // exactly like restoreDoc. Throws (404) if the cache entry is gone.
+      const resp = await api.activateState(docId);
+      set((s) => {
+        s.config = resp.config;
+        s.loadedImages = {};
+        s.panelThumbnails = {};
+        for (const name of resp.image_names) {
+          s.loadedImages[name] = { name, thumbnailB64: resp.thumbnails[name] ?? "" };
+        }
+        const valid = new Set(resp.image_names);
+        s.imageGroups = (resp.config.image_groups ?? []).map((g) => ({
+          ...g, imageNames: (g.imageNames ?? []).filter((n) => valid.has(n)),
+        }));
+        s.currentProjectPath = opts.path;
+        s.configDirty = false;
+        s.unsaved = true;
+      });
+      get().requestPreview();
       const cfg = resp.config;
       for (let r = 0; r < cfg.rows; r++) {
         for (let c = 0; c < cfg.cols; c++) {
