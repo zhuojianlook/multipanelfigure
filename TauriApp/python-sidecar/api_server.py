@@ -6626,6 +6626,22 @@ def check_cellpose_installed():
         return {"installed": False, "kind": "", "path": "", "error": str(e)[:200]}
 
 
+def _pip_supports_break_system(exe) -> bool:
+    """True iff this interpreter's pip understands --break-system-packages
+    (pip >= 23.0). Older pips — e.g. macOS Xcode's Python 3.9 — abort with
+    'no such option: --break-system-packages' (exit 2), so the flag must be
+    omitted for them. They also predate PEP-668 enforcement, so they don't
+    need it anyway."""
+    import subprocess as _sp, re as _re
+    try:
+        out = _sp.run([exe, "-m", "pip", "--version"],
+                      capture_output=True, text=True, timeout=30)
+        m = _re.search(r"pip\s+(\d+)\.(\d+)", f"{out.stdout or ''}{out.stderr or ''}")
+        return bool(m) and int(m.group(1)) >= 23
+    except Exception:
+        return False
+
+
 @app.post("/api/analysis/install-cellpose")
 def install_cellpose():
     """Run `pip install --upgrade cellpose` against the sidecar's own
@@ -6678,17 +6694,16 @@ def install_cellpose_stream():
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
         env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
-        # `--break-system-packages` is a no-op inside a venv (the
-        # case for the bundled Tauri sidecar) but lets us bypass
-        # PEP-668's externally-managed-environment guard when the
-        # sidecar happens to be the system Python (dev installs).
-        # Without it pip 23+ aborts immediately with a confusing
-        # error and the button looked like it "did nothing".
+        # `--break-system-packages` bypasses PEP-668's externally-managed
+        # guard on pip 23+, but OLDER pips (e.g. Xcode's Python 3.9) don't
+        # know the flag and abort with 'no such option' (exit 2). Only add
+        # it when this interpreter's pip actually supports it.
         cmd = [_sys.executable, "-u", "-m", "pip", "install",
                "--upgrade", "--no-input",
-               "--progress-bar", "on",
-               "--break-system-packages",
-               "cellpose"]
+               "--progress-bar", "on"]
+        if _pip_supports_break_system(_sys.executable):
+            cmd.append("--break-system-packages")
+        cmd.append("cellpose")
         try:
             proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
                              text=True, bufsize=1, env=env)

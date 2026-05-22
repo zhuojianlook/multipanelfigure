@@ -185,6 +185,7 @@ function NodeConsolePanel({ nodeId, text, status }: {
           maxHeight: 200, overflow: "auto",
           fontFamily: "monospace", fontSize: "0.65rem",
           whiteSpace: "pre-wrap", wordBreak: "break-word",
+          userSelect: "text", cursor: "text",
           p: 0.75, bgcolor: isError ? "rgba(244, 67, 54, 0.07)" : "background.default",
           color: isError ? "error.main" : "text.primary",
         }}>
@@ -4580,9 +4581,8 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
             // appeared to do nothing. Keep just zoom in/out + fit-view.
             showInteractive={false}
             style={{
-              // MiniMap is 110 px tall with margin: 8 → ends at 126.
-              // Sit just below it (small 4 px gap looks deliberate).
-              marginTop: 130,
+              // MiniMap now sits at top 44 → ends ≈154. Sit just below it.
+              marginTop: 158,
               marginRight: 8,
               backgroundColor: "#1f2933",
               border: "1px solid #37474f",
@@ -4605,6 +4605,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               width: 168,
               height: 110,
               margin: 8,
+              // Sit BELOW the action toolbar (top:8, ~32px tall) so it never
+              // overlaps the Run graph / Engines buttons.
+              marginTop: 44,
               backgroundColor: "#1f2933",
               border: "1px solid #37474f",
               borderRadius: 6,
@@ -5279,11 +5282,12 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       <Box sx={{
         position: "absolute",
         right: 8,
-        // Top-right corner stack: MiniMap (top 8 → ≈126), then
-        // Controls strip (≈130 → ≈160).  The console handle starts
-        // safely below both at 172, leaving a clean visual gap.
-        top: 172,
-        bottom: 8,        // grow to fill vertical space down to outputs drawer
+        // Top-right corner stack (all pushed below the action toolbar):
+        // MiniMap (top 44 → ≈154), Controls (≈158 → ≈188), then the console
+        // handle below at 196. Bottom stops above the outputs drawer when it's
+        // open so the console is never cut off by it.
+        top: 196,
+        bottom: drawerOpen ? "calc(max(42%, 240px) + 8px)" : 8,
         zIndex: 6,
         display: "flex", flexDirection: "row", alignItems: "stretch",
         pointerEvents: "none",
@@ -5379,6 +5383,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               flex: 1, minHeight: 0, overflow: "auto", p: 0.75,
               fontFamily: "monospace", fontSize: "0.65rem",
               whiteSpace: "pre-wrap", wordBreak: "break-word",
+              userSelect: "text", cursor: "text",
             }}>
               {consoleOut || <span style={{ opacity: 0.55, fontStyle: "italic" }}>(no output yet — runs, installs, and other long ops stream here)</span>}
             </Box>
