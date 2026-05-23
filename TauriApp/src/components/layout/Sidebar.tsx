@@ -1267,6 +1267,15 @@ function BuilderSidebar() {
             inputProps={{ min: 4, max: 200, step: 1 }}
             sx={{
               width: 56,
+              // This field has no floating label, but MUI's outlined border
+              // <fieldset> is still offset top:-5px to leave room for the
+              // label notch. On a field this short that makes the bordered
+              // box taller at the top, so the centered value ("14") looks
+              // sunk toward the bottom. Drop the notch (hide the legend +
+              // pull the outline back to the input's top) so symmetric
+              // padding actually centers the text.
+              "& .MuiOutlinedInput-notchedOutline": { top: 0 },
+              "& .MuiOutlinedInput-notchedOutline legend": { display: "none" },
               // colorScheme:dark switches the WebView's native form controls
               // (including the number-input spinner arrows) to a dark
               // palette → arrows render white instead of dark grey on the
