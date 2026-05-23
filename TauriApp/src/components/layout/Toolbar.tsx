@@ -1616,6 +1616,9 @@ export function RecordAppButton() {
   // What to do when the ffmpeg process closes: "save" → prompt + relocate the
   // temp file; "discard" → delete it; "" → unexpected exit (error handling).
   const nativeStopModeRef = useRef<"save" | "discard" | "">("");
+  // Fallback timer that force-kills ffmpeg if it doesn't quit on the "q" we
+  // send to stdin (which is unreliable through a piped stdin).
+  const nativeStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /** True when the webview supports browser screen capture (Windows WebView2,
    *  most Linux WebKitGTK, and any plain-browser dev preview). macOS WKWebView
@@ -1772,6 +1775,12 @@ export function RecordAppButton() {
         "-i", `${idx}:none`,
         ...(cropVf ? ["-vf", cropVf] : []),
         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        // 1-second keyframe interval + fragmented mp4. This makes the output a
+        // valid, playable file even if ffmpeg is force-killed (the moov atom is
+        // written up front and each ~1s fragment is self-contained), so Stop
+        // never depends on ffmpeg shutting down gracefully.
+        "-g", "30",
+        "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
         path,
       ]);
       let stderrTail = "";
@@ -1782,6 +1791,7 @@ export function RecordAppButton() {
         setRecError(`ffmpeg failed to start: ${err}`);
       });
       cmd.on("close", async () => {
+        if (nativeStopTimerRef.current) { clearTimeout(nativeStopTimerRef.current); nativeStopTimerRef.current = null; }
         nativeChildRef.current = null;
         setRecording(false);
         const mode = nativeStopModeRef.current;
@@ -1847,15 +1857,16 @@ export function RecordAppButton() {
     const child = nativeChildRef.current;
     if (!child) return;
     nativeStopModeRef.current = save ? "save" : "discard";
-    try {
-      // 'q' on stdin makes ffmpeg finalize the file cleanly (so the mp4's moov
-      // atom is written and the file is playable). For a discard we still
-      // finalize cleanly, then delete it in the close handler. Killing would
-      // truncate the file.
-      await child.write("q");
-    } catch {
-      try { await child.kill(); } catch { /* ignore */ }
-    }
+    // First ask ffmpeg to quit gracefully (writes a clean trailing fragment).
+    // Reading 'q' from a piped stdin is unreliable, though, so always arm a
+    // fallback that force-kills it. Thanks to the fragmented-mp4 flags the
+    // file stays valid either way. The close handler clears this timer.
+    try { await child.write("q"); } catch { /* ignore */ }
+    if (nativeStopTimerRef.current) clearTimeout(nativeStopTimerRef.current);
+    nativeStopTimerRef.current = setTimeout(() => {
+      const c = nativeChildRef.current;
+      if (c) { try { void c.kill(); } catch { /* ignore */ } }
+    }, 1000);
   };
 
   // Dispatch to the web or native implementation.
@@ -1868,6 +1879,7 @@ export function RecordAppButton() {
   useEffect(() => {
     return () => {
       try { streamRef.current?.getTracks().forEach((t) => t.stop()); } catch { /* ignore */ }
+      if (nativeStopTimerRef.current) { clearTimeout(nativeStopTimerRef.current); nativeStopTimerRef.current = null; }
       // Mark as a discard so the close handler cleans up the temp file quietly
       // instead of popping an "unexpected exit" dialog on unmount.
       if (nativeChildRef.current) nativeStopModeRef.current = "discard";
