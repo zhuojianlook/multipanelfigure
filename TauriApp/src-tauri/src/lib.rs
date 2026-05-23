@@ -190,6 +190,19 @@ async fn move_file(src: String, dest: String) -> Result<(), String> {
     }
 }
 
+/// Return a file's size in bytes, or -1 if it doesn't exist. Used by the screen
+/// recorder to tell "captured nothing" (ffmpeg stalled — usually missing Screen
+/// Recording permission, so no output file was ever written) apart from a real
+/// clip, and surface the right error.
+#[tauri::command]
+async fn file_size(path: String) -> Result<i64, String> {
+    match std::fs::metadata(&path) {
+        Ok(meta) => Ok(meta.len() as i64),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(-1),
+        Err(e) => Err(format!("Stat failed: {}", e)),
+    }
+}
+
 /// Delete a file. Succeeds silently if it's already gone. Used to clean up the
 /// recorder's temp capture when the user discards a recording or it fails.
 #[tauri::command]
@@ -495,7 +508,7 @@ pub fn run() {
       app.manage(SidecarChild(sidecar_child));
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, save_base64_to_path, move_file, delete_file, open_url, download_and_install_update, kill_sidecar])
+    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, save_base64_to_path, move_file, file_size, delete_file, open_url, download_and_install_update, kill_sidecar])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {

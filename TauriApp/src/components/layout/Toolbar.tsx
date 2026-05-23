@@ -1847,6 +1847,30 @@ export function RecordAppButton() {
     const tmp = nativeTmpRef.current;
     nativeTmpRef.current = "";
     if (!tmp) return;
+    // Validate the capture before offering to save. If ffmpeg produced no/empty
+    // output, screen capture never delivered a frame — almost always macOS
+    // Screen Recording permission is off (ffmpeg stalls waiting for the first
+    // frame and never writes the file). Show the real diagnosis instead of a
+    // cryptic "Copy failed: No such file" later.
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const size = await invoke<number>("file_size", { path: tmp });
+      if (size < 1024) {
+        try { await invoke("delete_file", { path: tmp }); } catch { /* ignore */ }
+        setRecError("Recording captured nothing — check Screen Recording permission.");
+        const go = await confirmDialog({
+          title: "Recording captured nothing",
+          body: "No video was written, which almost always means macOS Screen Recording "
+            + "permission is off for this app, so the recorder never received any frames.\n\n"
+            + "Enable it in System Settings → Privacy & Security → Screen Recording, then "
+            + "fully quit and reopen the app and record again.",
+          confirmLabel: "Open Settings",
+          cancelLabel: "Close",
+        });
+        if (go) await openScreenRecordingSettings();
+        return;
+      }
+    } catch { /* if the size check itself fails, fall through and try to save */ }
     setSaveFormat("mp4");
     setSaveModal({ tmp, durationSec });
   };
