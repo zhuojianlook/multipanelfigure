@@ -1581,6 +1581,10 @@ export function RecordAppButton() {
   // "close" handler tell an intentional Stop (handled entirely by stopNative)
   // apart from an unexpected exit (permission denied / crash → show an error).
   const nativeIntentionalStopRef = useRef<boolean>(false);
+  // Last chunk of ffmpeg stderr for the active recording, so a failed capture
+  // can show the REAL reason ("device not found" / "Invalid device index" →
+  // Screen Recording permission) instead of a vague message.
+  const nativeStderrRef = useRef<string>("");
 
   // Elapsed-time indicator (drives the "● 00:12" recording chip). Counts from
   // recStartRef while `recording` is true (see the effect below).
@@ -1779,7 +1783,8 @@ export function RecordAppButton() {
         path,
       ]);
       let stderrTail = "";
-      cmd.stderr.on("data", (line: string) => { stderrTail = (stderrTail + line).slice(-1200); });
+      nativeStderrRef.current = "";
+      cmd.stderr.on("data", (line: string) => { stderrTail = (stderrTail + line).slice(-1200); nativeStderrRef.current = stderrTail; });
       cmd.on("error", (err: string) => {
         nativeChildRef.current = null;
         setRecording(false);
@@ -1857,13 +1862,20 @@ export function RecordAppButton() {
       const size = await invoke<number>("file_size", { path: tmp });
       if (size < 1024) {
         try { await invoke("delete_file", { path: tmp }); } catch { /* ignore */ }
+        const errTail = (nativeStderrRef.current || "").slice(-280).trim();
         setRecError("Recording captured nothing — check Screen Recording permission.");
         const go = await confirmDialog({
           title: "Recording captured nothing",
-          body: "No video was written, which almost always means macOS Screen Recording "
-            + "permission is off for this app, so the recorder never received any frames.\n\n"
-            + "Enable it in System Settings → Privacy & Security → Screen Recording, then "
-            + "fully quit and reopen the app and record again.",
+          body: "No video frames were captured. On macOS this means the screen recorder "
+            + "(the bundled ffmpeg helper) doesn't have effective Screen Recording "
+            + "permission — macOS then hides the screen from it.\n\n"
+            + "Fix:\n"
+            + "1. System Settings → Privacy & Security → Screen Recording → enable the entry "
+            + "for this app (it may be listed as \"ffmpeg\" or \"MultiPanelFigureBuilder\").\n"
+            + "2. IMPORTANT: fully QUIT the app (Cmd+Q) and reopen it — permission changes "
+            + "don't apply to an already-running app.\n"
+            + "3. Record again."
+            + (errTail ? `\n\nffmpeg said:\n${errTail}` : ""),
           confirmLabel: "Open Settings",
           cancelLabel: "Close",
         });
