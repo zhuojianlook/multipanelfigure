@@ -1280,7 +1280,14 @@ def get_zstack_frame(name: str, frame_num: int, row: Optional[int] = None, col: 
 
 @app.get("/api/zstack/list")
 def list_zstacks():
-    return {"zstacks": list(loaded_zstacks.keys())}
+    # Include multichannel channel-groups that have a Z axis (num_z > 1) even
+    # when they aren't backed by a file in loaded_zstacks (e.g. restored from a
+    # saved project), so the Z-Stack tab + frame slider reappear on load.
+    names = set(loaded_zstacks.keys())
+    for nm, g in channel_groups.items():
+        if getattr(g, "num_z", 1) > 1:
+            names.add(nm)
+    return {"zstacks": sorted(names)}
 
 
 # ── Z-stack alignment ──────────────────────────────────────────────────────
@@ -4026,7 +4033,8 @@ def save_proj(body: ProjectSaveRequest):
             "tables": (body.analysis or {}).get("tables") or {},
         }
 
-    save_project(cfg, img_bytes, path, custom_fonts or None, analysis_payload)
+    save_project(cfg, img_bytes, path, custom_fonts or None, analysis_payload,
+                 channel_data=_serialize_channel_groups())
     # Verify file was written
     if not os.path.isfile(path) or os.path.getsize(path) == 0:
         try: os.unlink(path)
@@ -4039,7 +4047,80 @@ class ProjectLoadRequest(BaseModel):
     path: str
 
 
-def _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict):
+def _serialize_channel_groups() -> Dict[str, dict]:
+    """Serialize each multichannel image's raw array + LUT/display state for
+    embedding in a saved .mpf, so the figure reopens fully re-editable with the
+    exact per-channel display window preserved. Only groups backed by a real
+    loaded image are included."""
+    out: Dict[str, dict] = {}
+    for name, g in channel_groups.items():
+        if name not in loaded_images:
+            continue
+        try:
+            buf = io.BytesIO()
+            np.savez_compressed(buf, arr=g.arr)
+            out[name] = {
+                "npz": buf.getvalue(),
+                "state": {
+                    "axes": g.axes,
+                    "num_channels": int(g.num_channels),
+                    "num_z": int(g.num_z),
+                    "current_z": int(g.current_z),
+                    "tints": list(g.tints),
+                    "enabled": [bool(v) for v in g.enabled],
+                    "black_levels": [float(v) for v in g.black_levels],
+                    "white_levels": [float(v) for v in g.white_levels],
+                    "gammas": [float(v) for v in getattr(g, "gammas", [1.0] * g.num_channels)],
+                    "names": list(g.names),
+                    "max_vals": [float(v) for v in g.max_vals],
+                    "dtype_max": float(getattr(g, "dtype_max", 255.0)),
+                },
+            }
+        except Exception as e:
+            import sys
+            print(f"[save] channel serialize failed for {name}: {e}", file=sys.stderr, flush=True)
+    return out
+
+
+def _restore_channel_groups(channel_data: Optional[Dict[str, dict]]):
+    """Rebuild channel_groups (and recomposite into loaded_images) from a saved
+    project's `channels/` payload, so multichannel images stay editable with
+    their saved per-channel display window."""
+    if not channel_data:
+        return
+    for name, entry in channel_data.items():
+        try:
+            npz = entry.get("npz")
+            state = entry.get("state") or {}
+            if npz is None:
+                continue
+            with np.load(io.BytesIO(npz)) as zf:
+                arr = zf["arr"]
+            g = _ChannelGroup(state.get("axes", ""), arr)
+            g.arr = arr
+            g.axes = state.get("axes", "")
+            g.num_channels = int(state.get("num_channels", 1))
+            g.num_z = int(state.get("num_z", 1))
+            g.current_z = int(state.get("current_z", 0))
+            g.tints = list(state.get("tints", []))
+            g.enabled = [bool(v) for v in state.get("enabled", [])]
+            g.black_levels = [float(v) for v in state.get("black_levels", [])]
+            g.white_levels = [float(v) for v in state.get("white_levels", [])]
+            g.gammas = [float(v) for v in state.get("gammas", [1.0] * g.num_channels)]
+            g.names = list(state.get("names", []))
+            g.max_vals = [float(v) for v in state.get("max_vals", [])]
+            g.dtype_max = float(state.get("dtype_max", 255.0))
+            channel_groups[name] = g
+            loaded_images[name] = _composite_channel_group(name)
+            if g.num_z > 1:
+                zstack_counts[name] = g.num_z
+                zstack_frames.setdefault(name, 0)
+        except Exception as e:
+            import sys
+            print(f"[load] channel restore failed for {name}: {e}", file=sys.stderr, flush=True)
+
+
+def _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict, channel_data=None):
     """Replace the global builder state (config + images + fonts) with a
     freshly-deserialized project. Returns the per-image thumbnails dict.
     Shared by the on-disk project loader (/api/project/load) and the
@@ -4051,6 +4132,7 @@ def _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict):
     loaded_images.clear()
     loaded_videos.clear()
     video_frames.clear()
+    channel_groups.clear()
     for name, data in img_bytes_dict.items():
         if _is_video(name):
             # Restore video: save to temp file and extract first frame
@@ -4062,6 +4144,9 @@ def _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict):
             loaded_images[name] = _extract_video_frame(tmp.name, 0)
         else:
             loaded_images[name] = Image.open(io.BytesIO(data)).convert("RGB")
+    # Rebuild multichannel groups (overwrites the flat RGB above with the live
+    # composite) so per-channel LUT editing + the saved display window survive.
+    _restore_channel_groups(channel_data)
     custom_fonts = font_bytes_dict or {}
     _recalc_min_dims()
     return {n: _thumb_b64(img) for n, img in loaded_images.items()}
@@ -4074,8 +4159,8 @@ def load_proj(body: ProjectLoadRequest):
         path = os.path.join(os.path.expanduser("~"), "Documents", path)
     if not os.path.isfile(path):
         raise HTTPException(404, f"Project file not found: {path}")
-    loaded_cfg, img_bytes_dict, font_bytes_dict, analysis = load_project(path)
-    thumbnails = _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict)
+    loaded_cfg, img_bytes_dict, font_bytes_dict, analysis, channel_data = load_project(path)
+    thumbnails = _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict, channel_data)
 
     # Re-encode any analysis plot bytes as base64 strings for transport to the
     # frontend; tables travel as plain CSV text.
@@ -4123,7 +4208,8 @@ def snapshot_proj():
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mpf")
     tmp.close()
     try:
-        save_project(cfg, img_bytes, tmp.name, custom_fonts or None, None)
+        save_project(cfg, img_bytes, tmp.name, custom_fonts or None, None,
+                     channel_data=_serialize_channel_groups())
         with open(tmp.name, "rb") as f:
             data = f.read()
     finally:
@@ -4152,13 +4238,13 @@ def restore_proj(body: ProjectRestoreRequest):
     tmp.write(data)
     tmp.close()
     try:
-        loaded_cfg, img_bytes_dict, font_bytes_dict, _analysis = load_project(tmp.name)
+        loaded_cfg, img_bytes_dict, font_bytes_dict, _analysis, channel_data = load_project(tmp.name)
     finally:
         try:
             os.unlink(tmp.name)
         except OSError:
             pass
-    thumbnails = _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict)
+    thumbnails = _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict, channel_data)
     return {
         "config": _cfg_json(),
         "image_names": list(loaded_images.keys()),
@@ -4581,7 +4667,7 @@ def _load_collage_mpf(path: str):
     hit = _collage_mpf_cache.get(path)
     if hit and hit.get("mtime") == mtime:
         return hit["cfg"], hit["images"]
-    loaded_cfg, img_bytes_dict, _font_bytes, _analysis = load_project(path)
+    loaded_cfg, img_bytes_dict, _font_bytes, _analysis, _channel_data = load_project(path)
     loaded_cfg.ensure_grid()
     local_images: Dict[str, Image.Image] = {}
     for name, data in img_bytes_dict.items():

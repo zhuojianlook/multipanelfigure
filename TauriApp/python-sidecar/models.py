@@ -893,7 +893,8 @@ def paste_panel_settings(panel: PanelInfo, clipboard: PanelSettingsClipboard,
 
 def save_project(cfg: FigureConfig, images: Dict[str, bytes], path: str,
                   fonts: Dict[str, bytes] = None,
-                  analysis: Optional[dict] = None):
+                  analysis: Optional[dict] = None,
+                  channel_data: Optional[Dict[str, dict]] = None):
     """Save a full project: config JSON + images + videos + custom fonts into a .mpf zip.
 
     Optionally bundles an `analysis` payload of the shape:
@@ -911,6 +912,17 @@ def save_project(cfg: FigureConfig, images: Dict[str, bytes], path: str,
         if fonts:
             for name, font_bytes in fonts.items():
                 zf.writestr(f'fonts/{name}', font_bytes)
+        # Per-channel (multichannel TIFF) state: the raw native array (.npz) +
+        # the LUT/display state (.json), so a saved figure reopens fully
+        # re-editable with the exact per-channel display window preserved.
+        if channel_data:
+            for name, entry in channel_data.items():
+                npz = entry.get("npz")
+                state = entry.get("state")
+                if npz is not None:
+                    zf.writestr(f'channels/{name}.npz', npz)
+                if state is not None:
+                    zf.writestr(f'channels/{name}.json', json.dumps(state))
         if analysis:
             manifest = analysis.get("manifest")
             if manifest is not None:
@@ -942,6 +954,8 @@ def load_project(path: str) -> tuple:
     """
     images: Dict[str, bytes] = {}
     fonts: Dict[str, bytes] = {}
+    # name -> {"npz": bytes, "state": dict}
+    channel_data: Dict[str, dict] = {}
     analysis_manifest = None
     analysis_plots: Dict[str, bytes] = {}
     analysis_tables: Dict[str, str] = {}
@@ -957,6 +971,15 @@ def load_project(path: str) -> tuple:
             elif name.startswith('fonts/') and name != 'fonts/':
                 font_name = name[len('fonts/'):]
                 fonts[font_name] = zf.read(name)
+            elif name.startswith('channels/') and name.endswith('.npz'):
+                ch_name = name[len('channels/'):-len('.npz')]
+                channel_data.setdefault(ch_name, {})["npz"] = zf.read(name)
+            elif name.startswith('channels/') and name.endswith('.json'):
+                ch_name = name[len('channels/'):-len('.json')]
+                try:
+                    channel_data.setdefault(ch_name, {})["state"] = json.loads(zf.read(name))
+                except Exception:
+                    pass
             elif name == 'analysis/manifest.json':
                 has_analysis = True
                 try:
@@ -986,4 +1009,4 @@ def load_project(path: str) -> tuple:
             "plots": analysis_plots,
             "tables": analysis_tables,
         }
-    return cfg, images, fonts, analysis
+    return cfg, images, fonts, analysis, channel_data
