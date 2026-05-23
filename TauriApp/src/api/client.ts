@@ -715,26 +715,33 @@ class ApiClient {
     current_z?: number;
     tints?: string[];
     enabled?: boolean[];
+    // Display window in NATIVE intensity units (not 0-255) + optional gamma.
     black_levels?: number[];
     white_levels?: number[];
+    gammas?: number[];
     names?: string[];
+    // Per-channel intensity histogram (256 bins over [0, hist_max]) + ranges.
+    histograms?: number[][];
+    hist_max?: number[];
+    data_max?: number[];
+    dtype_max?: number;
   }> {
     return apiJson(`/api/zstack/${encodeURIComponent(name)}/channels/info`);
   }
 
-  // Update per-channel tints / enabled / levels / current_z. Any subset
+  // Update per-channel tints / enabled / levels / gamma / current_z. Any subset
   // of fields may be provided; only present fields are applied. Returns
   // the new composite thumbnail + the post-update state for state sync.
   async updateChannels(name: string, body: {
     tints?: string[]; enabled?: boolean[];
-    black_levels?: number[]; white_levels?: number[];
+    black_levels?: number[]; white_levels?: number[]; gammas?: number[];
     current_z?: number;
     names?: string[];
     row?: number; col?: number;
   }): Promise<{
     thumbnail: string; width: number; height: number;
     current_z: number; tints: string[]; enabled: boolean[];
-    black_levels: number[]; white_levels: number[];
+    black_levels: number[]; white_levels: number[]; gammas?: number[];
     names?: string[];
   }> {
     return apiJson(`/api/zstack/${encodeURIComponent(name)}/channels`, "PATCH", JSON.stringify(body));

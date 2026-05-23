@@ -175,7 +175,7 @@ zstack_counts: Dict[str, int] = {}     # name → total frame count
 class _ChannelGroup:
     __slots__ = ("axes", "arr", "num_channels", "num_z",
                  "current_z", "tints", "enabled",
-                 "black_levels", "white_levels", "max_vals", "names")
+                 "black_levels", "white_levels", "gammas", "max_vals", "dtype_max", "names")
 
     def __init__(self, axes: str, arr: "np.ndarray"):
         self.axes = axes
@@ -185,9 +185,16 @@ class _ChannelGroup:
         self.current_z = 0
         self.tints: List[str] = []
         self.enabled: List[bool] = []
-        self.black_levels: List[int] = []   # 0-255
-        self.white_levels: List[int] = []   # 0-255
-        self.max_vals: List[float] = []     # native max per channel (for level mapping)
+        # Display window in NATIVE intensity units (e.g. 0..65535 for uint16),
+        # so the figure records the exact, reportable min/max used — not an
+        # opaque 0-255 fraction. black = display min, white = display max.
+        self.black_levels: List[float] = []
+        self.white_levels: List[float] = []
+        # Per-channel display gamma (1.0 = linear). Non-linear; disclose in
+        # methods. Kept off (1.0) by default.
+        self.gammas: List[float] = []
+        self.max_vals: List[float] = []     # native max per channel (data max)
+        self.dtype_max: float = 255.0       # theoretical max for the array dtype
         # Human-readable channel names so the user can label "DAPI", "GFP",
         # etc. Surfaced in tooltips on the swatches and used in the 3D
         # viewer's channel toggles. Defaults to "Ch 1", "Ch 2", …
@@ -379,13 +386,22 @@ def _init_channel_group(name: str, axes: str, arr: "np.ndarray") -> _ChannelGrou
 
     g.tints    = [_DEFAULT_CHANNEL_TINTS[c % len(_DEFAULT_CHANNEL_TINTS)] for c in range(g.num_channels)]
     g.enabled  = [True] * g.num_channels
-    g.black_levels = [0]   * g.num_channels
-    g.white_levels = [255] * g.num_channels
+    g.gammas   = [1.0] * g.num_channels
     g.names    = [f"Ch {c + 1}" for c in range(g.num_channels)]
 
-    # Compute per-channel max for normalization (important for 16-bit /
-    # float data — a 16-bit channel with peak 4000 would otherwise
-    # render near-black if we naively assumed uint8).
+    # Theoretical max for the array dtype (used as the default white point /
+    # full-range reset for integer data). Float data falls back to the data max.
+    try:
+        if np.issubdtype(a.dtype, np.integer):
+            g.dtype_max = float(np.iinfo(a.dtype).max)
+        else:
+            g.dtype_max = 0.0  # resolved per-channel below from data max
+    except Exception:
+        g.dtype_max = 255.0
+
+    # Compute per-channel data max (important for 16-bit / float data — a 16-bit
+    # channel with peak 4000 would otherwise render near-black if we naively
+    # assumed uint8). Drives the histogram x-range and the Auto/Reset defaults.
     g.max_vals = []
     for c in range(g.num_channels):
         ch = _extract_channel_plane(g, c, 0)  # take z=0 sample for max scan
@@ -405,8 +421,30 @@ def _init_channel_group(name: str, axes: str, arr: "np.ndarray") -> _ChannelGrou
                     pass
         g.max_vals.append(mx if mx > 0 else 1.0)
 
+    if g.dtype_max <= 0.0:
+        # Float image: use the largest channel data max as the nominal full range.
+        g.dtype_max = max(g.max_vals) if g.max_vals else 1.0
+
+    # Display window defaults in NATIVE units: black = 0, white = data max, so
+    # the initial composite spans the full data range (linear, like before).
+    g.black_levels = [0.0] * g.num_channels
+    g.white_levels = [float(mx) for mx in g.max_vals]
+
     channel_groups[name] = g
     return g
+
+
+def _channel_histogram(g: "_ChannelGroup", c: int, bins: int = 256):
+    """Per-channel intensity histogram over [0, data_max] at the group's
+    current z-slice. Returns (counts, hist_max). Counts is a length-`bins`
+    list; hist_max is the native upper bound of the x-axis."""
+    try:
+        plane = _extract_channel_plane(g, c, g.current_z).astype(np.float64, copy=False)
+        hist_max = float(g.max_vals[c]) if c < len(g.max_vals) and g.max_vals[c] > 0 else 1.0
+        counts, _ = np.histogram(plane, bins=bins, range=(0.0, hist_max))
+        return [int(v) for v in counts.tolist()], hist_max
+    except Exception:
+        return [0] * bins, 1.0
 
 
 def _extract_channel_plane(g: _ChannelGroup, c: int, z: int) -> "np.ndarray":
@@ -432,6 +470,26 @@ def _extract_channel_plane(g: _ChannelGroup, c: int, z: int) -> "np.ndarray":
     return a
 
 
+def _apply_channel_levels(plane: "np.ndarray", g: "_ChannelGroup", c: int) -> "np.ndarray":
+    """Map a native-intensity plane to a 0..1 display image using the channel's
+    black/white window (in NATIVE units) and optional gamma. Linear when
+    gamma == 1.0. Shared by every composite path so the displayed contrast is
+    identical wherever a channel group is rendered."""
+    ch = plane.astype(np.float32, copy=False)
+    b = float(g.black_levels[c]) if c < len(g.black_levels) else 0.0
+    w = (float(g.white_levels[c]) if c < len(g.white_levels)
+         else (float(g.max_vals[c]) if c < len(g.max_vals) else 1.0))
+    if w > b:
+        norm = np.clip((ch - b) / (w - b), 0.0, 1.0)
+    else:
+        norm = np.zeros_like(ch)
+    gm = float(g.gammas[c]) if c < len(getattr(g, "gammas", []) or []) else 1.0
+    if gm > 0 and abs(gm - 1.0) > 1e-6:
+        # ImageJ convention: out = in**gamma (gamma < 1 brightens midtones).
+        norm = np.power(norm, gm, dtype=np.float32)
+    return norm
+
+
 def _composite_channel_group(name: str, z: Optional[int] = None) -> Image.Image:
     """Re-render the composite RGB image for the channel group at the
     given z-slice (or the group's `current_z` when z is None). The
@@ -452,18 +510,9 @@ def _composite_channel_group(name: str, z: Optional[int] = None) -> Image.Image:
         if H is None:
             H, W = ch.shape
             out = np.zeros((H, W, 3), dtype=np.float32)
-        # Normalize to 0..1 against this channel's native max so 16-bit
-        # data spans the full dynamic range.
-        denom = max(g.max_vals[c], 1.0)
-        norm = ch / denom
-        # Apply black/white window: bl→0, wl→1 (both as 0..255 fractions
-        # of the normalized range, matching the UI's levels semantics).
-        bl = g.black_levels[c] / 255.0 if c < len(g.black_levels) else 0.0
-        wl = g.white_levels[c] / 255.0 if c < len(g.white_levels) else 1.0
-        if wl > bl:
-            norm = np.clip((norm - bl) / (wl - bl), 0.0, 1.0)
-        else:
-            norm = np.zeros_like(norm)
+        # Map native intensities → 0..1 via the channel's black/white window
+        # (native units) + gamma.
+        norm = _apply_channel_levels(ch, g, c)
         # Tint
         hex_ = g.tints[c] if c < len(g.tints) else "#ffffff"
         try:
@@ -1798,6 +1847,12 @@ def get_channel_info(name: str):
     if key is None:
         return {"is_multichannel": False}
     g = channel_groups[key]
+    histograms = []
+    hist_max = []
+    for c in range(g.num_channels):
+        counts, hmax = _channel_histogram(g, c)
+        histograms.append(counts)
+        hist_max.append(hmax)
     return {
         "is_multichannel": True,
         "axes": g.axes,
@@ -1806,9 +1861,18 @@ def get_channel_info(name: str):
         "current_z": g.current_z,
         "tints": list(g.tints),
         "enabled": list(g.enabled),
-        "black_levels": list(g.black_levels),
-        "white_levels": list(g.white_levels),
+        # Display window + gamma in NATIVE intensity units.
+        "black_levels": [float(v) for v in g.black_levels],
+        "white_levels": [float(v) for v in g.white_levels],
+        "gammas": [float(v) for v in getattr(g, "gammas", [1.0] * g.num_channels)],
         "names": list(g.names),
+        # Per-channel intensity histogram (256 bins over [0, hist_max]) + the
+        # native ranges, so the UI can draw a real LUT-gating histogram and let
+        # the user set/report exact min/max instead of an opaque 0-255.
+        "histograms": histograms,
+        "hist_max": hist_max,
+        "data_max": [float(v) for v in g.max_vals],
+        "dtype_max": float(getattr(g, "dtype_max", 255.0)),
     }
 
 
@@ -1816,8 +1880,10 @@ class ChannelUpdateRequest(BaseModel):
     # All optional — only provided fields are applied.
     tints: Optional[List[str]] = None
     enabled: Optional[List[bool]] = None
-    black_levels: Optional[List[int]] = None
-    white_levels: Optional[List[int]] = None
+    # Display window in NATIVE intensity units (floats), not 0-255.
+    black_levels: Optional[List[float]] = None
+    white_levels: Optional[List[float]] = None
+    gammas: Optional[List[float]] = None
     current_z: Optional[int] = None
     names: Optional[List[str]] = None
     # When provided, also reassign panel.image_name = panel_key (mirrors
@@ -1850,15 +1916,21 @@ def update_channels(name: str, body: ChannelUpdateRequest):
             es.append(True)
         g.enabled = es
     if body.black_levels is not None:
-        bs = [max(0, min(255, int(v))) for v in body.black_levels][:g.num_channels]
+        # Native intensity units; clamp to [0, channel data max].
+        bs = [max(0.0, float(v)) for v in body.black_levels][:g.num_channels]
         while len(bs) < g.num_channels:
-            bs.append(0)
+            bs.append(0.0)
         g.black_levels = bs
     if body.white_levels is not None:
-        ws = [max(0, min(255, int(v))) for v in body.white_levels][:g.num_channels]
+        ws = [max(0.0, float(v)) for v in body.white_levels][:g.num_channels]
         while len(ws) < g.num_channels:
-            ws.append(255)
+            ws.append(float(g.max_vals[len(ws)]) if len(ws) < len(g.max_vals) else 255.0)
         g.white_levels = ws
+    if body.gammas is not None:
+        gs = [min(10.0, max(0.05, float(v))) for v in body.gammas][:g.num_channels]
+        while len(gs) < g.num_channels:
+            gs.append(1.0)
+        g.gammas = gs
     if body.names is not None:
         ns = [str(v)[:64] for v in body.names][:g.num_channels]
         while len(ns) < g.num_channels:
@@ -1889,8 +1961,9 @@ def update_channels(name: str, body: ChannelUpdateRequest):
         "current_z": g.current_z,
         "tints": list(g.tints),
         "enabled": list(g.enabled),
-        "black_levels": list(g.black_levels),
-        "white_levels": list(g.white_levels),
+        "black_levels": [float(v) for v in g.black_levels],
+        "white_levels": [float(v) for v in g.white_levels],
+        "gammas": [float(v) for v in getattr(g, "gammas", [1.0] * g.num_channels)],
         "names": list(g.names),
     }
 
@@ -1973,14 +2046,7 @@ def project_zstack(name: str, body: ZStackProjectRequest):
             if c < len(grp.enabled) and not grp.enabled[c]:
                 continue
             plane = projected_per_ch[c]
-            denom = max(grp.max_vals[c] if c < len(grp.max_vals) else 1.0, 1.0)
-            norm = plane / denom
-            bl = grp.black_levels[c] / 255.0 if c < len(grp.black_levels) else 0.0
-            wl = grp.white_levels[c] / 255.0 if c < len(grp.white_levels) else 1.0
-            if wl > bl:
-                norm = np.clip((norm - bl) / (wl - bl), 0.0, 1.0)
-            else:
-                norm = np.zeros_like(norm)
+            norm = _apply_channel_levels(plane, grp, c)
             hex_ = grp.tints[c] if c < len(grp.tints) else "#ffffff"
             try:
                 tr = int(hex_[1:3], 16) / 255.0
@@ -2191,14 +2257,7 @@ def get_zstack_nifti(name: str, body: ZStackNiftiRequest):
             if ch < len(grp.enabled) and not grp.enabled[ch]:
                 continue
             plane = arr_f[:, ch, :, :]
-            denom = max(grp.max_vals[ch] if ch < len(grp.max_vals) else 1.0, 1.0)
-            norm = plane / denom
-            bl = grp.black_levels[ch] / 255.0 if ch < len(grp.black_levels) else 0.0
-            wl = grp.white_levels[ch] / 255.0 if ch < len(grp.white_levels) else 1.0
-            if wl > bl:
-                norm = np.clip((norm - bl) / (wl - bl), 0.0, 1.0)
-            else:
-                norm = np.zeros_like(norm)
+            norm = _apply_channel_levels(plane, grp, ch)
             hex_ = grp.tints[ch] if ch < len(grp.tints) else "#ffffff"
             try:
                 tr = int(hex_[1:3], 16) / 255.0

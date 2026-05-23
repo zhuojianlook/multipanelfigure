@@ -1642,6 +1642,77 @@ function VideoFrameSelector({
 // recomputes the composite on every PATCH and writes it to
 // `loaded_images[name]`, so the panel render picks up the new look
 // without any frontend re-routing.
+/* HistogramGate — a per-channel intensity histogram with two draggable gates
+   (black point = display min, white point = display max), shown in NATIVE
+   intensity units. Log-scaled y so the background peak doesn't flatten faint
+   signal. This is the publication-grade replacement for a 0-255 slider: the
+   user sets the exact, reportable display window against the real data. */
+function HistogramGate({ hist, histMax, black, white, color, disabled, onChange, onCommit }: {
+  hist: number[]; histMax: number; black: number; white: number; color: string;
+  disabled?: boolean;
+  onChange: (black: number, white: number) => void;
+  onCommit: (black: number, white: number) => void;
+}) {
+  const ref = useRef<SVGSVGElement | null>(null);
+  const dragRef = useRef<"black" | "white" | null>(null);
+  const W = 100, H = 34;
+  const bins = hist.length || 1;
+  const maxC = Math.max(1, ...hist);
+  const logMax = Math.log1p(maxC);
+  const areaPath = (() => {
+    if (hist.length === 0) return "";
+    const pts = hist.map((v, i) => {
+      const x = (i / (bins - 1)) * W;
+      const y = H - (Math.log1p(Math.max(0, v)) / logMax) * H;
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    });
+    return `M0,${H} L${pts.join(" L")} L${W},${H} Z`;
+  })();
+  const xFor = (v: number) => (histMax > 0 ? Math.min(W, Math.max(0, (v / histMax) * W)) : 0);
+  const xB = xFor(black), xW = xFor(white);
+
+  const valAt = (clientX: number) => {
+    const el = ref.current; if (!el) return 0;
+    const r = el.getBoundingClientRect();
+    const frac = Math.min(1, Math.max(0, (clientX - r.left) / Math.max(1, r.width)));
+    return frac * histMax;
+  };
+  const apply = (which: "black" | "white", v: number, commit: boolean) => {
+    let b = black, w = white;
+    if (which === "black") b = Math.min(v, white - histMax * 0.005);
+    else w = Math.max(v, black + histMax * 0.005);
+    b = Math.max(0, Math.min(b, histMax)); w = Math.max(0, Math.min(w, histMax));
+    (commit ? onCommit : onChange)(b, w);
+  };
+  return (
+    <svg
+      ref={ref}
+      viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none"
+      style={{ width: "100%", height: 34, display: "block", touchAction: "none",
+               background: "var(--c-bg)", borderRadius: 3, cursor: disabled ? "default" : "ew-resize",
+               opacity: disabled ? 0.4 : 1 }}
+      onPointerDown={(e) => {
+        if (disabled) return;
+        const v = valAt(e.clientX);
+        dragRef.current = Math.abs(v - black) <= Math.abs(v - white) ? "black" : "white";
+        (e.target as SVGElement).setPointerCapture(e.pointerId);
+        apply(dragRef.current, v, false);
+      }}
+      onPointerMove={(e) => { if (dragRef.current) apply(dragRef.current, valAt(e.clientX), false); }}
+      onPointerUp={(e) => { if (dragRef.current) { apply(dragRef.current, valAt(e.clientX), true); dragRef.current = null; (e.target as SVGElement).releasePointerCapture?.(e.pointerId); } }}
+    >
+      {/* dim region outside the gated window */}
+      <rect x={0} y={0} width={xB} height={H} fill="rgba(0,0,0,0.45)" />
+      <rect x={xW} y={0} width={Math.max(0, W - xW)} height={H} fill="rgba(0,0,0,0.45)" />
+      {/* histogram (log-y) */}
+      <path d={areaPath} fill={color} fillOpacity={0.55} stroke={color} strokeWidth={0.4} vectorEffect="non-scaling-stroke" />
+      {/* gate handles */}
+      <line x1={xB} y1={0} x2={xB} y2={H} stroke="#fff" strokeWidth={1} vectorEffect="non-scaling-stroke" />
+      <line x1={xW} y1={0} x2={xW} y2={H} stroke="#4FC3F7" strokeWidth={1} vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+}
+
 function ChannelsBlock({ imageName, panelRow, panelCol, onChange }: {
   imageName: string; panelRow?: number; panelCol?: number;
   onChange: () => void;
@@ -1650,8 +1721,9 @@ function ChannelsBlock({ imageName, panelRow, panelCol, onChange }: {
     is_multichannel: boolean;
     num_channels?: number; num_z?: number; current_z?: number;
     tints?: string[]; enabled?: boolean[];
-    black_levels?: number[]; white_levels?: number[];
+    black_levels?: number[]; white_levels?: number[]; gammas?: number[];
     names?: string[];
+    histograms?: number[][]; hist_max?: number[]; data_max?: number[]; dtype_max?: number;
   };
   const [info, setInfo] = useState<ChInfo | null>(null);
   const [pending, setPending] = useState(false);
@@ -1686,6 +1758,55 @@ function ChannelsBlock({ imageName, panelRow, panelCol, onChange }: {
     patch({ names: next });
   };
 
+  // ── Per-channel display-window (LUT gate) helpers ──────────────────────
+  const nCh = info?.num_channels ?? 0;
+  const blackArr = () => [...(info?.black_levels ?? Array(nCh).fill(0))];
+  const whiteArr = () => [...(info?.white_levels ?? (info?.data_max ?? Array(nCh).fill(255)))];
+  // Live (drag) update — local only, no PATCH.
+  const setLevelsLive = (c: number, b: number, w: number) => {
+    setInfo(prev => {
+      if (!prev) return prev;
+      const bl = [...(prev.black_levels ?? Array(nCh).fill(0))];
+      const wl = [...(prev.white_levels ?? (prev.data_max ?? Array(nCh).fill(255)))];
+      bl[c] = b; wl[c] = w;
+      return { ...prev, black_levels: bl, white_levels: wl };
+    });
+  };
+  const commitLevels = (c: number, b: number, w: number) => {
+    const bl = blackArr(); const wl = whiteArr();
+    bl[c] = b; wl[c] = w;
+    patch({ black_levels: bl, white_levels: wl });
+  };
+  const setGamma = (c: number, g: number) => {
+    const gs = [...(info?.gammas ?? Array(nCh).fill(1.0))];
+    gs[c] = g;
+    patch({ gammas: gs });
+  };
+  const resetLevels = (c: number) => {
+    const dmax = info?.data_max?.[c] ?? info?.hist_max?.[c] ?? 255;
+    commitLevels(c, 0, dmax);
+  };
+  // ImageJ-style auto contrast: pick the window that leaves ~0.35% of pixels
+  // saturated at each end of the histogram (purely a viewing aid — values are
+  // still reported/native).
+  const autoContrast = (c: number) => {
+    const hist = info?.histograms?.[c];
+    const hmax = info?.hist_max?.[c] ?? info?.data_max?.[c] ?? 255;
+    if (!hist || hist.length === 0 || hmax <= 0) return;
+    const total = hist.reduce((a, b) => a + b, 0);
+    if (total <= 0) return;
+    const thresh = total * 0.0035;
+    const bins = hist.length;
+    let lo = 0, acc = 0;
+    for (let i = 0; i < bins; i++) { acc += hist[i]; if (acc > thresh) { lo = i; break; } }
+    let hi = bins - 1; acc = 0;
+    for (let i = bins - 1; i >= 0; i--) { acc += hist[i]; if (acc > thresh) { hi = i; break; } }
+    if (hi <= lo) { hi = bins - 1; lo = 0; }
+    const b = (lo / (bins - 1)) * hmax;
+    const w = (hi / (bins - 1)) * hmax;
+    commitLevels(c, b, w);
+  };
+
   if (!info || !info.is_multichannel) return null;
   const n = info.num_channels ?? 0;
   if (n <= 1) return null;
@@ -1696,75 +1817,88 @@ function ChannelsBlock({ imageName, panelRow, panelCol, onChange }: {
         Channels ({n}) {pending && <span style={{ opacity: 0.6 }}> · applying…</span>}
       </Typography>
       <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>
-        Pick a tint + name for each channel. The image is composited as the sum of all enabled channels.
+        Tint + name each channel; drag the black/white gates on the histogram to set the display window
+        (native intensity units, linear). The composite is the sum of all enabled channels.
       </Typography>
       {Array.from({ length: n }).map((_, c) => {
         const tint = info.tints?.[c] ?? "#ffffff";
         const enabled = info.enabled?.[c] ?? true;
+        const hmax = info.hist_max?.[c] ?? info.data_max?.[c] ?? 255;
         const bl = info.black_levels?.[c] ?? 0;
-        const wl = info.white_levels?.[c] ?? 255;
+        const wl = info.white_levels?.[c] ?? hmax;
+        const gm = info.gammas?.[c] ?? 1.0;
         const savedName = info.names?.[c] ?? `Ch ${c + 1}`;
         const draft = nameDrafts[c];
         const displayName = draft ?? savedName;
+        const numFieldSx = {
+          width: 64,
+          "& .MuiInputBase-input": { fontSize: "0.6rem", py: 0.25, px: 0.5, textAlign: "center" as const, colorScheme: "dark" as const },
+          "& .MuiOutlinedInput-notchedOutline": { top: 0 },
+          "& .MuiOutlinedInput-notchedOutline legend": { display: "none" },
+        };
         return (
-          <Box key={c} sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
-            <Checkbox
-              size="small" checked={enabled} sx={{ p: 0.25 }}
-              onChange={(e) => {
-                const next = [...(info.enabled ?? Array(n).fill(true))];
-                next[c] = e.target.checked;
-                patch({ enabled: next });
-              }}
+          <Box key={c} sx={{ display: "flex", flexDirection: "column", gap: 0.5, p: 0.75, border: "1px solid", borderColor: "divider", borderRadius: 1, opacity: enabled ? 1 : 0.7 }}>
+            {/* Row 1: enable · tint · name · auto/reset */}
+            <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
+              <Checkbox
+                size="small" checked={enabled} sx={{ p: 0.25 }}
+                onChange={(e) => { const next = [...(info.enabled ?? Array(n).fill(true))]; next[c] = e.target.checked; patch({ enabled: next }); }}
+              />
+              <input
+                type="color" value={tint} disabled={pending}
+                onChange={(e) => { const next = [...(info.tints ?? Array(n).fill("#ffffff"))]; next[c] = e.target.value; patch({ tints: next }); }}
+                title={`${displayName} tint`}
+                style={{ width: 24, height: 22, border: "1px solid #ccc", borderRadius: 3, padding: 0, cursor: "pointer" }}
+              />
+              <TextField
+                value={displayName} variant="standard" size="small" disabled={pending}
+                onChange={(e) => setNameDrafts(prev => ({ ...prev, [c]: e.target.value }))}
+                onBlur={() => commitName(c)}
+                onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+                title="Rename channel (e.g. DAPI, GFP). Enter to commit."
+                sx={{ flex: 1, minWidth: 60, "& .MuiInputBase-input": { fontSize: "0.65rem", py: 0, px: 0.5 }, "& .MuiInputBase-root:before": { borderBottomStyle: "dotted" } }}
+              />
+              <Button size="small" onClick={() => autoContrast(c)} disabled={pending}
+                sx={{ fontSize: "0.55rem", textTransform: "none", minWidth: 0, px: 0.75, py: 0 }}
+                title="Auto contrast — window that leaves ~0.35% pixels saturated (viewing aid)">Auto</Button>
+              <Button size="small" onClick={() => resetLevels(c)} disabled={pending}
+                sx={{ fontSize: "0.55rem", textTransform: "none", minWidth: 0, px: 0.75, py: 0 }}
+                title="Reset to full data range (linear)">Reset</Button>
+            </Box>
+            {/* Row 2: histogram with draggable black/white gates */}
+            <HistogramGate
+              hist={info.histograms?.[c] ?? []} histMax={hmax}
+              black={bl} white={wl} color={tint} disabled={pending}
+              onChange={(b, w) => setLevelsLive(c, b, w)}
+              onCommit={(b, w) => commitLevels(c, b, w)}
             />
-            <input
-              type="color"
-              value={tint}
-              disabled={!enabled || pending}
-              onChange={(e) => {
-                const next = [...(info.tints ?? Array(n).fill("#ffffff"))];
-                next[c] = e.target.value;
-                patch({ tints: next });
-              }}
-              title={`${displayName} tint`}
-              style={{ width: 24, height: 22, border: "1px solid #ccc", borderRadius: 3, padding: 0, cursor: enabled ? "pointer" : "not-allowed" }}
-            />
-            <TextField
-              value={displayName}
-              variant="standard"
-              size="small"
-              disabled={pending}
-              onChange={(e) => setNameDrafts(prev => ({ ...prev, [c]: e.target.value }))}
-              onBlur={() => commitName(c)}
-              onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-              title="Rename channel (e.g. DAPI, GFP). Enter to commit."
-              sx={{
-                width: 90,
-                "& .MuiInputBase-input": { fontSize: "0.65rem", py: 0, px: 0.5 },
-                "& .MuiInputBase-root:before": { borderBottomStyle: "dotted" },
-              }}
-            />
-            <Slider
-              value={[bl, wl]} min={0} max={255} step={1} disabled={!enabled || pending}
-              onChange={(_, v) => {
-                const [b, w] = v as [number, number];
-                const blArr = [...(info.black_levels ?? Array(n).fill(0))];
-                const wlArr = [...(info.white_levels ?? Array(n).fill(255))];
-                blArr[c] = b; wlArr[c] = w;
-                setInfo({ ...info, black_levels: blArr, white_levels: wlArr });
-              }}
-              onChangeCommitted={(_, v) => {
-                const [b, w] = v as [number, number];
-                const blArr = [...(info.black_levels ?? Array(n).fill(0))];
-                const wlArr = [...(info.white_levels ?? Array(n).fill(255))];
-                blArr[c] = b; wlArr[c] = w;
-                patch({ black_levels: blArr, white_levels: wlArr });
-              }}
-              size="small"
-              sx={{ flex: 1, mx: 0.5, "& .MuiSlider-thumb": { width: 10, height: 10 } }}
-            />
-            <Typography variant="caption" sx={{ width: 60, textAlign: "right", fontSize: "0.55rem", color: "text.secondary" }}>
-              {bl}–{wl}
-            </Typography>
+            {/* Row 3: exact native min / max + gamma */}
+            <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
+              <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>min</Typography>
+              <TextField
+                type="number" size="small" value={Math.round(bl)} disabled={pending}
+                inputProps={{ min: 0, max: Math.round(hmax), step: 1 }}
+                onChange={(e) => { const b = Math.max(0, Math.min(Number(e.target.value), wl - 1)); commitLevels(c, b, wl); }}
+                sx={numFieldSx}
+              />
+              <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>max</Typography>
+              <TextField
+                type="number" size="small" value={Math.round(wl)} disabled={pending}
+                inputProps={{ min: 0, max: Math.round(hmax), step: 1 }}
+                onChange={(e) => { const w = Math.max(bl + 1, Math.min(Number(e.target.value), hmax)); commitLevels(c, bl, w); }}
+                sx={numFieldSx}
+              />
+              <Box sx={{ flex: 1 }} />
+              <Tooltip title="Gamma (γ). 1.0 = linear (publication-safe). γ≠1 is non-linear — disclose in methods.">
+                <Typography variant="caption" sx={{ fontSize: "0.55rem", color: gm !== 1 ? "#FFB74D" : "text.secondary" }}>γ</Typography>
+              </Tooltip>
+              <TextField
+                type="number" size="small" value={gm} disabled={pending}
+                inputProps={{ min: 0.1, max: 5, step: 0.1 }}
+                onChange={(e) => { const g = Math.max(0.1, Math.min(Number(e.target.value) || 1, 5)); setGamma(c, g); }}
+                sx={numFieldSx}
+              />
+            </Box>
           </Box>
         );
       })}
