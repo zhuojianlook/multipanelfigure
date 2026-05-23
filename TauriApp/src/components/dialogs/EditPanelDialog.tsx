@@ -2153,6 +2153,12 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   const TAB_SCALE = 3 + tOff;
   const TAB_ANNOT = 4 + tOff;
   const TAB_ZOOM = 5 + tOff;
+  // Dedicated "Channels" tab for non-z-stack images: per-channel tint/levels
+  // for multichannel TIFFs, and a Pseudocolor (false-colour) control for
+  // single-channel / grayscale images. Z-stacks already surface channels in
+  // their Z-Stack tab, so this tab is only shown when !isZStackPanel. Uses a
+  // fresh value so it doesn't disturb the other tabs' fixed indices.
+  const TAB_CHANNELS = 6 + tOff;
   const OVERLAY_TABS = [TAB_ADJ, TAB_LABELS, TAB_SCALE, TAB_ANNOT, TAB_ZOOM];
 
   // ── Source-of-adjacent-zoom lookup ──────────────────────────
@@ -2259,6 +2265,9 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     if (tabIdx === TAB_SCALE) return "scale";
     if (tabIdx === TAB_ANNOT) return "annot";
     if (tabIdx === TAB_ZOOM) return "zoom";
+    // The Channels tab only edits pseudocolor (an "adj" field) + backend
+    // channel state, so route its per-tab undo through the adj history.
+    if (tabIdx === TAB_CHANNELS) return "adj";
     return "crop";
   };
   const pushHistory = useCallback((snapshot: PanelInfo) => {
@@ -3000,6 +3009,65 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     onClose();
   };
 
+  // Pseudocolor (false-colour LUT) control. Lives in the Channels tab (and the
+  // Z-Stack tab) so single-channel / grayscale images can be colourised — the
+  // backend treats a custom #rrggbb as a linear black→tint ramp modulated by
+  // intensity, and a named palette as a fixed LUT. Bound to local.pseudocolor
+  // so any copy of this control stays in sync.
+  const renderPseudocolor = () => {
+    if (!local) return null;
+    const ps = local.pseudocolor || "";
+    const isCustom = ps.startsWith("#");
+    return (
+      <Box>
+        <Typography variant="caption" sx={{ fontSize: "0.7rem", fontWeight: 600, mb: 0.5, display: "block" }}>Pseudocolor (LUT)</Typography>
+        <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
+          <Select
+            size="small"
+            value={isCustom ? "__custom__" : ps}
+            onChange={(e) => {
+              const v = e.target.value as string;
+              if (v === "__custom__") {
+                updateLocal({ pseudocolor: isCustom ? ps : "#00ff66" });
+              } else {
+                updateLocal({ pseudocolor: v });
+              }
+            }}
+            displayEmpty
+            sx={{ flex: 1, fontSize: "0.65rem", "& .MuiSelect-select": { py: 0.4, px: 1 } }}
+          >
+            <MenuItem value="" sx={{ fontSize: "0.65rem" }}>None (original colors)</MenuItem>
+            <MenuItem value="__custom__" sx={{ fontSize: "0.65rem" }}>🎨 Custom tint…</MenuItem>
+            <MenuItem value="green" sx={{ fontSize: "0.65rem" }}>🟢 Green</MenuItem>
+            <MenuItem value="red" sx={{ fontSize: "0.65rem" }}>🔴 Red</MenuItem>
+            <MenuItem value="blue" sx={{ fontSize: "0.65rem" }}>🔵 Blue</MenuItem>
+            <MenuItem value="cyan" sx={{ fontSize: "0.65rem" }}>🔵 Cyan</MenuItem>
+            <MenuItem value="magenta" sx={{ fontSize: "0.65rem" }}>🟣 Magenta</MenuItem>
+            <MenuItem value="yellow" sx={{ fontSize: "0.65rem" }}>🟡 Yellow</MenuItem>
+            <MenuItem value="hot" sx={{ fontSize: "0.65rem" }}>🔥 Hot</MenuItem>
+            <MenuItem value="cool" sx={{ fontSize: "0.65rem" }}>❄️ Cool</MenuItem>
+            <MenuItem value="viridis" sx={{ fontSize: "0.65rem" }}>🌿 Viridis</MenuItem>
+            <MenuItem value="magma" sx={{ fontSize: "0.65rem" }}>🌋 Magma</MenuItem>
+            <MenuItem value="inferno" sx={{ fontSize: "0.65rem" }}>🔥 Inferno</MenuItem>
+            <MenuItem value="plasma" sx={{ fontSize: "0.65rem" }}>⚡ Plasma</MenuItem>
+          </Select>
+          {isCustom && (
+            <input
+              type="color"
+              value={ps}
+              onChange={(e) => updateLocal({ pseudocolor: e.target.value })}
+              title="Pick custom tint color"
+              style={{ width: 32, height: 26, border: "1px solid #ccc", borderRadius: 4, padding: 0, cursor: "pointer" }}
+            />
+          )}
+        </Box>
+        <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", mt: 0.5, display: "block" }}>
+          Applies a false-color mapping to grayscale / single-channel images. Custom tint = linear black→color ramp scaled by intensity.
+        </Typography>
+      </Box>
+    );
+  };
+
   const updateLocal = (patch: Partial<PanelInfo>) => {
     setLocal((prev) => {
       if (!prev) return prev;
@@ -3306,6 +3374,10 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       stays pinned to TAB_ADJ … TAB_ZOOM regardless. */}
                   {!isZoomTarget && <Tab label="Crop/Resize" value={TAB_CROP} />}
                   <Tab label="Adjustments" value={TAB_ADJ} />
+                  {/* Channels tab — per-channel colours for multichannel TIFFs
+                      and a colorize control for single-channel images. Z-stacks
+                      already show channels in their Z-Stack tab. */}
+                  {!!local?.image_name && !isZStackPanel && <Tab label="Channels" value={TAB_CHANNELS} />}
                   <Tab label="Labels" value={TAB_LABELS} />
                   <Tab label="Scale Bar" value={TAB_SCALE} />
                   <Tab label="Annotations" value={TAB_ANNOT} />
@@ -3444,6 +3516,10 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 // loads the correct frame/adjustment state for the new PNG).
                 onClose();
               }} />
+              {/* Colorize a single-channel (grayscale) stack. For
+                  multichannel stacks the per-channel controls above already
+                  set tints; this is for stacks that have just one channel. */}
+              {renderPseudocolor()}
             </Box>
           </TabPanel>
         )}
@@ -4015,88 +4091,37 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
               />
             </Box>
 
-            {/* Pseudocolor — fixed palette OR custom user-picked tint.
-                Custom mode stores a hex color (#rrggbb) directly in
-                `pseudocolor`, which the backend treats as a linear
-                black→tint ramp modulated by intensity.  This makes
-                volume / z-stack channels fully user-assignable instead
-                of being constrained to a fixed list like inferno. */}
-            <Box>
-              <Typography variant="caption" sx={{ fontSize: "0.7rem", fontWeight: 600, mb: 0.5, display: "block" }}>Pseudocolor (LUT)</Typography>
-              {(() => {
-                const ps = local.pseudocolor || "";
-                const isCustom = ps.startsWith("#");
-                return (
-                  <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
-                    <Select
-                      size="small"
-                      value={isCustom ? "__custom__" : ps}
-                      onChange={(e) => {
-                        const v = e.target.value as string;
-                        if (v === "__custom__") {
-                          // Default custom tint = green if user had no prior hex
-                          updateLocal({ pseudocolor: isCustom ? ps : "#00ff66" });
-                        } else {
-                          updateLocal({ pseudocolor: v });
-                        }
-                      }}
-                      displayEmpty
-                      sx={{ flex: 1, fontSize: "0.65rem", "& .MuiSelect-select": { py: 0.4, px: 1 } }}
-                    >
-                      <MenuItem value="" sx={{ fontSize: "0.65rem" }}>None (original colors)</MenuItem>
-                      <MenuItem value="__custom__" sx={{ fontSize: "0.65rem" }}>🎨 Custom tint…</MenuItem>
-                      <MenuItem value="green" sx={{ fontSize: "0.65rem" }}>🟢 Green</MenuItem>
-                      <MenuItem value="red" sx={{ fontSize: "0.65rem" }}>🔴 Red</MenuItem>
-                      <MenuItem value="blue" sx={{ fontSize: "0.65rem" }}>🔵 Blue</MenuItem>
-                      <MenuItem value="cyan" sx={{ fontSize: "0.65rem" }}>🔵 Cyan</MenuItem>
-                      <MenuItem value="magenta" sx={{ fontSize: "0.65rem" }}>🟣 Magenta</MenuItem>
-                      <MenuItem value="yellow" sx={{ fontSize: "0.65rem" }}>🟡 Yellow</MenuItem>
-                      <MenuItem value="hot" sx={{ fontSize: "0.65rem" }}>🔥 Hot</MenuItem>
-                      <MenuItem value="cool" sx={{ fontSize: "0.65rem" }}>❄️ Cool</MenuItem>
-                      <MenuItem value="viridis" sx={{ fontSize: "0.65rem" }}>🌿 Viridis</MenuItem>
-                      <MenuItem value="magma" sx={{ fontSize: "0.65rem" }}>🌋 Magma</MenuItem>
-                      <MenuItem value="inferno" sx={{ fontSize: "0.65rem" }}>🔥 Inferno</MenuItem>
-                      <MenuItem value="plasma" sx={{ fontSize: "0.65rem" }}>⚡ Plasma</MenuItem>
-                    </Select>
-                    {isCustom && (
-                      <input
-                        type="color"
-                        value={ps}
-                        onChange={(e) => updateLocal({ pseudocolor: e.target.value })}
-                        title="Pick custom tint color"
-                        style={{ width: 32, height: 26, border: "1px solid #ccc", borderRadius: 4, padding: 0, cursor: "pointer" }}
-                      />
-                    )}
-                  </Box>
-                );
-              })()}
-              <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", mt: 0.5, display: "block" }}>
-                Applies a false-color mapping to grayscale images. Custom tint = linear black→color ramp scaled by intensity.
-              </Typography>
-            </Box>
+            {/* Per-channel tint + colorize controls live on the dedicated
+                "Channels" tab now (and the Z-Stack tab for stacks), so they
+                stay discoverable instead of being buried at the bottom of
+                Adjustments. */}
+          </Box>
+        </TabPanel>
 
-            {/* Per-channel tint controls — only renders for multichannel
-                TIFFs (CYX / ZCYX / ...).  Mirrors the block on the
-                Z-Stack tab so users still get channel controls when the
-                image has channels but no Z axis.  ChannelsBlock itself
-                returns null when the image isn't multichannel, so this
-                is safe to always mount. */}
-            {local.image_name && (
+        {/* -- Channels tab (non-z-stack images) ---------------- */}
+        {!!local.image_name && !isZStackPanel && (
+          <TabPanel value={tabIdx} index={TAB_CHANNELS}>
+            <Box sx={{ display: "flex", flexDirection: "column", gap: 1.5 }}>
+              <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.85rem" }}>
+                🎨 Channels
+              </Typography>
+              {/* Per-channel tint / visibility / levels — renders only when the
+                  image is multichannel (CYX etc.). Returns null otherwise. */}
               <ChannelsBlock
                 imageName={local.image_name}
                 panelRow={row}
                 panelCol={col}
                 onChange={() => {
-                  // Bump the panel's render so the new composite shows
-                  // up immediately. The store re-fetches the thumbnail
-                  // on its own; we just need to nudge the preview.
                   try { useFigureStore.getState().requestPreview(); } catch { /* ignore */ }
                   try { useFigureStore.getState().refreshPanelThumbnail(row, col); } catch { /* ignore */ }
                 }}
               />
-            )}
-          </Box>
-        </TabPanel>
+              {/* Colorize a single-channel / grayscale image. (For
+                  multichannel images use the per-channel tints above instead.) */}
+              {renderPseudocolor()}
+            </Box>
+          </TabPanel>
+        )}
 
         {/* -- Tab 2: Labels ------------------------------------ */}
         <TabPanel value={tabIdx} index={2 + tOff}>
