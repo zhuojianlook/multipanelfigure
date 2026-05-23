@@ -289,7 +289,20 @@ def _canonicalize_tiff_axes(arr: "np.ndarray", axes: str):
 def _detect_multichannel_tiff(tiff_path: str):
     """Read a TIFF with tifffile and return (canonical_axes, arr) if
     it has > 1 channel, else None. Robust to single-page, pyramidal,
-    ImageJ-hyperstack, and unknown-axis TIFFs."""
+    ImageJ-hyperstack, and unknown-axis TIFFs.
+
+    Two detection paths:
+      1) tifffile already labelled a C axis with size > 1 — the common
+         OME-TIFF / well-formed-hyperstack case.
+      2) FALLBACK: no usable C axis, but the file is an ImageJ stack whose
+         description metadata declares channels > 1. This catches plain
+         multichannel TIFFs saved as sequential pages (no Z), which
+         tifffile reports as an unknown/`Q`/`I` multi-page axis. Without
+         this they'd be promoted to a single-channel z-stack by
+         `_canonicalize_tiff_axes` and the per-channel UI would never
+         appear — exactly the "can't pick channels on a multichannel
+         (non-z-stack) TIFF" bug.
+    """
     try:
         import tifffile
     except ImportError:
@@ -304,15 +317,37 @@ def _detect_multichannel_tiff(tiff_path: str):
             s = max(tf.series, key=lambda ser: int(np.prod(ser.shape)))
             axes = (s.axes or "").upper()
             shape = s.shape
-            if "C" not in axes:
-                return None
-            ci = axes.index("C")
-            if ci >= len(shape) or shape[ci] <= 1:
-                return None
-            arr = s.asarray()
-        # Canonicalize so downstream code always sees ZCYX (or a substring).
-        arr, axes = _canonicalize_tiff_axes(arr, axes)
-        return axes, arr
+
+            # Path 1: explicit C axis with > 1 channel.
+            if "C" in axes:
+                ci = axes.index("C")
+                if ci < len(shape) and shape[ci] > 1:
+                    arr = s.asarray()
+                    arr, axes = _canonicalize_tiff_axes(arr, axes)
+                    return axes, arr
+
+            # Path 2: ImageJ-declared channels but no usable C axis. ImageJ
+            # hyperstacks store channel/slice/frame counts in the TIFF
+            # description and order pages XYCZT (channel varies fastest),
+            # so a C-order reshape to (T, Z, C, Y, X) maps the flat page
+            # stack back to the right axes.
+            ij = getattr(tf, "imagej_metadata", None) or {}
+            try:
+                c = int(ij.get("channels", 1) or 1)
+                z = int(ij.get("slices", 1) or 1)
+                t = int(ij.get("frames", 1) or 1)
+            except (TypeError, ValueError):
+                c, z, t = 1, 1, 1
+            if c > 1:
+                arr = s.asarray()
+                if arr.ndim >= 2:
+                    y, x = arr.shape[-2], arr.shape[-1]
+                    pages = int(np.prod(arr.shape[:-2])) if arr.ndim > 2 else 1
+                    if pages > 1 and pages == c * z * t:
+                        arr = arr.reshape(t, z, c, y, x)
+                        arr, new_axes = _canonicalize_tiff_axes(arr, "TZCYX")
+                        return new_axes, arr
+            return None
     except Exception as e:
         import sys
         print(f"[multichannel-detect] {tiff_path}: {e}", file=sys.stderr, flush=True)

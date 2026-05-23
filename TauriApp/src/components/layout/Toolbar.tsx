@@ -1609,8 +1609,13 @@ export function RecordAppButton() {
   // Native (ffmpeg) recording state — used on macOS, where the WKWebView
   // has no navigator.mediaDevices.getDisplayMedia.
   const nativeChildRef = useRef<{ write: (d: string) => Promise<void>; kill: () => Promise<void> } | null>(null);
-  const nativePathRef = useRef<string>("");
-  const stoppingRef = useRef<boolean>(false);
+  // Path of the temp file ffmpeg writes WHILE recording. We capture to a temp
+  // file and only ask the user where to save AFTER they stop (matching the web
+  // path's "record now, name later" UX).
+  const nativeTmpRef = useRef<string>("");
+  // What to do when the ffmpeg process closes: "save" → prompt + relocate the
+  // temp file; "discard" → delete it; "" → unexpected exit (error handling).
+  const nativeStopModeRef = useRef<"save" | "discard" | "">("");
 
   /** True when the webview supports browser screen capture (Windows WebView2,
    *  most Linux WebKitGTK, and any plain-browser dev preview). macOS WKWebView
@@ -1727,13 +1732,13 @@ export function RecordAppButton() {
   const startNative = async () => {
     setRecError("");
     try {
-      const { save: saveDialog } = await import("@tauri-apps/plugin-dialog");
+      // Record straight to a temp file — we ask WHERE to save only after the
+      // user stops (see stopNative + the close handler below). This makes the
+      // button behave like a real recorder: press to start, press to stop &
+      // save.
+      const { tempDir, join } = await import("@tauri-apps/api/path");
       const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const path = await saveDialog({
-        defaultPath: `mpfig-recording-${stamp}.mp4`,
-        filters: [{ name: "Video", extensions: ["mp4"] }],
-      });
-      if (!path) return;
+      const path = await join(await tempDir(), `mpfig-recording-${stamp}.mp4`);
       const idx = await getScreenDeviceIndex();
       // Crop the screen capture down to JUST this app window. avfoundation can
       // only grab a whole display, so we compute the window's rectangle as
@@ -1777,34 +1782,55 @@ export function RecordAppButton() {
         setRecError(`ffmpeg failed to start: ${err}`);
       });
       cmd.on("close", async () => {
-        const child = nativeChildRef.current;
         nativeChildRef.current = null;
         setRecording(false);
-        if (!stoppingRef.current) {
+        const mode = nativeStopModeRef.current;
+        nativeStopModeRef.current = "";
+        const tmp = nativeTmpRef.current;
+        nativeTmpRef.current = "";
+        const { invoke } = await import("@tauri-apps/api/core");
+        const cleanup = async () => { if (tmp) { try { await invoke("delete_file", { path: tmp }); } catch { /* ignore */ } } };
+
+        if (mode === "") {
           // Process exited on its own almost immediately — almost always the
           // missing macOS Screen Recording permission (ffmpeg opens the output
-          // file, fails to grab the screen, and quits, so the user just sees an
-          // empty file appear). Surface a clear, actionable dialog — the
-          // tooltip-only message was easy to miss.
+          // file, fails to grab the screen, and quits). Surface a clear,
+          // actionable dialog and discard the empty temp file.
+          await cleanup();
           const perm = /denied|not authorized|permission|abort|Operation not permitted/i.test(stderrTail);
           const msg = perm
             ? "macOS hasn't granted this app Screen Recording permission yet, so the "
-              + "recording couldn't capture anything (an empty file was written).\n\n"
+              + "recording couldn't capture anything.\n\n"
               + "Fix: System Settings → Privacy & Security → Screen Recording → enable "
               + "Multi-Panel Figure Builder, then fully quit and reopen the app and try again."
             : `Recording stopped unexpectedly.\n\n${stderrTail.slice(-400) || "No ffmpeg output."}`;
           setRecError(perm ? "Screen Recording permission needed — see the dialog." : "Recording stopped unexpectedly.");
           await alertDialog({ title: perm ? "Screen Recording permission needed" : "Recording failed", body: msg });
-        } else {
-          await alertDialog({ title: "Recording saved", body: `Screen recording saved to ${nativePathRef.current}` });
+          return;
         }
-        stoppingRef.current = false;
-        void child; // referenced for clarity
+        if (mode === "discard") { await cleanup(); return; }
+
+        // mode === "save": ffmpeg has finalized the temp file. Now ask where to
+        // keep it and relocate it there.
+        try {
+          const { save: saveDialog } = await import("@tauri-apps/plugin-dialog");
+          const stamp2 = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+          const dest = await saveDialog({
+            defaultPath: `mpfig-recording-${stamp2}.mp4`,
+            filters: [{ name: "Video", extensions: ["mp4"] }],
+          });
+          if (!dest) { await cleanup(); return; }  // user cancelled — discard
+          await invoke("move_file", { src: tmp, dest });
+          await alertDialog({ title: "Recording saved", body: `Screen recording saved to ${dest}` });
+        } catch (err) {
+          await cleanup();
+          await alertDialog({ title: "Couldn't save recording", body: err instanceof Error ? err.message : String(err) });
+        }
       });
       const child = await cmd.spawn();
       nativeChildRef.current = child as unknown as { write: (d: string) => Promise<void>; kill: () => Promise<void> };
-      nativePathRef.current = path;
-      stoppingRef.current = false;
+      nativeTmpRef.current = path;
+      nativeStopModeRef.current = "";
       setRecording(true);
     } catch (e) {
       setRecording(false);
@@ -1820,12 +1846,13 @@ export function RecordAppButton() {
   const stopNative = async (save: boolean) => {
     const child = nativeChildRef.current;
     if (!child) return;
-    stoppingRef.current = save;
+    nativeStopModeRef.current = save ? "save" : "discard";
     try {
-      // 'q' on stdin makes ffmpeg finalize the file cleanly; killing would
-      // truncate the moov atom and corrupt the mp4.
-      if (save) await child.write("q");
-      else await child.kill();
+      // 'q' on stdin makes ffmpeg finalize the file cleanly (so the mp4's moov
+      // atom is written and the file is playable). For a discard we still
+      // finalize cleanly, then delete it in the close handler. Killing would
+      // truncate the file.
+      await child.write("q");
     } catch {
       try { await child.kill(); } catch { /* ignore */ }
     }
@@ -1841,6 +1868,9 @@ export function RecordAppButton() {
   useEffect(() => {
     return () => {
       try { streamRef.current?.getTracks().forEach((t) => t.stop()); } catch { /* ignore */ }
+      // Mark as a discard so the close handler cleans up the temp file quietly
+      // instead of popping an "unexpected exit" dialog on unmount.
+      if (nativeChildRef.current) nativeStopModeRef.current = "discard";
       try { void nativeChildRef.current?.kill(); } catch { /* ignore */ }
     };
   }, []);

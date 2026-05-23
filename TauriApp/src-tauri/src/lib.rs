@@ -170,6 +170,37 @@ async fn save_base64_to_path(path: String, data_b64: String) -> Result<(), Strin
     Ok(())
 }
 
+/// Move a file from `src` to `dest`. Tries a fast same-volume rename, then
+/// falls back to copy + remove so it also works across volumes (e.g. the
+/// system temp dir → a user folder on a different disk). Used by the screen
+/// recorder, which writes to a temp file while capturing and relocates it to
+/// the user's chosen path only after they stop.
+#[tauri::command]
+async fn move_file(src: String, dest: String) -> Result<(), String> {
+    if let Some(parent) = std::path::Path::new(&dest).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::rename(&src, &dest) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            std::fs::copy(&src, &dest).map_err(|e| format!("Copy failed: {}", e))?;
+            let _ = std::fs::remove_file(&src);
+            Ok(())
+        }
+    }
+}
+
+/// Delete a file. Succeeds silently if it's already gone. Used to clean up the
+/// recorder's temp capture when the user discards a recording or it fails.
+#[tauri::command]
+async fn delete_file(path: String) -> Result<(), String> {
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Delete failed: {}", e)),
+    }
+}
+
 #[tauri::command]
 async fn fetch_url(url: String) -> Result<String, String> {
     let client = reqwest::Client::new();
@@ -442,7 +473,7 @@ pub fn run() {
       app.manage(SidecarChild(sidecar_child));
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, save_base64_to_path, download_and_install_update, kill_sidecar])
+    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, save_base64_to_path, move_file, delete_file, download_and_install_update, kill_sidecar])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {
