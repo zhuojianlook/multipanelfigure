@@ -9,17 +9,58 @@
    ────────────────────────────────────────────────────────── */
 
 import { useEffect, useRef, useState } from "react";
-import { Box, Tooltip, CircularProgress } from "@mui/material";
+import { Box, Tooltip, CircularProgress, IconButton, Menu, MenuItem } from "@mui/material";
 import ViewModuleIcon from "@mui/icons-material/ViewModule";
 import DescriptionIcon from "@mui/icons-material/Description";
 import InsightsIcon from "@mui/icons-material/Insights";
 import AddIcon from "@mui/icons-material/Add";
 import CloseIcon from "@mui/icons-material/Close";
 import SaveIcon from "@mui/icons-material/Save";
+import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
+import InfoIcon from "@mui/icons-material/Info";
 import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
 import { enterCollage, enterAnalysis, switchToDocument, newBlankDoc, closeDoc, saveDocument } from "../../utils/projectNav";
-import { RecordAppButton } from "./Toolbar";
+import { RecordAppButton, DEV_OPTIONS_KEY } from "./Toolbar";
+
+/* Help menu — lives in the always-visible tab bar (same level as the Record
+   button) so it's reachable in every mode. "About" opens the toolbar's About
+   dialog via a window event; the developer-options toggle is self-contained
+   (localStorage + the broadcast event the Record button listens for). */
+function HelpMenuButton() {
+  const [anchor, setAnchor] = useState<null | HTMLElement>(null);
+  const [devOn, setDevOn] = useState<boolean>(() => {
+    try { return localStorage.getItem(DEV_OPTIONS_KEY) === "1"; } catch { return false; }
+  });
+  return (
+    <>
+      <Tooltip title="Help">
+        <IconButton size="small" onClick={(e) => setAnchor(e.currentTarget)} sx={{ p: 0.5 }}>
+          <HelpOutlineIcon sx={{ fontSize: 18, color: "var(--c-text-dim)" }} />
+        </IconButton>
+      </Tooltip>
+      <Menu anchorEl={anchor} open={Boolean(anchor)} onClose={() => setAnchor(null)}>
+        <MenuItem onClick={() => { window.dispatchEvent(new CustomEvent("mpfig:open-about")); setAnchor(null); }}>
+          <InfoIcon sx={{ mr: 1, fontSize: 18 }} /> About
+        </MenuItem>
+        <MenuItem
+          onClick={(e) => {
+            e.preventDefault();
+            const next = !devOn;
+            setDevOn(next);
+            try { localStorage.setItem(DEV_OPTIONS_KEY, next ? "1" : "0"); } catch { /* ignore */ }
+            window.dispatchEvent(new CustomEvent("mpfig:dev-options-changed", { detail: { enabled: next } }));
+          }}
+        >
+          <Box component="span" sx={{ mr: 1, width: 18, display: "inline-flex", justifyContent: "center" }}>
+            {devOn ? "☑" : "☐"}
+          </Box>
+          Enable developer options
+        </MenuItem>
+      </Menu>
+    </>
+  );
+}
 
 export function DocumentTabs() {
   const mode = useCollageStore((s) => s.mode);
@@ -219,12 +260,12 @@ export function DocumentTabs() {
       </Tooltip>
      </Box>{/* end scrollable tabs region */}
 
-     {/* Record button — pinned right, never scrolls off, and present in
-         every mode (builder / analysis / collage) so a full workflow can
-         be filmed continuously across tab switches. Only renders when dev
-         options are enabled (handled inside RecordAppButton). */}
-     <Box sx={{ display: "flex", alignItems: "center", px: 0.5, flexShrink: 0 }}>
+     {/* Pinned right, never scrolls off, present in every mode: the Record
+         button (only when dev options are on — handled inside RecordAppButton)
+         and the Help menu, both on this one always-visible top level. */}
+     <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, px: 0.5, flexShrink: 0 }}>
        <RecordAppButton />
+       <HelpMenuButton />
      </Box>
     </Box>
   );

@@ -29,8 +29,6 @@ import {
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import AddPhotoAlternateIcon from "@mui/icons-material/AddPhotoAlternate";
 import SaveIcon from "@mui/icons-material/Save";
-import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
-import InfoIcon from "@mui/icons-material/Info";
 import RestartAltIcon from "@mui/icons-material/RestartAlt";
 import SystemUpdateAltIcon from "@mui/icons-material/SystemUpdateAlt";
 import DownloadIcon from "@mui/icons-material/Download";
@@ -1002,14 +1000,6 @@ export function Toolbar() {
     _aboutAutoShown = true;
     return true;
   });
-  const [helpMenuAnchor, setHelpMenuAnchor] = useState<null | HTMLElement>(null);
-  // Developer-options toggle lives in the Help menu (not inside
-  // the About dialog).  Persisted in localStorage and broadcast
-  // via a window event so the main-toolbar Record button can pick
-  // up changes without a global store.
-  const [devOptionsEnabled, setDevOptionsEnabled] = useState<boolean>(() => {
-    try { return localStorage.getItem(DEV_OPTIONS_KEY) === "1"; } catch { return false; }
-  });
   const [updateStatus, setUpdateStatus] = useState<"idle" | "checking" | "up-to-date" | "available" | "downloading" | "ready" | "error">("idle");
   const [latestVersion, setLatestVersion] = useState<string | null>(null);
   const [releaseNotes, setReleaseNotes] = useState("");
@@ -1032,6 +1022,15 @@ export function Toolbar() {
 
   useEffect(() => {
     getVersion().then((v) => setAppVersion(v)).catch(() => setAppVersion("unknown"));
+  }, []);
+
+  // The Help menu now lives in the always-visible DocumentTabs bar; it opens
+  // this About dialog by firing a window event (avoids lifting all the update
+  // state out of the toolbar).
+  useEffect(() => {
+    const onOpen = () => setAboutOpen(true);
+    window.addEventListener("mpfig:open-about", onOpen);
+    return () => window.removeEventListener("mpfig:open-about", onOpen);
   }, []);
 
   // Fetch changelog when About dialog opens
@@ -1214,46 +1213,10 @@ export function Toolbar() {
         <SaveCollageButton />
       )}
 
-      {/* Record app moved to the DocumentTabs bar so it's available — and a
-          recording keeps running — across every mode (builder / analysis /
-          collage). */}
-
-      {/* Help menu */}
-      <Tooltip title="Help">
-        <IconButton size="small" onClick={(e) => setHelpMenuAnchor(e.currentTarget)}>
-          <HelpOutlineIcon sx={{ fontSize: 20 }} />
-        </IconButton>
-      </Tooltip>
-
-      <Menu
-        anchorEl={helpMenuAnchor}
-        open={Boolean(helpMenuAnchor)}
-        onClose={() => setHelpMenuAnchor(null)}
-      >
-        <MenuItem onClick={() => { setAboutOpen(true); setHelpMenuAnchor(null); }}>
-          <InfoIcon sx={{ mr: 1, fontSize: 18 }} /> About
-        </MenuItem>
-        {/* Toggleable developer options — directly in the Help menu
-            (NOT inside the About dialog) so the user can flip it on
-            with a single click and the Record button immediately
-            appears in the main toolbar. */}
-        <MenuItem
-          onClick={(e) => {
-            e.preventDefault();
-            const next = !devOptionsEnabled;
-            setDevOptionsEnabled(next);
-            try { localStorage.setItem(DEV_OPTIONS_KEY, next ? "1" : "0"); } catch { /* ignore */ }
-            // Broadcast so the AppShell-level Record button can update
-            // without needing a global state library.
-            window.dispatchEvent(new CustomEvent("mpfig:dev-options-changed", { detail: { enabled: next } }));
-          }}
-        >
-          <Box component="span" sx={{ mr: 1, width: 18, display: "inline-flex", justifyContent: "center" }}>
-            {devOptionsEnabled ? "☑" : "☐"}
-          </Box>
-          Enable developer options
-        </MenuItem>
-      </Menu>
+      {/* Record app + Help moved to the DocumentTabs bar so they sit on one
+          always-visible top level (and a recording keeps running across every
+          mode). The About dialog below is opened from there via the
+          "mpfig:open-about" window event. */}
 
       <SaveFigureDialog open={saveDlgOpen} onClose={() => setSaveDlgOpen(false)} />
 
@@ -1579,7 +1542,7 @@ export function Toolbar() {
 }
 
 // ── Developer options + screen recorder ──────────────────────
-const DEV_OPTIONS_KEY = "mpfig.dev_options_enabled";
+export const DEV_OPTIONS_KEY = "mpfig.dev_options_enabled";
 
 /** Mounted ONCE in the always-present DocumentTabs bar (so the button — and an
  *  in-progress recording — persists across every mode/tab; the recorder used to
@@ -1980,7 +1943,13 @@ export function RecordAppButton() {
                             "@keyframes mpfig-rec-blink": { "50%": { opacity: 0.25 } } }} />
                 : <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: "#e53935" }} />
             }
-            sx={{ textTransform: "none", fontVariantNumeric: "tabular-nums", minWidth: recording ? 86 : undefined }}
+            sx={{
+              textTransform: "none", fontVariantNumeric: "tabular-nums",
+              minWidth: recording ? 84 : undefined,
+              // Keep it compact so it sits inside the 30px DocumentTabs bar with
+              // breathing room (was as tall as the bar and touched the border).
+              height: 22, minHeight: 0, py: 0, fontSize: "0.72rem", lineHeight: 1,
+            }}
           >
             {recording ? `Rec ${fmtDuration(recElapsed)}` : "Record app"}
           </Button>
