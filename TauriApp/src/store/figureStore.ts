@@ -289,11 +289,20 @@ function _renumberAllAutoLetters(cfg: { rows: number; cols: number; panels: { im
       const p = cfg.panels[r]?.[c];
       if (!p) continue;
       const isImagePanel = !!(p.image_name && p.image_name.trim());
-      const isZoomTarget = _isAdjacentZoomTarget(cfg, r, c);
-      // Promote either image-bearing or zoom-target cells to have a
-      // default auto-label first (so _relabelAutoLetter below has
-      // something to relabel). Empty cells stay label-less.
-      if (isImagePanel || isZoomTarget) {
+      // Only auto-seed a default letter on ADJACENT-ZOOM TARGET cells
+      // that carry no image — those never pass through setPanelImage, so
+      // without this they'd stay label-less.
+      //
+      // Image-bearing panels are deliberately NOT promoted here. They get
+      // their auto-letter exactly once, at assignment (setPanelImage). If
+      // we re-created it on every renumber, a user who deleted all of a
+      // panel's labels would see the default reappear whenever the grid is
+      // renumbered (grid resize, an adjacent-zoom toggle, or the manual
+      // Renumber button). So an empty labels[] on an image panel is an
+      // intentional "no labels" state — respected, and durable across
+      // save/load (renumber isn't run on load).
+      const isZoomTargetCell = !isImagePanel && _isAdjacentZoomTarget(cfg, r, c);
+      if (isZoomTargetCell) {
         _ensureZoomTargetLabel(p, r, c, cfg.cols);
       }
       _relabelAutoLetter(p, r, c, cfg.cols);
