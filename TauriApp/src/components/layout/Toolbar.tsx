@@ -12,6 +12,7 @@ import {
   IconButton,
   Menu,
   MenuItem,
+  Select,
   Dialog,
   DialogTitle,
   DialogContent,
@@ -1618,6 +1619,39 @@ export function RecordAppButton() {
   // apart from an unexpected exit (permission denied / crash → show an error).
   const nativeIntentionalStopRef = useRef<boolean>(false);
 
+  // Elapsed-time indicator (drives the "● 00:12" recording chip). Counts from
+  // recStartRef while `recording` is true (see the effect below).
+  const [recElapsed, setRecElapsed] = useState(0);
+  const recStartRef = useRef<number>(0);
+  // After a native recording stops we open this modal instead of a bare save
+  // dialog, so the user can Discard or Save As… in a chosen video format.
+  const [saveModal, setSaveModal] = useState<{ tmp: string; durationSec: number } | null>(null);
+  const [saveFormat, setSaveFormat] = useState<"mp4" | "mov" | "gif" | "webm">("mp4");
+  const [saving, setSaving] = useState(false);
+
+  // Run the elapsed-time clock purely off the `recording` flag so every start
+  // path (native + web) and every stop path reset it consistently.
+  useEffect(() => {
+    if (!recording) { setRecElapsed(0); return; }
+    recStartRef.current = Date.now();
+    setRecElapsed(0);
+    const id = setInterval(() => {
+      setRecElapsed(Math.max(0, Math.floor((Date.now() - recStartRef.current) / 1000)));
+    }, 500);
+    return () => clearInterval(id);
+  }, [recording]);
+
+  const fmtDuration = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+
+  // Jump to macOS Screen Recording settings (used from the permission-denied
+  // dialog and the save modal's "looks black?" hint).
+  const openScreenRecordingSettings = async () => {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("open_url", { url: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture" });
+    } catch { /* ignore */ }
+  };
+
   /** True when the webview supports browser screen capture (Windows WebView2,
    *  most Linux WebKitGTK, and any plain-browser dev preview). macOS WKWebView
    *  returns false → we fall back to native ffmpeg capture. */
@@ -1801,14 +1835,21 @@ export function RecordAppButton() {
         nativeTmpRef.current = "";
         if (tmp) { try { const { invoke } = await import("@tauri-apps/api/core"); await invoke("delete_file", { path: tmp }); } catch { /* ignore */ } }
         const perm = /denied|not authorized|permission|abort|Operation not permitted/i.test(stderrTail);
-        const msg = perm
-          ? "macOS hasn't granted this app Screen Recording permission yet, so the "
-            + "recording couldn't capture anything.\n\n"
-            + "Fix: System Settings → Privacy & Security → Screen Recording → enable "
-            + "the app, then fully quit and reopen it and try again."
-          : `Recording stopped unexpectedly.\n\n${stderrTail.slice(-400) || "No ffmpeg output."}`;
-        setRecError(perm ? "Screen Recording permission needed — see the dialog." : "Recording stopped unexpectedly.");
-        await alertDialog({ title: perm ? "Screen Recording permission needed" : "Recording failed", body: msg });
+        if (perm) {
+          setRecError("Screen Recording permission needed — see the dialog.");
+          const go = await confirmDialog({
+            title: "Screen Recording permission needed",
+            body: "macOS hasn't granted Screen Recording permission to the recorder, so it "
+              + "couldn't capture anything.\n\nEnable it in System Settings → Privacy & Security "
+              + "→ Screen Recording, then fully quit and reopen the app and try again.",
+            confirmLabel: "Open Settings",
+            cancelLabel: "Close",
+          });
+          if (go) await openScreenRecordingSettings();
+        } else {
+          setRecError("Recording stopped unexpectedly.");
+          await alertDialog({ title: "Recording failed", body: `Recording stopped unexpectedly.\n\n${stderrTail.slice(-400) || "No ffmpeg output."}` });
+        }
       });
       const child = await cmd.spawn();
       nativeChildRef.current = child as unknown as { write: (d: string) => Promise<void>; kill: () => Promise<void> };
@@ -1826,47 +1867,87 @@ export function RecordAppButton() {
     }
   };
 
-  const stopNative = async (save: boolean) => {
+  // Stop the native recorder and open the Save/Discard modal (instead of a bare
+  // save dialog). Kill is reliable; fragmented-mp4 output stays valid on a hard
+  // kill, so we don't depend on the "close" event or on ffmpeg reading "q".
+  const stopNativeToModal = async () => {
     const child = nativeChildRef.current;
     if (!child) return;
-    // Self-contained stop: kill ffmpeg, wait for the file to flush, then
-    // (optionally) prompt for a destination and relocate the temp clip. This
-    // does NOT depend on the process "close" event firing or on ffmpeg reading
-    // "q" from stdin — both proved unreliable. Fragmented-mp4 output stays
-    // valid on a hard kill.
+    const durationSec = recElapsed;
     nativeIntentionalStopRef.current = true;
-    setRecording(false);  // instant UI feedback
+    setRecording(false);  // instant UI feedback (also stops the timer)
     try { await child.kill(); } catch { /* ignore */ }
     nativeChildRef.current = null;
     // Let the OS flush + close the file handle before we touch the file.
     await new Promise((r) => setTimeout(r, 400));
+    nativeIntentionalStopRef.current = false;
     const tmp = nativeTmpRef.current;
     nativeTmpRef.current = "";
+    if (!tmp) return;
+    setSaveFormat("mp4");
+    setSaveModal({ tmp, durationSec });
+  };
+
+  // Transcode/remux the recorded temp clip to the chosen container/codec via the
+  // bundled ffmpeg. mp4/mov from our mp4 temp are a fast stream-copy; gif/webm
+  // re-encode. Throws on a non-zero ffmpeg exit.
+  const transcodeRecording = async (src: string, dest: string, fmt: string) => {
+    const { Command } = await import("@tauri-apps/plugin-shell");
+    let args: string[];
+    if (fmt === "mp4") args = ["-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dest];
+    else if (fmt === "mov") args = ["-y", "-i", src, "-c", "copy", dest];
+    else if (fmt === "webm") args = ["-y", "-i", src, "-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "32", "-row-mt", "1", dest];
+    else if (fmt === "gif") args = ["-y", "-i", src, "-vf", "fps=12,scale=720:-1:flags=lanczos", "-loop", "0", dest];
+    else args = ["-y", "-i", src, dest];
+    const out = await Command.sidecar("binaries/ffmpeg", args).execute();
+    if (out.code !== 0) throw new Error((out.stderr || "").slice(-300) || "ffmpeg conversion failed");
+  };
+
+  const discardRecording = async () => {
+    const m = saveModal;
+    setSaveModal(null);
+    if (!m) return;
+    try { const { invoke } = await import("@tauri-apps/api/core"); await invoke("delete_file", { path: m.tmp }); } catch { /* ignore */ }
+  };
+
+  const saveRecordingAs = async () => {
+    const m = saveModal;
+    if (!m) return;
+    const fmt = saveFormat;
+    const { save: saveDialog } = await import("@tauri-apps/plugin-dialog");
     const { invoke } = await import("@tauri-apps/api/core");
-    const cleanup = async () => { if (tmp) { try { await invoke("delete_file", { path: tmp }); } catch { /* ignore */ } } };
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const dest = await saveDialog({
+      defaultPath: `mpfig-recording-${stamp}.${fmt}`,
+      filters: [{ name: fmt.toUpperCase(), extensions: [fmt] }],
+    });
+    if (!dest) return;  // keep modal open so the user can pick again
+    setSaving(true);
     try {
-      if (!save) { await cleanup(); return; }
-      const { save: saveDialog } = await import("@tauri-apps/plugin-dialog");
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const dest = await saveDialog({
-        defaultPath: `mpfig-recording-${stamp}.mp4`,
-        filters: [{ name: "Video", extensions: ["mp4"] }],
-      });
-      if (!dest) { await cleanup(); return; }  // user cancelled — discard
-      await invoke("move_file", { src: tmp, dest });
-      await alertDialog({ title: "Recording saved", body: `Screen recording saved to ${dest}` });
+      try {
+        await transcodeRecording(m.tmp, dest, fmt);
+      } catch (convErr) {
+        // If conversion failed but the user wanted mp4, fall back to a plain
+        // move of the (already-mp4) temp so they don't lose the recording.
+        if (fmt === "mp4") await invoke("move_file", { src: m.tmp, dest });
+        else throw convErr;
+      }
+      try { await invoke("delete_file", { path: m.tmp }); } catch { /* ignore */ }
+      setSaveModal(null);
+      await alertDialog({ title: "Recording saved", body: `Saved to ${dest}` });
     } catch (err) {
-      await cleanup();
       await alertDialog({ title: "Couldn't save recording", body: err instanceof Error ? err.message : String(err) });
     } finally {
-      nativeIntentionalStopRef.current = false;
+      setSaving(false);
     }
   };
 
   // Dispatch to the web or native implementation.
   const startRecording = () => (canWebCapture() ? startWeb() : startNative());
-  const stopRecording = (save: boolean) =>
-    (mediaRecRef.current ? stopWeb(save) : nativeChildRef.current ? stopNative(save) : Promise.resolve());
+  // Click on the recording chip → stop. Native opens the Save/Discard modal;
+  // the web path keeps its existing save-on-stop flow.
+  const onStopClick = () =>
+    (mediaRecRef.current ? stopWeb(true) : nativeChildRef.current ? stopNativeToModal() : Promise.resolve());
 
   // If the host unmounts mid-recording, stop the stream / kill ffmpeg so the
   // OS recording indicator goes away.
@@ -1882,27 +1963,76 @@ export function RecordAppButton() {
 
   if (!visible) return null;
   return (
-    <Tooltip title={recording
-      ? "Stop & save recording"
-      : (recError || "Record the app window (asks the OS for screen-share permission, then saves to a file)")}>
-      <span>
-        <Button
-          variant={recording ? "contained" : "outlined"}
-          color={recording ? "error" : "primary"}
-          size="small"
-          onClick={recording ? () => stopRecording(true) : startRecording}
-          startIcon={
-            recording
-              ? <Box sx={{ width: 8, height: 8, borderRadius: "50%", bgcolor: "white",
-                          animation: "mpfig-rec-blink 1s linear infinite",
-                          "@keyframes mpfig-rec-blink": { "50%": { opacity: 0.3 } } }} />
-              : <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: "#e53935" }} />
-          }
-          sx={{ textTransform: "none" }}
-        >
-          {recording ? "Stop & save" : "Record app"}
-        </Button>
-      </span>
-    </Tooltip>
+    <>
+      <Tooltip title={recording
+        ? "Recording — click to stop"
+        : (recError || "Record the app window (asks the OS for screen-share permission, then saves to a file)")}>
+        <span>
+          <Button
+            variant={recording ? "contained" : "outlined"}
+            color={recording ? "error" : "primary"}
+            size="small"
+            onClick={recording ? onStopClick : startRecording}
+            startIcon={
+              recording
+                ? <Box sx={{ width: 9, height: 9, borderRadius: "50%", bgcolor: "white",
+                            animation: "mpfig-rec-blink 1s linear infinite",
+                            "@keyframes mpfig-rec-blink": { "50%": { opacity: 0.25 } } }} />
+                : <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: "#e53935" }} />
+            }
+            sx={{ textTransform: "none", fontVariantNumeric: "tabular-nums", minWidth: recording ? 86 : undefined }}
+          >
+            {recording ? `Rec ${fmtDuration(recElapsed)}` : "Record app"}
+          </Button>
+        </span>
+      </Tooltip>
+
+      {/* Save / Discard modal shown after a native recording stops. */}
+      <Dialog open={!!saveModal} onClose={() => { /* require an explicit Discard/Save choice */ }} maxWidth="xs" fullWidth>
+        <DialogTitle sx={{ pb: 0.5 }}>Recording finished</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" sx={{ color: "text.secondary", mb: 2 }}>
+            Captured {saveModal ? fmtDuration(saveModal.durationSec) : "0:00"}. Choose a format and save it, or discard it.
+          </Typography>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1 }}>
+            <Typography variant="body2" sx={{ width: 60 }}>Format</Typography>
+            <Select
+              size="small"
+              value={saveFormat}
+              disabled={saving}
+              onChange={(e) => setSaveFormat(e.target.value as typeof saveFormat)}
+              sx={{ flex: 1 }}
+            >
+              <MenuItem value="mp4">MP4 (H.264) — best for video</MenuItem>
+              <MenuItem value="mov">MOV (H.264) — QuickTime</MenuItem>
+              <MenuItem value="webm">WebM (VP9) — web embed</MenuItem>
+              <MenuItem value="gif">Animated GIF — slides/docs</MenuItem>
+            </Select>
+          </Box>
+          {(saveFormat === "webm" || saveFormat === "gif") && (
+            <Typography variant="caption" sx={{ color: "text.secondary", display: "block" }}>
+              {saveFormat === "gif" ? "GIF is re-encoded at 12 fps / 720px wide." : "WebM is re-encoded with VP9 — this can take a while for long clips."}
+            </Typography>
+          )}
+          <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mt: 1.5 }}>
+            Recording looks black?{" "}
+            <Box component="span" onClick={() => void openScreenRecordingSettings()}
+              sx={{ color: "primary.main", cursor: "pointer", textDecoration: "underline" }}>
+              Grant Screen Recording permission
+            </Box>{" "}then record again.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button color="error" disabled={saving} onClick={() => void discardRecording()} sx={{ textTransform: "none" }}>
+            Discard
+          </Button>
+          <Button variant="contained" disabled={saving} onClick={() => void saveRecordingAs()}
+            startIcon={saving ? <CircularProgress size={14} /> : <SaveIcon sx={{ fontSize: 16 }} />}
+            sx={{ textTransform: "none" }}>
+            {saving ? "Saving…" : "Save As…"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </>
   );
 }

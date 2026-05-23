@@ -201,6 +201,28 @@ async fn delete_file(path: String) -> Result<(), String> {
     }
 }
 
+/// Open a URL / URI scheme with the OS default handler. Used to jump the user
+/// straight to macOS System Settings → Privacy & Security → Screen Recording
+/// (x-apple.systempreferences:…) when a screen recording fails for permission.
+#[tauri::command]
+async fn open_url(url: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(&url).spawn().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        std::process::Command::new("xdg-open").arg(&url).spawn().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
 #[tauri::command]
 async fn fetch_url(url: String) -> Result<String, String> {
     let client = reqwest::Client::new();
@@ -473,7 +495,7 @@ pub fn run() {
       app.manage(SidecarChild(sidecar_child));
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, save_base64_to_path, move_file, delete_file, download_and_install_update, kill_sidecar])
+    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, save_base64_to_path, move_file, delete_file, open_url, download_and_install_update, kill_sidecar])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {
