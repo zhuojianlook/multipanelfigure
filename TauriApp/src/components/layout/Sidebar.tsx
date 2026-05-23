@@ -871,13 +871,6 @@ function BuilderSidebar() {
 
   return (
     <Box sx={{ display: "flex", flexDirection: "column", pb: 2 }}>
-      {/* App title */}
-      <Box sx={{ px: 1.5, py: 1.5, borderBottom: 1, borderColor: "divider" }}>
-        <Typography variant="subtitle2" fontWeight={600}>
-          Multi-Panel Figure
-        </Typography>
-      </Box>
-
       {/* ── GRID ──────────────────────────────────────── */}
       <SectionTitle>Grid</SectionTitle>
 

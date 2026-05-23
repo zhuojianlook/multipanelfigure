@@ -3368,16 +3368,18 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 <Tabs value={tabIdx} onChange={(_, v) => setTabIdx(v)} variant="scrollable" scrollButtons="auto">
                   {isVid && <Tab label="Play & Seek" value={0} />}
                   {!isVid && isZStackPanel && <Tab label="Z-Stack Slice" value={0} />}
+                  {/* Channels tab — per-channel colours for multichannel TIFFs
+                      and a colorize control for single-channel images. Shown
+                      first (right after any frame/z-stack tab, before
+                      Crop/Resize) so it's as discoverable as the Z-Stack tab.
+                      Z-stacks already show channels inside their Z-Stack tab. */}
+                  {!!local?.image_name && !isZStackPanel && !isVid && <Tab label="Channels" value={TAB_CHANNELS} />}
                   {/* Crop/Resize is omitted for adjacent-zoom target panels
                       — they have no source image of their own. The other
                       tabs use explicit `value` props so their routing
                       stays pinned to TAB_ADJ … TAB_ZOOM regardless. */}
                   {!isZoomTarget && <Tab label="Crop/Resize" value={TAB_CROP} />}
                   <Tab label="Adjustments" value={TAB_ADJ} />
-                  {/* Channels tab — per-channel colours for multichannel TIFFs
-                      and a colorize control for single-channel images. Z-stacks
-                      already show channels in their Z-Stack tab. */}
-                  {!!local?.image_name && !isZStackPanel && <Tab label="Channels" value={TAB_CHANNELS} />}
                   <Tab label="Labels" value={TAB_LABELS} />
                   <Tab label="Scale Bar" value={TAB_SCALE} />
                   <Tab label="Annotations" value={TAB_ANNOT} />
@@ -4112,6 +4114,11 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 panelRow={row}
                 panelCol={col}
                 onChange={() => {
+                  // Refresh the DIALOG's own preview (this is what the user is
+                  // looking at) — without this, toggling a channel updated the
+                  // figure behind the dialog but the editor preview looked
+                  // unchanged. Also nudge the figure + grid thumbnail.
+                  refreshPreview();
                   try { useFigureStore.getState().requestPreview(); } catch { /* ignore */ }
                   try { useFigureStore.getState().refreshPanelThumbnail(row, col); } catch { /* ignore */ }
                 }}
