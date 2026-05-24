@@ -1772,6 +1772,7 @@ export function RecordAppButton() {
   const beginRecorder = async (
     cmd: { stderr: { on: (e: string, cb: (l: string) => void) => void }; on: (e: string, cb: (a: string) => void) => void; spawn: () => Promise<unknown> },
     path: string,
+    opts?: { onEarlyFail?: () => Promise<void> },
   ) => {
     let stderrTail = "";
     nativeStderrRef.current = "";
@@ -1782,16 +1783,26 @@ export function RecordAppButton() {
       setRecError(`recorder failed to start: ${err}`);
     });
     cmd.on("close", async () => {
-      nativeChildRef.current = null;
-      setRecording(false);
       // An intentional Stop is finalized by stopNativeToModal. Don't double-handle.
       if (nativeIntentionalStopRef.current) return;
-      // Otherwise the recorder exited on its own — usually missing macOS Screen
-      // Recording permission. Surface a clear dialog and discard the temp file.
+      // The SCK helper prints "RECORDING" once capture is actually live. If a
+      // backend exits BEFORE that for a non-permission reason (e.g. the SCK
+      // CoreGraphics init crash on some setups), silently fall back to the next
+      // backend (ffmpeg) instead of failing the whole recording.
+      const started = stderrTail.includes("RECORDING");
+      const perm = /denied|not authorized|permission|abort|Operation not permitted|TCC/i.test(stderrTail);
+      if (opts?.onEarlyFail && !started && !perm) {
+        console.warn("[record] primary backend exited before capture, falling back:", stderrTail.slice(-200));
+        try { await opts.onEarlyFail(); }
+        catch (e) { nativeChildRef.current = null; setRecording(false); await alertDialog({ title: "Recording failed", body: e instanceof Error ? e.message : String(e) }); }
+        return;
+      }
+      nativeChildRef.current = null;
+      setRecording(false);
+      // Discard the (empty/partial) temp file.
       const tmp = nativeTmpRef.current;
       nativeTmpRef.current = "";
       if (tmp) { try { const { invoke } = await import("@tauri-apps/api/core"); await invoke("delete_file", { path: tmp }); } catch { /* ignore */ } }
-      const perm = /denied|not authorized|permission|abort|Operation not permitted|TCC/i.test(stderrTail);
       if (perm) {
         setRecError("Screen Recording permission needed — see the dialog.");
         const go = await confirmDialog({
@@ -1831,10 +1842,48 @@ export function RecordAppButton() {
       const path = await join(await tempDir(), `mpfig-recording-${stamp}.mp4`);
       const { Command } = await import("@tauri-apps/plugin-shell");
 
-      // 1) Preferred: the ScreenCaptureKit helper (macOS 14+). It captures the
-      //    APP WINDOW directly (not the whole screen) and follows it if moved —
-      //    far more robust than cropping a full-display grab. We pass our own
-      //    PID so it picks this app's window.
+      // ffmpeg fallback: avfoundation can only grab a whole display, so capture
+      // the display the window is on and CROP to the window's bounds (physical
+      // px relative to the captured monitor). Used when the SCK helper isn't
+      // available OR fails before capture starts.
+      const startFfmpeg = async () => {
+        const idx = await pickScreenDeviceIndex(await listScreenDeviceIndices());
+        let cropFilter: string | null = null;
+        try {
+          const { getCurrentWindow, currentMonitor } = await import("@tauri-apps/api/window");
+          const win = getCurrentWindow();
+          const [pos, size, mon] = await Promise.all([win.outerPosition(), win.outerSize(), currentMonitor()]);
+          if (mon && size.width > 0 && size.height > 0) {
+            const capW = mon.size.width, capH = mon.size.height;
+            let cx = pos.x - mon.position.x;
+            let cy = pos.y - mon.position.y;
+            cx = Math.max(0, Math.min(cx, capW - 2));
+            cy = Math.max(0, Math.min(cy, capH - 2));
+            let cw = Math.min(size.width, capW - cx);
+            let ch = Math.min(size.height, capH - cy);
+            cw -= cw % 2; ch -= ch % 2;
+            if (cw >= 2 && ch >= 2 && (cw < capW || ch < capH)) cropFilter = `crop=${cw}:${ch}:${cx}:${cy}`;
+          }
+        } catch { /* geometry unavailable → full-screen capture */ }
+        const cmd = Command.sidecar("binaries/ffmpeg", [
+          "-hide_banner", "-y",
+          "-f", "avfoundation", "-capture_cursor", "1", "-framerate", "30",
+          "-i", `${idx}:none`,
+          ...(cropFilter ? ["-vf", cropFilter] : []),
+          // CFR resample — avfoundation's erratic timestamps otherwise yield a
+          // "1000k fps / 0 duration" file that plays as a single frame.
+          "-fps_mode", "cfr", "-r", "30",
+          "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+          "-g", "60",
+          "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+          path,
+        ]);
+        await beginRecorder(cmd as never, path);
+      };
+
+      // Preferred: the ScreenCaptureKit helper (macOS 14+). Captures just the
+      // APP WINDOW and follows it. If it can't spawn (missing / macOS < 14) or
+      // exits before capture starts, fall back to ffmpeg automatically.
       try {
         const { invoke } = await import("@tauri-apps/api/core");
         const pid = await invoke<number>("app_pid");
@@ -1844,50 +1893,12 @@ export function RecordAppButton() {
           "--fps", "30",
           "--title", "Multi-Panel Figure Builder",
         ]);
-        await beginRecorder(sck as never, path);
+        await beginRecorder(sck as never, path, { onEarlyFail: startFfmpeg });
         return;
       } catch (sckErr) {
-        // Helper not bundled / can't spawn (e.g. macOS < 14) → fall back to ffmpeg.
-        console.warn("[record] ScreenCaptureKit helper unavailable, falling back to ffmpeg:", sckErr);
+        console.warn("[record] ScreenCaptureKit helper couldn't spawn, falling back to ffmpeg:", sckErr);
       }
-
-      // 2) Fallback: avfoundation can only grab a whole display, so capture the
-      //    display the window is on (pickScreenDeviceIndex) and CROP to the
-      //    window's bounds (physical px relative to the captured monitor).
-      const idx = await pickScreenDeviceIndex(await listScreenDeviceIndices());
-      let cropFilter: string | null = null;
-      try {
-        const { getCurrentWindow, currentMonitor } = await import("@tauri-apps/api/window");
-        const win = getCurrentWindow();
-        const [pos, size, mon] = await Promise.all([win.outerPosition(), win.outerSize(), currentMonitor()]);
-        if (mon && size.width > 0 && size.height > 0) {
-          const capW = mon.size.width, capH = mon.size.height;
-          let cx = pos.x - mon.position.x;
-          let cy = pos.y - mon.position.y;
-          cx = Math.max(0, Math.min(cx, capW - 2));
-          cy = Math.max(0, Math.min(cy, capH - 2));
-          let cw = Math.min(size.width, capW - cx);
-          let ch = Math.min(size.height, capH - cy);
-          cw -= cw % 2; ch -= ch % 2;
-          if (cw >= 2 && ch >= 2 && (cw < capW || ch < capH)) {
-            cropFilter = `crop=${cw}:${ch}:${cx}:${cy}`;
-          }
-        }
-      } catch { /* geometry unavailable → fall back to full-screen capture */ }
-      const cmd = Command.sidecar("binaries/ffmpeg", [
-        "-hide_banner", "-y",
-        "-f", "avfoundation", "-capture_cursor", "1", "-framerate", "30",
-        "-i", `${idx}:none`,
-        ...(cropFilter ? ["-vf", cropFilter] : []),
-        // CFR resample — avfoundation's erratic timestamps otherwise yield a
-        // "1000k fps / 0 duration" file that plays as a single frame.
-        "-fps_mode", "cfr", "-r", "30",
-        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-        "-g", "60",
-        "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
-        path,
-      ]);
-      await beginRecorder(cmd as never, path);
+      await startFfmpeg();
     } catch (e) {
       setRecording(false);
       const msg = e instanceof Error ? e.message : String(e);

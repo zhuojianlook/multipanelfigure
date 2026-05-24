@@ -20,6 +20,7 @@
 //  Requires macOS 14+ (SCContentFilter.pointPixelScale / contentRect).
 //  On older macOS the app falls back to the ffmpeg path.
 import Foundation
+import AppKit
 import ScreenCaptureKit
 import AVFoundation
 import CoreMedia
@@ -157,6 +158,14 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
 let rec = Recorder(outURL: URL(fileURLWithPath: outPath), fps: fps)
 
+// ScreenCaptureKit (and the CoreGraphics it relies on) need a connection to the
+// WindowServer. A bare CLI tool doesn't establish one automatically and crashes
+// with: Assertion failed: (did_initialize) … CGS_REQUIRE_INIT … CGInitialization.c.
+// Bringing up a headless (dock-less, menu-bar-less) NSApplication initializes
+// CoreGraphics so SCK can run from this helper.
+let nsApp = NSApplication.shared
+nsApp.setActivationPolicy(.accessory)
+
 // Graceful stop on SIGINT / SIGTERM: ignore the default action and route
 // to a dispatch source so we can finalize the mp4 before exiting.
 signal(SIGINT, SIG_IGN)
@@ -168,5 +177,7 @@ let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
 sigterm.setEventHandler { rec.stop() }
 sigterm.resume()
 
-rec.start(pid: targetPid, titleHint: titleHint)
-RunLoop.main.run()
+// Start capture once the run loop is up, then run the AppKit main loop (which
+// services the SCK completion handlers + the signal dispatch sources).
+DispatchQueue.main.async { rec.start(pid: targetPid, titleHint: titleHint) }
+nsApp.run()
