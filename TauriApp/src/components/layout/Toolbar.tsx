@@ -1084,7 +1084,12 @@ export function Toolbar() {
   return (
     <Box
       sx={{
-        display: "flex",
+        // Hidden (but still MOUNTED) in Analysis mode so the About dialog
+        // below — opened via the "mpfig:open-about" window event from the
+        // always-visible Help menu — keeps working there.  The Dialog
+        // portals to document.body, so display:none on this bar doesn't
+        // hide the dialog; it only collapses the toolbar's own buttons.
+        display: mode === "analysis" ? "none" : "flex",
         alignItems: "center",
         gap: 1.5,
         px: 1.5,
@@ -1770,16 +1775,42 @@ export function RecordAppButton() {
       const { tempDir, join } = await import("@tauri-apps/api/path");
       const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
       const path = await join(await tempDir(), `mpfig-recording-${stamp}.mp4`);
-      // Capture the FULL display the window is on (no crop). Per-window cropping
-      // was unreliable across multiple monitors — avfoundation grabs a whole
-      // display, and the window's coordinates only line up if we capture the
-      // SAME display the window is on, which pickScreenDeviceIndex resolves.
+      // avfoundation can only grab a whole display, so we capture the SAME
+      // display the window is on (pickScreenDeviceIndex) and then CROP to the
+      // app window's bounds with an ffmpeg filter — that records just the app,
+      // not the whole screen.  Coords are computed in PHYSICAL pixels (Tauri's
+      // outerPosition/outerSize are already physical, matching avfoundation's
+      // native capture resolution) relative to the captured monitor's origin.
       const idx = await pickScreenDeviceIndex(await listScreenDeviceIndices());
+      let cropFilter: string | null = null;
+      try {
+        const { getCurrentWindow, currentMonitor } = await import("@tauri-apps/api/window");
+        const win = getCurrentWindow();
+        const [pos, size, mon] = await Promise.all([win.outerPosition(), win.outerSize(), currentMonitor()]);
+        if (mon && size.width > 0 && size.height > 0) {
+          const capW = mon.size.width, capH = mon.size.height;
+          let cx = pos.x - mon.position.x;
+          let cy = pos.y - mon.position.y;
+          // Clamp the rect inside the captured frame; libx264 + yuv420p needs
+          // even width/height, so round the extents down to even numbers.
+          cx = Math.max(0, Math.min(cx, capW - 2));
+          cy = Math.max(0, Math.min(cy, capH - 2));
+          let cw = Math.min(size.width, capW - cx);
+          let ch = Math.min(size.height, capH - cy);
+          cw -= cw % 2; ch -= ch % 2;
+          if (cw >= 2 && ch >= 2 && (cw < capW || ch < capH)) {
+            cropFilter = `crop=${cw}:${ch}:${cx}:${cy}`;
+          }
+        }
+      } catch { /* geometry unavailable → fall back to full-screen capture */ }
       const { Command } = await import("@tauri-apps/plugin-shell");
       const cmd = Command.sidecar("binaries/ffmpeg", [
         "-hide_banner", "-y",
         "-f", "avfoundation", "-capture_cursor", "1", "-framerate", "30",
         "-i", `${idx}:none`,
+        // Crop to the app window (omitted → whole display) BEFORE the CFR
+        // resample so the filter graph stays simple.
+        ...(cropFilter ? ["-vf", cropFilter] : []),
         // Force constant 30fps output. avfoundation delivers frames with erratic
         // timestamps that otherwise yield a "1000k fps / 0 duration" file that
         // plays as a single frame. CFR resampling fixes the duration + playback.
@@ -1817,8 +1848,14 @@ export function RecordAppButton() {
           const go = await confirmDialog({
             title: "Screen Recording permission needed",
             body: "macOS hasn't granted Screen Recording permission to the recorder, so it "
-              + "couldn't capture anything.\n\nEnable it in System Settings → Privacy & Security "
-              + "→ Screen Recording, then fully quit and reopen the app and try again.",
+              + "couldn't capture anything.\n\n"
+              + "If you JUST UPDATED the app, the previous permission can go stale (this "
+              + "build is self-signed without an Apple Team ID, so macOS doesn't always "
+              + "carry the grant across versions). The reliable fix:\n\n"
+              + "1. Open System Settings → Privacy & Security → Screen Recording.\n"
+              + "2. REMOVE any existing “Multi-Panel Figure Builder” entry (select it, click –).\n"
+              + "3. Fully quit the app (⌘Q) and reopen it.\n"
+              + "4. Click Record again and grant permission when prompted.",
             confirmLabel: "Open Settings",
             cancelLabel: "Close",
           });

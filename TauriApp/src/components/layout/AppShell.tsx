@@ -317,9 +317,11 @@ export function AppShell() {
 
         {/* ── Center area ─────────────────────────────────── */}
         <main className="flex flex-1 flex-col min-w-0 min-h-0">
-          {/* Toolbar — builder/collage actions only; hidden in Analysis,
-              which has its own toolbar. */}
-          {mode !== "analysis" && <Toolbar />}
+          {/* Toolbar — builder/collage actions. Always MOUNTED (it hides its
+              own bar via display:none in Analysis mode) so the About dialog it
+              hosts stays reachable from the always-visible Help menu in every
+              mode; the Analysis workspace provides its own toolbar separately. */}
+          <Toolbar />
 
           {/* Mode-specific body. Builder = image strip + grid|preview split.
               Collage = single-pane CollageView. Analysis = node-graph. */}
