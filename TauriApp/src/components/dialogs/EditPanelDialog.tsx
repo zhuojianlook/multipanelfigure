@@ -705,10 +705,23 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
     // Right
     ctx.fillRect(rx + rw, ry, canvasW - rx - rw, rh);
 
-    // Crop rectangle border
+    // Crop rectangle border. strokeRect centers the line on the path, so when
+    // an edge sits exactly on the canvas boundary (e.g. a full-height/width
+    // crop) half the 2px stroke falls outside the canvas and gets clipped —
+    // the bottom/right line then looks thinner / cut off. Inset the stroke path
+    // by half the line width on any edge that touches the boundary so the whole
+    // border stays visible.
     ctx.strokeStyle = "#2196f3";
     ctx.lineWidth = 2;
-    ctx.strokeRect(rx, ry, rw, rh);
+    {
+      const half = 1; // lineWidth / 2
+      let sx = rx, sy = ry, sw = rw, sh = rh;
+      if (sx < half) { sw -= half - sx; sx = half; }
+      if (sy < half) { sh -= half - sy; sy = half; }
+      if (sx + sw > canvasW - half) sw = canvasW - half - sx;
+      if (sy + sh > canvasH - half) sh = canvasH - half - sy;
+      ctx.strokeRect(sx, sy, Math.max(0, sw), Math.max(0, sh));
+    }
 
     // Corner handles (4 corners)
     ctx.fillStyle = "#2196f3";

@@ -129,54 +129,77 @@ mpfig_data(rows, name="band_iod")
 }
 
 // ── Auto-detect lanes from a grayscale intensity profile ──────
-// Western-blot lanes run vertically (one sample per column), so we
-// sum inverted intensity DOWN each column to get a 1-D profile,
-// smooth it, and pick peaks as lane centres.  ROIs are placed at
-// each peak spanning a generous vertical band the user then nudges.
-function autoDetectLanes(gray: Float32Array, w: number, h: number): BandRoi[] {
-  // Column profile of inverted intensity (bright = signal).
-  const prof = new Float32Array(w);
-  for (let x = 0; x < w; x++) {
-    let s = 0;
-    for (let y = 0; y < h; y++) s += 255 - gray[y * w + x];
-    prof[x] = s / h;
-  }
-  // Smooth with a moving average (~2% of width, min 3px).
-  const k = Math.max(3, Math.round(w * 0.02));
-  const sm = new Float32Array(w);
-  for (let x = 0; x < w; x++) {
+// Western-blot lanes run vertically (one sample per column). We:
+//   1. Decide polarity — dark bands on a light membrane (colorimetric)
+//      vs light bands on a dark background (chemiluminescence/fluor) —
+//      from the image median, so "signal" is always bright.
+//   2. Build a column profile of mean signal, smooth it, and pick the
+//      contiguous runs above a baseline-relative threshold as lanes.
+//   3. For EACH lane, build a row profile within that lane's columns
+//      and tighten the ROI to the band's actual vertical extent
+//      (largest contiguous run), instead of a generic full-height box.
+function smooth1d(arr: Float32Array, k: number): Float32Array {
+  const out = new Float32Array(arr.length);
+  for (let i = 0; i < arr.length; i++) {
     let s = 0, n = 0;
-    for (let j = -k; j <= k; j++) {
-      const xi = x + j;
-      if (xi >= 0 && xi < w) { s += prof[xi]; n++; }
-    }
-    sm[x] = s / n;
+    for (let j = -k; j <= k; j++) { const ii = i + j; if (ii >= 0 && ii < arr.length) { s += arr[ii]; n++; } }
+    out[i] = s / n;
   }
-  // Threshold = mean + 0.5σ over the smoothed profile.
-  let mean = 0; for (let x = 0; x < w; x++) mean += sm[x]; mean /= w;
-  let varr = 0; for (let x = 0; x < w; x++) varr += (sm[x] - mean) ** 2; varr /= w;
-  const std = Math.sqrt(varr);
-  const thr = mean + 0.5 * std;
-  // Find contiguous runs above threshold; each run = one lane.
-  const lanes: BandRoi[] = [];
+  return out;
+}
+/** Contiguous runs where val > thr, each at least minLen long. */
+function runsAbove(arr: Float32Array, thr: number, minLen: number): Array<[number, number]> {
+  const runs: Array<[number, number]> = [];
   let i = 0;
-  while (i < w) {
-    if (sm[i] > thr) {
-      const start = i;
-      while (i < w && sm[i] > thr) i++;
-      const end = i;          // exclusive
-      const width = end - start;
-      if (width >= Math.max(2, w * 0.015)) {
-        // Pad each lane slightly and span 80% of the height (user adjusts).
-        const pad = width * 0.1;
-        const x0 = clamp01((start - pad) / w);
-        const x1 = clamp01((end + pad) / w);
-        lanes.push({
-          id: uid(), x: x0, y: 0.1, w: x1 - x0, h: 0.8,
-          label: `Lane ${lanes.length + 1}`, isReference: lanes.length === 0,
-        });
-      }
-    } else i++;
+  while (i < arr.length) {
+    if (arr[i] > thr) { const s = i; while (i < arr.length && arr[i] > thr) i++; if (i - s >= minLen) runs.push([s, i]); }
+    else i++;
+  }
+  return runs;
+}
+function autoDetectLanes(gray: Float32Array, w: number, h: number): BandRoi[] {
+  if (w < 4 || h < 4) return [];
+  // 1) Polarity from the median (sampled for speed).
+  const step = Math.max(1, Math.floor((w * h) / 20000));
+  const samp: number[] = [];
+  for (let i = 0; i < gray.length; i += step) samp.push(gray[i]);
+  samp.sort((a, b) => a - b);
+  const median = samp[Math.floor(samp.length / 2)] ?? 128;
+  const darkOnLight = median >= 128;
+  const sig = (v: number) => (darkOnLight ? 255 - v : v); // bands → bright
+
+  // 2) Column profile → lane x-segments.
+  const col = new Float32Array(w);
+  for (let x = 0; x < w; x++) { let s = 0; for (let y = 0; y < h; y++) s += sig(gray[y * w + x]); col[x] = s / h; }
+  const colS = smooth1d(col, Math.max(2, Math.round(w * 0.01)));
+  let cmin = Infinity, cmax = -Infinity;
+  for (const v of colS) { if (v < cmin) cmin = v; if (v > cmax) cmax = v; }
+  if (cmax - cmin < 1e-3) return [];
+  const cThr = cmin + 0.22 * (cmax - cmin);
+  const xRuns = runsAbove(colS, cThr, Math.max(3, Math.round(w * 0.012)));
+
+  // 3) Per-lane band y-extent.
+  const lanes: BandRoi[] = [];
+  for (const [x0, x1] of xRuns) {
+    const row = new Float32Array(h);
+    for (let y = 0; y < h; y++) { let s = 0; for (let x = x0; x < x1; x++) s += sig(gray[y * w + x]); row[y] = s / (x1 - x0); }
+    const rowS = smooth1d(row, Math.max(2, Math.round(h * 0.01)));
+    let rmin = Infinity, rmax = -Infinity;
+    for (const v of rowS) { if (v < rmin) rmin = v; if (v > rmax) rmax = v; }
+    const rThr = rmin + 0.4 * (rmax - rmin);
+    const yRuns = runsAbove(rowS, rThr, Math.max(2, Math.round(h * 0.02)));
+    // Pick the strongest band (largest integrated signal over the run).
+    let best: [number, number] | null = null, bestScore = -1;
+    for (const [s, e] of yRuns) { let sum = 0; for (let y = s; y < e; y++) sum += rowS[y] - rThr; if (sum > bestScore) { bestScore = sum; best = [s, e]; } }
+    let y0: number, y1: number;
+    if (best) { const padY = (best[1] - best[0]) * 0.3; y0 = Math.max(0, best[0] - padY); y1 = Math.min(h, best[1] + padY); }
+    else { y0 = h * 0.1; y1 = h * 0.9; }
+    const padX = (x1 - x0) * 0.06;
+    const nx0 = clamp01((x0 - padX) / w), nx1 = clamp01((x1 + padX) / w);
+    lanes.push({
+      id: uid(), x: nx0, y: clamp01(y0 / h), w: nx1 - nx0, h: clamp01((y1 - y0) / h),
+      label: `Lane ${lanes.length + 1}`, isReference: lanes.length === 0,
+    });
   }
   return lanes;
 }

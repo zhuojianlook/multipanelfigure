@@ -33,7 +33,11 @@ import {
   applyEdgeChanges,
   type NodeChange,
   type EdgeChange,
+  type EdgeProps,
   useUpdateNodeInternals,
+  BaseEdge,
+  EdgeLabelRenderer,
+  getBezierPath,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import {
@@ -769,6 +773,8 @@ interface GraphCallbacks {
   addSourceToNode: (nodeId: string, sourceKey: string) => void;
   /** Detach an inset (by index) from a SourceNode's list. */
   removeSourceFromNode: (nodeId: string, idx: number) => void;
+  /** Delete a connecting edge by id (used by the edge's hover × button). */
+  removeEdge: (edgeId: string) => void;
   /** Open the output drawer focused on this output + briefly flash it. */
   navigateToOutput: (nodeId: string, outputId: string, kind: DataKind) => void;
   /** Open the large-preview modal for an output. */
@@ -1321,6 +1327,49 @@ const nodeTypes = {
   imagej: ProcessNode,
   cellpose: ProcessNode,
 };
+
+// Custom edge with an always-visible × button at its midpoint, so removing a
+// connection is discoverable (clicking the thin line + Backspace was the only
+// way before).  A wide transparent hit-path also makes the edge itself easy to
+// click/select.  Deletion goes through the graph callback so the parent's
+// controlled edge state stays authoritative.
+function DeletableEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, style, markerEnd, selected }: EdgeProps) {
+  const cbs = useGraphCallbacks();
+  const [edgePath, labelX, labelY] = getBezierPath({
+    sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition,
+  });
+  return (
+    <>
+      <BaseEdge id={id} path={edgePath} style={style} markerEnd={markerEnd} />
+      {/* Wide invisible hit area for easy selection of an otherwise-thin line. */}
+      <path d={edgePath} fill="none" stroke="transparent" strokeWidth={18} style={{ cursor: "pointer" }} />
+      <EdgeLabelRenderer>
+        <button
+          className="nodrag nopan"
+          title="Remove this connection"
+          onClick={(e) => { e.stopPropagation(); cbs?.removeEdge(id); }}
+          style={{
+            position: "absolute",
+            transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
+            pointerEvents: "all",
+            width: 16, height: 16, lineHeight: "13px", padding: 0,
+            borderRadius: "50%",
+            border: "1px solid rgba(255,255,255,0.6)",
+            background: selected ? "#e53935" : "rgba(40,44,52,0.85)",
+            color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            boxShadow: "0 1px 3px rgba(0,0,0,0.4)",
+          }}
+          onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "#e53935"; }}
+          onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = selected ? "#e53935" : "rgba(40,44,52,0.85)"; }}
+        >
+          ×
+        </button>
+      </EdgeLabelRenderer>
+    </>
+  );
+}
+const edgeTypes = { deletable: DeletableEdge };
 
 // ── Per-engine code preset registries ───────────────────────
 // Each engine ships a small library of ready-to-run snippets the
@@ -2304,7 +2353,7 @@ function buildCornealHazeWorkflow(): SavedWorkflow {
     id: `e_${sId}_${sH}__${tId}_${tH}`,
     source: sId, sourceHandle: sH,
     target: tId, targetHandle: tH,
-    type: "default",
+    type: "deletable",
     animated: false,
     style: { stroke: PORT_COLOR[kind], strokeWidth: 2 },
   });
@@ -2427,7 +2476,7 @@ function buildIntensityWorkflow(): SavedWorkflow {
   ];
   const mkEdge = (s: string, sh: string, t: string, th: string, k: DataKind): Edge => ({
     id: `e_${s}_${sh}__${t}_${th}`, source: s, sourceHandle: sh,
-    target: t, targetHandle: th, type: "default", animated: false,
+    target: t, targetHandle: th, type: "deletable", animated: false,
     style: { stroke: PORT_COLOR[k], strokeWidth: 2 },
   });
   return {
@@ -2536,7 +2585,7 @@ function buildWesternBlotWorkflow(): SavedWorkflow {
   ];
   const mkEdge = (s: string, sh: string, t: string, th: string, k: DataKind): Edge => ({
     id: `e_${s}_${sh}__${t}_${th}`, source: s, sourceHandle: sh,
-    target: t, targetHandle: th, type: "default", animated: false,
+    target: t, targetHandle: th, type: "deletable", animated: false,
     style: { stroke: PORT_COLOR[k], strokeWidth: 2 },
   });
   return {
@@ -2897,7 +2946,7 @@ function buildCellCharacteristicsWorkflow(): SavedWorkflow {
   ];
   const mkEdge = (s: string, sh: string, t: string, th: string, k: DataKind): Edge => ({
     id: `e_${s}_${sh}__${t}_${th}`, source: s, sourceHandle: sh,
-    target: t, targetHandle: th, type: "default", animated: false,
+    target: t, targetHandle: th, type: "deletable", animated: false,
     style: { stroke: PORT_COLOR[k], strokeWidth: 2 },
   });
   return {
@@ -2971,10 +3020,15 @@ function loadWorkflowSession(): WorkflowSession | null {
     const parsed = JSON.parse(raw) as Partial<WorkflowSession>;
     if (!parsed || !Array.isArray(parsed.tabs) || parsed.tabs.length === 0) return null;
     // Light shape validation.
-    const tabs = parsed.tabs.filter((t) =>
+    const tabs = (parsed.tabs.filter((t) =>
       t && typeof t.id === "string" && typeof t.name === "string" &&
       Array.isArray(t.nodes) && Array.isArray(t.edges),
-    ) as WorkflowTab[];
+    ) as WorkflowTab[]).map((t) => ({
+      // Upgrade pre-existing edges to the custom "deletable" type so their
+      // × remove button + wide hit area appear after this version too.
+      ...t,
+      edges: t.edges.map((e) => ({ ...e, type: "deletable" })),
+    }));
     if (tabs.length === 0) return null;
     return { tabs, activeId: typeof parsed.activeId === "string" ? parsed.activeId : tabs[0].id };
   } catch { return null; }
@@ -3511,11 +3565,22 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     const kind: DataKind = srcHandle.includes("image") ? "image" : "table";
     setEdges((eds) => addEdge({
       ...connection,
-      type: "default",
+      type: "deletable",
       animated: false,
       style: { stroke: PORT_COLOR[kind], strokeWidth: 2 },
     }, eds));
   }, [isValidConnection]);
+
+  // Delete a single connection (the edge's × button). Edge removal doesn't
+  // change any handle set, so no handleRev bump is needed.
+  const removeEdge = useCallback((edgeId: string) => {
+    setEdges((eds) => eds.filter((e) => e.id !== edgeId));
+    setRfSelection((prev) => {
+      if (!prev.edgeIds.has(edgeId)) return prev;
+      const next = new Set(prev.edgeIds); next.delete(edgeId);
+      return { nodeIds: prev.nodeIds, edgeIds: next };
+    });
+  }, [setEdges]);
 
   // ── Add a new node ─────────────────────────────────────────
 
@@ -3992,6 +4057,16 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   const runNode = useCallback(async (node: Node<NodeData>, nodeMap: Map<string, Node<NodeData>>) => {
     const engine = node.data.kind as EngineKind;
     if (engine !== "python" && engine !== "matlab" && engine !== "r" && engine !== "imagej" && engine !== "cellpose") return;
+    // Interactive band-picker with no lanes defined yet → open the "Pick bands…"
+    // editor FIRST rather than running and hitting a "No lanes defined" error.
+    // (Works for both a single-node run and a full "Run graph".)
+    if (node.data.interactive === "wb_bands" && (!node.data.roi || (node.data.roi.lanes?.length ?? 0) === 0)) {
+      consoleRef.current += `\n=== ${node.data.label}: pick bands first — opening the editor (drag/auto-detect lanes, then Run again) ===\n`;
+      setConsoleOut(consoleRef.current);
+      setNodes((cur) => cur.map((n) => n.id === node.id ? { ...n, data: { ...n.data, status: "idle" } } : n));
+      openBandPicker(node.id);
+      return;
+    }
     // Parse a `# @name: <label>` / `// @name: <label>` marker from the
     // first 20 lines so users can name a node from within the code.
     const codeBody = node.data.code || "";
@@ -4185,7 +4260,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         data: { ...n.data, status: "error", error: msg.slice(0, 200), consoleOut: `error: ${msg}` },
       } : n));
     }
-  }, [collectInputs, insetSources, enginePaths, setNodes, sourceNameOverrides]);
+  }, [collectInputs, insetSources, enginePaths, setNodes, sourceNameOverrides, openBandPicker]);
 
   const runGraph = useCallback(async () => {
     setRunningGraph(true);
@@ -4458,7 +4533,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
 
       {/* Canvas + side panel + drawer (flex row below the tabs) */}
       <GraphCallbacksContext.Provider value={{
-        addSourceToNode, removeSourceFromNode, navigateToOutput, openPreview,
+        addSourceToNode, removeSourceFromNode, removeEdge, navigateToOutput, openPreview,
         insetSources, sourceNameOverrides, renameSource: renameSourceHandler,
         hasMeasurements, highlightedUpstreamIds,
         inputCountsByNode, declaredByNode,
@@ -4597,6 +4672,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           onConnectStart={() => rfInternalsRef.current?.refresh()}
           isValidConnection={isValidConnection}
           nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
+          // Every edge gets the × delete button + wide hit area.
+          defaultEdgeOptions={{ type: "deletable" }}
           onNodeClick={(_, n) => setSelectedNodeId(n.id)}
           onPaneClick={() => setSelectedNodeId(null)}
           onSelectionChange={({ nodes: sn, edges: se }) => {
