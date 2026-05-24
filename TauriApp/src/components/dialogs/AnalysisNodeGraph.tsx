@@ -77,6 +77,11 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import { api } from "../../api/client";
 import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
+import BandPickerDialog, {
+  type BandPickerConfig,
+  generateBandPickerCode,
+  emptyBandConfig,
+} from "./BandPickerDialog";
 
 // ── Helper: base64 PNG → File (for main-timeline + collage uploads) ──
 function b64ToFile(b64: string, filename: string): File {
@@ -897,6 +902,12 @@ export interface NodeData {
   /** When true, the user has explicitly removed the node from
    *  the canvas — used to no-op stale auto-edges. */
   deleted?: boolean;
+  /** Marks a specialised interactive Python node.  "wb_bands" → the
+   *  western-blot band picker: its `code` is auto-generated from
+   *  `roi` (edited via the "Pick bands…" button) rather than typed. */
+  interactive?: "wb_bands";
+  /** Band-picker ROI config (only when interactive === "wb_bands"). */
+  roi?: BandPickerConfig;
   [key: string]: unknown;  // index signature for ReactFlow's Record
 }
 
@@ -2429,53 +2440,11 @@ function buildIntensityWorkflow(): SavedWorkflow {
 }
 
 // ── Western blot quantification ──────────────────────────────
-// 3-node pipeline: per-band integrated density (background-
-// subtracted) → normalise to a control band → bar plot.  Source
-// labels: `Sample_1`, `Sample_2`, …  First label = loading
-// control / reference; everything else is normalised against it.
-const WB_DENSITY_PY = `# @name: Band density (integrated, bg-subtracted)
-# For each band image we invert (so dark protein bands become
-# bright), subtract a per-image background floor (5th percentile
-# of pixel intensity), then sum the remaining signal.  The
-# integrated optical density (IOD) so produced is the canonical
-# western-blot quantification metric.
-import numpy as np, re
-
-def clean_label(label):
-    return label.rsplit("/", 1)[-1].strip()
-
-def infer_group(label):
-    m = re.match(r"^(.*?)[\s_\-]+\d+$", label)
-    return (m.group(1) if m else label).strip() or label
-
-imgs = [(k, v) for k, v in inputs.items() if isinstance(v, dict) and "image" in v]
-if not imgs:
-    raise SystemExit("No band images — wire each cropped band inset here in order (first = loading control / ref).")
-
-rows = []
-for i, (key, src) in enumerate(imgs):
-    arr = src["image"].astype(np.float32)
-    if arr.ndim == 3:
-        gray = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
-    else:
-        gray = arr
-    inverted = 255.0 - gray            # bright bands on dark bg
-    bg = float(np.percentile(inverted, 5))
-    signal = np.clip(inverted - bg, 0, None)
-    iod = float(signal.sum())
-    label = clean_label(src.get("label", key))
-    rows.append({
-        "source": label,
-        "group": infer_group(label),
-        "is_reference": (i == 0),
-        "iod": iod,
-        "mean_signal": float(signal.mean()),
-        "area_px": int(gray.size),
-    })
-print(f"quantified {len(rows)} band(s); reference = {rows[0]['source']!r}")
-mpfig_data(rows, name="band_iod")
-`;
-
+// 3-stage pipeline: interactive Band picker (per-lane integrated
+// density, background-subtracted) → normalise to a control lane →
+// bar plot.  The picker designates the loading control explicitly
+// (a per-lane "reference" radio), so quantification no longer
+// depends on the order bands were wired.
 const WB_NORMALIZE_PY = `# @name: Normalize to reference
 # Divide every band's IOD by the reference band's IOD (the first
 # input).  Output is "relative_density" — unitless ratio used in
@@ -2537,19 +2506,21 @@ print(p)
 `;
 
 function buildWesternBlotWorkflow(): SavedWorkflow {
-  const srcId = "source", densId = "wb_density", normId = "wb_normalize", plotId = "wb_plot";
+  const srcId = "source", pickId = "wb_bands", normId = "wb_normalize", plotId = "wb_plot";
+  const bandCfg = emptyBandConfig();
   const nodes: Node<NodeData>[] = [
     {
       id: srcId, type: "source", position: { x: 40, y: 60 },
       data: {
-        label: "Source — drop each band in order (first = loading control)",
+        label: "Source — drop the WHOLE blot membrane here",
         kind: "source", sources: [], status: "ok",
       } as NodeData,
       draggable: true, deletable: false,
     },
     {
-      id: densId, type: "python", position: { x: 360, y: 60 },
-      data: { label: "Band density", kind: "python", code: WB_DENSITY_PY,
+      id: pickId, type: "python", position: { x: 360, y: 60 },
+      data: { label: "Band picker", kind: "python", interactive: "wb_bands", roi: bandCfg,
+              code: generateBandPickerCode(bandCfg),
               outputs: [], inputs: [], status: "idle", currentPreset: "custom" } as NodeData,
     },
     {
@@ -2570,10 +2541,13 @@ function buildWesternBlotWorkflow(): SavedWorkflow {
   });
   return {
     id: "builtin:western_blot",
-    name: "Western blot quantification (IOD → normalised → plot)",
+    name: "Western blot quantification (pick bands → normalise → plot)",
     nodes,
     edges: [
-      mkEdge(densId, "out_table", normId, "in_table", "table"),
+      // Source → Band picker can't be pre-wired (the Source has no
+      // output port until the blot is dropped onto it), so the user
+      // makes that one connection after dropping the membrane.
+      mkEdge(pickId, "out_table", normId, "in_table", "table"),
       mkEdge(normId, "out_table", plotId, "in_table", "table"),
     ],
     createdAt: 0,
@@ -3166,6 +3140,12 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // the <ReactFlow> element below.
   const [handleRev, setHandleRev] = useState(0);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  // Band-picker (western-blot lane editor) modal state.  `image` is
+  // the upstream membrane resolved at open time (base64 PNG); `cfg`
+  // seeds the editor from the node's saved ROIs.
+  const [bandPicker, setBandPicker] = useState<{ open: boolean; nodeId: string | null; image: string | null; cfg: BandPickerConfig | null }>(
+    () => ({ open: false, nodeId: null, image: null, cfg: null }),
+  );
   // Set of currently-selected node ids + edge ids — populated by
   // React Flow's onSelectionChange.  Drives the visible "Delete
   // selected" affordance in the canvas toolbar (the only reliable
@@ -3595,6 +3575,38 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     setSelectedNodeId(id);
   }, [setNodes]);
 
+  // Spawn a western-blot band-picker node.  It's a Python node under
+  // the hood (renders + runs like one) but flagged `interactive:
+  // "wb_bands"` so the detail panel shows "Pick bands…" and its code
+  // is auto-generated from the ROI editor.
+  const addBandPickerNode = useCallback(() => {
+    const id = newId("python");
+    const cfg = emptyBandConfig();
+    let pos = { x: 350, y: 120 };
+    const inst = rfRef.current;
+    if (inst) {
+      try {
+        const container = document.querySelector(".react-flow") as HTMLElement | null;
+        if (container) {
+          const rect = container.getBoundingClientRect();
+          pos = inst.screenToFlowPosition({ x: rect.left + rect.width * 0.35 + Math.random() * 60, y: rect.top + rect.height * 0.30 + Math.random() * 60 });
+        }
+      } catch { /* default pos */ }
+    }
+    setNodes((cur) => [
+      ...cur,
+      {
+        id, type: "python", position: pos,
+        data: {
+          label: "Band picker", kind: "python", interactive: "wb_bands", roi: cfg,
+          code: generateBandPickerCode(cfg), outputs: [], inputs: [],
+          status: "idle", currentPreset: "custom",
+        } as NodeData,
+      },
+    ]);
+    setSelectedNodeId(id);
+  }, [setNodes]);
+
   const removeNode = useCallback((nodeId: string) => {
     if (nodeId === "source") return;  // primary source is undeletable
     setNodes((cur) => cur.filter((n) => n.id !== nodeId));
@@ -3951,6 +3963,31 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     }
     return result;
   }, [edges, measurementsCsv, sourceNameOverrides]);
+
+  // ── Band picker (western-blot lane editor) ──────────────────
+  // Resolve the upstream membrane image (first image input, by
+  // thumbnail / cached output payload) and open the editor seeded
+  // from the node's saved ROIs.
+  const openBandPicker = useCallback((nodeId: string) => {
+    const nm = new Map(nodes.map((n) => [n.id, n]));
+    const ins = collectInputs(nodeId, nm);
+    const img = ins.find((x) => x.kind === "image" && x.image_b64)?.image_b64 || null;
+    const node = nm.get(nodeId);
+    setBandPicker({ open: true, nodeId, image: img, cfg: (node?.data.roi as BandPickerConfig | undefined) || emptyBandConfig() });
+  }, [nodes, collectInputs]);
+
+  // Persist the edited ROIs back onto the node and regenerate its
+  // Python so a normal Run uses the new lanes.
+  const saveBandPicker = useCallback((cfg: BandPickerConfig) => {
+    setBandPicker((bp) => {
+      if (bp.nodeId) {
+        setNodes((cur) => cur.map((n) => n.id === bp.nodeId
+          ? { ...n, data: { ...n.data, roi: cfg, code: generateBandPickerCode(cfg), status: "idle" as const } }
+          : n));
+      }
+      return { open: false, nodeId: null, image: null, cfg: null };
+    });
+  }, [setNodes]);
 
   const runNode = useCallback(async (node: Node<NodeData>, nodeMap: Map<string, Node<NodeData>>) => {
     const engine = node.data.kind as EngineKind;
@@ -4708,6 +4745,13 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               📊 R Plot
             </Button>
           </Tooltip>
+          <Tooltip placement="bottom" title="Add a western-blot Band picker — drop the whole blot on a Source, wire it here, then draw/auto-detect one ROI per lane">
+            <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
+              onClick={addBandPickerNode}
+              sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.python, "&:hover": { bgcolor: KIND_COLOR.python, filter: "brightness(0.9)" } }}>
+              🩻 Bands
+            </Button>
+          </Tooltip>
           <Tooltip placement="bottom" title={imagejKind
             ? `Add an ImageJ / Fiji macro node (detected: ${imagejKind})`
             : "ImageJ / Fiji not detected — install Fiji and ensure ImageJ-* is on PATH"}>
@@ -4892,6 +4936,21 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               <DeleteOutlineIcon sx={{ fontSize: 14 }} />
             </IconButton>
           </Box>
+          {/* Band-picker banner — the interactive western-blot lane
+              editor.  The Python below is auto-generated from the
+              ROIs, so we steer users to the visual editor instead of
+              hand-editing the code. */}
+          {selectedNode.data.interactive === "wb_bands" && (
+            <Box sx={{ display: "flex", alignItems: "center", gap: 1, px: 1, py: 0.75, borderBottom: "1px solid", borderColor: "divider", bgcolor: "action.hover" }}>
+              <Button size="small" variant="contained" onClick={() => openBandPicker(selectedNode.id)}
+                sx={{ textTransform: "none", fontSize: "0.7rem" }}>
+                🩻 Pick bands…
+              </Button>
+              <Typography variant="caption" sx={{ color: "text.secondary", lineHeight: 1.3 }}>
+                {(selectedNode.data.roi?.lanes?.length ?? 0)} lane(s) defined · wire the whole blot (Source) into this node
+              </Typography>
+            </Box>
+          )}
           {/* Layer-1 preset selector — built-in snippets + user-
               saved presets stored per-engine in localStorage.  The
               Select is controlled by the node's currentPreset field
@@ -5539,6 +5598,15 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           saveEnginePaths(next);
           setSettingsOpen(false);
         }}
+      />
+
+      {/* Western-blot band picker — interactive lane ROI editor. */}
+      <BandPickerDialog
+        open={bandPicker.open}
+        imageSrc={bandPicker.image}
+        initial={bandPicker.cfg}
+        onClose={() => setBandPicker({ open: false, nodeId: null, image: null, cfg: null })}
+        onSave={saveBandPicker}
       />
     </Box>
   );
