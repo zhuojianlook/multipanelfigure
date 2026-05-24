@@ -164,30 +164,60 @@ jobs:
           IDENTITY=$(security find-identity -p codesigning "$KC" | grep '"' | head -1 | sed -E 's/.*"(.*)".*/\1/')
           if [ -z "$IDENTITY" ]; then echo "ERROR: no code-signing identity found in keychain"; exit 1; fi
           echo "Using signing identity: $IDENTITY"
-          echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          # Deliberately NOT named APPLE_SIGNING_IDENTITY: we don't want Tauri to
+          # sign during the build (Tauri forces the hardened runtime, which turns
+          # on library validation and breaks the PyInstaller api-server's runtime
+          # dlopen of its bundled Python). We sign ourselves afterwards WITHOUT
+          # the hardened runtime.
+          echo "MPFB_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
         shell: bash
       - name: Build Tauri (with updater signing)
         working-directory: TauriApp
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # When set (cert secret present), Tauri code-signs the .app with this
-          # identity and builds the DMG + updater bundle from the signed app.
-          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
         run: npx tauri build
-      # Cert-signed builds: Tauri already signed the .app + DMG + updater bundle
-      # with the stable identity above, so just verify it.
-      - name: Verify macOS signature (cert-signed)
-        if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY != ''
+      # Cert path: sign with our self-signed cert WITHOUT hardened runtime (so the
+      # PyInstaller sidecar still loads), then rebuild the DMG and regenerate +
+      # re-sign the updater bundle so both install paths carry the stable identity.
+      - name: Sign macOS app with self-signed cert + rebuild artifacts
+        if: runner.os == 'macOS' && env.MPFB_SIGN_IDENTITY != ''
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          APP_PATH=$(find TauriApp/src-tauri/target/release/bundle/macos -name "*.app" -maxdepth 1)
-          echo "Verifying $APP_PATH"
-          codesign -dv --verbose=2 "$APP_PATH" 2>&1 | grep -iE "Authority|Identifier|Signature" || true
+          set -e
+          ID="$MPFB_SIGN_IDENTITY"
+          WS="$GITHUB_WORKSPACE"
+          MACOS_DIR="$WS/TauriApp/src-tauri/target/release/bundle/macos"
+          APP_PATH=$(find "$MACOS_DIR" -maxdepth 1 -name "*.app")
+          APP_NAME=$(basename "$APP_PATH")
+          echo "Signing $APP_PATH with '$ID' (no hardened runtime)"
+          # Sign nested helpers first, then the bundle. NO --options runtime →
+          # library validation stays off → the api-server can dlopen its Python.
+          for bin in ffmpeg api-server MultiPanelFigureBuilder; do
+            [ -f "$APP_PATH/Contents/MacOS/$bin" ] && codesign --force -s "$ID" "$APP_PATH/Contents/MacOS/$bin"
+          done
+          codesign --force -s "$ID" "$APP_PATH"
           codesign --verify --deep --strict "$APP_PATH" && echo "Signature valid"
+          codesign -dv --verbose=2 "$APP_PATH" 2>&1 | grep -iE "Authority|Identifier=" || true
+          # Rebuild the DMG from the signed app
+          DMG_PATH=$(find "$WS/TauriApp/src-tauri/target/release/bundle/dmg" -maxdepth 1 -name "*.dmg")
+          DMG_NAME=$(basename "$DMG_PATH")
+          rm "$DMG_PATH"
+          STAGE=$(mktemp -d)
+          cp -R "$APP_PATH" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "Multi-Panel Figure Builder" -srcfolder "$STAGE" -ov -format UDZO "$WS/TauriApp/src-tauri/target/release/bundle/dmg/$DMG_NAME"
+          rm -rf "$STAGE"
+          # Regenerate the updater bundle (.app.tar.gz) from the signed app + re-sign it
+          ( cd "$MACOS_DIR" && rm -f "$APP_NAME.tar.gz" "$APP_NAME.tar.gz.sig" && COPYFILE_DISABLE=1 tar czf "$APP_NAME.tar.gz" "$APP_NAME" )
+          ( cd "$WS/TauriApp" && npx tauri signer sign "$MACOS_DIR/$APP_NAME.tar.gz" )
+          echo "Updater bundle re-signed:"; ls -la "$MACOS_DIR/"
         shell: bash
       # Fallback (no cert secret): ad-hoc sign + rebuild DMG as before.
       - name: Ad-hoc sign macOS app and rebuild DMG
-        if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY == ''
+        if: runner.os == 'macOS' && env.MPFB_SIGN_IDENTITY == ''
         run: |
           APP_PATH=$(find TauriApp/src-tauri/target/release/bundle/macos -name "*.app" -maxdepth 1)
           echo "Signing $APP_PATH"
