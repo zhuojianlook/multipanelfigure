@@ -498,6 +498,33 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     }
   };
 
+  // Snap each existing lane's vertical position to its actual band, keeping the
+  // user's x-grid. Sends the current lanes to the backend's per-lane detector
+  // (65th-pct vertical profile + rolling baseline → strongest band).
+  const snapToBands = async () => {
+    if (!imageSrc || cfg.lanes.length === 0 || detecting) return;
+    setDetecting(true);
+    try {
+      const b64 = imageSrc.startsWith("data:") ? imageSrc.split(",")[1] : imageSrc;
+      const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
+      const resp = await fetch(`${apiBase}/api/analysis/wb-detect-bands`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image_b64: b64, lanes: cfg.lanes.map((l) => ({ x: l.x, y: l.y, w: l.w, h: l.h })) }),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (Array.isArray(data.lanes) && data.lanes.length === cfg.lanes.length) {
+          setCfg((c) => ({
+            ...c,
+            lanes: c.lanes.map((l, i) => ({ ...l, y: clamp01(data.lanes[i].y), h: clamp01(data.lanes[i].h) })),
+          }));
+        }
+      }
+    } catch { /* backend unavailable — leave lanes as-is */ } finally {
+      setDetecting(false);
+    }
+  };
+
   // Re-flow the lanes into an evenly-spaced grid of `n` across the current span.
   // The span + band row come from the existing lanes (so the user positions the
   // outermost lanes / auto-detects, then dials the count); with <2 lanes we fall
@@ -604,6 +631,14 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
               onClick={runAutoDetect} disabled={!srcUrl || detecting}>
               {detecting ? "Detecting…" : "Auto-detect lanes"}
             </Button>
+            <Tooltip title="Snap each lane's vertical position to its band (keeps your lane spacing)">
+              <span>
+                <Button size="small" variant="outlined"
+                  onClick={snapToBands} disabled={!srcUrl || detecting || cfg.lanes.length === 0}>
+                  Snap to bands
+                </Button>
+              </span>
+            </Tooltip>
             <Box sx={{ display: "flex", alignItems: "center", gap: 0.25, ml: "auto" }}>
               <Tooltip title="Even out into N lanes across the current span (positions the spacing for you; nudge individual lanes after)">
                 <Typography variant="caption" sx={{ color: "text.secondary", mr: 0.25 }}>Lanes</Typography>
