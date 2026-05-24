@@ -131,6 +131,32 @@ jobs:
       - name: Build frontend
         working-directory: TauriApp
         run: npm run build
+      # Compile the ScreenCaptureKit window-recorder helper (macOS only) and
+      # add it to externalBin so Tauri bundles it. SCK captures just the app
+      # window (and follows it) instead of cropping a whole-display grab. Kept
+      # OUT of the committed tauri.conf.json so Windows/local builds — which
+      # have no Swift helper — aren't forced to provide one.
+      - name: Build ScreenCaptureKit recorder helper (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -e
+          mkdir -p TauriApp/src-tauri/binaries
+          OUT="TauriApp/src-tauri/binaries/mpfb-recorder-${{ matrix.triple }}"
+          swiftc -O -swift-version 5 -target arm64-apple-macos14.0 \
+            -framework ScreenCaptureKit -framework AVFoundation \
+            -framework CoreMedia -framework CoreGraphics \
+            -o "$OUT" TauriApp/native-helpers/mpfb-recorder/recorder.swift
+          chmod +x "$OUT"
+          file "$OUT"
+          node -e '
+            const fs=require("fs");const p="TauriApp/src-tauri/tauri.conf.json";
+            const c=JSON.parse(fs.readFileSync(p,"utf8"));
+            c.bundle.externalBin=c.bundle.externalBin||[];
+            if(!c.bundle.externalBin.includes("binaries/mpfb-recorder")) c.bundle.externalBin.push("binaries/mpfb-recorder");
+            fs.writeFileSync(p,JSON.stringify(c,null,2));
+            console.log("externalBin:",c.bundle.externalBin);
+          '
+        shell: bash
       # Import a self-signed code-signing certificate (if provided as a secret)
       # so the macOS app gets a STABLE signing identity. macOS only persists
       # Screen Recording permission for a stable identity — ad-hoc signatures
@@ -195,7 +221,7 @@ jobs:
           echo "Signing $APP_PATH with '$ID' (no hardened runtime)"
           # Sign nested helpers first, then the bundle. NO --options runtime →
           # library validation stays off → the api-server can dlopen its Python.
-          for bin in ffmpeg api-server MultiPanelFigureBuilder; do
+          for bin in ffmpeg mpfb-recorder api-server MultiPanelFigureBuilder; do
             [ -f "$APP_PATH/Contents/MacOS/$bin" ] && codesign --force -s "$ID" "$APP_PATH/Contents/MacOS/$bin"
           done
           codesign --force -s "$ID" "$APP_PATH"

@@ -1765,22 +1765,95 @@ export function RecordAppButton() {
     return screenIdx[0];
   };
 
+  // Wire stderr/error/close handlers shared by BOTH recorder backends (the SCK
+  // helper and the ffmpeg fallback) and spawn it, storing the child so Stop can
+  // SIGINT it. The close handler distinguishes an intentional Stop from a crash
+  // / permission denial and surfaces the right guidance.
+  const beginRecorder = async (
+    cmd: { stderr: { on: (e: string, cb: (l: string) => void) => void }; on: (e: string, cb: (a: string) => void) => void; spawn: () => Promise<unknown> },
+    path: string,
+  ) => {
+    let stderrTail = "";
+    nativeStderrRef.current = "";
+    cmd.stderr.on("data", (line: string) => { stderrTail = (stderrTail + line).slice(-1200); nativeStderrRef.current = stderrTail; });
+    cmd.on("error", (err: string) => {
+      nativeChildRef.current = null;
+      setRecording(false);
+      setRecError(`recorder failed to start: ${err}`);
+    });
+    cmd.on("close", async () => {
+      nativeChildRef.current = null;
+      setRecording(false);
+      // An intentional Stop is finalized by stopNativeToModal. Don't double-handle.
+      if (nativeIntentionalStopRef.current) return;
+      // Otherwise the recorder exited on its own — usually missing macOS Screen
+      // Recording permission. Surface a clear dialog and discard the temp file.
+      const tmp = nativeTmpRef.current;
+      nativeTmpRef.current = "";
+      if (tmp) { try { const { invoke } = await import("@tauri-apps/api/core"); await invoke("delete_file", { path: tmp }); } catch { /* ignore */ } }
+      const perm = /denied|not authorized|permission|abort|Operation not permitted|TCC/i.test(stderrTail);
+      if (perm) {
+        setRecError("Screen Recording permission needed — see the dialog.");
+        const go = await confirmDialog({
+          title: "Screen Recording permission needed",
+          body: "macOS hasn't granted Screen Recording permission to the recorder, so it "
+            + "couldn't capture anything.\n\n"
+            + "If you JUST UPDATED the app, the previous permission can go stale (this "
+            + "build is self-signed without an Apple Team ID, so macOS doesn't always "
+            + "carry the grant across versions). The reliable fix:\n\n"
+            + "1. Open System Settings → Privacy & Security → Screen Recording.\n"
+            + "2. REMOVE any existing “Multi-Panel Figure Builder” entry (select it, click –).\n"
+            + "3. Fully quit the app (⌘Q) and reopen it.\n"
+            + "4. Click Record again and grant permission when prompted.",
+          confirmLabel: "Open Settings",
+          cancelLabel: "Close",
+        });
+        if (go) await openScreenRecordingSettings();
+      } else {
+        setRecError("Recording stopped unexpectedly.");
+        await alertDialog({ title: "Recording failed", body: `Recording stopped unexpectedly.\n\n${stderrTail.slice(-400) || "No recorder output."}` });
+      }
+    });
+    const child = await cmd.spawn();
+    nativeChildRef.current = child as unknown as { write: (d: string) => Promise<void>; kill: () => Promise<void> };
+    nativeTmpRef.current = path;
+    nativeIntentionalStopRef.current = false;
+    setRecording(true);
+  };
+
   const startNative = async () => {
     setRecError("");
     try {
       // Record straight to a temp file — we ask WHERE to save only after the
-      // user stops (see stopNative + the close handler below). This makes the
-      // button behave like a real recorder: press to start, press to stop &
-      // save.
+      // user stops (see stopNativeToModal). Press to start, press to stop & save.
       const { tempDir, join } = await import("@tauri-apps/api/path");
       const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
       const path = await join(await tempDir(), `mpfig-recording-${stamp}.mp4`);
-      // avfoundation can only grab a whole display, so we capture the SAME
-      // display the window is on (pickScreenDeviceIndex) and then CROP to the
-      // app window's bounds with an ffmpeg filter — that records just the app,
-      // not the whole screen.  Coords are computed in PHYSICAL pixels (Tauri's
-      // outerPosition/outerSize are already physical, matching avfoundation's
-      // native capture resolution) relative to the captured monitor's origin.
+      const { Command } = await import("@tauri-apps/plugin-shell");
+
+      // 1) Preferred: the ScreenCaptureKit helper (macOS 14+). It captures the
+      //    APP WINDOW directly (not the whole screen) and follows it if moved —
+      //    far more robust than cropping a full-display grab. We pass our own
+      //    PID so it picks this app's window.
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const pid = await invoke<number>("app_pid");
+        const sck = Command.sidecar("binaries/mpfb-recorder", [
+          "--pid", String(pid),
+          "--out", path,
+          "--fps", "30",
+          "--title", "Multi-Panel Figure Builder",
+        ]);
+        await beginRecorder(sck as never, path);
+        return;
+      } catch (sckErr) {
+        // Helper not bundled / can't spawn (e.g. macOS < 14) → fall back to ffmpeg.
+        console.warn("[record] ScreenCaptureKit helper unavailable, falling back to ffmpeg:", sckErr);
+      }
+
+      // 2) Fallback: avfoundation can only grab a whole display, so capture the
+      //    display the window is on (pickScreenDeviceIndex) and CROP to the
+      //    window's bounds (physical px relative to the captured monitor).
       const idx = await pickScreenDeviceIndex(await listScreenDeviceIndices());
       let cropFilter: string | null = null;
       try {
@@ -1791,8 +1864,6 @@ export function RecordAppButton() {
           const capW = mon.size.width, capH = mon.size.height;
           let cx = pos.x - mon.position.x;
           let cy = pos.y - mon.position.y;
-          // Clamp the rect inside the captured frame; libx264 + yuv420p needs
-          // even width/height, so round the extents down to even numbers.
           cx = Math.max(0, Math.min(cx, capW - 2));
           cy = Math.max(0, Math.min(cy, capH - 2));
           let cw = Math.min(size.width, capW - cx);
@@ -1803,80 +1874,24 @@ export function RecordAppButton() {
           }
         }
       } catch { /* geometry unavailable → fall back to full-screen capture */ }
-      const { Command } = await import("@tauri-apps/plugin-shell");
       const cmd = Command.sidecar("binaries/ffmpeg", [
         "-hide_banner", "-y",
         "-f", "avfoundation", "-capture_cursor", "1", "-framerate", "30",
         "-i", `${idx}:none`,
-        // Crop to the app window (omitted → whole display) BEFORE the CFR
-        // resample so the filter graph stays simple.
         ...(cropFilter ? ["-vf", cropFilter] : []),
-        // Force constant 30fps output. avfoundation delivers frames with erratic
-        // timestamps that otherwise yield a "1000k fps / 0 duration" file that
-        // plays as a single frame. CFR resampling fixes the duration + playback.
+        // CFR resample — avfoundation's erratic timestamps otherwise yield a
+        // "1000k fps / 0 duration" file that plays as a single frame.
         "-fps_mode", "cfr", "-r", "30",
         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
         "-g", "60",
-        // Fragmented mp4 = safety net if the process is ever force-killed; with
-        // the graceful SIGINT stop (see stopNativeToModal) it finalizes cleanly.
         "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
         path,
       ]);
-      let stderrTail = "";
-      nativeStderrRef.current = "";
-      cmd.stderr.on("data", (line: string) => { stderrTail = (stderrTail + line).slice(-1200); nativeStderrRef.current = stderrTail; });
-      cmd.on("error", (err: string) => {
-        nativeChildRef.current = null;
-        setRecording(false);
-        setRecError(`ffmpeg failed to start: ${err}`);
-      });
-      cmd.on("close", async () => {
-        nativeChildRef.current = null;
-        setRecording(false);
-        // An intentional Stop is finalized by stopNative (kill → save dialog →
-        // move). Don't double-handle it here.
-        if (nativeIntentionalStopRef.current) return;
-        // Otherwise ffmpeg exited on its own — almost always missing macOS
-        // Screen Recording permission (it opens the output, fails to grab the
-        // screen, and quits). Surface a clear dialog and discard the temp file.
-        const tmp = nativeTmpRef.current;
-        nativeTmpRef.current = "";
-        if (tmp) { try { const { invoke } = await import("@tauri-apps/api/core"); await invoke("delete_file", { path: tmp }); } catch { /* ignore */ } }
-        const perm = /denied|not authorized|permission|abort|Operation not permitted/i.test(stderrTail);
-        if (perm) {
-          setRecError("Screen Recording permission needed — see the dialog.");
-          const go = await confirmDialog({
-            title: "Screen Recording permission needed",
-            body: "macOS hasn't granted Screen Recording permission to the recorder, so it "
-              + "couldn't capture anything.\n\n"
-              + "If you JUST UPDATED the app, the previous permission can go stale (this "
-              + "build is self-signed without an Apple Team ID, so macOS doesn't always "
-              + "carry the grant across versions). The reliable fix:\n\n"
-              + "1. Open System Settings → Privacy & Security → Screen Recording.\n"
-              + "2. REMOVE any existing “Multi-Panel Figure Builder” entry (select it, click –).\n"
-              + "3. Fully quit the app (⌘Q) and reopen it.\n"
-              + "4. Click Record again and grant permission when prompted.",
-            confirmLabel: "Open Settings",
-            cancelLabel: "Close",
-          });
-          if (go) await openScreenRecordingSettings();
-        } else {
-          setRecError("Recording stopped unexpectedly.");
-          await alertDialog({ title: "Recording failed", body: `Recording stopped unexpectedly.\n\n${stderrTail.slice(-400) || "No ffmpeg output."}` });
-        }
-      });
-      const child = await cmd.spawn();
-      nativeChildRef.current = child as unknown as { write: (d: string) => Promise<void>; kill: () => Promise<void> };
-      nativeTmpRef.current = path;
-      nativeIntentionalStopRef.current = false;
-      setRecording(true);
+      await beginRecorder(cmd as never, path);
     } catch (e) {
       setRecording(false);
       const msg = e instanceof Error ? e.message : String(e);
       setRecError(msg);
-      // Surface the failure in a dialog — previously it only set the tooltip,
-      // so a blocked spawn / missing device looked like "the save dialog did
-      // nothing".
       await alertDialog({ title: "Couldn't start recording", body: msg });
     }
   };
@@ -1922,15 +1937,16 @@ export function RecordAppButton() {
         const go = await confirmDialog({
           title: "Recording captured nothing",
           body: "No video frames were captured. On macOS this means the screen recorder "
-            + "(the bundled ffmpeg helper) doesn't have effective Screen Recording "
-            + "permission — macOS then hides the screen from it.\n\n"
+            + "doesn't have effective Screen Recording permission — macOS then hides the "
+            + "screen from it.\n\n"
             + "Fix:\n"
-            + "1. System Settings → Privacy & Security → Screen Recording → enable the entry "
-            + "for this app (it may be listed as \"ffmpeg\" or \"MultiPanelFigureBuilder\").\n"
+            + "1. System Settings → Privacy & Security → Screen Recording. REMOVE any stale "
+            + "entry for this app (it may be listed as \"Multi-Panel Figure Builder\", "
+            + "\"mpfb-recorder\" or \"ffmpeg\"), then re-add/grant it.\n"
             + "2. IMPORTANT: fully QUIT the app (Cmd+Q) and reopen it — permission changes "
             + "don't apply to an already-running app.\n"
             + "3. Record again."
-            + (errTail ? `\n\nffmpeg said:\n${errTail}` : ""),
+            + (errTail ? `\n\nRecorder said:\n${errTail}` : ""),
           confirmLabel: "Open Settings",
           cancelLabel: "Close",
         });

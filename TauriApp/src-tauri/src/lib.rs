@@ -210,6 +210,14 @@ async fn interrupt_pid(pid: i32) -> Result<(), String> {
     }
 }
 
+/// Return this app process's PID. The ScreenCaptureKit recorder helper
+/// (mpfb-recorder) needs it (--pid) to pick the app's OWN window to capture
+/// rather than the whole screen — SCK identifies windows by owning process.
+#[tauri::command]
+fn app_pid() -> u32 {
+    std::process::id()
+}
+
 /// Return a file's size in bytes, or -1 if it doesn't exist. Used by the screen
 /// recorder to tell "captured nothing" (ffmpeg stalled — usually missing Screen
 /// Recording permission, so no output file was ever written) apart from a real
@@ -528,7 +536,7 @@ pub fn run() {
       app.manage(SidecarChild(sidecar_child));
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, save_base64_to_path, move_file, file_size, delete_file, open_url, interrupt_pid, download_and_install_update, kill_sidecar])
+    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, save_base64_to_path, move_file, file_size, delete_file, open_url, interrupt_pid, app_pid, download_and_install_update, kill_sidecar])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {
