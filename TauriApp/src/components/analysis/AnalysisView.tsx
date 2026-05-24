@@ -43,8 +43,24 @@ export function AnalysisView() {
 
   useEffect(() => { void refresh(); }, [refresh, config]);
 
+  // Swallow EXTERNAL file drops anywhere in the Analysis tab. Without this the
+  // WebView's default behavior on a file drop is to NAVIGATE to the file,
+  // which replaces the whole SPA → the Analysis tab appears to crash. We only
+  // intercept "Files" drags; the internal inset drags (application/x-mpfig-*)
+  // pass straight through to the source nodes that handle them.
+  const blockFileDrop = useCallback((e: React.DragEvent) => {
+    if (Array.from(e.dataTransfer.types).includes("Files")) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }, []);
+
   return (
-    <Box sx={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+    <Box
+      sx={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}
+      onDragOver={blockFileDrop}
+      onDrop={blockFileDrop}
+    >
       <AnalysisNodeGraph open measurementsCsv={measurementsCsv} />
     </Box>
   );

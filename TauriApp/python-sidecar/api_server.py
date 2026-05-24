@@ -6457,16 +6457,21 @@ def wb_detect_bands(body: WbBandDetectRequest):
         if lane.size == 0:
             return None
         span = y1 - y0
-        vp = _gf1d(_np.percentile(lane, 65, axis=1), max(1.0, span * 0.02))
-        base = _gf1d(vp, max(6.0, span * 0.12))
+        # Match the standalone script's per-lane detection: LIGHT smoothing of
+        # the 65th-percentile profile, a broad rolling baseline, then peaks
+        # filtered by prominence + width. The script's absolute 2.2 / 18 / 18 /
+        # (3,35) were tuned for ~260 px lanes, so we scale by lane height.
+        vp = _gf1d(_np.percentile(lane, 65, axis=1), max(1.2, span * 0.0085))
+        base = _gf1d(vp, max(4.0, span * 0.069))
         pp = _np.clip(vp - base, 0.0, None)
         if float(pp.max()) <= 1e-6:
             return None
         # Strongest band via find_peaks (prominence relative to the lane), with
         # a plain-argmax fallback so a single clear band is never missed.
-        minprom = max(float(_np.percentile(pp, 90)) * 0.45, float(pp.max()) * 0.10)
-        peaks, props = _find_peaks(pp, distance=max(3, int(span * 0.04)),
-                                   prominence=minprom, width=(2, None))
+        minprom = max(float(_np.percentile(pp, 90)) * 0.45, float(pp.max()) * 0.08)
+        wmin = max(2, int(span * 0.012)); wmax = max(wmin + 2, int(span * 0.16))
+        peaks, props = _find_peaks(pp, distance=max(4, int(span * 0.069)),
+                                   prominence=minprom, width=(wmin, wmax))
         if len(peaks):
             bi = int(_np.argmax(props["prominences"]))
             pk = int(peaks[bi]); width = float(props["widths"][bi])
