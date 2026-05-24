@@ -17,6 +17,22 @@ _mpl_config = os.path.join(os.path.expanduser("~"), ".multipanelfigure", "mplcon
 os.makedirs(_mpl_config, exist_ok=True)
 os.environ["MPLCONFIGDIR"] = _mpl_config
 
+# ── Frozen-binary Python runner ────────────────────────────────────────────
+# In a PyInstaller build, sys.executable is THIS binary, not a Python
+# interpreter — so an analysis Python node can't do `[sys.executable, script]`
+# (it would hit our argparse: "unrecognized arguments: pipeline.py"). Instead
+# the run-python endpoint re-invokes this binary as `--mpfig-run-script <path>`,
+# and we execute that script here, before importing the web stack, using the
+# bundled deps (numpy/PIL/cv2/scipy/skimage/matplotlib). Never triggered in dev
+# (there sys.executable is a real Python and we call it directly).
+import sys as _sys_boot
+if len(_sys_boot.argv) >= 3 and _sys_boot.argv[1] == "--mpfig-run-script":
+    import runpy as _runpy_boot
+    _boot_script = _sys_boot.argv[2]
+    _sys_boot.argv = [_boot_script] + _sys_boot.argv[3:]
+    _runpy_boot.run_path(_boot_script, run_name="__main__")
+    raise SystemExit(0)
+
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -6600,19 +6616,24 @@ except Exception:
             f.write(harness)
 
         # Resolve which Python binary to use.  User override wins
-        # (Settings dialog stores `interpreter_path` per-engine);
-        # otherwise we fall back to the sidecar's own sys.executable
-        # so the pipeline shares the bundled deps.
+        # (Settings dialog stores `interpreter_path` per-engine); otherwise we
+        # use the sidecar's own interpreter so the pipeline shares the bundled
+        # deps. In a frozen build sys.executable is THIS binary (not Python),
+        # so we re-invoke it via the --mpfig-run-script shim handled at startup.
         py_bin = _sys.executable
+        frozen = bool(getattr(_sys, "frozen", False))
         if body.interpreter_path and os.path.isfile(body.interpreter_path):
             py_bin = body.interpreter_path
+            frozen = False  # a user-pinned interpreter is a real Python
         elif body.interpreter_path:
             return {"success": False, "stdout": "",
                     "stderr": f"Configured Python interpreter not found at: {body.interpreter_path}",
                     "plots": [], "tables": [], "images": []}
+        cmd = ([py_bin, "--mpfig-run-script", script_path] if frozen
+               else [py_bin, script_path])
         try:
             result = subprocess.run(
-                [py_bin, script_path],
+                cmd,
                 capture_output=True, text=True, timeout=timeout_sec, cwd=tmpdir,
             )
         except subprocess.TimeoutExpired:

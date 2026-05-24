@@ -1018,7 +1018,22 @@ function SourceNode({ data, id }: NodeCardProps) {
     const t1 = setTimeout(() => updateNodeInternals(id), 16);
     const t2 = setTimeout(() => updateNodeInternals(id), 120);
     const t3 = setTimeout(() => updateNodeInternals(id), 320);
-    return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
+    // WKWebView (the Tauri webview on macOS) aggressively coalesces /
+    // throttles setTimeout, so the staircase above can fire before the
+    // new Handle has actually been laid out — leaving the brand-new
+    // output port visible-but-dead until the user switches tabs.
+    // requestAnimationFrame is tied to the compositor's paint cycle and
+    // is NOT throttled the same way, so a double-rAF ("wait for the
+    // frame after layout commits") is the most reliable "DOM settled"
+    // signal in WebKit.  Strictly additive on top of the timeouts.
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => updateNodeInternals(id));
+    });
+    return () => {
+      clearTimeout(t1); clearTimeout(t2); clearTimeout(t3);
+      cancelAnimationFrame(raf1); if (raf2) cancelAnimationFrame(raf2);
+    };
   }, [id, sources.length, showMeasurements, updateNodeInternals]);
 
   const onDragOver = (e: React.DragEvent) => {
@@ -2485,6 +2500,22 @@ mpfig_data(rows, name="band_relative_density")
 const WB_PLOT_R = `# @name: Plot relative band density
 library(ggplot2); library(ggprism)
 
+# Defensive: if the upstream Python "Band density" / "Normalize"
+# chain failed (e.g. no band images were wired into the Source node)
+# no table reaches this node and inputs[[1]] would crash with a
+# cryptic "subscript out of bounds".  Surface a clear message and
+# emit a placeholder plot so the run reports something useful.
+if (length(inputs) == 0 || is.null(inputs[[1]]) || nrow(inputs[[1]]) == 0) {
+  message("No relative-density table reached this node — wire band insets into the Source node, then Source -> Band density -> Normalize -> this R node.")
+  mpfig_plot("wb_relative_density.png", width = 1500, height = 1100, res = 300)
+  print(ggplot() + theme_void() +
+    annotate("text", x = 0.5, y = 0.55, size = 6,
+             label = "No band-density table reached this node.") +
+    annotate("text", x = 0.5, y = 0.40, size = 4, color = "grey40",
+             label = "Drop band insets into Source, then run Source -> Band density -> Normalize -> Plot.") +
+    xlim(0, 1) + ylim(0, 1))
+} else {
+
 data <- inputs[[1]]
 data$is_reference <- as.logical(toupper(as.character(data$is_reference)))
 data$source <- factor(data$source, levels = unique(data$source))
@@ -2502,6 +2533,7 @@ p <- ggplot(data, aes(x = source, y = relative_density, fill = is_reference)) +
         plot.margin = margin(10, 10, 6, 10)) +
   labs(x = NULL, y = "Relative band density (× reference)")
 print(p)
+}
 `;
 
 function buildWesternBlotWorkflow(): SavedWorkflow {
@@ -4645,6 +4677,13 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           flexWrap: "nowrap", overflowX: "auto", overflowY: "hidden",
           gap: 0.5, zIndex: 5, "& > *": { flexShrink: 0 },
         }}>
+          <Tooltip placement="bottom" title="Add an empty Source node — drop image insets onto it to feed the graph">
+            <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
+              onClick={addEmptySourceNode}
+              sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.source, "&:hover": { bgcolor: KIND_COLOR.source, filter: "brightness(0.9)" } }}>
+              🖼 Source
+            </Button>
+          </Tooltip>
           <Tooltip placement="bottom" title="Add a Python node">
             <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
               onClick={() => addProcessNode("python")}
