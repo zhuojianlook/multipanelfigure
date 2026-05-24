@@ -1284,7 +1284,7 @@ export function Toolbar() {
                 try {
                   // Fetch the correct manifest based on channel
                   const manifestFile = updateChannel === "experimental" ? "latest-experimental.json" : "latest.json";
-                  const manifestUrl = `https://raw.githubusercontent.com/zhuojianlook/multipanelfigure/updater/${manifestFile}`;
+                  const manifestUrl = `https://raw.githubusercontent.com/zhuojianlook/multipanelfigure/updater/${manifestFile}?t=${Date.now()}`;
 
                   // Fetch manifest via Rust proxy (WebView blocks cross-origin)
                   const manifestText = await proxyFetch(manifestUrl);
@@ -1395,7 +1395,7 @@ export function Toolbar() {
                           }
                         );
                         const manifestFile = updateChannel === "experimental" ? "latest-experimental.json" : "latest.json";
-                        const manifestUrl = `https://raw.githubusercontent.com/zhuojianlook/multipanelfigure/updater/${manifestFile}`;
+                        const manifestUrl = `https://raw.githubusercontent.com/zhuojianlook/multipanelfigure/updater/${manifestFile}?t=${Date.now()}`;
                         const timeoutMs = 3 * 60 * 1000;
                         const timeoutPromise = new Promise((_, reject) =>
                           setTimeout(() => reject(new Error("Download timed out after 3 minutes")), timeoutMs)
