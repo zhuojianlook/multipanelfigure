@@ -3197,8 +3197,8 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // Band-picker (western-blot lane editor) modal state.  `image` is
   // the upstream membrane resolved at open time (base64 PNG); `cfg`
   // seeds the editor from the node's saved ROIs.
-  const [bandPicker, setBandPicker] = useState<{ open: boolean; nodeId: string | null; image: string | null; cfg: BandPickerConfig | null }>(
-    () => ({ open: false, nodeId: null, image: null, cfg: null }),
+  const [bandPicker, setBandPicker] = useState<{ open: boolean; nodeId: string | null; image: string | null; source: { key: string; row: number; col: number; inset_index: number } | null; cfg: BandPickerConfig | null }>(
+    () => ({ open: false, nodeId: null, image: null, source: null, cfg: null }),
   );
   // Set of currently-selected node ids + edge ids — populated by
   // React Flow's onSelectionChange.  Drives the visible "Delete
@@ -4036,10 +4036,19 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   const openBandPicker = useCallback((nodeId: string) => {
     const nm = new Map(nodes.map((n) => [n.id, n]));
     const ins = collectInputs(nodeId, nm);
-    const img = ins.find((x) => x.kind === "image" && x.image_b64)?.image_b64 || null;
+    const imgEntry = ins.find((x) => x.kind === "image" && x.image_b64);
+    const img = imgEntry?.image_b64 || null;
+    // Resolve the upstream source descriptor so the backend can re-extract the
+    // FULL-RESOLUTION image for detection (far better than the thumbnail).
+    let source: { key: string; row: number; col: number; inset_index: number } | null = null;
+    if (imgEntry?.key?.startsWith("inset_")) {
+      const insetKey = imgEntry.key.replace(/^inset_\d+_/, "");
+      const s = insetSources.find((x) => x.key === insetKey);
+      if (s) source = { key: s.key, row: s.row, col: s.col, inset_index: s.inset_index };
+    }
     const node = nm.get(nodeId);
-    setBandPicker({ open: true, nodeId, image: img, cfg: (node?.data.roi as BandPickerConfig | undefined) || emptyBandConfig() });
-  }, [nodes, collectInputs]);
+    setBandPicker({ open: true, nodeId, image: img, source, cfg: (node?.data.roi as BandPickerConfig | undefined) || emptyBandConfig() });
+  }, [nodes, collectInputs, insetSources]);
 
   // Persist the edited ROIs back onto the node and regenerate its
   // Python so a normal Run uses the new lanes.
@@ -4050,7 +4059,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           ? { ...n, data: { ...n.data, roi: cfg, code: generateBandPickerCode(cfg), status: "idle" as const } }
           : n));
       }
-      return { open: false, nodeId: null, image: null, cfg: null };
+      return { open: false, nodeId: null, image: null, source: null, cfg: null };
     });
   }, [setNodes]);
 
@@ -5682,8 +5691,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       <BandPickerDialog
         open={bandPicker.open}
         imageSrc={bandPicker.image}
+        source={bandPicker.source}
         initial={bandPicker.cfg}
-        onClose={() => setBandPicker({ open: false, nodeId: null, image: null, cfg: null })}
+        onClose={() => setBandPicker({ open: false, nodeId: null, image: null, source: null, cfg: null })}
         onSave={saveBandPicker}
       />
     </Box>

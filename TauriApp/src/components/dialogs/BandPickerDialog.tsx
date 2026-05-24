@@ -273,8 +273,12 @@ interface DragState {
 
 interface BandPickerDialogProps {
   open: boolean;
-  /** Membrane image as a base64 PNG (no data: prefix) or a data URL. */
+  /** Membrane image as a base64 PNG (no data: prefix) or a data URL — used for
+   *  the editor DISPLAY and as the detection fallback. */
   imageSrc: string | null;
+  /** Source descriptor so the backend can re-extract the FULL-RES image for
+   *  detection (much better than the thumbnail). */
+  source?: { key: string; row: number; col: number; inset_index: number } | null;
   initial: BandPickerConfig | null;
   onClose: () => void;
   onSave: (cfg: BandPickerConfig) => void;
@@ -284,7 +288,7 @@ const MAX_DISP_W = 620;
 const MAX_DISP_H = 520;
 
 export default function BandPickerDialog(props: BandPickerDialogProps) {
-  const { open, imageSrc, initial, onClose, onSave } = props;
+  const { open, imageSrc, source, initial, onClose, onSave } = props;
   const [cfg, setCfg] = useState<BandPickerConfig>(initial ?? emptyBandConfig());
   const [selId, setSelId] = useState<string | null>(null);
   const [drawingBg, setDrawingBg] = useState(false);
@@ -478,13 +482,13 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
       // Prefer the backend detector (robust band-row-constrained algorithm,
       // pure-numpy so it ships in the frozen sidecar). Fall back to the local
       // heuristic if the endpoint isn't reachable (e.g. older sidecar / no backend).
-      if (imageSrc) {
+      if (imageSrc || source) {
         try {
-          const b64 = imageSrc.startsWith("data:") ? imageSrc.split(",")[1] : imageSrc;
+          const b64 = imageSrc ? (imageSrc.startsWith("data:") ? imageSrc.split(",")[1] : imageSrc) : "";
           const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
           const resp = await fetch(`${apiBase}/api/analysis/wb-detect-bands`, {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ image_b64: b64 }),
+            body: JSON.stringify({ image_b64: b64, source: source ?? undefined }),
           });
           if (resp.ok) {
             const data = await resp.json();
@@ -502,14 +506,14 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   // user's x-grid. Sends the current lanes to the backend's per-lane detector
   // (65th-pct vertical profile + rolling baseline → strongest band).
   const snapToBands = async () => {
-    if (!imageSrc || cfg.lanes.length === 0 || detecting) return;
+    if ((!imageSrc && !source) || cfg.lanes.length === 0 || detecting) return;
     setDetecting(true);
     try {
-      const b64 = imageSrc.startsWith("data:") ? imageSrc.split(",")[1] : imageSrc;
+      const b64 = imageSrc ? (imageSrc.startsWith("data:") ? imageSrc.split(",")[1] : imageSrc) : "";
       const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
       const resp = await fetch(`${apiBase}/api/analysis/wb-detect-bands`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image_b64: b64, lanes: cfg.lanes.map((l) => ({ x: l.x, y: l.y, w: l.w, h: l.h })) }),
+        body: JSON.stringify({ image_b64: b64, source: source ?? undefined, lanes: cfg.lanes.map((l) => ({ x: l.x, y: l.y, w: l.w, h: l.h })) }),
       });
       if (resp.ok) {
         const data = await resp.json();

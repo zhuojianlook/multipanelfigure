@@ -6379,7 +6379,12 @@ def list_inset_sources_for(body: InsetSourcesForRequest):
 
 class WbBandDetectRequest(BaseModel):
     # base64-encoded image (data-URL prefix tolerated) of the whole blot membrane.
-    image_b64: str
+    # Optional when `source` is given (we then re-extract full-res in-app).
+    image_b64: str = ""
+    # Optional source descriptor {key,row,col,inset_index} — when present we
+    # re-extract the FULL-RESOLUTION display-adjusted source image in the
+    # sidecar (much better than the small thumbnail the dialog has on hand).
+    source: Optional[Dict[str, object]] = None
     # Optional user-defined lane grid (normalized 0..1 rects {x,y,w,h}). When
     # present each lane's vertical band position is REFINED (snapped to its band)
     # while keeping the user's x-grid. When absent, lanes are auto-laid out.
@@ -6404,11 +6409,25 @@ def wb_detect_bands(body: WbBandDetectRequest):
     import cv2 as _cv2
     from scipy.ndimage import gaussian_filter1d as _gf1d
     from scipy.signal import find_peaks as _find_peaks
-    try:
-        raw = base64.b64decode(str(body.image_b64).split(",")[-1])
-        img = Image.open(io.BytesIO(raw)).convert("RGB")
-    except Exception as e:
-        return {"lanes": [], "error": f"decode failed: {e}"}
+    # Prefer the FULL-RES, display-adjusted source image (re-extracted in-app)
+    # over the small thumbnail the dialog sends — that's what makes detection
+    # match a standalone script run on the original. Fall back to image_b64.
+    img = None
+    if body.source:
+        try:
+            ex = _extract_source_image(body.source)
+            if ex is not None:
+                img = ex.convert("RGB")
+        except Exception as _e:
+            import sys as __s
+            print(f"[wb-detect] full-res extract failed: {_e}", file=__s.stderr, flush=True)
+            img = None
+    if img is None:
+        try:
+            raw = base64.b64decode(str(body.image_b64 or "").split(",")[-1])
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+        except Exception as e:
+            return {"lanes": [], "error": f"decode failed: {e}"}
     rgb = _np.asarray(img).astype(_np.float32)
     H, W = rgb.shape[:2]
     if W < 16 or H < 16:
