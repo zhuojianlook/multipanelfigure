@@ -5255,7 +5255,12 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         variant="persistent"
         anchor="bottom"
         open={drawerOpen}
-        PaperProps={{ sx: { position: "absolute", height: "42%", minHeight: 240, display: "flex", flexDirection: "column" } }}
+        PaperProps={{ sx: {
+          position: "absolute", height: "42%", minHeight: 240, display: "flex", flexDirection: "column",
+          // Stop the outputs drawer at the LEFT edge of the detail panel so it
+          // never overlaps / cuts off the selected node's code + console.
+          left: 0, right: selectedNode ? detailPanelWidth : 0,
+        } }}
       >
         <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, px: 1, py: 0.25, borderBottom: "1px solid", borderColor: "divider", flexWrap: "wrap" }}>
           <Tabs value={drawerTab} onChange={(_, v) => setDrawerTab(v)} sx={{ minHeight: 28, "& .MuiTab-root": { minHeight: 28, fontSize: "0.65rem", py: 0, textTransform: "none" } }}>
@@ -5458,123 +5463,6 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           Show outputs ({allOutputs.length})
         </Button>
       )}
-      {/* Togglable Console panel — anchored to the RIGHT edge of the
-          canvas so it doesn't collide with the bottom outputs
-          drawer or the top-right MiniMap.  A small "Console" pill
-          handle sticks out below the MiniMap when collapsed; click
-          to slide the full log panel open.  Auto-opens during
-          long-running ops (Install Cellpose etc.). */}
-      <Box sx={{
-        position: "absolute",
-        right: 8,
-        // Top-right corner stack (all pushed below the action toolbar):
-        // MiniMap (top 44 → ≈154), Controls (≈158 → ≈188), then the console
-        // handle below at 196. Bottom stops above the outputs drawer when it's
-        // open so the console is never cut off by it.
-        top: 196,
-        bottom: drawerOpen ? "calc(max(42%, 240px) + 8px)" : 8,
-        zIndex: 6,
-        display: "flex", flexDirection: "row", alignItems: "stretch",
-        pointerEvents: "none",
-      }}>
-        {/* Spine handle — vertical tab pinned flush to the right
-            edge, matches the dark MiniMap chrome above it.  Glyph
-            flips on hover; lines-count chip floats next to the
-            label when there's output. */}
-        <Box sx={{
-          pointerEvents: "auto",
-          display: "flex", flexDirection: "column",
-          alignSelf: "flex-start",
-        }}>
-          <Tooltip
-            placement="left"
-            title={consoleOpen ? "Hide console" : "Show console output (graph runs, installs, dependency fetches)"}
-          >
-            <Box
-              onClick={() => setConsoleOpen((v) => !v)}
-              sx={{
-                cursor: "pointer",
-                userSelect: "none",
-                display: "flex", flexDirection: "column", alignItems: "center",
-                gap: 0.5,
-                py: 1, px: 0.6,
-                minHeight: 80,
-                bgcolor: "#1f2933",
-                color: consoleOpen ? "#ffa726" : "#cfd8dc",
-                border: "1px solid #37474f",
-                borderRadius: 0.75,
-                boxShadow: "0 2px 6px rgba(0,0,0,0.35)",
-                transition: "color 120ms, transform 120ms",
-                "&:hover": { color: consoleOpen ? "#ffb74d" : "#ffffff", transform: "translateX(-1px)" },
-              }}
-            >
-              <span style={{ fontSize: 13, lineHeight: 1 }}>{consoleOpen ? "▸" : "◂"}</span>
-              <Typography variant="caption" sx={{
-                fontSize: "0.6rem", fontWeight: 700, letterSpacing: 0.6,
-                writingMode: "vertical-rl",
-                transform: "rotate(180deg)",
-                textTransform: "uppercase",
-              }}>
-                Console
-              </Typography>
-              {consoleOut && (
-                <Box sx={{
-                  fontSize: "0.55rem",
-                  px: 0.5, py: 0.1, mt: 0.25,
-                  bgcolor: "rgba(255,167,38,0.15)",
-                  color: "#ffd180",
-                  border: "1px solid rgba(255,167,38,0.45)",
-                  borderRadius: 0.5,
-                  fontFamily: "monospace",
-                  lineHeight: 1,
-                }}>
-                  {consoleOut.split("\n").length}
-                </Box>
-              )}
-            </Box>
-          </Tooltip>
-        </Box>
-        {consoleOpen && (
-          <Box sx={{
-            pointerEvents: "auto",
-            ml: 0.5,
-            width: 440,
-            maxWidth: "55vw",
-            display: "flex", flexDirection: "column",
-            bgcolor: "rgba(0,0,0,0.93)",
-            color: "#e0e0e0",
-            border: "1px solid", borderColor: "divider",
-            borderRadius: 0.5,
-            overflow: "hidden",
-            boxShadow: 3,
-          }}>
-            <Box sx={{
-              display: "flex", alignItems: "center", gap: 0.5,
-              px: 0.75, py: 0.4,
-              borderBottom: "1px solid rgba(255,255,255,0.12)",
-              fontFamily: "monospace", fontSize: "0.6rem",
-              color: "#bcd",
-            }}>
-              <span style={{ flex: 1, fontWeight: 700, letterSpacing: 0.5, textTransform: "uppercase" }}>
-                Console
-              </span>
-              <span style={{ opacity: 0.7 }}>{consoleOut ? `${consoleOut.split("\n").length} lines` : "—"}</span>
-              <Button size="small" onClick={() => { consoleRef.current = ""; setConsoleOut(""); }}
-                sx={{ fontSize: "0.55rem", color: "#9aa", textTransform: "none", minWidth: 0, ml: 0.5 }}>
-                Clear
-              </Button>
-            </Box>
-            <Box sx={{
-              flex: 1, minHeight: 0, overflow: "auto", p: 0.75,
-              fontFamily: "monospace", fontSize: "0.65rem",
-              whiteSpace: "pre-wrap", wordBreak: "break-word",
-              userSelect: "text", cursor: "text",
-            }}>
-              {consoleOut || <span style={{ opacity: 0.55, fontStyle: "italic" }}>(no output yet — runs, installs, and other long ops stream here)</span>}
-            </Box>
-          </Box>
-        )}
-      </Box>
       </Box>{/* end canvas + side-panel row */}
       </GraphCallbacksContext.Provider>
 
