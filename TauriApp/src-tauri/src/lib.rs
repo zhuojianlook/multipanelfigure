@@ -190,6 +190,26 @@ async fn move_file(src: String, dest: String) -> Result<(), String> {
     }
 }
 
+/// Send SIGINT to a process (graceful stop). Used to stop the ffmpeg screen
+/// recorder cleanly so it finalizes the mp4 (a hard kill leaves a corrupt
+/// "partial file"). The JS shell plugin's kill() only sends SIGKILL.
+#[tauri::command]
+async fn interrupt_pid(pid: i32) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("/bin/kill")
+            .args(["-INT", &pid.to_string()])
+            .status()
+            .map_err(|e| format!("kill -INT failed: {}", e))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        Ok(())
+    }
+}
+
 /// Return a file's size in bytes, or -1 if it doesn't exist. Used by the screen
 /// recorder to tell "captured nothing" (ffmpeg stalled — usually missing Screen
 /// Recording permission, so no output file was ever written) apart from a real
@@ -508,7 +528,7 @@ pub fn run() {
       app.manage(SidecarChild(sidecar_child));
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, save_base64_to_path, move_file, file_size, delete_file, open_url, download_and_install_update, kill_sidecar])
+    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, save_base64_to_path, move_file, file_size, delete_file, open_url, interrupt_pid, download_and_install_update, kill_sidecar])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {

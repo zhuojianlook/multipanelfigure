@@ -1710,25 +1710,54 @@ export function RecordAppButton() {
 
   // ── Native (ffmpeg) screen capture for macOS WKWebView ──
 
-  /** Query ffmpeg for the avfoundation index of the screen-capture device.
-   *  Prefers "Capture screen 0" (the main display); else the first "Capture
-   *  screen N". THROWS if none is found instead of guessing a numeric index —
-   *  a wrong guess can land on a camera (e.g. a Continuity Camera at [1]) and
-   *  silently record the wrong thing. */
-  const getScreenDeviceIndex = async (): Promise<string> => {
+  /** All avfoundation "Capture screen N" device indices, in listed order
+   *  (which is main-display-first, then by display order). Empty when macOS
+   *  is hiding the screens (no Screen Recording permission). */
+  const listScreenDeviceIndices = async (): Promise<string[]> => {
     const { Command } = await import("@tauri-apps/plugin-shell");
     const out = await Command.sidecar("binaries/ffmpeg", [
       "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", "",
     ]).execute();
     const text = `${out.stderr || ""}\n${out.stdout || ""}`;
-    const m = text.match(/\[(\d+)\]\s+Capture screen 0\b/)
-      || text.match(/\[(\d+)\]\s+Capture screen\b/);
-    if (m) return m[1];
-    throw new Error(
-      "No screen-capture device was found by ffmpeg. Make sure macOS Screen "
-      + "Recording permission is enabled for this app (System Settings → "
-      + "Privacy & Security → Screen Recording), then fully quit and reopen it.",
-    );
+    const indices: string[] = [];
+    const re = /\[(\d+)\]\s+Capture screen \d+/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) indices.push(m[1]);
+    return indices;
+  };
+
+  /** Pick the avfoundation device index for the display the app window is on.
+   *  avfoundation lists screens main-first then by position; we order the OS
+   *  monitors the same way and map by rank, so we capture the RIGHT display on
+   *  multi-monitor setups (not always the main one). Falls back to the first
+   *  screen. THROWS if no screen device exists (permission hidden). */
+  const pickScreenDeviceIndex = async (screenIdx: string[]): Promise<string> => {
+    if (screenIdx.length === 0) {
+      throw new Error(
+        "No screen-capture device was found. Enable macOS Screen Recording "
+        + "permission for the app (System Settings → Privacy & Security → Screen "
+        + "Recording), then fully quit (Cmd+Q) and reopen it.",
+      );
+    }
+    if (screenIdx.length === 1) return screenIdx[0];
+    try {
+      const { currentMonitor, availableMonitors, primaryMonitor } = await import("@tauri-apps/api/window");
+      const [cur, all, primary] = await Promise.all([currentMonitor(), availableMonitors(), primaryMonitor()]);
+      if (cur && all && all.length > 1) {
+        const key = (mn: { position: { x: number; y: number } }) => `${mn.position.x},${mn.position.y}`;
+        const primKey = primary ? key(primary) : null;
+        const ordered = [...all].sort((a, b) => {
+          const ap = primKey && key(a) === primKey ? 0 : 1;
+          const bp = primKey && key(b) === primKey ? 0 : 1;
+          if (ap !== bp) return ap - bp;
+          if (a.position.x !== b.position.x) return a.position.x - b.position.x;
+          return a.position.y - b.position.y;
+        });
+        const rank = ordered.findIndex((mn) => key(mn) === key(cur));
+        if (rank >= 0 && rank < screenIdx.length) return screenIdx[rank];
+      }
+    } catch { /* fall back to first screen */ }
+    return screenIdx[0];
   };
 
   const startNative = async () => {
@@ -1741,44 +1770,24 @@ export function RecordAppButton() {
       const { tempDir, join } = await import("@tauri-apps/api/path");
       const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
       const path = await join(await tempDir(), `mpfig-recording-${stamp}.mp4`);
-      const idx = await getScreenDeviceIndex();
-      // Crop the screen capture down to JUST this app window. avfoundation can
-      // only grab a whole display, so we compute the window's rectangle as
-      // fractions of its monitor (scale-independent — works on Retina/scaled
-      // modes) and let ffmpeg's crop filter resolve them against the real
-      // capture resolution at runtime. Falls back to full-screen if the
-      // window/monitor geometry can't be read.
-      let cropVf: string | null = null;
-      try {
-        const { getCurrentWindow, currentMonitor } = await import("@tauri-apps/api/window");
-        const win = getCurrentWindow();
-        const [pos, size, mon] = await Promise.all([win.outerPosition(), win.outerSize(), currentMonitor()]);
-        if (mon && mon.size.width > 0 && mon.size.height > 0) {
-          const fx = (pos.x - mon.position.x) / mon.size.width;
-          const fy = (pos.y - mon.position.y) / mon.size.height;
-          const fw = size.width / mon.size.width;
-          const fh = size.height / mon.size.height;
-          const cx = Math.max(0, Math.min(1, fx));
-          const cy = Math.max(0, Math.min(1, fy));
-          const cw = Math.max(0.02, Math.min(1 - cx, fw));
-          const ch = Math.max(0.02, Math.min(1 - cy, fh));
-          cropVf = `crop=floor(iw*${cw.toFixed(5)}/2)*2:floor(ih*${ch.toFixed(5)}/2)*2:floor(iw*${cx.toFixed(5)}/2)*2:floor(ih*${cy.toFixed(5)}/2)*2`;
-        }
-      } catch (e) {
-        console.warn("[record] window geometry unavailable — recording full screen", e);
-      }
+      // Capture the FULL display the window is on (no crop). Per-window cropping
+      // was unreliable across multiple monitors — avfoundation grabs a whole
+      // display, and the window's coordinates only line up if we capture the
+      // SAME display the window is on, which pickScreenDeviceIndex resolves.
+      const idx = await pickScreenDeviceIndex(await listScreenDeviceIndices());
       const { Command } = await import("@tauri-apps/plugin-shell");
       const cmd = Command.sidecar("binaries/ffmpeg", [
         "-hide_banner", "-y",
         "-f", "avfoundation", "-capture_cursor", "1", "-framerate", "30",
         "-i", `${idx}:none`,
-        ...(cropVf ? ["-vf", cropVf] : []),
+        // Force constant 30fps output. avfoundation delivers frames with erratic
+        // timestamps that otherwise yield a "1000k fps / 0 duration" file that
+        // plays as a single frame. CFR resampling fixes the duration + playback.
+        "-fps_mode", "cfr", "-r", "30",
         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-        // 1-second keyframe interval + fragmented mp4. This makes the output a
-        // valid, playable file even if ffmpeg is force-killed (the moov atom is
-        // written up front and each ~1s fragment is self-contained), so Stop
-        // never depends on ffmpeg shutting down gracefully.
-        "-g", "30",
+        "-g", "60",
+        // Fragmented mp4 = safety net if the process is ever force-killed; with
+        // the graceful SIGINT stop (see stopNativeToModal) it finalizes cleanly.
         "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
         path,
       ]);
@@ -1835,19 +1844,29 @@ export function RecordAppButton() {
     }
   };
 
-  // Stop the native recorder and open the Save/Discard modal (instead of a bare
-  // save dialog). Kill is reliable; fragmented-mp4 output stays valid on a hard
-  // kill, so we don't depend on the "close" event or on ffmpeg reading "q".
+  // Stop the native recorder and open the Save/Discard modal. We stop ffmpeg
+  // GRACEFULLY with SIGINT so it writes the mp4 trailer and the file is valid —
+  // a hard kill (SIGKILL, which the JS shell plugin's kill() sends) leaves a
+  // corrupt "partial file". A force-kill is armed only as a last-resort safety
+  // net (fragmented-mp4 keeps even that mostly-playable).
   const stopNativeToModal = async () => {
     const child = nativeChildRef.current;
     if (!child) return;
     const durationSec = recElapsed;
+    const pid = (child as unknown as { pid?: number }).pid;
     nativeIntentionalStopRef.current = true;
     setRecording(false);  // instant UI feedback (also stops the timer)
+    const { invoke } = await import("@tauri-apps/api/core");
+    try {
+      if (typeof pid === "number") await invoke("interrupt_pid", { pid });
+      else await child.kill();
+    } catch { try { await child.kill(); } catch { /* ignore */ } }
+    // Give ffmpeg time to finalize (write the moov trailer) and exit, then
+    // force-kill as a safety net if it's somehow still running.
+    await new Promise((r) => setTimeout(r, 1500));
     try { await child.kill(); } catch { /* ignore */ }
     nativeChildRef.current = null;
-    // Let the OS flush + close the file handle before we touch the file.
-    await new Promise((r) => setTimeout(r, 400));
+    await new Promise((r) => setTimeout(r, 300));
     nativeIntentionalStopRef.current = false;
     const tmp = nativeTmpRef.current;
     nativeTmpRef.current = "";
@@ -1858,7 +1877,6 @@ export function RecordAppButton() {
     // frame and never writes the file). Show the real diagnosis instead of a
     // cryptic "Copy failed: No such file" later.
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
       const size = await invoke<number>("file_size", { path: tmp });
       if (size < 1024) {
         try { await invoke("delete_file", { path: tmp }); } catch { /* ignore */ }

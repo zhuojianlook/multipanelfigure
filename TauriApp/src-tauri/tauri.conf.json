@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Multi-Panel Figure Builder",
   "mainBinaryName": "MultiPanelFigureBuilder",
-  "version": "0.1.234",
+  "version": "0.1.235",
   "identifier": "com.multipanelfigure.app",
   "build": {
     "frontendDist": "../dist",
