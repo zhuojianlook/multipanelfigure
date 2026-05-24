@@ -131,14 +131,63 @@ jobs:
       - name: Build frontend
         working-directory: TauriApp
         run: npm run build
+      # Import a self-signed code-signing certificate (if provided as a secret)
+      # so the macOS app gets a STABLE signing identity. macOS only persists
+      # Screen Recording permission for a stable identity — ad-hoc signatures
+      # change every build and are re-prompted forever. This is NOT notarized
+      # (Gatekeeper still warns on first launch), but it makes screen recording
+      # work and stick. Falls back to ad-hoc signing when no cert secret is set.
+      - name: Import macOS signing certificate
+        if: runner.os == 'macOS'
+        env:
+          CERT_B64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PW: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          if [ -z "$CERT_B64" ]; then
+            echo "No MACOS_CERT_P12_BASE64 secret — falling back to ad-hoc signing."
+            exit 0
+          fi
+          set -e
+          KC="$RUNNER_TEMP/build.keychain-db"
+          KC_PW="ci-$RANDOM-$RANDOM"
+          echo "$CERT_B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PW" "$KC"
+          # Make our keychain searchable alongside the defaults.
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed s/\"//g)
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$CERT_PW" -T /usr/bin/codesign -A
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PW" "$KC"
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Self-signed certs are untrusted, so find-identity -v lists nothing;
+          # use the unfiltered list and take the friendly name.
+          IDENTITY=$(security find-identity -p codesigning "$KC" | grep '"' | head -1 | sed -E 's/.*"(.*)".*/\1/')
+          if [ -z "$IDENTITY" ]; then echo "ERROR: no code-signing identity found in keychain"; exit 1; fi
+          echo "Using signing identity: $IDENTITY"
+          echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+        shell: bash
       - name: Build Tauri (with updater signing)
         working-directory: TauriApp
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # When set (cert secret present), Tauri code-signs the .app with this
+          # identity and builds the DMG + updater bundle from the signed app.
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
         run: npx tauri build
+      # Cert-signed builds: Tauri already signed the .app + DMG + updater bundle
+      # with the stable identity above, so just verify it.
+      - name: Verify macOS signature (cert-signed)
+        if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY != ''
+        run: |
+          APP_PATH=$(find TauriApp/src-tauri/target/release/bundle/macos -name "*.app" -maxdepth 1)
+          echo "Verifying $APP_PATH"
+          codesign -dv --verbose=2 "$APP_PATH" 2>&1 | grep -iE "Authority|Identifier|Signature" || true
+          codesign --verify --deep --strict "$APP_PATH" && echo "Signature valid"
+        shell: bash
+      # Fallback (no cert secret): ad-hoc sign + rebuild DMG as before.
       - name: Ad-hoc sign macOS app and rebuild DMG
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && env.APPLE_SIGNING_IDENTITY == ''
         run: |
           APP_PATH=$(find TauriApp/src-tauri/target/release/bundle/macos -name "*.app" -maxdepth 1)
           echo "Signing $APP_PATH"
