@@ -6394,16 +6394,16 @@ def wb_detect_bands(body: WbBandDetectRequest):
       * MAX across RGB channels (colored ladder + white bands both count),
       * light denoise blur, subtract a large-sigma background (top-hat),
       * DIRECTIONAL smooth (sigmaX >> sigmaY) to enhance horizontal bands.
+    Per-lane detection (scipy): collapse the lane to a 65th-percentile vertical
+    profile, subtract a rolling baseline, then find_peaks -> strongest band.
     Two modes:
-      * lanes given -> REFINE: per lane, collapse to a 65th-percentile vertical
-        profile, subtract a rolling baseline, snap to the strongest band within
-        a slightly expanded y-window. Keeps the user's x-grid.
-      * no lanes     -> AUTO: find the band row + lane x-peaks on the enhanced
-        signal, then refine each lane's y the same way.
-    cv2 + numpy only (both ship in the frozen sidecar; scipy does not).
+      * lanes given -> REFINE: snap each lane's y to its band, keep the x-grid.
+      * no lanes     -> AUTO: find band row + lane x-peaks, then per-lane y.
     """
     import numpy as _np
     import cv2 as _cv2
+    from scipy.ndimage import gaussian_filter1d as _gf1d
+    from scipy.signal import find_peaks as _find_peaks
     try:
         raw = base64.b64decode(str(body.image_b64).split(",")[-1])
         img = Image.open(io.BytesIO(raw)).convert("RGB")
@@ -6431,34 +6431,37 @@ def wb_detect_bands(body: WbBandDetectRequest):
     sig = _np.clip(blur.astype(_np.float32) - bg.astype(_np.float32), 0, None)
     sig = _cv2.GaussianBlur(sig, (0, 0), sigmaX=max(2.0, W * 0.0021), sigmaY=max(0.6, H * 0.0009))
 
-    def gf1d(a, sigma):
-        sigma = max(0.5, float(sigma))
-        r = max(1, int(round(sigma * 3)))
-        x = _np.arange(-r, r + 1)
-        k = _np.exp(-(x * x) / (2 * sigma * sigma)); k /= k.sum()
-        return _np.convolve(_np.pad(a, (r, r), mode="edge"), k, "valid")
-
     def detect_band(x0, x1, y0, y1):
         x0 = max(0, min(W - 1, int(x0))); x1 = max(x0 + 1, min(W, int(x1)))
         y0 = max(0, min(H - 1, int(y0))); y1 = max(y0 + 1, min(H, int(y1)))
         lane = sig[y0:y1, x0:x1]
         if lane.size == 0:
             return None
-        vp = gf1d(_np.percentile(lane, 65, axis=1), max(1.0, (y1 - y0) * 0.02))
-        base = gf1d(vp, max(6.0, (y1 - y0) * 0.12))
-        pp = _np.clip(vp - base, 0, None)
+        span = y1 - y0
+        vp = _gf1d(_np.percentile(lane, 65, axis=1), max(1.0, span * 0.02))
+        base = _gf1d(vp, max(6.0, span * 0.12))
+        pp = _np.clip(vp - base, 0.0, None)
         if float(pp.max()) <= 1e-6:
             return None
-        pk = int(_np.argmax(pp))
-        half = pp[pk] / 2.0
-        ll = pk
-        while ll > 0 and pp[ll] > half:
-            ll -= 1
-        rr = pk
-        while rr < len(pp) - 1 and pp[rr] > half:
-            rr += 1
+        # Strongest band via find_peaks (prominence relative to the lane), with
+        # a plain-argmax fallback so a single clear band is never missed.
+        minprom = max(float(_np.percentile(pp, 90)) * 0.45, float(pp.max()) * 0.10)
+        peaks, props = _find_peaks(pp, distance=max(3, int(span * 0.04)),
+                                   prominence=minprom, width=(2, None))
+        if len(peaks):
+            bi = int(_np.argmax(props["prominences"]))
+            pk = int(peaks[bi]); width = float(props["widths"][bi])
+        else:
+            pk = int(_np.argmax(pp))
+            half = pp[pk] / 2.0; ll = pk
+            while ll > 0 and pp[ll] > half:
+                ll -= 1
+            rr = pk
+            while rr < len(pp) - 1 and pp[rr] > half:
+                rr += 1
+            width = float(rr - ll)
         cy = y0 + pk
-        hh = max(rr - ll, int((y1 - y0) * 0.06))
+        hh = max(int(width), int(span * 0.06))
         return cy, hh
 
     # ---- REFINE: snap each user lane to its band (keep the x-grid) ----
@@ -6478,7 +6481,7 @@ def wb_detect_bands(body: WbBandDetectRequest):
                 out.append({"x": round(lx, 4), "y": round(ly, 4), "w": round(lw, 4), "h": round(lh, 4)})
         return {"lanes": out, "mode": "refine", "polarity": "dark_on_light" if dark_on_light else "light_on_dark"}
 
-    # ---- AUTO: band row + lane x-peaks on the enhanced signal, then per-lane y ----
+    # ---- AUTO: find band row + lane x-peaks, then refine each lane's y ----
     def sm(a, r):
         r = max(1, int(r)); k = 2 * r + 1
         cs = _np.concatenate([[0.0], _np.cumsum(_np.pad(a, (r, r), mode="edge"))])
@@ -6501,25 +6504,8 @@ def wb_detect_bands(body: WbBandDetectRequest):
     lanes = []
     if cmax - cmin > 1e-6:
         cc = (colp - cmin) / (cmax - cmin)
-        md = max(10, round(W * 0.03))
-        loc = [i for i in range(1, len(cc) - 1) if cc[i] >= cc[i - 1] and cc[i] > cc[i + 1]]
-        cand = []
-        for i in loc:
-            l = i
-            while l > 0 and cc[l - 1] <= cc[i]:
-                l -= 1
-            rr = i
-            while rr < len(cc) - 1 and cc[rr + 1] <= cc[i]:
-                rr += 1
-            prom = cc[i] - max(cc[l:i + 1].min(), cc[i:rr + 1].min())
-            if prom >= 0.06:
-                cand.append(i)
-        cand.sort(key=lambda i: -cc[i])
-        pks = []
-        for i in cand:
-            if all(abs(i - j) >= md for j in pks):
-                pks.append(i)
-        pks.sort()
+        peaks, _props = _find_peaks(cc, prominence=0.06, distance=max(10, round(W * 0.03)))
+        pks = [int(p) for p in peaks]
         for k, px in enumerate(pks):
             left = (pks[k - 1] + px) // 2 if k > 0 else px - round(W * 0.04)
             right = (pks[k + 1] + px) // 2 if k < len(pks) - 1 else px + round(W * 0.04)

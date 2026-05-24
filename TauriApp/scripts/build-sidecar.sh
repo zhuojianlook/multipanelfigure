@@ -38,6 +38,7 @@ pyinstaller --onefile \
     --collect-all PIL \
     --collect-all matplotlib \
     --collect-all cv2 \
+    --collect-all scipy \
     --noconfirm \
     api_server.py
 
