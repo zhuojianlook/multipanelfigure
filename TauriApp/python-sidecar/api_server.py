@@ -6377,6 +6377,145 @@ def list_inset_sources_for(body: InsetSourcesForRequest):
     return {"sources": sources}
 
 
+class WbBandDetectRequest(BaseModel):
+    # base64-encoded image (data-URL prefix tolerated) of the whole blot membrane.
+    image_b64: str
+
+
+@app.post("/api/analysis/wb-detect-bands")
+def wb_detect_bands(body: WbBandDetectRequest):
+    """Auto-detect western-blot lanes/bands for the interactive band picker.
+
+    Returns lane ROIs as NORMALISED 0..1 rects.  Tuned for real blot photos
+    (fluorescence light-on-dark OR colorimetric dark-on-light) where the
+    membrane is a bright/dark rectangle with bright EDGES, scattered speckles
+    and a ladder — the naive "threshold the column profile" approach selects
+    the whole membrane as one box.  Instead we:
+      1. pick polarity from the median so bands read as bright,
+      2. top-hat (subtract a large blur) to kill the membrane DC + gradient,
+      3. horizontal grey-opening to drop thin vertical edge-lines + speckles,
+      4. find the dominant BAND ROW (row profile peak in the upper part), then
+      5. find lane x-peaks WITHIN that row strip (prominence + min-distance),
+    so membrane edges/speckles below/around the bands don't create false lanes.
+    Pure numpy (no scipy) so it works in the frozen sidecar.
+    """
+    import numpy as _np
+    try:
+        raw = base64.b64decode(str(body.image_b64).split(",")[-1])
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as e:
+        return {"lanes": [], "error": f"decode failed: {e}"}
+    arr = _np.asarray(img).astype(_np.float32)
+    gray = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    H, W = gray.shape
+    if W < 16 or H < 16:
+        return {"lanes": [], "error": "image too small"}
+
+    def box1d(a, r, axis):
+        if r < 1:
+            return a
+        k = 2 * r + 1
+        pad = [(0, 0), (0, 0)]; pad[axis] = (r, r)
+        ap = _np.pad(a, pad, mode="edge")
+        z = list(ap.shape); z[axis] = 1
+        cs = _np.cumsum(_np.concatenate([_np.zeros(z, dtype=ap.dtype), ap], axis=axis), axis=axis)
+        hi = [slice(None)] * 2; lo = [slice(None)] * 2
+        hi[axis] = slice(k, None); lo[axis] = slice(0, -k)
+        return (cs[tuple(hi)] - cs[tuple(lo)]) / k
+
+    def gauss(a, r):
+        o = a.astype(_np.float32)
+        for _ in range(3):
+            o = box1d(o, r, 1); o = box1d(o, r, 0)
+        return o
+
+    def rmin(a, r):
+        o = a.copy()
+        for s in range(1, r + 1):
+            o[:, :-s] = _np.minimum(o[:, :-s], a[:, s:]); o[:, s:] = _np.minimum(o[:, s:], a[:, :-s])
+        return o
+
+    def rmax(a, r):
+        o = a.copy()
+        for s in range(1, r + 1):
+            o[:, :-s] = _np.maximum(o[:, :-s], a[:, s:]); o[:, s:] = _np.maximum(o[:, s:], a[:, :-s])
+        return o
+
+    def sm(a, r):
+        if r < 1:
+            return a
+        k = 2 * r + 1
+        cs = _np.concatenate([[0.0], _np.cumsum(_np.pad(a, (r, r), mode="edge"))])
+        return (cs[k:] - cs[:-k]) / k
+
+    def peaks_prom(c, md, minprom):
+        loc = [i for i in range(1, len(c) - 1) if c[i] >= c[i - 1] and c[i] > c[i + 1]]
+        res = []
+        for i in loc:
+            l = i
+            while l > 0 and c[l - 1] <= c[i]:
+                l -= 1
+            r = i
+            while r < len(c) - 1 and c[r + 1] <= c[i]:
+                r += 1
+            base = max(c[l:i + 1].min(), c[i:r + 1].min())
+            if c[i] - base >= minprom:
+                res.append(i)
+        res.sort(key=lambda i: -c[i])
+        chosen = []
+        for i in res:
+            if all(abs(i - j) >= md for j in chosen):
+                chosen.append(i)
+        return sorted(chosen)
+
+    dark_on_light = bool(_np.median(gray) >= 128)
+    sig = (255.0 - gray) if dark_on_light else gray
+    th = _np.clip(sig - gauss(sig, max(4, round(W * 0.014))), 0, None)
+    rr = max(4, round(W * 0.006))
+    opened = rmax(rmin(th, rr), rr)
+
+    # 1) dominant band row (search the upper 60% so the bottom membrane edge
+    #    doesn't win; central columns only so the L/R edges don't dominate).
+    rowp = sm(opened[:, int(0.12 * W):int(0.95 * W)].mean(axis=1), max(2, round(H * 0.008)))
+    top = max(2, int(0.6 * H))
+    yb = int(_np.argmax(rowp[:top]))
+    lo = 0.4 * rowp[yb]
+    yy0 = yb
+    while yy0 > 0 and rowp[yy0] > lo:
+        yy0 -= 1
+    yy1 = yb
+    while yy1 < top and rowp[yy1] > lo:
+        yy1 += 1
+    if yy1 - yy0 < 2:
+        yy0 = max(0, yb - 2); yy1 = min(H, yb + 2)
+
+    # 2) lane x-peaks within the band strip.
+    colp = sm(opened[yy0:yy1, :].mean(axis=0), max(2, round(W * 0.006)))
+    cmin, cmax = float(colp.min()), float(colp.max())
+    if cmax - cmin < 1e-6:
+        return {"lanes": [], "polarity": "dark_on_light" if dark_on_light else "light_on_dark"}
+    c = (colp - cmin) / (cmax - cmin)
+    pks = peaks_prom(c, max(10, round(W * 0.03)), 0.06)
+
+    pad_y = 0.25 * (yy1 - yy0)
+    lanes = []
+    for i, px in enumerate(pks):
+        left = (pks[i - 1] + px) // 2 if i > 0 else px - round(W * 0.04)
+        right = (pks[i + 1] + px) // 2 if i < len(pks) - 1 else px + round(W * 0.04)
+        lov = 0.35 * c[px]
+        l = px
+        while l > left and c[l] > lov:
+            l -= 1
+        r = px
+        while r < right and c[r] > lov:
+            r += 1
+        x0 = max(0.0, l / W); x1 = min(1.0, r / W)
+        y0 = max(0.0, (yy0 - pad_y) / H); y1 = min(1.0, (yy1 + pad_y) / H)
+        if x1 - x0 > 0.005 and y1 - y0 > 0.005:
+            lanes.append({"x": round(x0, 4), "y": round(y0, 4), "w": round(x1 - x0, 4), "h": round(y1 - y0, 4)})
+    return {"lanes": lanes, "polarity": "dark_on_light" if dark_on_light else "light_on_dark"}
+
+
 class PyAnalysisRequest(BaseModel):
     code: str
     # Sources the pipeline can read. Each entry: { key, row, col,

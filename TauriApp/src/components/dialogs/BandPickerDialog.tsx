@@ -261,6 +261,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   const [cfg, setCfg] = useState<BandPickerConfig>(initial ?? emptyBandConfig());
   const [selId, setSelId] = useState<string | null>(null);
   const [drawingBg, setDrawingBg] = useState(false);
+  const [detecting, setDetecting] = useState(false);
   const [natW, setNatW] = useState(0);
   const [natH, setNatH] = useState(0);
   const [gray, setGray] = useState<Float32Array | null>(null);
@@ -432,12 +433,42 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   const deleteLane = (id: string) =>
     setCfg((c) => ({ ...c, lanes: c.lanes.filter((l) => l.id !== id) }));
 
-  const runAutoDetect = () => {
-    if (!gray || !natW || !natH) return;
-    const lanes = autoDetectLanes(gray, natW, natH);
-    if (lanes.length === 0) return;
+  const applyDetectedLanes = (rects: Array<{ x: number; y: number; w: number; h: number }>): boolean => {
+    if (!rects.length) return false;
+    const lanes: BandRoi[] = rects.map((r, i) => ({
+      id: uid(), x: clamp01(r.x), y: clamp01(r.y), w: clamp01(r.w), h: clamp01(r.h),
+      label: `Lane ${i + 1}`, isReference: i === 0,
+    }));
     setCfg((c) => ({ ...c, lanes }));
     setSelId(lanes[0]?.id ?? null);
+    return true;
+  };
+
+  const runAutoDetect = async () => {
+    if (detecting) return;
+    setDetecting(true);
+    try {
+      // Prefer the backend detector (robust band-row-constrained algorithm,
+      // pure-numpy so it ships in the frozen sidecar). Fall back to the local
+      // heuristic if the endpoint isn't reachable (e.g. older sidecar / no backend).
+      if (imageSrc) {
+        try {
+          const b64 = imageSrc.startsWith("data:") ? imageSrc.split(",")[1] : imageSrc;
+          const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
+          const resp = await fetch(`${apiBase}/api/analysis/wb-detect-bands`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ image_b64: b64 }),
+          });
+          if (resp.ok) {
+            const data = await resp.json();
+            if (Array.isArray(data.lanes) && applyDetectedLanes(data.lanes)) return;
+          }
+        } catch { /* backend unavailable → local fallback */ }
+      }
+      if (gray && natW && natH) applyDetectedLanes(autoDetectLanes(gray, natW, natH));
+    } finally {
+      setDetecting(false);
+    }
   };
 
   // Render an 8-handle set for a normalised rect.
@@ -515,8 +546,8 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
         <Box sx={{ flex: 1, minWidth: 280, display: "flex", flexDirection: "column", gap: 1.25 }}>
           <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
             <Button size="small" variant="outlined" startIcon={<AutoFixHighIcon sx={{ fontSize: 16 }} />}
-              onClick={runAutoDetect} disabled={!gray}>
-              Auto-detect lanes
+              onClick={runAutoDetect} disabled={!srcUrl || detecting}>
+              {detecting ? "Detecting…" : "Auto-detect lanes"}
             </Button>
             <Typography variant="caption" sx={{ color: "text.secondary" }}>{cfg.lanes.length} lane(s)</Typography>
           </Box>
