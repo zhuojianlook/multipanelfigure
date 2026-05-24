@@ -51,6 +51,33 @@ export function emptyBandConfig(): BandPickerConfig {
 const uid = () => `lane_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
 
+/** Lay out `n` evenly-spaced lanes across a region [x0,x1] at band-row y/h.
+ *  This is the robust core: the user sets the span (via the outermost lanes /
+ *  auto-detect) + the count, and every lane gets an ROI — even where a band is
+ *  faint or absent (it then quantifies as ~0, which is correct). `refIdx` keeps
+ *  the loading-control designation on a stable lane index. */
+function makeLaneGrid(
+  region: { x0: number; x1: number; y: number; h: number },
+  n: number,
+  refIdx: number,
+): BandRoi[] {
+  const count = Math.max(1, Math.min(60, Math.round(n)));
+  const span = Math.max(0.01, region.x1 - region.x0);
+  const cell = span / count;
+  const w = cell * 0.84;                 // slight gutter between lanes
+  const ref = refIdx >= 0 ? Math.min(refIdx, count - 1) : 0;
+  const out: BandRoi[] = [];
+  for (let i = 0; i < count; i++) {
+    const cx = region.x0 + (i + 0.5) * cell;
+    const x = clamp01(cx - w / 2);
+    out.push({
+      id: uid(), x, y: clamp01(region.y), w: Math.min(w, 1 - x), h: clamp01(region.h),
+      label: `Lane ${i + 1}`, isReference: i === ref,
+    });
+  }
+  return out;
+}
+
 // ── Python code generator ────────────────────────────────────
 // Emits a self-contained script.  The config is embedded as a JSON
 // literal so the run is fully reproducible from the saved node.
@@ -471,6 +498,34 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     }
   };
 
+  // Re-flow the lanes into an evenly-spaced grid of `n` across the current span.
+  // The span + band row come from the existing lanes (so the user positions the
+  // outermost lanes / auto-detects, then dials the count); with <2 lanes we fall
+  // back to a sensible centred default so "+" works from scratch too.
+  const regridBy = (delta: number) => {
+    setSelId(null);
+    setCfg((c) => {
+      // Derive the target count from the LATEST state (not a click-closure
+      // value) so rapid −/+ clicks accumulate correctly.
+      const n = Math.max(1, Math.min(60, c.lanes.length + delta));
+      let region: { x0: number; x1: number; y: number; h: number };
+      let refIdx = c.lanes.findIndex((l) => l.isReference);
+      if (c.lanes.length >= 2) {
+        region = {
+          x0: Math.min(...c.lanes.map((l) => l.x)),
+          x1: Math.max(...c.lanes.map((l) => l.x + l.w)),
+          y: c.lanes[0].y, h: c.lanes[0].h,
+        };
+      } else if (c.lanes.length === 1) {
+        region = { x0: 0.12, x1: 0.88, y: c.lanes[0].y, h: c.lanes[0].h };
+        refIdx = 0;
+      } else {
+        region = { x0: 0.12, x1: 0.88, y: 0.42, h: 0.1 };
+      }
+      return { ...c, lanes: makeLaneGrid(region, n, refIdx) };
+    });
+  };
+
   // Render an 8-handle set for a normalised rect.
   const handlesFor = (rect: { x: number; y: number; w: number; h: number }, id: string | null, roleHandle: string) => {
     const hs = [
@@ -491,7 +546,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
       <DialogTitle sx={{ fontSize: "1rem", py: 1.25 }}>
         🩻 Pick bands
         <Typography component="span" variant="caption" sx={{ ml: 1.5, color: "text.secondary" }}>
-          Drag on the blot to draw a lane · drag a lane to move · handles to resize
+          Auto-detect, then set the lane count with −/+ · drag the end lanes to set the span · nudge / resize any lane
         </Typography>
       </DialogTitle>
       <DialogContent dividers sx={{ display: "flex", gap: 2, alignItems: "flex-start" }}>
@@ -549,7 +604,22 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
               onClick={runAutoDetect} disabled={!srcUrl || detecting}>
               {detecting ? "Detecting…" : "Auto-detect lanes"}
             </Button>
-            <Typography variant="caption" sx={{ color: "text.secondary" }}>{cfg.lanes.length} lane(s)</Typography>
+            <Box sx={{ display: "flex", alignItems: "center", gap: 0.25, ml: "auto" }}>
+              <Tooltip title="Even out into N lanes across the current span (positions the spacing for you; nudge individual lanes after)">
+                <Typography variant="caption" sx={{ color: "text.secondary", mr: 0.25 }}>Lanes</Typography>
+              </Tooltip>
+              <IconButton size="small" sx={{ p: 0.25 }} disabled={cfg.lanes.length <= 1}
+                onClick={() => regridBy(-1)}>
+                <span style={{ fontSize: 16, lineHeight: 1, fontWeight: 700 }}>−</span>
+              </IconButton>
+              <Typography variant="caption" sx={{ minWidth: 18, textAlign: "center", fontVariantNumeric: "tabular-nums", fontWeight: 600 }}>
+                {cfg.lanes.length}
+              </Typography>
+              <IconButton size="small" sx={{ p: 0.25 }}
+                onClick={() => regridBy(1)}>
+                <span style={{ fontSize: 16, lineHeight: 1, fontWeight: 700 }}>+</span>
+              </IconButton>
+            </Box>
           </Box>
 
           {/* Background subtraction */}
