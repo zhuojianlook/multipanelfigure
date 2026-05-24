@@ -51,33 +51,6 @@ export function emptyBandConfig(): BandPickerConfig {
 const uid = () => `lane_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
 
-/** Lay out `n` evenly-spaced lanes across a region [x0,x1] at band-row y/h.
- *  This is the robust core: the user sets the span (via the outermost lanes /
- *  auto-detect) + the count, and every lane gets an ROI — even where a band is
- *  faint or absent (it then quantifies as ~0, which is correct). `refIdx` keeps
- *  the loading-control designation on a stable lane index. */
-function makeLaneGrid(
-  region: { x0: number; x1: number; y: number; h: number },
-  n: number,
-  refIdx: number,
-): BandRoi[] {
-  const count = Math.max(1, Math.min(60, Math.round(n)));
-  const span = Math.max(0.01, region.x1 - region.x0);
-  const cell = span / count;
-  const w = cell * 0.84;                 // slight gutter between lanes
-  const ref = refIdx >= 0 ? Math.min(refIdx, count - 1) : 0;
-  const out: BandRoi[] = [];
-  for (let i = 0; i < count; i++) {
-    const cx = region.x0 + (i + 0.5) * cell;
-    const x = clamp01(cx - w / 2);
-    out.push({
-      id: uid(), x, y: clamp01(region.y), w: Math.min(w, 1 - x), h: clamp01(region.h),
-      label: `Lane ${i + 1}`, isReference: i === ref,
-    });
-  }
-  return out;
-}
-
 // ── Python code generator ────────────────────────────────────
 // Emits a self-contained script.  The config is embedded as a JSON
 // literal so the run is fully reproducible from the saved node.
@@ -504,59 +477,6 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
 
   // Snap each existing lane's vertical position to its actual band, keeping the
   // user's x-grid. Sends the current lanes to the backend's per-lane detector
-  // (65th-pct vertical profile + rolling baseline → strongest band).
-  const snapToBands = async () => {
-    if ((!imageSrc && !source) || cfg.lanes.length === 0 || detecting) return;
-    setDetecting(true);
-    try {
-      const b64 = imageSrc ? (imageSrc.startsWith("data:") ? imageSrc.split(",")[1] : imageSrc) : "";
-      const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
-      const resp = await fetch(`${apiBase}/api/analysis/wb-detect-bands`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image_b64: b64, source: source ?? undefined, lanes: cfg.lanes.map((l) => ({ x: l.x, y: l.y, w: l.w, h: l.h })) }),
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        if (Array.isArray(data.lanes) && data.lanes.length === cfg.lanes.length) {
-          setCfg((c) => ({
-            ...c,
-            lanes: c.lanes.map((l, i) => ({ ...l, y: clamp01(data.lanes[i].y), h: clamp01(data.lanes[i].h) })),
-          }));
-        }
-      }
-    } catch { /* backend unavailable — leave lanes as-is */ } finally {
-      setDetecting(false);
-    }
-  };
-
-  // Re-flow the lanes into an evenly-spaced grid of `n` across the current span.
-  // The span + band row come from the existing lanes (so the user positions the
-  // outermost lanes / auto-detects, then dials the count); with <2 lanes we fall
-  // back to a sensible centred default so "+" works from scratch too.
-  const regridBy = (delta: number) => {
-    setSelId(null);
-    setCfg((c) => {
-      // Derive the target count from the LATEST state (not a click-closure
-      // value) so rapid −/+ clicks accumulate correctly.
-      const n = Math.max(1, Math.min(60, c.lanes.length + delta));
-      let region: { x0: number; x1: number; y: number; h: number };
-      let refIdx = c.lanes.findIndex((l) => l.isReference);
-      if (c.lanes.length >= 2) {
-        region = {
-          x0: Math.min(...c.lanes.map((l) => l.x)),
-          x1: Math.max(...c.lanes.map((l) => l.x + l.w)),
-          y: c.lanes[0].y, h: c.lanes[0].h,
-        };
-      } else if (c.lanes.length === 1) {
-        region = { x0: 0.12, x1: 0.88, y: c.lanes[0].y, h: c.lanes[0].h };
-        refIdx = 0;
-      } else {
-        region = { x0: 0.12, x1: 0.88, y: 0.42, h: 0.1 };
-      }
-      return { ...c, lanes: makeLaneGrid(region, n, refIdx) };
-    });
-  };
-
   // Render an 8-handle set for a normalised rect.
   const handlesFor = (rect: { x: number; y: number; w: number; h: number }, id: string | null, roleHandle: string) => {
     const hs = [
@@ -577,7 +497,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
       <DialogTitle sx={{ fontSize: "1rem", py: 1.25 }}>
         🩻 Pick bands
         <Typography component="span" variant="caption" sx={{ ml: 1.5, color: "text.secondary" }}>
-          Auto-detect, then set the lane count with −/+ · drag the end lanes to set the span · nudge / resize any lane
+          Auto-detect bands, then clean up: drag to move · handles to resize · select + Delete to remove · drag on the blot to add
         </Typography>
       </DialogTitle>
       <DialogContent dividers sx={{ display: "flex", gap: 2, alignItems: "flex-start" }}>
@@ -631,34 +551,13 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
         {/* Controls */}
         <Box sx={{ flex: 1, minWidth: 280, display: "flex", flexDirection: "column", gap: 1.25 }}>
           <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-            <Button size="small" variant="outlined" startIcon={<AutoFixHighIcon sx={{ fontSize: 16 }} />}
+            <Button size="small" variant="contained" startIcon={<AutoFixHighIcon sx={{ fontSize: 16 }} />}
               onClick={runAutoDetect} disabled={!srcUrl || detecting}>
-              {detecting ? "Detecting…" : "Auto-detect lanes"}
+              {detecting ? "Detecting…" : "Auto-detect bands"}
             </Button>
-            <Tooltip title="Snap each lane's vertical position to its band (keeps your lane spacing)">
-              <span>
-                <Button size="small" variant="outlined"
-                  onClick={snapToBands} disabled={!srcUrl || detecting || cfg.lanes.length === 0}>
-                  Snap to bands
-                </Button>
-              </span>
-            </Tooltip>
-            <Box sx={{ display: "flex", alignItems: "center", gap: 0.25, ml: "auto" }}>
-              <Tooltip title="Even out into N lanes across the current span (positions the spacing for you; nudge individual lanes after)">
-                <Typography variant="caption" sx={{ color: "text.secondary", mr: 0.25 }}>Lanes</Typography>
-              </Tooltip>
-              <IconButton size="small" sx={{ p: 0.25 }} disabled={cfg.lanes.length <= 1}
-                onClick={() => regridBy(-1)}>
-                <span style={{ fontSize: 16, lineHeight: 1, fontWeight: 700 }}>−</span>
-              </IconButton>
-              <Typography variant="caption" sx={{ minWidth: 18, textAlign: "center", fontVariantNumeric: "tabular-nums", fontWeight: 600 }}>
-                {cfg.lanes.length}
-              </Typography>
-              <IconButton size="small" sx={{ p: 0.25 }}
-                onClick={() => regridBy(1)}>
-                <span style={{ fontSize: 16, lineHeight: 1, fontWeight: 700 }}>+</span>
-              </IconButton>
-            </Box>
+            <Typography variant="caption" sx={{ color: "text.secondary", ml: "auto" }}>
+              {cfg.lanes.length} band(s) — delete / drag / resize to clean up
+            </Typography>
           </Box>
 
           {/* Background subtraction */}
@@ -700,7 +599,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
             </Box>
             {cfg.lanes.length === 0 ? (
               <Typography variant="caption" sx={{ display: "block", p: 1.5, color: "text.secondary", fontStyle: "italic" }}>
-                No lanes yet. Click “Auto-detect lanes” or drag rectangles on the blot.
+                No bands yet. Click “Auto-detect bands”, or drag rectangles on the blot.
               </Typography>
             ) : cfg.lanes.map((lane, i) => (
               <Box key={lane.id}
