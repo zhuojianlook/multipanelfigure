@@ -6381,28 +6381,22 @@ class WbBandDetectRequest(BaseModel):
     # base64-encoded image (data-URL prefix tolerated). Optional when `source`
     # is given (we then re-extract full-res in-app).
     image_b64: str = ""
-    # Optional source descriptor {key,row,col,inset_index} — re-extract the
+    # Optional source descriptor {key,row,col,inset_index} → re-extract the
     # FULL-RES display-adjusted source image in the sidecar.
     source: Optional[Dict[str, object]] = None
-    # Optional user-defined lanes (normalized rects) → REFINE each lane's band y.
-    lanes: Optional[List[Dict[str, float]]] = None
 
 
 @app.post("/api/analysis/wb-detect-bands")
 def wb_detect_bands(body: WbBandDetectRequest):
-    """Best-effort western-blot band auto-detection (one button; user cleans up).
+    """Western-blot band auto-detection — a faithful port of the user's validated
+    detect_bands.py (contrast_scale + horizontal_signal + auto_detect_lanes +
+    detect_lane_bands). auto_detect_lanes finds lanes from band-SHAPED connected
+    components (99th-pct seeds, width/height/aspect filters) so it rejects the
+    membrane edges / black background / smears that naive profiles pick up.
 
-    Pipeline = the user's validated standalone script, applied automatically:
-      * percentile contrast-stretch (faint bands surface),
-      * MAX-channel + light blur + large-sigma background subtract (top-hat) +
-        DIRECTIONAL smooth (sigmaX >> sigmaY) → horizontal-band-enhanced signal,
-      * detect the membrane (largest bright blob) to keep detection off the
-        black background,
-      * find lane columns inside the membrane, and within each lane collapse to
-        a 65th-pct vertical profile, subtract a rolling baseline, and find_peaks
-        → ALL bands (clear + faint).
-    Real blots are messy (tilted membrane edges, smears, ladder) so this WILL
-    place some wrong boxes the user deletes/moves. scipy + cv2 (both bundled).
+    The image is resized to a canonical 1400 px width so the script's pixel-tuned
+    parameters apply at the right scale; ROIs are returned NORMALISED 0..1.
+    scipy + cv2 (both bundled). One button; the user cleans up from there.
     """
     import numpy as _np
     import cv2 as _cv2
@@ -6426,104 +6420,130 @@ def wb_detect_bands(body: WbBandDetectRequest):
         except Exception as e:
             return {"lanes": [], "error": f"decode failed: {e}"}
     rgb = _np.asarray(img).astype(_np.float32)
-    H, W = rgb.shape[:2]
-    if W < 16 or H < 16:
+    if rgb.ndim != 3 or rgb.shape[2] < 3 or rgb.shape[0] < 16 or rgb.shape[1] < 16:
         return {"lanes": [], "error": "image too small"}
 
+    # Canonical resize to ~1400 px wide so the script's fixed pixel params match.
+    H0, W0 = rgb.shape[:2]
+    TW = 1400
+    TH = max(16, int(round(H0 * TW / W0)))
+    rgb = _cv2.resize(rgb, (TW, TH), interpolation=_cv2.INTER_AREA)
+    H, W = TH, TW
+
+    # ---- contrast_scale ----
     lo, hi = _np.percentile(rgb, [0.5, 99.95])
-    sc = _np.clip((rgb - lo) / max(1e-6, float(hi - lo)), 0.0, 1.0)
-    analysis = (sc * 255.0).astype(_np.uint8)
+    scaled = _np.clip((rgb - lo) / max(1e-6, float(hi - lo)), 0, 1)
+    analysis = _np.clip(scaled * 255, 0, 255).astype(_np.uint8)
 
-    gmax = analysis.max(axis=2)
-    dark_on_light = bool(_np.median(gmax) >= 128)
-    gray = (255 - gmax) if dark_on_light else gmax        # bands → bright
-    blur = _cv2.GaussianBlur(gray, (0, 0), max(0.8, W * 0.0008))
-    bg = _cv2.GaussianBlur(blur, (0, 0), max(12.0, W * 0.02))
-    sig = _np.clip(blur.astype(_np.float32) - bg.astype(_np.float32), 0, None)
-    sig = _cv2.GaussianBlur(sig, (0, 0), sigmaX=max(2.0, W * 0.0021), sigmaY=max(0.7, H * 0.0009))
+    # ---- polarity (bands bright? else dark) ----
+    gmax = _np.max(analysis, axis=2)
+    polarity = "dark" if bool(_np.median(gmax) >= 128) else "bright"
 
-    def band_in(x0, x1, y0, y1, multi):
-        """Detect band(s) in a lane region. multi=True → all; else strongest."""
-        x0 = max(0, min(W - 1, int(x0))); x1 = max(x0 + 1, min(W, int(x1)))
-        y0 = max(0, min(H - 1, int(y0))); y1 = max(y0 + 1, min(H, int(y1)))
-        lane = sig[y0:y1, x0:x1]
-        if lane.size == 0:
+    # ---- horizontal_signal ----
+    gray = (255 - gmax) if polarity == "dark" else gmax
+    blur = _cv2.GaussianBlur(gray, (0, 0), 1.0)
+    bg = _cv2.GaussianBlur(blur, (0, 0), 28)
+    signal = blur.astype(_np.float32) - bg.astype(_np.float32)
+    signal[signal < 0] = 0
+    signal = _cv2.GaussianBlur(signal, (0, 0), sigmaX=3, sigmaY=1)
+
+    # ---- auto_detect_lanes (verbatim) ----
+    def auto_detect_lanes(sig, expected_lanes, lane_width, lane_y1, lane_y2, min_gap, threshold_percentile, max_band_width):
+        height, width = sig.shape
+        threshold = float(_np.percentile(sig, threshold_percentile)); threshold = max(threshold, 1.0)
+        feature = _cv2.morphologyEx(sig.astype(_np.uint8), _cv2.MORPH_OPEN, _cv2.getStructuringElement(_cv2.MORPH_RECT, (11, 3)))
+        mask = (feature > threshold).astype(_np.uint8) * 255
+        mask = _cv2.morphologyEx(mask, _cv2.MORPH_CLOSE, _cv2.getStructuringElement(_cv2.MORPH_RECT, (7, 3)))
+        num, labels, stats, cents = _cv2.connectedComponentsWithStats(mask, 8)
+        components = []
+        min_band_width = max(12, int(width * 0.01))
+        if max_band_width <= 0:
+            max_band_width = max(50, int(width * 0.16))
+        for label in range(1, num):
+            x, y, cw, ch, area = stats[label]
+            cx, cy = cents[label]
+            if cw < min_band_width or cw > max_band_width:
+                continue
+            if ch < 3 or ch > max(60, int(height * 0.08)):
+                continue
+            if area < max(30, min_band_width * 2):
+                continue
+            if cw / max(ch, 1) < 2.0:
+                continue
+            mean_signal = float(sig[labels == label].mean())
+            components.append({"cx": float(cx), "x1": int(x), "x2": int(x + cw), "y1": int(y), "y2": int(y + ch), "score": float(area * mean_signal)})
+        if not components:
             return []
-        span = y1 - y0
-        vp = _gf1d(_np.percentile(lane, 65, axis=1), max(1.2, span * 0.0085))
-        base = _gf1d(vp, max(4.0, span * 0.069))
-        pp = _np.clip(vp - base, 0.0, None)
-        pmax = float(pp.max())
-        if pmax <= 1e-6:
-            return []
-        minprom = max(float(_np.percentile(pp, 90)) * 0.45, pmax * 0.08)
-        wmin = max(2, int(span * 0.012)); wmax = max(wmin + 2, int(span * 0.16))
-        peaks, props = _find_peaks(pp, distance=max(4, int(span * 0.069)),
-                                   prominence=minprom, width=(wmin, wmax))
+        components.sort(key=lambda it: it["cx"])
+        clusters = []
+        for c in components:
+            if not clusters or c["cx"] - clusters[-1][-1]["cx"] > min_gap:
+                clusters.append([c])
+            else:
+                clusters[-1].append(c)
+        gy1 = int(lane_y1) if lane_y1 is not None else max(0, min(c["y1"] for c in components) - 35)
+        gy2 = int(lane_y2) if lane_y2 is not None else min(height, max(c["y2"] for c in components) + 35)
+        cands = []
+        for cl in clusters:
+            centers = _np.array([it["cx"] for it in cl]); scores = _np.array([max(it["score"], 1.0) for it in cl])
+            center = int(round(float(_np.average(centers, weights=scores)))); score = float(_np.sum(scores))
+            cwid = int(lane_width) if lane_width is not None else max(40, int(_np.percentile([it["x2"] - it["x1"] for it in cl], 75)) + 24)
+            x1 = max(0, center - cwid // 2); x2 = min(width, x1 + cwid)
+            if x2 - x1 < cwid and x2 == width:
+                x1 = max(0, x2 - cwid)
+            cands.append((score, center, x1, x2, gy1, gy2))
+        cands.sort(key=lambda it: it[0], reverse=True)
+        if expected_lanes is not None:
+            cands = cands[:expected_lanes]
+        else:
+            strongest = cands[0][0]
+            cands = [it for it in cands if it[0] >= strongest * 0.015]
+        cands.sort(key=lambda it: it[1])
+        return [(f"Lane{i}", int(x1), int(x2), int(y1), int(y2)) for i, (_s, _c, x1, x2, y1, y2) in enumerate(cands, start=1)]
+
+    # ---- detect_lane_bands (verbatim) ----
+    marker_lanes = {"L", "Ladder", "Marker"}
+    def detect_lane_bands(sig, lanes):
         out = []
-        if len(peaks):
-            order = list(range(len(peaks)))
-            if not multi:
-                order = [int(_np.argmax(props["prominences"]))]
-            for j in order:
-                pk = int(peaks[j]); w = float(props["widths"][j])
-                pad = max(int(span * 0.012), int(w * 0.7))
-                out.append((y0 + pk - pad, y0 + pk + pad))
-        elif not multi:
-            pk = int(_np.argmax(pp)); pad = max(2, int(span * 0.04))
-            out.append((y0 + pk - pad, y0 + pk + pad))
+        for lane_name, x1, x2, y1, y2 in lanes:
+            lane = sig[y1:y2, x1:x2]
+            if lane.size == 0:
+                continue
+            vp = _gf1d(_np.percentile(lane, 65, axis=1), 2.2)
+            base = _gf1d(vp, 18)
+            pp = vp - base; pp[pp < 0] = 0
+            min_prom = max(float(_np.percentile(pp, 90)) * 0.45, 1.5)
+            min_dist = 18
+            if lane_name in marker_lanes:
+                min_prom = max(float(_np.percentile(pp, 80)) * 0.30, 2.0); min_dist = 20
+            peaks, props = _find_peaks(pp, distance=min_dist, prominence=min_prom, width=(3, 35))
+            for idx, pk in enumerate(peaks):
+                prom = float(props["prominences"][idx]); w = float(props["widths"][idx])
+                if lane_name in marker_lanes or prom >= 10:
+                    conf = "clear"
+                elif prom >= 4:
+                    conf = "faint"
+                else:
+                    continue
+                out.append({"x1": x1, "x2": x2, "y": int(pk + y1), "width": round(w, 1), "confidence": conf})
         return out
 
-    # ---- REFINE: snap each user lane to its strongest band ----
-    if body.lanes:
-        res = []
-        for L in body.lanes:
-            try:
-                lx, ly, lw, lh = float(L["x"]), float(L["y"]), float(L["w"]), float(L["h"])
-            except Exception:
-                continue
-            got = band_in(lx * W, (lx + lw) * W, (ly - lh * 0.6) * H, (ly + lh * 1.6) * H, multi=False)
-            if got:
-                a, b = got[0]
-                res.append({"x": round(lx, 4), "y": round(max(0.0, a / H), 4), "w": round(lw, 4), "h": round(min(1.0, b / H) - max(0.0, a / H), 4)})
-            else:
-                res.append({"x": round(lx, 4), "y": round(ly, 4), "w": round(lw, 4), "h": round(lh, 4)})
-        return {"lanes": res, "mode": "refine"}
+    try:
+        lanes = auto_detect_lanes(signal, None, None, None, None, 45, 99.0, 0)
+    except Exception as _e:
+        import sys as __s
+        print(f"[wb-detect] auto_detect_lanes failed: {_e}", file=__s.stderr, flush=True)
+        lanes = []
+    bands = detect_lane_bands(signal, lanes)
 
-    # ---- AUTO: membrane → lanes → all bands ----
-    gb = _cv2.GaussianBlur(gmax, (0, 0), max(2.0, W * 0.004))
-    thr = max(int(_np.percentile(gmax, 60)), 25)
-    mmask = (gb > thr).astype(_np.uint8)
-    kk = max(9, int(W * 0.02)) | 1
-    mmask = _cv2.morphologyEx(mmask, _cv2.MORPH_CLOSE, _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (kk, kk)))
-    mmask = _cv2.morphologyEx(mmask, _cv2.MORPH_OPEN, _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (max(9, kk // 2) | 1,) * 2))
-    num, _lab, stats, _c = _cv2.connectedComponentsWithStats(mmask, 8)
-    if num > 1:
-        li = 1 + int(_np.argmax(stats[1:, _cv2.CC_STAT_AREA]))
-        mx, my, mw, mh = int(stats[li, 0]), int(stats[li, 1]), int(stats[li, 2]), int(stats[li, 3])
-    else:
-        mx, my, mw, mh = 0, 0, W, H
-    ix, iy = int(mw * 0.05), int(mh * 0.08)
-    MX0, MY0, MX1, MY1 = mx + ix, my + iy, mx + mw - ix, my + mh - iy
-    if MX1 - MX0 < W * 0.15: MX0, MX1 = 0, W
-    if MY1 - MY0 < H * 0.15: MY0, MY1 = 0, H
-
-    colp = _gf1d(sig[MY0:MY1, MX0:MX1].sum(axis=0), max(2.0, W * 0.004))
-    cmin, cmax = float(colp.min()), float(colp.max())
-    bands = []
-    if cmax - cmin > 1e-6:
-        cc = (colp - cmin) / (cmax - cmin)
-        lpk, _lp = _find_peaks(cc, prominence=0.05, distance=max(10, int(W * 0.035)))
-        lanes_x = [MX0 + int(x) for x in lpk]
-        for i, px in enumerate(lanes_x):
-            left = (lanes_x[i - 1] + px) // 2 if i > 0 else MX0
-            right = (lanes_x[i + 1] + px) // 2 if i < len(lanes_x) - 1 else MX1
-            for (a, b) in band_in(left, right, MY0, MY1, multi=True):
-                x0n = max(0.0, left / W); x1n = min(1.0, right / W)
-                y0n = max(0.0, a / H); y1n = min(1.0, b / H)
-                if x1n - x0n > 0.005 and y1n - y0n > 0.004:
-                    bands.append({"x": round(x0n, 4), "y": round(y0n, 4), "w": round(x1n - x0n, 4), "h": round(y1n - y0n, 4)})
-    return {"lanes": bands, "mode": "auto", "polarity": "dark_on_light" if dark_on_light else "light_on_dark"}
+    out = []
+    for b in bands:
+        pad = max(6, int(b["width"] * 1.2))
+        x0n = max(0.0, b["x1"] / W); x1n = min(1.0, b["x2"] / W)
+        y0n = max(0.0, (b["y"] - pad) / H); y1n = min(1.0, (b["y"] + pad) / H)
+        if x1n - x0n > 0.004 and y1n - y0n > 0.003:
+            out.append({"x": round(x0n, 4), "y": round(y0n, 4), "w": round(x1n - x0n, 4), "h": round(y1n - y0n, 4)})
+    return {"lanes": out, "mode": "auto", "polarity": polarity}
 
 
 class PyAnalysisRequest(BaseModel):
