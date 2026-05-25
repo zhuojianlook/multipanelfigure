@@ -6547,9 +6547,10 @@ def wb_detect_bands(body: WbBandDetectRequest):
         filter (the script's `--auto-min-group-lanes` default is 3) that drops
         isolated dust / hot spots which were making the app over-detect.
 
-    The image is resized to a canonical 1400 px width so the script's fixed
-    pixel params apply at the right scale; ROIs are returned NORMALISED 0..1.
-    scipy + cv2 (both bundled). One button; the user cleans up from there.
+    Detection runs at the source's NATIVE resolution (matching the script's
+    load_rgb_tiff, which never resizes) on FULL-BIT-DEPTH pixels when available;
+    ROIs are returned NORMALISED 0..1. scipy + cv2 (both bundled). One button;
+    the user cleans up from there.
     """
     import numpy as _np
     import cv2 as _cv2
@@ -6600,17 +6601,17 @@ def wb_detect_bands(body: WbBandDetectRequest):
     if rgb.ndim != 3 or rgb.shape[2] < 3 or rgb.shape[0] < 16 or rgb.shape[1] < 16:
         return {"lanes": [], "error": "image too small"}
 
-    # Source resolution actually analysed (BEFORE any resize). The script's
-    # fixed pixel params are tuned for full-res blots (~1000-2000 px wide); if
-    # we only have a small preview the detection is unreliable, so we report
-    # this back and the UI warns the user to supply the full-res membrane.
+    # Source resolution actually analysed. The script (detect_bands.py) runs at
+    # the TIFF's NATIVE resolution — its absolute pixel params (gaussian σ=28,
+    # peak distance=18, width 3..35, min_gap=45) are tuned for that — so to
+    # reproduce its result EXACTLY we must NOT resize. (A previous canonical
+    # 1400px downscale silently diverged on larger blots.) A small preview is
+    # still flagged via src_w so the UI can warn the user.
     src_h, src_w = rgb.shape[:2]
-
-    # Only DOWNSCALE large blots to ~1400 px wide so the script's fixed pixel
-    # params match. Never UPSCALE a small image (e.g. a 256 px thumbnail) — that
-    # just blurs noise and produces junk detections at the wrong scale.
+    # Safety valve only: cap pathologically huge inputs (> ~4000 px wide) so a
+    # giant scan can't OOM / hang the sidecar. Normal blots run at native res.
     H0, W0 = rgb.shape[:2]
-    TW = 1400
+    TW = 4000
     if W0 > TW:
         TH = max(16, int(round(H0 * TW / W0)))
         rgb = _cv2.resize(rgb, (TW, TH), interpolation=_cv2.INTER_AREA)

@@ -36,7 +36,10 @@ Lane = tuple
 DEFAULT_SIGNAL_POLARITY = "bright"
 DEFAULT_MARKER_LANES = {"L", "Ladder", "Marker"}
 DEFAULT_AUTO_LANE_MIN_GAP = 45
-DEFAULT_AUTO_LANE_THRESHOLD_PERCENTILE = 99.0
+# detect_bands.py --auto-lane-threshold-percentile default is 98.0 (NOT 99.0).
+# 99.0 rejects too many band components and collapses adjacent lanes (e.g.
+# 6 lanes → 4 on f35t_nrf2-5000ms-m2.tiff), so this must stay 98.0 for parity.
+DEFAULT_AUTO_LANE_THRESHOLD_PERCENTILE = 98.0
 DEFAULT_AUTO_LANE_MAX_BAND_WIDTH = 0
 DEFAULT_AUTO_MIN_GROUP_LANES = 3
 DEFAULT_AUTO_CONSENSUS_TOLERANCE = 24
