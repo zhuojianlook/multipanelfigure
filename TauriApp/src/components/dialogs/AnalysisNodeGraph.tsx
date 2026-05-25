@@ -4767,8 +4767,11 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               <span style={{ fontSize: 12, lineHeight: 1 }}>📁+</span>
             </IconButton>
           </Tooltip>
-          <Tooltip placement="right" title="Add an empty source node to the canvas">
-            <IconButton size="small" onClick={addEmptySourceNode} sx={{ p: 0.25 }}>
+          <input ref={analysisUploadRef} type="file" multiple
+            accept="image/*,.tif,.tiff,.png,.jpg,.jpeg" style={{ display: "none" }}
+            onChange={(e) => { const fs = Array.from(e.target.files || []); e.currentTarget.value = ""; uploadAnalysisImages(fs); }} />
+          <Tooltip placement="right" title="Upload image file(s) into Analysis — full bit depth (16-bit) retained for quantification. Creates a Source node.">
+            <IconButton size="small" onClick={() => analysisUploadRef.current?.click()} sx={{ p: 0.25 }}>
               <AddIcon sx={{ fontSize: 14 }} />
             </IconButton>
           </Tooltip>
@@ -5010,16 +5013,6 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               onClick={addEmptySourceNode}
               sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.source, "&:hover": { bgcolor: KIND_COLOR.source, filter: "brightness(0.9)" } }}>
               🖼 Source
-            </Button>
-          </Tooltip>
-          <input ref={analysisUploadRef} type="file" multiple
-            accept="image/*,.tif,.tiff,.png,.jpg,.jpeg" style={{ display: "none" }}
-            onChange={(e) => { const fs = Array.from(e.target.files || []); e.currentTarget.value = ""; uploadAnalysisImages(fs); }} />
-          <Tooltip placement="bottom" title="Upload an image file straight into Analysis — full bit depth (16-bit) retained for quantification. Creates a Source node.">
-            <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
-              onClick={() => analysisUploadRef.current?.click()}
-              sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.source, "&:hover": { bgcolor: KIND_COLOR.source, filter: "brightness(0.9)" } }}>
-              ⬆ Upload
             </Button>
           </Tooltip>
           <Tooltip placement="bottom" title="Add a Python node">
