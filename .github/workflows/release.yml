@@ -37,6 +37,7 @@ jobs:
             --hidden-import=uvicorn.lifespan.on \
             --hidden-import=uvicorn.lifespan.off \
             --hidden-import=multipart --hidden-import=multipart.multipart \
+            --hidden-import=wb_detect \
             --collect-all PIL --collect-all matplotlib --collect-all cv2 \
             --collect-all tifffile --collect-all nibabel --collect-all scipy \
             --noconfirm api_server.py
