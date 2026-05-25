@@ -309,7 +309,10 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   // Contrast-stretched preview from the backend (bright, clearly-visible bands).
   // Replaces the dark raw thumbnail in the display once auto-detect has run.
   const [previewSrc, setPreviewSrc] = useState<string | null>(null);
+  // Measured size of the image area so the image fills it (no empty space).
+  const [box, setBox] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
   const svgRef = useRef<SVGSVGElement | null>(null);
+  const imgAreaRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<DragState | null>(null);
 
   // Reset state whenever the dialog (re)opens with fresh inputs.
@@ -357,12 +360,29 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     return () => { cancelled = true; };
   }, [dispUrl]);
 
-  // Display geometry — fit within the max box, preserve aspect.
+  // Measure the image area (ResizeObserver) so the image fills the available
+  // space instead of a fixed cap — no empty gap, image as large as it fits.
+  useEffect(() => {
+    if (!open) return;
+    const el = imgAreaRef.current;
+    if (!el) return;
+    const measure = () => setBox({ w: el.clientWidth, h: el.clientHeight });
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [open, srcUrl, previewSrc]);
+
+  // Display geometry — fill the measured image area, preserving aspect.
+  // Allows upscaling so a small thumbnail still expands; the post-detect
+  // preview (~1100px) downscales to fit crisply.
   const disp = useMemo(() => {
-    if (!natW || !natH) return { w: MAX_DISP_W, h: 360 };
-    const scale = Math.min(MAX_DISP_W / natW, MAX_DISP_H / natH, 1.5);
-    return { w: Math.round(natW * scale), h: Math.round(natH * scale) };
-  }, [natW, natH]);
+    const aw = box.w || MAX_DISP_W;
+    const ah = box.h || MAX_DISP_H;
+    if (!natW || !natH) return { w: Math.max(1, aw), h: Math.min(ah, 360) };
+    const scale = Math.min(aw / natW, ah / natH);
+    return { w: Math.max(1, Math.round(natW * scale)), h: Math.max(1, Math.round(natH * scale)) };
+  }, [natW, natH, box]);
 
   // Live IOD per lane (approximate, from display-res grayscale).
   const iodById = useMemo(() => {
@@ -589,11 +609,12 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
           Auto-detect bands, then clean up: drag to move · handles to resize · select + Delete to remove · drag on the blot to add
         </Typography>
       </DialogTitle>
-      {/* Image on the RIGHT (row-reverse) and large, so the user gets a clear
-          look at the membrane; controls sit on the left. */}
-      <DialogContent dividers sx={{ display: "flex", flexDirection: "row-reverse", gap: 2, alignItems: "flex-start" }}>
-        {/* Image + ROI overlay */}
-        <Box sx={{ flexShrink: 0 }}>
+      {/* Image on the RIGHT and FLEX-FILLING, so the user gets a clear look at
+          the membrane; controls are a fixed column on the left. */}
+      <DialogContent dividers sx={{ display: "flex", flexDirection: "row-reverse", gap: 2, alignItems: "stretch", height: "80vh" }}>
+        {/* Image + ROI overlay — flex-fills the remaining width/height, image
+            centred and scaled to fill it (see `disp`, measured from this box). */}
+        <Box ref={imgAreaRef} sx={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
           {dispUrl ? (
             <Box sx={{ position: "relative", width: disp.w, height: disp.h, userSelect: "none", border: "1px solid", borderColor: "divider" }}>
               <Box component="img" src={dispUrl} alt="blot" draggable={false}
@@ -635,7 +656,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
               </svg>
             </Box>
           ) : (
-            <Box sx={{ width: MAX_DISP_W, height: 320, display: "flex", alignItems: "center", justifyContent: "center", border: "1px dashed", borderColor: "divider", color: "text.secondary", textAlign: "center", p: 3 }}>
+            <Box sx={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", border: "1px dashed", borderColor: "divider", color: "text.secondary", textAlign: "center", p: 3 }}>
               <Typography variant="body2">
                 No blot image reached this node.<br />Wire a Source node (with the whole membrane dropped on it) into this Band picker, then reopen.
               </Typography>
@@ -643,8 +664,8 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
           )}
         </Box>
 
-        {/* Controls */}
-        <Box sx={{ flex: 1, minWidth: 300, maxWidth: 440, display: "flex", flexDirection: "column", gap: 1.25 }}>
+        {/* Controls — fixed-width column on the left, scrolls if tall. */}
+        <Box sx={{ width: 380, flexShrink: 0, display: "flex", flexDirection: "column", gap: 1.25, overflowY: "auto", overflowX: "hidden" }}>
           <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
             <Button size="small" variant="contained" startIcon={<AutoFixHighIcon sx={{ fontSize: 16 }} />}
               onClick={runAutoDetect} disabled={!srcUrl || detecting}>
