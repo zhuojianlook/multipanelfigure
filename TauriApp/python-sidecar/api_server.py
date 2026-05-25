@@ -6527,6 +6527,11 @@ class WbBandDetectRequest(BaseModel):
     # Optional source descriptor {key,row,col,inset_index} → re-extract the
     # FULL-RES display-adjusted source image in the sidecar.
     source: Optional[Dict[str, object]] = None
+    # Detection sensitivity = the cross-lane consensus filter's min_group_lanes
+    # (detect_bands.py --auto-min-group-lanes). 3 = strict (script default),
+    # 2 = balanced, 1 = relaxed (keep isolated/faint bands). The app defaults to
+    # 1 ("catch more, clean up") when unset.
+    min_group_lanes: Optional[int] = None
 
 
 @app.post("/api/analysis/wb-detect-bands")
@@ -6624,8 +6629,16 @@ def wb_detect_bands(body: WbBandDetectRequest):
     _gmax = _np.max(_analysis, axis=2)
     polarity = "dark" if bool(_np.median(_gmax) >= 128) else "bright"
 
+    # Sensitivity: default RELAXED (keep isolated/faint bands) for the
+    # "auto-detect then clean up" workflow; the UI can request strict/balanced.
     try:
-        lanes, bands, (H, W) = _wb.detect_wb_bands(rgb, signal_polarity=polarity)
+        mgl = int(body.min_group_lanes) if body.min_group_lanes is not None else 1
+    except Exception:
+        mgl = 1
+    mgl = max(1, min(3, mgl))
+
+    try:
+        lanes, bands, (H, W) = _wb.detect_wb_bands(rgb, signal_polarity=polarity, min_group_lanes=mgl)
         # Tag each band with a molecular-weight ROW group (G1, G2…) so the UI
         # can offer a "level" (target row): "lanes of the same level" are bands
         # at the same apparent MW across columns. assign_band_groups leaves

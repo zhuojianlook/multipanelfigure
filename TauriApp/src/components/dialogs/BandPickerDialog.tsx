@@ -299,6 +299,10 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   const [drawingBg, setDrawingBg] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [detectInfo, setDetectInfo] = useState<string | null>(null);
+  // Auto-detect sensitivity → the cross-lane consensus filter (min_group_lanes).
+  // "relaxed" keeps isolated/faint bands (catch more, clean up); "strict" is the
+  // detect_bands.py default that only keeps bands shared across ≥3 lanes.
+  const [sensitivity, setSensitivity] = useState<"strict" | "balanced" | "relaxed">("relaxed");
   const [natW, setNatW] = useState(0);
   const [natH, setNatH] = useState(0);
   const [gray, setGray] = useState<Float32Array | null>(null);
@@ -516,9 +520,10 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
         try {
           const b64 = imageSrc ? (imageSrc.startsWith("data:") ? imageSrc.split(",")[1] : imageSrc) : "";
           const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
+          const mgl = sensitivity === "strict" ? 3 : sensitivity === "balanced" ? 2 : 1;
           const resp = await fetch(`${apiBase}/api/analysis/wb-detect-bands`, {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ image_b64: b64, source: source ?? undefined }),
+            body: JSON.stringify({ image_b64: b64, source: source ?? undefined, min_group_lanes: mgl }),
           });
           if (resp.ok) {
             const data = await resp.json();
@@ -635,6 +640,17 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
             <Typography variant="caption" sx={{ color: "text.secondary", ml: "auto" }}>
               {cfg.lanes.length} band(s) — delete / drag / resize to clean up
             </Typography>
+          </Box>
+          <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
+            <Tooltip title="How readily a band is kept. Relaxed keeps isolated / faint bands (catch more, then delete extras). Strict only keeps bands shared across ≥3 lanes — the detect_bands.py default.">
+              <Typography variant="caption" sx={{ fontWeight: 700 }}>Sensitivity</Typography>
+            </Tooltip>
+            <ToggleButtonGroup size="small" exclusive value={sensitivity}
+              onChange={(_, v) => { if (v) setSensitivity(v); }}>
+              <ToggleButton value="relaxed" sx={{ textTransform: "none", fontSize: "0.68rem", py: 0.1 }}>Relaxed</ToggleButton>
+              <ToggleButton value="balanced" sx={{ textTransform: "none", fontSize: "0.68rem", py: 0.1 }}>Balanced</ToggleButton>
+              <ToggleButton value="strict" sx={{ textTransform: "none", fontSize: "0.68rem", py: 0.1 }}>Strict</ToggleButton>
+            </ToggleButtonGroup>
           </Box>
           {detectInfo && (
             <Typography variant="caption" sx={{
