@@ -73,7 +73,7 @@ import HourglassEmptyIcon from "@mui/icons-material/HourglassEmpty";
 import EditIcon from "@mui/icons-material/Edit";
 import TextField from "@mui/material/TextField";
 import DialogActions from "@mui/material/DialogActions";
-import CodeMirror from "@uiw/react-codemirror";
+import CodeMirror, { EditorView } from "@uiw/react-codemirror";
 import { python as cmPython } from "@codemirror/lang-python";
 import { StreamLanguage } from "@codemirror/language";
 import { r as cmR } from "@codemirror/legacy-modes/mode/r";
@@ -3122,6 +3122,11 @@ interface WorkflowTab {
 // ~5 MB per-origin quota.  Status is reset to "stale" so users see
 // the cached payloads are no longer authoritative.
 const SESSION_KEY = "mpfig.workflow_session";
+// Code-editor font size (px) for the node detail panel — a display preference
+// that persists across sessions.
+const CODE_FONT_KEY = "mpfig.analysis.code_font";
+const CODE_FONT_MIN = 9;
+const CODE_FONT_MAX = 28;
 interface WorkflowSession {
   tabs: WorkflowTab[];
   activeId: string;
@@ -3232,6 +3237,25 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // Inset sources from the backend (image ports for the source node).
   const [insetSources, setInsetSources] = useState<InsetSource[]>([]);
   const [matlabKind, setMatlabKind] = useState<string>("");
+
+  // Code-editor font size (px) for the selected node's code panel — a display
+  // preference, persisted across sessions.
+  const [codeFontSize, setCodeFontSize] = useState<number>(() => {
+    const v = parseInt(localStorage.getItem(CODE_FONT_KEY) || "", 10);
+    return Number.isFinite(v) && v >= CODE_FONT_MIN && v <= CODE_FONT_MAX ? v : 13;
+  });
+  useEffect(() => {
+    try { localStorage.setItem(CODE_FONT_KEY, String(codeFontSize)); } catch { /* ignore */ }
+  }, [codeFontSize]);
+  const bumpCodeFont = useCallback((delta: number) => {
+    setCodeFontSize((s) => Math.max(CODE_FONT_MIN, Math.min(CODE_FONT_MAX, s + delta)));
+  }, []);
+  // CodeMirror theme extension that applies the chosen font size to the editor
+  // (and gutter, so line numbers scale too).
+  const codeFontTheme = useMemo(() => EditorView.theme({
+    "&": { fontSize: `${codeFontSize}px` },
+    ".cm-gutters": { fontSize: `${codeFontSize}px` },
+  }), [codeFontSize]);
 
   // ── Layer-2 canvases: multiple workflow tabs ────────────────
   // Each tab is an independent graph. The user creates new tabs
@@ -5422,6 +5446,31 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
                 inner divs, leaving the editor stuck at 0 height
                 and silently ignoring overflow.  Letting the flex
                 cascade do the work fixes it across both engines. */}
+            {/* Code font-size control */}
+            <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, mb: 0.5, color: "text.secondary" }}>
+              <Tooltip title="Code display font size">
+                <Typography variant="caption" sx={{ fontSize: "0.6rem", fontWeight: 700, letterSpacing: 0.3 }}>Code size</Typography>
+              </Tooltip>
+              <Tooltip title="Smaller (Ctrl/Cmd −)">
+                <span>
+                  <IconButton size="small" onClick={() => bumpCodeFont(-1)} disabled={codeFontSize <= CODE_FONT_MIN}
+                    sx={{ p: 0.25, width: 20, height: 20 }}>
+                    <Box component="span" sx={{ fontSize: "0.85rem", lineHeight: 1, fontWeight: 700 }}>A−</Box>
+                  </IconButton>
+                </span>
+              </Tooltip>
+              <Typography variant="caption" sx={{ fontSize: "0.62rem", fontVariantNumeric: "tabular-nums", minWidth: 26, textAlign: "center" }}>
+                {codeFontSize}px
+              </Typography>
+              <Tooltip title="Larger (Ctrl/Cmd +)">
+                <span>
+                  <IconButton size="small" onClick={() => bumpCodeFont(1)} disabled={codeFontSize >= CODE_FONT_MAX}
+                    sx={{ p: 0.25, width: 20, height: 20 }}>
+                    <Box component="span" sx={{ fontSize: "0.95rem", lineHeight: 1, fontWeight: 700 }}>A+</Box>
+                  </IconButton>
+                </span>
+              </Tooltip>
+            </Box>
             <Box sx={{
               flex: 1, minHeight: 0,
               display: "flex", flexDirection: "column",
@@ -5457,8 +5506,8 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
                 theme={oneDark}
                 height="100%"
                 extensions={selectedNode.data.kind === "r"
-                  ? [StreamLanguage.define(cmR)]
-                  : [cmPython()]}
+                  ? [StreamLanguage.define(cmR), codeFontTheme]
+                  : [cmPython(), codeFontTheme]}
                 basicSetup={{
                   lineNumbers: true,
                   highlightActiveLine: true,
