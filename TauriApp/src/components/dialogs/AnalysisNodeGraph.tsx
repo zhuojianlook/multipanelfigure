@@ -3325,6 +3325,14 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   const [bandPicker, setBandPicker] = useState<{ open: boolean; nodeId: string | null; image: string | null; source: { key: string; name?: string; row?: number; col?: number; inset_index?: number } | null; cfg: BandPickerConfig | null }>(
     () => ({ open: false, nodeId: null, image: null, source: null, cfg: null }),
   );
+  // When a workflow run opens the band picker, the run AWAITS this resolver so
+  // it pauses until the user finishes specifying bands (Save → cfg, Cancel →
+  // null) instead of barreling on to the downstream Normalize/Plot nodes.
+  const bandPickerResolveRef = useRef<((cfg: BandPickerConfig | null) => void) | null>(null);
+  // Set when a "Run graph" must stop early (e.g. the user cancelled the band
+  // picker). runAll checks it after each node and breaks instead of running the
+  // downstream Normalize/Plot with no bands.
+  const runAbortRef = useRef(false);
   // Set of currently-selected node ids + edge ids — populated by
   // React Flow's onSelectionChange.  Drives the visible "Delete
   // selected" affordance in the canvas toolbar (the only reliable
@@ -4247,20 +4255,46 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       }
       return { open: false, nodeId: null, image: null, source: null, cfg: null };
     });
+    // Resume any run that was waiting on the picker.
+    const r = bandPickerResolveRef.current; bandPickerResolveRef.current = null;
+    if (r) r(cfg);
   }, [setNodes]);
+
+  /** Close the picker and tell a waiting run it was cancelled (null). */
+  const closeBandPicker = useCallback(() => {
+    setBandPicker({ open: false, nodeId: null, image: null, source: null, cfg: null });
+    const r = bandPickerResolveRef.current; bandPickerResolveRef.current = null;
+    if (r) r(null);
+  }, []);
+
+  /** Open the band picker and resolve when the user Saves (cfg) or Cancels
+   *  (null) — lets a workflow run pause until bands are specified. */
+  const openBandPickerAndWait = useCallback((nodeId: string): Promise<BandPickerConfig | null> => {
+    openBandPicker(nodeId);
+    return new Promise((resolve) => { bandPickerResolveRef.current = resolve; });
+  }, [openBandPicker]);
 
   const runNode = useCallback(async (node: Node<NodeData>, nodeMap: Map<string, Node<NodeData>>) => {
     const engine = node.data.kind as EngineKind;
     if (engine !== "python" && engine !== "matlab" && engine !== "r" && engine !== "imagej" && engine !== "cellpose") return;
     // Interactive band-picker with no lanes defined yet → open the "Pick bands…"
-    // editor FIRST rather than running and hitting a "No lanes defined" error.
-    // (Works for both a single-node run and a full "Run graph".)
+    // editor FIRST and WAIT for the user to finish, rather than running (and
+    // hitting "No bands defined") or letting a full "Run graph" barrel on to the
+    // downstream Normalize/Plot before any bands exist.
     if (node.data.interactive === "wb_bands" && (!node.data.roi || (node.data.roi.lanes?.length ?? 0) === 0)) {
-      consoleRef.current += `\n=== ${node.data.label}: pick bands first — opening the editor (drag/auto-detect lanes, then Run again) ===\n`;
+      consoleRef.current += `\n=== ${node.data.label}: specify bands first — opening the picker (auto-detect / draw lanes, then Save bands) ===\n`;
       setConsoleOut(consoleRef.current);
       setNodes((cur) => cur.map((n) => n.id === node.id ? { ...n, data: { ...n.data, status: "idle" } } : n));
-      openBandPicker(node.id);
-      return;
+      const picked = await openBandPickerAndWait(node.id);
+      if (!picked || (picked.lanes?.length ?? 0) === 0) {
+        consoleRef.current += `=== ${node.data.label}: no bands specified — run stopped ===\n`;
+        setConsoleOut(consoleRef.current);
+        runAbortRef.current = true;   // stop a full "Run graph" here
+        return;
+      }
+      // Continue the run with the freshly-picked config (state was already
+      // updated by saveBandPicker; refresh our local node too).
+      node = { ...node, data: { ...node.data, roi: picked, code: generateBandPickerCode(picked) } };
     }
     // Parse a `# @name: <label>` / `// @name: <label>` marker from the
     // first 20 lines so users can name a node from within the code.
@@ -4467,7 +4501,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         data: { ...n.data, status: "error", error: msg.slice(0, 200), consoleOut: `error: ${msg}` },
       } : n));
     }
-  }, [collectInputs, insetSources, enginePaths, setNodes, sourceNameOverrides, openBandPicker]);
+  }, [collectInputs, insetSources, enginePaths, setNodes, sourceNameOverrides, openBandPickerAndWait]);
 
   const runGraph = useCallback(async () => {
     setRunningGraph(true);
@@ -4476,6 +4510,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     // Take a fresh snapshot of nodes — we'll be updating state in
     // the loop and need to look up upstream outputs as they land.
     const order = topoOrder();
+    runAbortRef.current = false;
     // We run sequentially so each node sees fresh upstream state.
     for (const id of order) {
       // Re-read node from state on each iteration.
@@ -4489,6 +4524,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       if (!node) continue;
       if (node.data.kind === "source") continue;
       await runNode(node, snapshot);
+      // A node may have requested the run stop (e.g. band picking cancelled, or
+      // the interactive picker is gating the rest of the pipeline).
+      if (runAbortRef.current) { runAbortRef.current = false; break; }
     }
     setRunningGraph(false);
   }, [topoOrder, runNode]);
@@ -5782,7 +5820,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         imageSrc={bandPicker.image}
         source={bandPicker.source}
         initial={bandPicker.cfg}
-        onClose={() => setBandPicker({ open: false, nodeId: null, image: null, source: null, cfg: null })}
+        onClose={closeBandPicker}
         onSave={saveBandPicker}
       />
     </Box>
