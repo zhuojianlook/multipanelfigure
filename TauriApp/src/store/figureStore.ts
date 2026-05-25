@@ -436,6 +436,12 @@ let headerEditsPending = false;
 // response can't overwrite a newer one (race condition seen as a
 // "ghost" of the previous header state appearing in the preview).
 let previewSeq = 0;
+// True while a background "wait for the sidecar to come up" poll is running,
+// so we never spawn more than one. Set when the initial connect window
+// elapses without the sidecar answering (it can still be extracting — a
+// PyInstaller --onefile bundling scipy/cv2/matplotlib + a first-run Gatekeeper
+// scan can exceed the initial window), cleared once it recovers.
+let backendRecoveryActive = false;
 
 // ── Store ────────────────────────────────────────────────
 
@@ -462,14 +468,14 @@ export const useFigureStore = create<FigureState>()(
     fetchConfig: async () => {
       // Give sidecar time to start (PyInstaller --onefile extracts on first run)
       await new Promise(r => setTimeout(r, 2000));
-      // Wait for sidecar to be ready (retry up to 30 times with 1s delay)
+      // Wait for sidecar to be ready (retry up to 45 times with 1s delay).
       let connected = false;
-      for (let attempt = 0; attempt < 30; attempt++) {
+      for (let attempt = 0; attempt < 45; attempt++) {
         if (await checkHealth()) { connected = true; break; }
         await new Promise(r => setTimeout(r, 1000));
       }
       if (!connected) {
-        console.error("API server not reachable after 30 attempts");
+        console.error("API server not reachable after 45 attempts");
         // Gather diagnostic info
         let diagMsg = "";
         // Last health check error
@@ -482,8 +488,33 @@ export const useFigureStore = create<FigureState>()(
         } catch { /* not in Tauri context */ }
         set((s) => {
           s.config = buildDefaultConfig(2, 2);
-          s.apiError = `Cannot connect to backend server. Image loading and preview will not work.${diagMsg}`;
+          s.apiError = `Cannot connect to backend server. Image loading and preview will not work.${diagMsg} Retrying in the background…`;
         });
+        // Self-heal: the sidecar may still be coming up. Keep polling and,
+        // once it answers, clear the banner and load everything for real so
+        // the user never has to restart the app.
+        if (!backendRecoveryActive) {
+          backendRecoveryActive = true;
+          void (async () => {
+            try {
+              while (!(await checkHealth())) {
+                await new Promise(r => setTimeout(r, 3000));
+              }
+              // Recovered — load config + assets and clear the error.
+              try {
+                const cfg = await api.getConfig();
+                set((s) => { s.config = cfg; s.apiError = null; });
+              } catch {
+                set((s) => { s.apiError = null; });
+              }
+              try { await get().fetchImages(); } catch { /* best-effort */ }
+              try { get().fetchFonts(); } catch { /* best-effort */ }
+              setTimeout(() => { try { get().requestPreview(); } catch { /* best-effort */ } }, 200);
+            } finally {
+              backendRecoveryActive = false;
+            }
+          })();
+        }
         return;
       }
       try {
