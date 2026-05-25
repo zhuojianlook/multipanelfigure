@@ -3586,7 +3586,14 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     api.listInsetAnalysisSources()
       .then((r) => {
         const list = r.sources || [];
-        setInsetSources(list);
+        // Preserve user-uploaded standalone sources (name-based) across the
+        // refresh — they live in loaded_images for the session, not in the
+        // builder inset list the backend returns here.
+        setInsetSources((prev) => {
+          const liveKeys = new Set(list.map((l) => l.key));
+          const uploads = prev.filter((s) => s.name && !liveKeys.has(s.key));
+          return [...uploads, ...list];
+        });
         // Do NOT auto-populate the Source node — the user picks
         // which insets to attach by dragging from the library
         // panel. We still refresh any sources that are already
@@ -3915,9 +3922,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
 
   /** Upload image file(s) DIRECTLY into the Analysis tab as standalone
    *  whole-image sources. The backend retains full bit depth (16-bit) for
-   *  these, so quantitative analysis keeps its analytical value. Creates a
-   *  Source node holding the uploaded image(s) — independent of the figure
-   *  builder grid. */
+   *  these, so quantitative analysis keeps its analytical value. The uploads
+   *  land in the SOURCES library (left panel) — the user drags them onto a
+   *  Source node, exactly like builder insets — rather than auto-spawning a
+   *  node on the canvas. */
   const uploadAnalysisImages = useCallback(async (files: File[]) => {
     if (!files.length) return;
     try {
@@ -3934,30 +3942,16 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         });
       }
       if (!entries.length) return;
-      const id = newId("src");
-      let pos = { x: 30, y: 220 };
-      const inst = rfRef.current;
-      if (inst) {
-        try {
-          const container = document.querySelector(".react-flow") as HTMLElement | null;
-          if (container) {
-            const rect = container.getBoundingClientRect();
-            pos = inst.screenToFlowPosition({
-              x: rect.left + 60 + Math.random() * 30,
-              y: rect.top + rect.height * 0.55 + Math.random() * 40,
-            });
-          }
-        } catch { /* default pos */ }
-      }
-      const srcCount = nodes.filter((n) => n.data.kind === "source").length;
-      const label = entries.length === 1 ? entries[0].label : `Uploaded ${srcCount + 1}`;
-      setNodes((cur) => [...cur, newSourceNode(entries, { id, label, position: pos })]);
-      setSelectedNodeId(id);
-      setHandleRev((r) => r + 1);
+      // Add to the Sources library (dedupe by key); new uploads sort to the top.
+      setInsetSources((cur) => {
+        const have = new Set(cur.map((s) => s.key));
+        const add = entries.filter((e) => !have.has(e.key));
+        return [...add, ...cur];
+      });
     } catch (e) {
       console.error("analysis image upload failed", e);
     }
-  }, [nodes, setNodes]);
+  }, []);
 
   // ── Output viewer plumbing ─────────────────────────────────────
 
