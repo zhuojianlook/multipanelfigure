@@ -90,16 +90,25 @@ import numpy as np, json
 
 CFG = json.loads(r'''${json}''')
 
-imgs = [v for v in inputs.values() if isinstance(v, dict) and "image" in v]
+imgs = [v for v in inputs.values() if isinstance(v, dict) and ("image_raw" in v or "image" in v)]
 if not imgs:
     raise SystemExit("No membrane image — wire the blot (Source) into this node.")
-arr = np.asarray(imgs[0]["image"]).astype(np.float32)
+src = imgs[0]
+# Prefer FULL-BIT-DEPTH pixels (e.g. 16-bit) for quantitative IOD; fall back to
+# the 8-bit display image when raw isn't available.
+use_raw = "image_raw" in src
+arr = np.asarray(src["image_raw"] if use_raw else src["image"]).astype(np.float32)
 if arr.ndim == 3:
-    gray = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    gray = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2] if arr.shape[2] >= 3 else arr[..., 0]
 else:
     gray = arr
 H, W = gray.shape[:2]
-inv_full = 255.0 - gray            # dark protein bands -> bright signal
+# Invert relative to the white level so dark protein bands -> bright signal,
+# preserving the native dynamic range (16-bit) when available.
+white = float(src.get("raw_max") or 0) if use_raw else 255.0
+if white <= 0:
+    white = float(gray.max()) or 1.0
+inv_full = white - gray
 
 def _px(rect):
     x0 = int(round(rect["x"] * W)); x1 = int(round((rect["x"] + rect["w"]) * W))
@@ -271,9 +280,10 @@ interface BandPickerDialogProps {
   /** Membrane image as a base64 PNG (no data: prefix) or a data URL — used for
    *  the editor DISPLAY and as the detection fallback. */
   imageSrc: string | null;
-  /** Source descriptor so the backend can re-extract the FULL-RES image for
-   *  detection (much better than the thumbnail). */
-  source?: { key: string; row: number; col: number; inset_index: number } | null;
+  /** Source descriptor so the backend can re-extract the FULL-RES (and
+   *  full-bit-depth) image for detection. Either a builder inset
+   *  (row/col/inset_index) or a standalone analysis upload ({name}). */
+  source?: { key: string; name?: string; row?: number; col?: number; inset_index?: number } | null;
   initial: BandPickerConfig | null;
   onClose: () => void;
   onSave: (cfg: BandPickerConfig) => void;

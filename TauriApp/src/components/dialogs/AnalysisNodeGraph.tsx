@@ -816,6 +816,11 @@ export interface InsetSource {
    *  project save can tell which MPF a workflow's data belongs to. */
   mpfId?: string;
   mpf?: string;
+  /** Set for STANDALONE analysis images uploaded directly into the Analysis
+   *  tab (not a builder inset). When present, the backend resolves the WHOLE
+   *  uploaded image (by this loaded-image name) at full bit depth, and row/col/
+   *  inset_index are -1. */
+  name?: string;
   row: number;
   col: number;
   inset_index: number;
@@ -3317,7 +3322,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // Band-picker (western-blot lane editor) modal state.  `image` is
   // the upstream membrane resolved at open time (base64 PNG); `cfg`
   // seeds the editor from the node's saved ROIs.
-  const [bandPicker, setBandPicker] = useState<{ open: boolean; nodeId: string | null; image: string | null; source: { key: string; row: number; col: number; inset_index: number } | null; cfg: BandPickerConfig | null }>(
+  const [bandPicker, setBandPicker] = useState<{ open: boolean; nodeId: string | null; image: string | null; source: { key: string; name?: string; row?: number; col?: number; inset_index?: number } | null; cfg: BandPickerConfig | null }>(
     () => ({ open: false, nodeId: null, image: null, source: null, cfg: null }),
   );
   // Set of currently-selected node ids + edge ids — populated by
@@ -3905,6 +3910,55 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     setSelectedNodeId(id);
   }, [nodes, setNodes]);
 
+  // Hidden file input that backs the "Upload" toolbar button.
+  const analysisUploadRef = useRef<HTMLInputElement | null>(null);
+
+  /** Upload image file(s) DIRECTLY into the Analysis tab as standalone
+   *  whole-image sources. The backend retains full bit depth (16-bit) for
+   *  these, so quantitative analysis keeps its analytical value. Creates a
+   *  Source node holding the uploaded image(s) — independent of the figure
+   *  builder grid. */
+  const uploadAnalysisImages = useCallback(async (files: File[]) => {
+    if (!files.length) return;
+    try {
+      const res = await api.uploadImages(files);
+      const names: string[] = res.names || [];
+      const thumbs: Record<string, string> = (res as { thumbnails?: Record<string, string> }).thumbnails || {};
+      const entries: InsetSource[] = [];
+      for (const name of names) {
+        let w = 0, h = 0;
+        try { const info = await api.getImageInfo(name); w = info.width; h = info.height; } catch { /* size unknown */ }
+        entries.push({
+          key: `img:${name}`, name, row: -1, col: -1, inset_index: -1,
+          label: name, natural_width: w, natural_height: h, thumbnail: thumbs[name] || "",
+        });
+      }
+      if (!entries.length) return;
+      const id = newId("src");
+      let pos = { x: 30, y: 220 };
+      const inst = rfRef.current;
+      if (inst) {
+        try {
+          const container = document.querySelector(".react-flow") as HTMLElement | null;
+          if (container) {
+            const rect = container.getBoundingClientRect();
+            pos = inst.screenToFlowPosition({
+              x: rect.left + 60 + Math.random() * 30,
+              y: rect.top + rect.height * 0.55 + Math.random() * 40,
+            });
+          }
+        } catch { /* default pos */ }
+      }
+      const srcCount = nodes.filter((n) => n.data.kind === "source").length;
+      const label = entries.length === 1 ? entries[0].label : `Uploaded ${srcCount + 1}`;
+      setNodes((cur) => [...cur, newSourceNode(entries, { id, label, position: pos })]);
+      setSelectedNodeId(id);
+      setHandleRev((r) => r + 1);
+    } catch (e) {
+      console.error("analysis image upload failed", e);
+    }
+  }, [nodes, setNodes]);
+
   // ── Output viewer plumbing ─────────────────────────────────────
 
   /** Open the drawer at the right tab and flash-highlight the card.
@@ -4165,7 +4219,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     // OWN cached source entry — which still carries row/col/inset_index — so
     // detection stays full-res even when the live inset list is momentarily
     // empty (e.g. right after a backend restart).
-    let source: { key: string; row: number; col: number; inset_index: number } | null = null;
+    let source: { key: string; name?: string; row?: number; col?: number; inset_index?: number } | null = null;
     if (imgEntry?.key?.startsWith("inset_")) {
       const insetKey = imgEntry.key.replace(/^inset_\d+_/, "");
       let s: InsetSource | undefined = insetSources.find((x) => x.key === insetKey);
@@ -4176,7 +4230,13 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           if (found) { s = found; break; }
         }
       }
-      if (s) source = { key: s.key, row: s.row, col: s.col, inset_index: s.inset_index };
+      if (s) {
+        // Standalone uploads resolve by name (whole image, full bit depth);
+        // builder insets resolve by row/col/inset_index.
+        source = s.name
+          ? { key: s.key, name: s.name }
+          : { key: s.key, row: s.row, col: s.col, inset_index: s.inset_index };
+      }
     }
     const node = nm.get(nodeId);
     setBandPicker({ open: true, nodeId, image: img, source, cfg: (node?.data.roi as BandPickerConfig | undefined) || emptyBandConfig() });
@@ -4245,11 +4305,23 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         .filter((x) => x.kind === "image" && x.key.startsWith("inset_"))
         .map((x) => {
           const insetKey = x.key.replace(/^inset_\d+_/, "");
-          const src = insetSources.find((s) => s.key === insetKey);
+          // Builder insets live in the live inset list; standalone analysis
+          // uploads live only on the Source node — search both.
+          let src = insetSources.find((s) => s.key === insetKey);
+          if (!src) {
+            for (const n of nodes) {
+              if (n.data.kind !== "source") continue;
+              const f = (n.data.sources || []).find((s) => s.key === insetKey);
+              if (f) { src = f; break; }
+            }
+          }
           if (!src) return null;
-          return { key: insetKey, row: src.row, col: src.col, inset_index: src.inset_index, label: displayName(src, sourceNameOverrides) };
+          const base: { key: string; row: number; col: number; inset_index: number; label: string; name?: string } =
+            { key: insetKey, row: src.row, col: src.col, inset_index: src.inset_index, label: displayName(src, sourceNameOverrides) };
+          if (src.name) base.name = src.name;  // standalone whole-image source
+          return base;
         })
-        .filter((s): s is { key: string; row: number; col: number; inset_index: number; label: string } => !!s);
+        .filter((s): s is { key: string; row: number; col: number; inset_index: number; label: string; name?: string } => !!s);
 
       if (engine === "python") {
         const sources = buildSources();
@@ -4938,6 +5010,16 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               onClick={addEmptySourceNode}
               sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.source, "&:hover": { bgcolor: KIND_COLOR.source, filter: "brightness(0.9)" } }}>
               🖼 Source
+            </Button>
+          </Tooltip>
+          <input ref={analysisUploadRef} type="file" multiple
+            accept="image/*,.tif,.tiff,.png,.jpg,.jpeg" style={{ display: "none" }}
+            onChange={(e) => { const fs = Array.from(e.target.files || []); e.currentTarget.value = ""; uploadAnalysisImages(fs); }} />
+          <Tooltip placement="bottom" title="Upload an image file straight into Analysis — full bit depth (16-bit) retained for quantification. Creates a Source node.">
+            <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
+              onClick={() => analysisUploadRef.current?.click()}
+              sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.source, "&:hover": { bgcolor: KIND_COLOR.source, filter: "brightness(0.9)" } }}>
+              ⬆ Upload
             </Button>
           </Tooltip>
           <Tooltip placement="bottom" title="Add a Python node">

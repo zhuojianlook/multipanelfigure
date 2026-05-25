@@ -151,6 +151,12 @@ async def health():
 cfg = FigureConfig()
 cfg.ensure_grid()
 loaded_images: Dict[str, Image.Image] = {}
+# Full-bit-depth source arrays (keyed by image name), retained for uploaded
+# TIFFs so the ANALYSIS pipeline (band detection + integrated density) can
+# operate on RAW pixels instead of the 8-bit display image. The render/display
+# code never reads this — it's analysis-only, so it can't change any figure
+# output. Values are HxW or HxWxC numpy arrays at native dtype (e.g. uint16).
+raw_analysis_images: Dict[str, "np.ndarray"] = {}
 # Panel-internal images (e.g. 3D-volume renders assigned to a panel) that
 # should NOT appear in the user-facing media timeline. Still editable through
 # the panel itself.
@@ -615,6 +621,32 @@ def _get_panel_image(panel) -> Optional[Image.Image]:
         frame_num = int(getattr(panel, "frame", 0) or 0)
         return _extract_tiff_frame(loaded_zstacks[name], frame_num)
     return loaded_images.get(name)
+
+
+def _retain_raw_analysis(name: str, path: Optional[str] = None, pil_img=None) -> None:
+    """Stash a FULL-BIT-DEPTH array for `name` (analysis only) when the source
+    is >8-bit. Best-effort: any failure just means analysis falls back to the
+    8-bit display image. We only keep it when it's genuinely high-bit-depth
+    (dtype != uint8), since for 8-bit sources the display image is identical."""
+    try:
+        arr = None
+        if path is not None:
+            try:
+                import tifffile as _tf
+                arr = _tf.imread(path)
+            except Exception:
+                arr = None
+        if arr is None and pil_img is not None and getattr(pil_img, "mode", "") in ("I", "I;16", "I;16B", "I;16L", "F"):
+            arr = np.array(pil_img)
+        if arr is None:
+            return
+        arr = np.squeeze(np.asarray(arr))
+        if arr.dtype == np.uint8 or arr.ndim < 2:
+            return
+        raw_analysis_images[name] = arr
+    except Exception:
+        pass
+
 
 def _is_tiff(filename: str) -> bool:
     return Path(filename).suffix.lower() in {'.tif', '.tiff'}
@@ -1183,6 +1215,10 @@ async def upload_images(files: List[UploadFile] = File(...)):
                     else:
                         img = img_obj.convert("RGB")
                         loaded_images[f.filename] = img
+                        # Retain the FULL-BIT-DEPTH array (e.g. 16-bit) so the
+                        # analysis pipeline can quantify on raw pixels instead
+                        # of this display-converted 8-bit RGB.
+                        _retain_raw_analysis(f.filename, tmp.name, img_obj)
                     names.append(f.filename)
             else:
                 img = Image.open(io.BytesIO(data)).convert("RGB")
@@ -2797,6 +2833,7 @@ def get_volume_data(name: str, body: ZStackVolumeDataRequest):
 def delete_image(name: str):
     if name in loaded_images:
         del loaded_images[name]
+        raw_analysis_images.pop(name, None)
         hidden_images.discard(name)
         # Clean up z-stack temp file if present
         if name in loaded_zstacks:
@@ -4146,6 +4183,7 @@ def _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict, channel
     cfg = loaded_cfg
     cfg.ensure_grid()
     loaded_images.clear()
+    raw_analysis_images.clear()
     loaded_videos.clear()
     video_frames.clear()
     channel_groups.clear()
@@ -6206,6 +6244,12 @@ def _extract_source_image(s: Dict[str, object]) -> Optional[Image.Image]:
     suffix ("_panel" / "_area<N>") with `inset_index` as the legacy
     fallback for normal zoom-inset sources."""
     key = str(s.get("key") or "")
+    # Standalone analysis image: a file uploaded directly into the Analysis
+    # tab (not a builder panel). The WHOLE image is the source.
+    name = s.get("name") or s.get("image_name")
+    if name:
+        im = loaded_images.get(str(name))
+        return im.convert("RGB") if im is not None else None
     try:
         row = int(s.get("row") or 0)
         col = int(s.get("col") or 0)
@@ -6236,6 +6280,105 @@ def _extract_source_image(s: Dict[str, object]) -> Optional[Image.Image]:
     except Exception:
         idx = 0
     return _extract_inset_image(row, col, idx)
+
+
+def _extract_source_raw(s: Dict[str, object]):
+    """Full-bit-depth numpy array (HxW or HxWxC, native dtype) of the source
+    region for QUANTITATIVE analysis — GEOMETRY ONLY, no display leveling — so
+    the detector / integrated-density see the raw 16-bit dynamic range, matching
+    a reference script that reads the original TIFF. Returns None when raw isn't
+    available or the panel geometry can't be mirrored exactly (the caller then
+    falls back to the 8-bit `_extract_source_image`, so this is always safe)."""
+    try:
+        # 1) Standalone analysis image — the WHOLE uploaded image, raw. This is
+        #    the primary path: exact, no geometry to mirror.
+        name = s.get("name") or s.get("image_name")
+        if name:
+            arr = raw_analysis_images.get(str(name))
+            return np.asarray(arr) if arr is not None else None
+
+        # 2) Builder panel / zoom inset — raw only when we have a raw array for
+        #    the panel's source AND the geometry is simple enough to reproduce.
+        key = str(s.get("key") or "")
+        try:
+            row = int(s.get("row") or 0); col = int(s.get("col") or 0)
+        except Exception:
+            return None
+        if cfg is None or row < 0 or col < 0 or row >= cfg.rows or col >= cfg.cols:
+            return None
+        panel = cfg.panels[row][col]
+        pname = getattr(panel, "image_name", None)
+        if not pname:
+            return None
+        arr = raw_analysis_images.get(str(pname))
+        if arr is None:
+            return None
+        arr = np.asarray(arr)
+
+        # Bail (→ 8-bit fallback) on geometry we can't mirror 1:1 in numpy, so
+        # the raw region can never silently disagree with the 8-bit one.
+        rot = getattr(panel, "rotation", 0) or 0
+        if isinstance(rot, (int, float)) and (int(rot) % 90 != 0):
+            return None
+        if getattr(panel, "final_resize", False):
+            return None
+        asp = getattr(panel, "aspect_ratio_str", "") or ""
+        if asp not in ("", "Free", "Original"):
+            return None
+
+        # rotation (90s) → flips → direct pixel crop, matching process_panel.
+        rot_int = int(rot) % 360
+        if rot_int == 90:    arr = np.rot90(arr, k=3)   # PIL ROTATE_270
+        elif rot_int == 180: arr = np.rot90(arr, k=2)
+        elif rot_int == 270: arr = np.rot90(arr, k=1)   # PIL ROTATE_90
+        if getattr(panel, "flip_horizontal", False): arr = np.fliplr(arr)
+        if getattr(panel, "flip_vertical", False):   arr = np.flipud(arr)
+        crop = getattr(panel, "crop", None)
+        if crop is not None:
+            try:
+                left, top, right, bottom = [int(v) for v in crop]
+                ih, iw = arr.shape[:2]
+                left = max(0, min(left, iw - 1)); top = max(0, min(top, ih - 1))
+                right = max(left + 1, min(right, iw)); bottom = max(top + 1, min(bottom, ih))
+                arr = arr[top:bottom, left:right]
+            except Exception:
+                return None
+
+        # Whole panel → done.
+        if key.endswith("_panel") or s.get("inset_type") == "Panel":
+            return arr
+        # Area masks aren't supported raw yet.
+        if "_area" in key or s.get("inset_type") == "Area":
+            return None
+        # Zoom inset: take its region from the (geometry-corrected) panel. We
+        # do NOT apply zoom_factor — analysis wants native pixels, not an
+        # upscaled display crop.
+        try:
+            idx = int(s.get("inset_index") or 0)
+        except Exception:
+            idx = 0
+        insets = _panel_zoom_insets(panel)
+        if idx < 0 or idx >= len(insets) or insets[idx] is None:
+            return arr
+        zi = insets[idx]
+        zrot = getattr(zi, "rotation", 0) or 0
+        if isinstance(zrot, (int, float)) and (int(zrot) % 90 != 0):
+            return None
+        ih, iw = arr.shape[:2]
+        x = max(0, min(int(getattr(zi, "x", 0)), iw - 1))
+        y = max(0, min(int(getattr(zi, "y", 0)), ih - 1))
+        w = max(1, min(int(getattr(zi, "width", iw)), iw - x))
+        h = max(1, min(int(getattr(zi, "height", ih)), ih - y))
+        region = arr[y:y + h, x:x + w]
+        zrot_int = int(zrot) % 360
+        if zrot_int == 90:    region = np.rot90(region, k=3)
+        elif zrot_int == 180: region = np.rot90(region, k=2)
+        elif zrot_int == 270: region = np.rot90(region, k=1)
+        return region
+    except Exception as _e:
+        import sys as __s
+        print(f"[raw-extract] failed for {s}: {_e}", file=__s.stderr, flush=True)
+        return None
 
 
 def _extract_inset_image(row: int, col: int, inset_index: int) -> Optional[Image.Image]:
@@ -6413,24 +6556,47 @@ def wb_detect_bands(body: WbBandDetectRequest):
     import sys as __s
     import wb_detect as _wb
 
-    img = None
+    rgb = None
     used_source = False
+    raw_depth = False  # True when we analysed full-bit-depth (16-bit) pixels
     if body.source:
+        # Prefer FULL-BIT-DEPTH raw pixels (geometry only, no display leveling)
+        # so contrast_scale's percentile stretch operates on the real dynamic
+        # range — exactly like the reference script reading the raw TIFF.
         try:
-            ex = _extract_source_image(body.source)
-            if ex is not None:
-                img = ex.convert("RGB")
-                used_source = True
+            arr = _extract_source_raw(body.source)
         except Exception as _e:
-            print(f"[wb-detect] full-res extract failed: {_e}", file=__s.stderr, flush=True)
-            img = None
-    if img is None:
+            print(f"[wb-detect] raw extract failed: {_e}", file=__s.stderr, flush=True)
+            arr = None
+        if arr is not None:
+            a = _np.asarray(arr).astype(_np.float32)
+            if a.ndim == 2:
+                a = _np.stack([a, a, a], axis=-1)
+            elif a.ndim == 3 and a.shape[2] == 1:
+                a = _np.repeat(a, 3, axis=2)
+            elif a.ndim == 3 and a.shape[2] >= 3:
+                a = a[:, :, :3]
+            if a.ndim == 3 and a.shape[2] == 3:
+                rgb = a
+                used_source = True
+                raw_depth = bool(_np.asarray(arr).dtype != _np.uint8)
+        if rgb is None:
+            # Raw unavailable / unsupported geometry → 8-bit display image.
+            try:
+                ex = _extract_source_image(body.source)
+                if ex is not None:
+                    rgb = _np.asarray(ex.convert("RGB")).astype(_np.float32)
+                    used_source = True
+            except Exception as _e:
+                print(f"[wb-detect] full-res extract failed: {_e}", file=__s.stderr, flush=True)
+                rgb = None
+    if rgb is None:
         try:
             raw = base64.b64decode(str(body.image_b64 or "").split(",")[-1])
             img = Image.open(io.BytesIO(raw)).convert("RGB")
+            rgb = _np.asarray(img).astype(_np.float32)
         except Exception as e:
             return {"lanes": [], "error": f"decode failed: {e}"}
-    rgb = _np.asarray(img).astype(_np.float32)
     if rgb.ndim != 3 or rgb.shape[2] < 3 or rgb.shape[0] < 16 or rgb.shape[1] < 16:
         return {"lanes": [], "error": "image too small"}
 
@@ -6495,6 +6661,7 @@ def wb_detect_bands(body: WbBandDetectRequest):
         "src_w": int(src_w),
         "src_h": int(src_h),
         "used_source": bool(used_source),
+        "raw_depth": bool(raw_depth),
     }
 
 
@@ -6557,19 +6724,38 @@ def run_python_pipeline(body: PyAnalysisRequest):
             try:
                 key = str(s.get("key", ""))
                 r = int(s.get("row", -1)); c = int(s.get("col", -1))
-                if not key or r < 0 or c < 0:
+                has_name = bool(s.get("name") or s.get("image_name"))
+                if not key or ((r < 0 or c < 0) and not has_name):
                     continue
-                img = _extract_source_image(s)  # dispatches: inset / panel / area
+                img = _extract_source_image(s)  # inset / panel / area / standalone
                 if img is None:
                     continue
                 arr = _np.asarray(img.convert("RGB"))
-                inputs_dict[key] = {
+                entry = {
                     "image": arr,
                     "width": int(arr.shape[1]),
                     "height": int(arr.shape[0]),
                     "label": str(s.get("label") or key),
                     "row": r, "col": c, "inset_index": int(s.get("inset_index", -1)),
                 }
+                # Attach FULL-BIT-DEPTH pixels (geometry only, no leveling) so
+                # quantitative code (band integrated density) uses the real
+                # dynamic range instead of the 8-bit display image.
+                try:
+                    raw = _extract_source_raw(s)
+                except Exception:
+                    raw = None
+                if raw is not None:
+                    raw = _np.asarray(raw)
+                    entry["image_raw"] = raw
+                    entry["raw_dtype"] = str(raw.dtype)
+                    try:
+                        entry["raw_max"] = (float(_np.iinfo(raw.dtype).max)
+                                            if _np.issubdtype(raw.dtype, _np.integer)
+                                            else float(raw.max()))
+                    except Exception:
+                        entry["raw_max"] = float(raw.max()) if raw.size else 255.0
+                inputs_dict[key] = entry
             except Exception as _e:
                 import sys as __s
                 print(f"[run-python] extract failed for {s}: {_e}", file=__s.stderr, flush=True)
