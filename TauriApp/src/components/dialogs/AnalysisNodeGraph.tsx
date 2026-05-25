@@ -3170,6 +3170,22 @@ function saveWorkflowSession(s: WorkflowSession) {
   } catch { /* localStorage quota / disabled — give up silently */ }
 }
 
+// True once the Analysis UI has mounted in THIS page load. A full app restart
+// reloads the page → this module re-evaluates → the flag resets, so we treat
+// that first mount as a FRESH LAUNCH: we do NOT carry over the previous run's
+// workflow (we clear it and start with an empty graph). Within the SAME run
+// (e.g. leaving and returning to the Analysis tab) the flag is already set, so
+// we DO restore the in-session save and don't lose in-flight work.
+let analysisSessionStarted = false;
+function restoreSessionUnlessFreshLaunch(): WorkflowSession | null {
+  if (!analysisSessionStarted) {
+    analysisSessionStarted = true;
+    try { localStorage.removeItem(SESSION_KEY); } catch { /* ignore */ }
+    return null;
+  }
+  return loadWorkflowSession();
+}
+
 function newSourceNode(sources: InsetSource[], opts?: { id?: string; label?: string; position?: { x: number; y: number } }): Node<NodeData> {
   const id = opts?.id ?? "source";
   return {
@@ -3227,7 +3243,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // the user's open tabs, attached insets, and code edits.  Falls
   // back to a single empty workflow when there's nothing saved.
   const [workflowTabs, setWorkflowTabs] = useState<WorkflowTab[]>(() => {
-    const restored = loadWorkflowSession();
+    const restored = restoreSessionUnlessFreshLaunch();
     if (restored && restored.tabs.length > 0) return restored.tabs;
     return [{
       id: newId("wf"),
@@ -3237,7 +3253,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     }];
   });
   const [activeWfId, setActiveWfId] = useState<string>(() => {
-    const restored = loadWorkflowSession();
+    const restored = restoreSessionUnlessFreshLaunch();
     return restored?.activeId || "";
   });
   const activeWf = useMemo(() => workflowTabs.find((w) => w.id === activeWfId) || workflowTabs[0], [workflowTabs, activeWfId]);
@@ -3285,11 +3301,11 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     if (!activeWfId && workflowTabs.length > 0) setActiveWfId(workflowTabs[0].id);
   }, [activeWfId, workflowTabs]);
 
-  // Persist the open tabs + active id to localStorage on every
-  // change so closing and reopening the Analysis dialog (or even
-  // reloading the whole app) restores in-flight work.  Debounced
-  // so a flurry of node-position drag updates doesn't hammer
-  // JSON.stringify on a multi-megabyte tabs array.
+  // Persist the open tabs + active id to localStorage on every change so
+  // leaving and returning to the Analysis tab WITHIN A RUN restores in-flight
+  // work. A fresh app launch deliberately starts empty (see
+  // restoreSessionUnlessFreshLaunch). Debounced so a flurry of node-position
+  // drag updates doesn't hammer JSON.stringify on a multi-megabyte tabs array.
   const sessionSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (sessionSaveTimerRef.current) clearTimeout(sessionSaveTimerRef.current);
