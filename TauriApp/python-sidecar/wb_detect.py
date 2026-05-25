@@ -477,6 +477,75 @@ def filter_sample_band_groups(
     return kept
 
 
+def detect_ladder_lane(signal: np.ndarray, sample_lanes: list, min_bands: int = 5):
+    """Locate the MOLECULAR-WEIGHT LADDER column, which auto_detect_lanes can't
+    find (the ladder is a tall vertical marker strip whose bands merge into
+    vertical blobs that fail the horizontal band-shape filter).
+
+    The ladder is conventionally the LEFTMOST lane, so we search only the region
+    LEFT of the leftmost detected sample lane — this both (a) avoids the
+    right-edge membrane noise that can fake a dense column, and (b) means a blot
+    whose ladder was already detected as the leftmost lane (nothing to its left)
+    correctly adds nothing. We pick the window with the most band-like peaks,
+    scored by total peak strength so a faint noisy patch can't win.
+
+    Returns (x1, x2, y1, y2) for the ladder lane box, or None."""
+    height, width = signal.shape
+    if not sample_lanes:
+        return None
+
+    def _count_bands(x0, x1, y0, y1):
+        sub = signal[y0:y1, x0:x1]
+        if sub.size == 0:
+            return 0
+        vp = gaussian_filter1d(np.percentile(sub, 65, axis=1), 2.2)
+        base = gaussian_filter1d(vp, 18)
+        pp = vp - base
+        pp[pp < 0] = 0
+        mp = max(np.percentile(pp, 80) * 0.30, 2.0)
+        pk, _p = find_peaks(pp, distance=20, prominence=mp, width=(3, 35))
+        return int(len(pk))
+
+    # If the leftmost detected lane is ALREADY ladder-like (many bands), the
+    # ladder was captured by auto_detect_lanes — don't add a duplicate.
+    left_lane = min(sample_lanes, key=lambda l: l[1])
+    if _count_bands(left_lane[1], left_lane[2], left_lane[3], left_lane[4]) >= min_bands:
+        return None
+
+    sx1 = min(l[1] for l in sample_lanes)
+    if sx1 < 30:
+        return None  # no room left of the leftmost lane → ladder already leftmost
+    gy1 = min(l[3] for l in sample_lanes)
+    gy2 = max(l[4] for l in sample_lanes)
+
+    best = None  # (score, x0, x1, ytop, ybot)
+    for win in (32, 40, 48):
+        step = max(4, win // 6)
+        x = 0
+        while x + win <= sx1:
+            col = signal[:, x:x + win]
+            vp = gaussian_filter1d(np.percentile(col, 65, axis=1), 2.2)
+            base = gaussian_filter1d(vp, 18)
+            pp = vp - base
+            pp[pp < 0] = 0
+            min_prom = max(np.percentile(pp, 80) * 0.30, 2.0)
+            peaks, props = find_peaks(pp, distance=20, prominence=min_prom, width=(3, 35))
+            if len(peaks) >= min_bands:
+                score = float(np.sum(props["prominences"]))  # total band strength
+                if best is None or score > best[0]:
+                    ytop = int(max(0, int(peaks.min()) - 25))
+                    ybot = int(min(height, int(peaks.max()) + 25))
+                    best = (score, x, x + win, ytop, ybot)
+            x += step
+
+    if best is None:
+        return None
+    _, x0, x1, ytop, ybot = best
+    # Expand the lane box to cover both the sample y-range and the ladder's own
+    # (taller) extent so detect_lane_bands sees every marker band.
+    return (int(x0), int(x1), int(min(gy1, ytop)), int(max(gy2, ybot)))
+
+
 def detect_wb_bands(
     rgb: np.ndarray,
     signal_polarity: str = DEFAULT_SIGNAL_POLARITY,
@@ -488,6 +557,7 @@ def detect_wb_bands(
     threshold_percentile: float = DEFAULT_AUTO_LANE_THRESHOLD_PERCENTILE,
     max_band_width: int = DEFAULT_AUTO_LANE_MAX_BAND_WIDTH,
     first_lane_marker: bool = True,
+    detect_ladder: bool = True,
 ):
     """Run the script's default auto-detect path and return (lanes, bands, (H, W)).
 
@@ -517,6 +587,14 @@ def detect_wb_bands(
         threshold_percentile=threshold_percentile,
         max_band_width=max_band_width,
     )
+    # Add the MW ladder column (auto_detect_lanes only finds horizontal sample
+    # bands, never the vertical marker strip). Inserted leftmost so the
+    # first-lane-marker naming labels it "L" and its bands are quantified.
+    if detect_ladder:
+        ladder = detect_ladder_lane(signal, lanes)
+        if ladder is not None:
+            lanes = list(lanes) + [("Ladder", ladder[0], ladder[1], ladder[2], ladder[3])]
+            lanes.sort(key=lambda lane: lane[1])
     lanes = name_auto_lanes(lanes, lane_names=None, first_lane_marker=first_lane_marker)
 
     bands = detect_lane_bands(signal, lanes, marker_lanes)

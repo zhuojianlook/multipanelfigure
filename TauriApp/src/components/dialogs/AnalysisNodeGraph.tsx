@@ -2589,6 +2589,8 @@ if ("is_loading_control" %in% names(df)) {
   is_lc <- tolower(as.character(df$is_loading_control)) %in% c("true", "1", "yes")
   df <- df[!is_lc, , drop = FALSE]
 }
+# Drop the molecular-weight ladder — it's a size reference, not a sample.
+df <- df[tolower(as.character(df$level)) != "ladder" & df$lane != "L", , drop = FALSE]
 df <- df[is.finite(df$value), , drop = FALSE]
 if (!is.null(levels_to_plot)) df <- df[df$level %in% levels_to_plot, , drop = FALSE]
 if (nrow(df) == 0) stop("No target bands to plot after filtering (check levels_to_plot / loading control).")

@@ -495,11 +495,10 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     rects: Array<{ x: number; y: number; w: number; h: number; lane?: string; level?: string }>,
   ): boolean => {
     if (!rects.length) return false;
-    // Drop ladder/marker rows — they're a visual reference, not a quantified
-    // target. The user can still add them by hand if needed.
-    const usable = rects.filter((r) => (r.level || "") !== "Ladder" && (r.lane || "") !== "L");
-    const src = usable.length ? usable : rects;
-    const lanes: BandRoi[] = src.map((r, i) => ({
+    // Keep ALL detected ROIs including the molecular-weight ladder (lane "L",
+    // level "Ladder") — it's a useful MW reference. It carries its own level so
+    // it's excluded from the sample comparison downstream.
+    const lanes: BandRoi[] = rects.map((r, i) => ({
       id: uid(), x: clamp01(r.x), y: clamp01(r.y), w: clamp01(r.w), h: clamp01(r.h),
       label: (r.lane || `S${i + 1}`), level: (r.level || "Target"),
     }));
