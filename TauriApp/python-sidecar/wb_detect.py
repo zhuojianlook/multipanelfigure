@@ -557,7 +557,7 @@ def detect_wb_bands(
     threshold_percentile: float = DEFAULT_AUTO_LANE_THRESHOLD_PERCENTILE,
     max_band_width: int = DEFAULT_AUTO_LANE_MAX_BAND_WIDTH,
     first_lane_marker: bool = True,
-    detect_ladder: bool = True,
+    detect_ladder: bool = False,  # NOT in detect_bands.py auto mode; off for parity
 ):
     """Run the script's default auto-detect path and return (lanes, bands, (H, W)).
 

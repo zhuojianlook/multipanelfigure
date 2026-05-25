@@ -300,9 +300,9 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   const [detecting, setDetecting] = useState(false);
   const [detectInfo, setDetectInfo] = useState<string | null>(null);
   // Auto-detect sensitivity → the cross-lane consensus filter (min_group_lanes).
-  // "relaxed" keeps isolated/faint bands (catch more, clean up); "strict" is the
-  // detect_bands.py default that only keeps bands shared across ≥3 lanes.
-  const [sensitivity, setSensitivity] = useState<"strict" | "balanced" | "relaxed">("relaxed");
+  // Default "strict" == detect_bands.py's --auto-min-group-lanes=3 (faithful to
+  // the script). "balanced"/"relaxed" (2/1) keep more isolated/faint bands.
+  const [sensitivity, setSensitivity] = useState<"strict" | "balanced" | "relaxed">("strict");
   const [natW, setNatW] = useState(0);
   const [natH, setNatH] = useState(0);
   const [gray, setGray] = useState<Float32Array | null>(null);

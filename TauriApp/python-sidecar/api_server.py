@@ -6629,12 +6629,12 @@ def wb_detect_bands(body: WbBandDetectRequest):
     _gmax = _np.max(_analysis, axis=2)
     polarity = "dark" if bool(_np.median(_gmax) >= 128) else "bright"
 
-    # Sensitivity: default RELAXED (keep isolated/faint bands) for the
-    # "auto-detect then clean up" workflow; the UI can request strict/balanced.
+    # Sensitivity = detect_bands.py --auto-min-group-lanes. Default 3 to MATCH
+    # the script's auto mode exactly; the UI can relax it (2 / 1) on request.
     try:
-        mgl = int(body.min_group_lanes) if body.min_group_lanes is not None else 1
+        mgl = int(body.min_group_lanes) if body.min_group_lanes is not None else 3
     except Exception:
-        mgl = 1
+        mgl = 3
     mgl = max(1, min(3, mgl))
 
     try:
@@ -6651,11 +6651,17 @@ def wb_detect_bands(body: WbBandDetectRequest):
         print(f"[wb-detect] detect_wb_bands failed: {_e}", file=__s.stderr, flush=True)
         return {"lanes": [], "mode": "auto", "polarity": polarity, "error": str(_e)}
 
+    # Band ROI box geometry — MATCH detect_bands.py's quantify_bands defaults:
+    # a UNIFORM height of (roi_half_height * 2 + 1) centred on the band y, and
+    # the full lane width. (--roi-half-height default = 12 → 25 px.) This
+    # replaces the old variable y±(width·1.2) slivers so boxes look like the
+    # script's. Detection runs at native resolution, so 25 px matches 1:1.
+    ROI_HALF_H = 12
     out = []
     for b in bands:
-        pad = max(6, int(b["width"] * 1.2))
         x0n = max(0.0, b["x1"] / W); x1n = min(1.0, b["x2"] / W)
-        y0n = max(0.0, (b["y"] - pad) / H); y1n = min(1.0, (b["y"] + pad) / H)
+        y0n = max(0.0, (b["y"] - ROI_HALF_H) / H)
+        y1n = min(1.0, (b["y"] + ROI_HALF_H + 1) / H)
         if x1n - x0n > 0.004 and y1n - y0n > 0.003:
             lane_name = str(b.get("lane") or "")
             grp = str(b.get("band_group") or "")
