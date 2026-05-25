@@ -6666,6 +6666,24 @@ def wb_detect_bands(body: WbBandDetectRequest):
                 "w": round(x1n - x0n, 4), "h": round(y1n - y0n, 4),
                 "lane": lane_name, "level": level,
             })
+    # Contrast-stretched DISPLAY preview (the bright, gamma-corrected image the
+    # detector effectively sees) so the band picker can show clearly-visible
+    # bands instead of the dark raw thumbnail. ROIs are normalised 0..1 so any
+    # preview size maps correctly; cap width for a small transfer.
+    preview_b64 = ""
+    try:
+        disp8 = _disp  # uint8 HxWx3 from contrast_scale (gamma-sqrt, bright)
+        ph, pw = disp8.shape[:2]
+        PW = 1100
+        if pw > PW:
+            pth = max(1, int(round(ph * PW / pw)))
+            disp8 = _cv2.resize(disp8, (PW, pth), interpolation=_cv2.INTER_AREA)
+        _pbuf = io.BytesIO()
+        Image.fromarray(_np.ascontiguousarray(disp8)).save(_pbuf, format="PNG")
+        preview_b64 = base64.b64encode(_pbuf.getvalue()).decode()
+    except Exception as _e:
+        print(f"[wb-detect] preview build failed: {_e}", file=__s.stderr, flush=True)
+
     return {
         "lanes": out,
         "mode": "auto",
@@ -6676,6 +6694,7 @@ def wb_detect_bands(body: WbBandDetectRequest):
         "src_h": int(src_h),
         "used_source": bool(used_source),
         "raw_depth": bool(raw_depth),
+        "preview_b64": preview_b64,
     }
 
 

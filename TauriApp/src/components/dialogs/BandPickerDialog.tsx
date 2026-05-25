@@ -289,8 +289,8 @@ interface BandPickerDialogProps {
   onSave: (cfg: BandPickerConfig) => void;
 }
 
-const MAX_DISP_W = 620;
-const MAX_DISP_H = 520;
+const MAX_DISP_W = 900;
+const MAX_DISP_H = 760;
 
 export default function BandPickerDialog(props: BandPickerDialogProps) {
   const { open, imageSrc, source, initial, onClose, onSave } = props;
@@ -306,6 +306,9 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   const [natW, setNatW] = useState(0);
   const [natH, setNatH] = useState(0);
   const [gray, setGray] = useState<Float32Array | null>(null);
+  // Contrast-stretched preview from the backend (bright, clearly-visible bands).
+  // Replaces the dark raw thumbnail in the display once auto-detect has run.
+  const [previewSrc, setPreviewSrc] = useState<string | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const dragRef = useRef<DragState | null>(null);
 
@@ -316,6 +319,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
       setSelId(null);
       setDrawingBg(false);
       setDetectInfo(null);
+      setPreviewSrc(null);
     }
   }, [open, initial]);
 
@@ -324,9 +328,14 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     return imageSrc.startsWith("data:") ? imageSrc : `data:image/png;base64,${imageSrc}`;
   }, [imageSrc]);
 
-  // Decode the image once to a grayscale buffer for auto-detect + IOD.
+  // The image actually shown: the bright contrast-stretched preview once
+  // auto-detect has run, otherwise the raw thumbnail.
+  const dispUrl = previewSrc || srcUrl;
+
+  // Decode the displayed image to a grayscale buffer for auto-detect + IOD,
+  // and to drive the display geometry (so the box sizes to the shown image).
   useEffect(() => {
-    if (!srcUrl) { setGray(null); setNatW(0); setNatH(0); return; }
+    if (!dispUrl) { setGray(null); setNatW(0); setNatH(0); return; }
     let cancelled = false;
     const img = new Image();
     img.onload = () => {
@@ -344,9 +353,9 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
       }
       setNatW(w); setNatH(h); setGray(g);
     };
-    img.src = srcUrl;
+    img.src = dispUrl;
     return () => { cancelled = true; };
-  }, [srcUrl]);
+  }, [dispUrl]);
 
   // Display geometry — fit within the max box, preserve aspect.
   const disp = useMemo(() => {
@@ -527,6 +536,9 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
           if (resp.ok) {
             const data = await resp.json();
             if (Array.isArray(data.lanes) && applyDetectedLanes(data.lanes)) {
+              // Swap the display to the bright contrast-stretched preview so
+              // the user can clearly see the bands the detector found.
+              if (data.preview_b64) setPreviewSrc(`data:image/png;base64,${data.preview_b64}`);
               // Warn if detection ran on a low-res preview rather than the
               // full-res membrane — the single biggest cause of poor results.
               const sw = Number(data.src_w) || 0;
@@ -570,19 +582,21 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   };
 
   return (
-    <Dialog open={open} onClose={onClose} maxWidth="lg" fullWidth>
+    <Dialog open={open} onClose={onClose} maxWidth="xl" fullWidth>
       <DialogTitle sx={{ fontSize: "1rem", py: 1.25 }}>
         🩻 Pick bands
         <Typography component="span" variant="caption" sx={{ ml: 1.5, color: "text.secondary" }}>
           Auto-detect bands, then clean up: drag to move · handles to resize · select + Delete to remove · drag on the blot to add
         </Typography>
       </DialogTitle>
-      <DialogContent dividers sx={{ display: "flex", gap: 2, alignItems: "flex-start" }}>
+      {/* Image on the RIGHT (row-reverse) and large, so the user gets a clear
+          look at the membrane; controls sit on the left. */}
+      <DialogContent dividers sx={{ display: "flex", flexDirection: "row-reverse", gap: 2, alignItems: "flex-start" }}>
         {/* Image + ROI overlay */}
         <Box sx={{ flexShrink: 0 }}>
-          {srcUrl ? (
+          {dispUrl ? (
             <Box sx={{ position: "relative", width: disp.w, height: disp.h, userSelect: "none", border: "1px solid", borderColor: "divider" }}>
-              <Box component="img" src={srcUrl} alt="blot" draggable={false}
+              <Box component="img" src={dispUrl} alt="blot" draggable={false}
                 sx={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "fill", pointerEvents: "none" }} />
               <svg ref={svgRef} width={disp.w} height={disp.h}
                 style={{ position: "absolute", inset: 0, cursor: drawingBg ? "crosshair" : "crosshair", touchAction: "none" }}
@@ -630,7 +644,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
         </Box>
 
         {/* Controls */}
-        <Box sx={{ flex: 1, minWidth: 280, display: "flex", flexDirection: "column", gap: 1.25 }}>
+        <Box sx={{ flex: 1, minWidth: 300, maxWidth: 440, display: "flex", flexDirection: "column", gap: 1.25 }}>
           <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
             <Button size="small" variant="contained" startIcon={<AutoFixHighIcon sx={{ fontSize: 16 }} />}
               onClick={runAutoDetect} disabled={!srcUrl || detecting}>
@@ -713,7 +727,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
           </Box>
 
           {/* Band list */}
-          <Box sx={{ flex: 1, overflow: "auto", maxHeight: 360, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
+          <Box sx={{ flex: 1, overflow: "auto", maxHeight: 520, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
             <Box sx={{ display: "grid", gridTemplateColumns: "20px 1fr 1fr 60px 28px", alignItems: "center", gap: 0.5, px: 1, py: 0.5, position: "sticky", top: 0, bgcolor: "background.paper", borderBottom: "1px solid", borderColor: "divider" }}>
               <Typography variant="caption" sx={{ fontWeight: 700 }}>#</Typography>
               <Tooltip title="Lane / sample (the column)"><Typography variant="caption" sx={{ fontWeight: 700 }}>Lane</Typography></Tooltip>
