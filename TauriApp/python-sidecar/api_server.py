@@ -6414,11 +6414,13 @@ def wb_detect_bands(body: WbBandDetectRequest):
     import wb_detect as _wb
 
     img = None
+    used_source = False
     if body.source:
         try:
             ex = _extract_source_image(body.source)
             if ex is not None:
                 img = ex.convert("RGB")
+                used_source = True
         except Exception as _e:
             print(f"[wb-detect] full-res extract failed: {_e}", file=__s.stderr, flush=True)
             img = None
@@ -6432,11 +6434,20 @@ def wb_detect_bands(body: WbBandDetectRequest):
     if rgb.ndim != 3 or rgb.shape[2] < 3 or rgb.shape[0] < 16 or rgb.shape[1] < 16:
         return {"lanes": [], "error": "image too small"}
 
-    # Canonical resize to ~1400 px wide so the script's fixed pixel params match.
+    # Source resolution actually analysed (BEFORE any resize). The script's
+    # fixed pixel params are tuned for full-res blots (~1000-2000 px wide); if
+    # we only have a small preview the detection is unreliable, so we report
+    # this back and the UI warns the user to supply the full-res membrane.
+    src_h, src_w = rgb.shape[:2]
+
+    # Only DOWNSCALE large blots to ~1400 px wide so the script's fixed pixel
+    # params match. Never UPSCALE a small image (e.g. a 256 px thumbnail) — that
+    # just blurs noise and produces junk detections at the wrong scale.
     H0, W0 = rgb.shape[:2]
     TW = 1400
-    TH = max(16, int(round(H0 * TW / W0)))
-    rgb = _cv2.resize(rgb, (TW, TH), interpolation=_cv2.INTER_AREA)
+    if W0 > TW:
+        TH = max(16, int(round(H0 * TW / W0)))
+        rgb = _cv2.resize(rgb, (TW, TH), interpolation=_cv2.INTER_AREA)
 
     # Polarity: the script defaults to "bright" (fluorescent bands on a dark
     # membrane). For arbitrary uploads (e.g. dark-on-white colorimetric blots)
@@ -6481,6 +6492,9 @@ def wb_detect_bands(body: WbBandDetectRequest):
         "polarity": polarity,
         "lane_count": len(lanes),
         "band_count": len(out),
+        "src_w": int(src_w),
+        "src_h": int(src_h),
+        "used_source": bool(used_source),
     }
 
 

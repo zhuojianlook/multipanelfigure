@@ -4159,11 +4159,23 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     const imgEntry = ins.find((x) => x.kind === "image" && x.image_b64);
     const img = imgEntry?.image_b64 || null;
     // Resolve the upstream source descriptor so the backend can re-extract the
-    // FULL-RESOLUTION image for detection (far better than the thumbnail).
+    // FULL-RESOLUTION image for detection (the node only carries a 256px
+    // thumbnail; detecting on that is far worse than the full-res membrane).
+    // Prefer the live inset list, but fall back to the upstream Source node's
+    // OWN cached source entry — which still carries row/col/inset_index — so
+    // detection stays full-res even when the live inset list is momentarily
+    // empty (e.g. right after a backend restart).
     let source: { key: string; row: number; col: number; inset_index: number } | null = null;
     if (imgEntry?.key?.startsWith("inset_")) {
       const insetKey = imgEntry.key.replace(/^inset_\d+_/, "");
-      const s = insetSources.find((x) => x.key === insetKey);
+      let s: InsetSource | undefined = insetSources.find((x) => x.key === insetKey);
+      if (!s) {
+        for (const n of nodes) {
+          if (n.data.kind !== "source") continue;
+          const found = (n.data.sources || []).find((x) => x.key === insetKey);
+          if (found) { s = found; break; }
+        }
+      }
       if (s) source = { key: s.key, row: s.row, col: s.col, inset_index: s.inset_index };
     }
     const node = nm.get(nodeId);

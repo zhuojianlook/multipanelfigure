@@ -288,6 +288,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   const [selId, setSelId] = useState<string | null>(null);
   const [drawingBg, setDrawingBg] = useState(false);
   const [detecting, setDetecting] = useState(false);
+  const [detectInfo, setDetectInfo] = useState<string | null>(null);
   const [natW, setNatW] = useState(0);
   const [natH, setNatH] = useState(0);
   const [gray, setGray] = useState<Float32Array | null>(null);
@@ -300,6 +301,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
       setCfg(initial ? structuredClone(initial) : emptyBandConfig());
       setSelId(null);
       setDrawingBg(false);
+      setDetectInfo(null);
     }
   }, [open, initial]);
 
@@ -495,6 +497,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   const runAutoDetect = async () => {
     if (detecting) return;
     setDetecting(true);
+    setDetectInfo(null);
     try {
       // Prefer the backend detector (robust band-row-constrained algorithm,
       // pure-numpy so it ships in the frozen sidecar). Fall back to the local
@@ -509,11 +512,27 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
           });
           if (resp.ok) {
             const data = await resp.json();
-            if (Array.isArray(data.lanes) && applyDetectedLanes(data.lanes)) return;
+            if (Array.isArray(data.lanes) && applyDetectedLanes(data.lanes)) {
+              // Warn if detection ran on a low-res preview rather than the
+              // full-res membrane — the single biggest cause of poor results.
+              const sw = Number(data.src_w) || 0;
+              if (!data.used_source || (sw > 0 && sw < 700)) {
+                setDetectInfo(
+                  `⚠ Detected on a ${sw || "low"}px preview — the full-resolution membrane wasn't available, so results are coarse. ` +
+                  `Re-drop the original blot onto the Source node (and make sure the backend is connected), then auto-detect again.`,
+                );
+              } else {
+                setDetectInfo(`Detected on the full-resolution membrane (${sw}px).`);
+              }
+              return;
+            }
           }
         } catch { /* backend unavailable → local fallback */ }
       }
-      if (gray && natW && natH) applyDetectedLanes(autoDetectLanes(gray, natW, natH));
+      if (gray && natW && natH) {
+        applyDetectedLanes(autoDetectLanes(gray, natW, natH));
+        setDetectInfo("Detected with the in-app fallback (backend unavailable) — clean up as needed.");
+      }
     } finally {
       setDetecting(false);
     }
@@ -607,6 +626,14 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
               {cfg.lanes.length} band(s) — delete / drag / resize to clean up
             </Typography>
           </Box>
+          {detectInfo && (
+            <Typography variant="caption" sx={{
+              color: detectInfo.startsWith("⚠") ? "warning.main" : "text.secondary",
+              lineHeight: 1.4, mt: -0.5,
+            }}>
+              {detectInfo}
+            </Typography>
+          )}
 
           {/* Background subtraction */}
           <Box sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, p: 1 }}>
