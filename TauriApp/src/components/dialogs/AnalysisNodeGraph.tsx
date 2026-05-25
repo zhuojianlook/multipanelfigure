@@ -3967,41 +3967,71 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     setSelectedNodeId(id);
   }, [nodes, setNodes]);
 
-  // Hidden file input that backs the "Upload" toolbar button.
+  // Hidden file input — only the browser/dev FALLBACK for the upload button
+  // (in the Tauri webview we use the native file dialog, which actually opens).
   const analysisUploadRef = useRef<HTMLInputElement | null>(null);
 
-  /** Upload image file(s) DIRECTLY into the Analysis tab as standalone
-   *  whole-image sources. The backend retains full bit depth (16-bit) for
-   *  these, so quantitative analysis keeps its analytical value. The uploads
-   *  land in the SOURCES library (left panel) — the user drags them onto a
-   *  Source node, exactly like builder insets — rather than auto-spawning a
-   *  node on the canvas. */
+  /** Turn an upload response (names + thumbnails) into standalone source-library
+   *  entries (full bit depth retained on the backend) and add them to the
+   *  Sources panel, deduped by key, newest on top. */
+  const addUploadedSources = useCallback(async (names: string[], thumbs: Record<string, string>) => {
+    const entries: InsetSource[] = [];
+    for (const name of names) {
+      let w = 0, h = 0;
+      try { const info = await api.getImageInfo(name); w = info.width; h = info.height; } catch { /* size unknown */ }
+      entries.push({
+        key: `img:${name}`, name, row: -1, col: -1, inset_index: -1,
+        label: name, natural_width: w, natural_height: h, thumbnail: thumbs[name] || "",
+      });
+    }
+    if (!entries.length) return;
+    setInsetSources((cur) => {
+      const have = new Set(cur.map((s) => s.key));
+      const add = entries.filter((e) => !have.has(e.key));
+      return add.length ? [...add, ...cur] : cur;
+    });
+  }, []);
+
+  /** Browser/dev fallback: upload File objects from the hidden <input>. */
   const uploadAnalysisImages = useCallback(async (files: File[]) => {
     if (!files.length) return;
     try {
       const res = await api.uploadImages(files);
-      const names: string[] = res.names || [];
-      const thumbs: Record<string, string> = (res as { thumbnails?: Record<string, string> }).thumbnails || {};
-      const entries: InsetSource[] = [];
-      for (const name of names) {
-        let w = 0, h = 0;
-        try { const info = await api.getImageInfo(name); w = info.width; h = info.height; } catch { /* size unknown */ }
-        entries.push({
-          key: `img:${name}`, name, row: -1, col: -1, inset_index: -1,
-          label: name, natural_width: w, natural_height: h, thumbnail: thumbs[name] || "",
-        });
-      }
-      if (!entries.length) return;
-      // Add to the Sources library (dedupe by key); new uploads sort to the top.
-      setInsetSources((cur) => {
-        const have = new Set(cur.map((s) => s.key));
-        const add = entries.filter((e) => !have.has(e.key));
-        return [...add, ...cur];
-      });
+      await addUploadedSources(res.names || [], (res as { thumbnails?: Record<string, string> }).thumbnails || {});
     } catch (e) {
       console.error("analysis image upload failed", e);
     }
-  }, []);
+  }, [addUploadedSources]);
+
+  /** Upload image file(s) DIRECTLY into the Analysis tab as standalone
+   *  whole-image sources. Uses the Tauri NATIVE file dialog (which reliably
+   *  opens in the webview and returns paths, avoiding base64/IPC limits);
+   *  falls back to the hidden HTML <input> in a plain browser / dev. The
+   *  uploads land in the SOURCES library — drag them onto a Source node. */
+  const openAnalysisUpload = useCallback(async () => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        multiple: true,
+        filters: [{
+          name: "Images",
+          extensions: ["tif", "tiff", "png", "jpg", "jpeg", "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2", "pef", "raf", "nd2"],
+        }],
+      });
+      if (!selected) return;  // user cancelled
+      const items = Array.isArray(selected) ? selected : [selected];
+      const paths = items
+        .map((it: unknown) => (typeof it === "string" ? it : (it as { path: string }).path))
+        .filter(Boolean) as string[];
+      if (!paths.length) return;
+      const res = await api.uploadImagesFromPaths(paths);
+      await addUploadedSources(res.names || [], (res as { thumbnails?: Record<string, string> }).thumbnails || {});
+    } catch (e) {
+      // Dialog plugin unavailable (dev/browser) → HTML file input fallback.
+      console.warn("native upload dialog unavailable, falling back to <input>", e);
+      analysisUploadRef.current?.click();
+    }
+  }, [addUploadedSources]);
 
   // ── Output viewer plumbing ─────────────────────────────────────
 
@@ -4844,8 +4874,8 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           <input ref={analysisUploadRef} type="file" multiple
             accept="image/*,.tif,.tiff,.png,.jpg,.jpeg" style={{ display: "none" }}
             onChange={(e) => { const fs = Array.from(e.target.files || []); e.currentTarget.value = ""; uploadAnalysisImages(fs); }} />
-          <Tooltip placement="right" title="Upload image file(s) into Analysis — full bit depth (16-bit) retained for quantification. Creates a Source node.">
-            <IconButton size="small" onClick={() => analysisUploadRef.current?.click()} sx={{ p: 0.25 }}>
+          <Tooltip placement="right" title="Upload image file(s) into Analysis — full bit depth (16-bit) retained for quantification. They appear here as sources to drag onto a Source node.">
+            <IconButton size="small" onClick={openAnalysisUpload} sx={{ p: 0.25 }}>
               <AddIcon sx={{ fontSize: 14 }} />
             </IconButton>
           </Tooltip>
