@@ -4,23 +4,25 @@
 //  The user drops the WHOLE blot membrane onto a Source node and
 //  wires it into a "Band picker" node.  This dialog shows that
 //  membrane and lets them:
-//    • auto-detect lanes (column intensity-profile peak finder),
-//    • draw / move / resize a rectangular ROI per lane,
-//    • label each lane and tick exactly one as the loading control,
+//    • auto-detect bands (backend lane/level detector),
+//    • draw / move / resize a rectangular ROI per band,
+//    • label each band's LANE (column / sample) and LEVEL (target /
+//      MW row) — "lanes of the same level" are compared to each other,
+//    • pick which LEVEL is the loading control (per-lane normaliser),
 //    • optionally draw a background ROI (toggle) for subtraction.
 //
 //  The ROIs are stored as NORMALISED 0..1 coords so they survive
 //  image resizing / DPI changes, and are baked into auto-generated
 //  Python at run time (see generateBandPickerCode) that maps them
-//  onto the full-res membrane, crops each lane, inverts, subtracts
-//  background and sums → integrated optical density (IOD) per lane.
-//  The emitted table schema (source / is_reference / iod) matches
-//  the existing Normalize node, so Source → Band picker → Normalize
-//  → R plot works unchanged.
+//  onto the full-res membrane, crops each band, inverts, subtracts
+//  background and sums → integrated optical density (IOD) per band.
+//  The emitted table schema (lane / level / is_loading_control / iod)
+//  feeds the Normalize node (per-lane loading-control division) and
+//  the R plot (grouped bars, mean±SD, significance, faceted by level).
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Box, Typography, Button, IconButton, Dialog, DialogTitle, DialogContent,
-  DialogActions, TextField, Tooltip, ToggleButton, ToggleButtonGroup, Radio,
+  DialogActions, TextField, Tooltip, ToggleButton, ToggleButtonGroup, MenuItem,
 } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AutoFixHighIcon from "@mui/icons-material/AutoFixHigh";
@@ -30,12 +32,22 @@ export interface BandRoi {
   id: string;
   /** Normalised 0..1 rect over the membrane image (top-left origin). */
   x: number; y: number; w: number; h: number;
+  /** Lane / sample name (the COLUMN), e.g. "S1". */
   label: string;
-  isReference: boolean;
+  /** Target / protein row (the LEVEL): "lanes of the same level" are bands
+   *  at the same apparent molecular weight across columns. e.g. "G1" / "GAPDH". */
+  level: string;
+  /** @deprecated — loading control is now chosen per LEVEL
+   *  (BandPickerConfig.loadingControlLevel). Kept so older saved nodes load. */
+  isReference?: boolean;
 }
 export interface BandPickerConfig {
   version: 1;
   lanes: BandRoi[];
+  /** Which `level` (target row) is the loading control. Per-lane normalisation
+   *  divides every other level's IOD by this level's IOD in the same lane.
+   *  null → no loading-control normalisation (raw IOD passes through). */
+  loadingControlLevel?: string | null;
   /** "percentile" → per-lane Nth-percentile floor (default);
    *  "roi" → subtract the mean of a user-drawn background rect. */
   bgMode: "percentile" | "roi";
@@ -45,11 +57,25 @@ export interface BandPickerConfig {
 }
 
 export function emptyBandConfig(): BandPickerConfig {
-  return { version: 1, lanes: [], bgMode: "percentile", bgRoi: null, bgPercentile: 5 };
+  return { version: 1, lanes: [], loadingControlLevel: null, bgMode: "percentile", bgRoi: null, bgPercentile: 5 };
 }
 
 const uid = () => `lane_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+
+// Distinct, color-blind-friendly palette to tint ROIs by their level (row), so
+// "lanes of the same level" share a color in the editor.
+const LEVEL_PALETTE = [
+  "#1976d2", "#43a047", "#e65100", "#8e24aa", "#00838f",
+  "#c62828", "#5d4037", "#558b2f", "#6a1b9a", "#00695c",
+];
+/** Stable color for a level, by its index in the (sorted) distinct-level list. */
+function levelColor(level: string, order: string[]): string {
+  const i = order.indexOf(level);
+  return LEVEL_PALETTE[(i < 0 ? 0 : i) % LEVEL_PALETTE.length];
+}
+/** Read a ROI's level with back-compat default for older saved nodes. */
+const roiLevel = (l: BandRoi): string => (l.level || "Target");
 
 // ── Python code generator ────────────────────────────────────
 // Emits a self-contained script.  The config is embedded as a JSON
@@ -90,40 +116,36 @@ if CFG.get("bgMode") == "roi" and CFG.get("bgRoi"):
         bg_global = float(inv_full[by0:by1, bx0:bx1].mean())
 
 pct = float(CFG.get("bgPercentile", 5))
+lc_level = CFG.get("loadingControlLevel")          # which level is the loading control
 rows = []
-for i, lane in enumerate(CFG.get("lanes", [])):
-    x0, y0, x1, y1 = _px(lane)
+for i, band in enumerate(CFG.get("lanes", [])):
+    x0, y0, x1, y1 = _px(band)
     if x1 <= x0 or y1 <= y0:
         continue
     inv = inv_full[y0:y1, x0:x1]
     bg = bg_global if bg_global is not None else float(np.percentile(inv, pct))
     signal = np.clip(inv - bg, 0, None)
-    label = (lane.get("label") or "").strip() or f"Lane {i + 1}"
+    lane = (band.get("label") or "").strip() or f"Lane {i + 1}"
+    level = (band.get("level") or "").strip() or "Target"
     rows.append({
-        "source": label,
-        "is_reference": bool(lane.get("isReference", False)),
+        "lane": lane,                              # column / sample
+        "level": level,                            # target / MW row
+        "is_loading_control": bool(lc_level is not None and level == lc_level),
         "iod": float(signal.sum()),
         "mean_signal": float(signal.mean()),
         "area_px": int(inv.size),
     })
 
 if not rows:
-    raise SystemExit("No lanes defined — open 'Pick bands…' and mark each lane.")
+    raise SystemExit("No bands defined — open 'Pick bands…' and mark each band.")
 
-# Guarantee exactly one reference (loading control).  If the user
-# didn't tick one, assume the first lane; if they ticked several,
-# keep the first ticked.
-ref_seen = False
-for r in rows:
-    if r["is_reference"] and not ref_seen:
-        ref_seen = True
-    else:
-        r["is_reference"] = False
-if not ref_seen:
-    rows[0]["is_reference"] = True
-
-ref = next(r for r in rows if r["is_reference"])
-print(f"quantified {len(rows)} lane(s); reference = {ref['source']!r}")
+n_lanes = len({r["lane"] for r in rows})
+n_levels = len({r["level"] for r in rows})
+print(f"quantified {len(rows)} band(s) across {n_lanes} lane(s) x {n_levels} level(s)")
+if lc_level:
+    print(f"loading control level = {lc_level!r}")
+else:
+    print("no loading-control level set — Normalize will pass IOD through unchanged")
 mpfig_data(rows, name="band_iod")
 `;
 }
@@ -198,7 +220,7 @@ function autoDetectLanes(gray: Float32Array, w: number, h: number): BandRoi[] {
     const nx0 = clamp01((x0 - padX) / w), nx1 = clamp01((x1 + padX) / w);
     lanes.push({
       id: uid(), x: nx0, y: clamp01(y0 / h), w: nx1 - nx0, h: clamp01((y1 - y0) / h),
-      label: `Lane ${lanes.length + 1}`, isReference: lanes.length === 0,
+      label: `S${lanes.length + 1}`, level: "Target",
     });
   }
   return lanes;
@@ -365,13 +387,19 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     } else {
       const newId = uid();
       dragRef.current = { mode: "draw", id: newId, startNx: nx, startNy: ny, orig: { x: nx, y: ny, w: 0, h: 0 } };
-      setCfg((c) => ({
-        ...c,
-        lanes: [...c.lanes, { id: newId, x: nx, y: ny, w: 0, h: 0, label: `Lane ${c.lanes.length + 1}`, isReference: c.lanes.length === 0 }],
-      }));
+      setCfg((c) => {
+        // Inherit the level (row) from the selected band so you can add more
+        // bands to the same level by drawing; fall back to the last band's level.
+        const sel = c.lanes.find((l) => l.id === selId);
+        const defLevel = sel ? roiLevel(sel) : (c.lanes.length ? roiLevel(c.lanes[c.lanes.length - 1]) : "Target");
+        return {
+          ...c,
+          lanes: [...c.lanes, { id: newId, x: nx, y: ny, w: 0, h: 0, label: `S${c.lanes.length + 1}`, level: defLevel }],
+        };
+      });
       setSelId(newId);
     }
-  }, [cfg.lanes, cfg.bgRoi, clientToNorm, drawingBg]);
+  }, [cfg.lanes, cfg.bgRoi, clientToNorm, drawingBg, selId]);
 
   const onPointerMove = useCallback((e: React.PointerEvent) => {
     const d = dragRef.current;
@@ -432,16 +460,32 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
 
   const setLabel = (id: string, label: string) =>
     setCfg((c) => ({ ...c, lanes: c.lanes.map((l) => l.id === id ? { ...l, label } : l) }));
-  const setReference = (id: string) =>
-    setCfg((c) => ({ ...c, lanes: c.lanes.map((l) => ({ ...l, isReference: l.id === id })) }));
+  const setLevel = (id: string, level: string) =>
+    setCfg((c) => ({ ...c, lanes: c.lanes.map((l) => l.id === id ? { ...l, level } : l) }));
+  const setLoadingControlLevel = (level: string | null) =>
+    setCfg((c) => ({ ...c, loadingControlLevel: level }));
   const deleteLane = (id: string) =>
     setCfg((c) => ({ ...c, lanes: c.lanes.filter((l) => l.id !== id) }));
 
-  const applyDetectedLanes = (rects: Array<{ x: number; y: number; w: number; h: number }>): boolean => {
+  // Distinct levels (rows) present, in first-seen order, for coloring + the
+  // loading-control selector.
+  const levelOrder = useMemo(() => {
+    const seen: string[] = [];
+    for (const l of cfg.lanes) { const lv = roiLevel(l); if (!seen.includes(lv)) seen.push(lv); }
+    return seen;
+  }, [cfg.lanes]);
+
+  const applyDetectedLanes = (
+    rects: Array<{ x: number; y: number; w: number; h: number; lane?: string; level?: string }>,
+  ): boolean => {
     if (!rects.length) return false;
-    const lanes: BandRoi[] = rects.map((r, i) => ({
+    // Drop ladder/marker rows — they're a visual reference, not a quantified
+    // target. The user can still add them by hand if needed.
+    const usable = rects.filter((r) => (r.level || "") !== "Ladder" && (r.lane || "") !== "L");
+    const src = usable.length ? usable : rects;
+    const lanes: BandRoi[] = src.map((r, i) => ({
       id: uid(), x: clamp01(r.x), y: clamp01(r.y), w: clamp01(r.w), h: clamp01(r.h),
-      label: `Lane ${i + 1}`, isReference: i === 0,
+      label: (r.lane || `S${i + 1}`), level: (r.level || "Target"),
     }));
     setCfg((c) => ({ ...c, lanes }));
     setSelId(lanes[0]?.id ?? null);
@@ -519,19 +563,23 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
                     {handlesFor(cfg.bgRoi, null, "bg-handle")}
                   </>
                 )}
-                {/* Lanes */}
-                {cfg.lanes.map((lane, i) => {
+                {/* Bands — colored by level (row); same level = same color */}
+                {cfg.lanes.map((lane) => {
                   const sel = lane.id === selId;
+                  const lv = roiLevel(lane);
+                  const col = levelColor(lv, levelOrder);
+                  const isLC = cfg.loadingControlLevel != null && lv === cfg.loadingControlLevel;
                   return (
                     <g key={lane.id}>
                       <rect data-role="lane" data-id={lane.id}
                         x={lane.x * disp.w} y={lane.y * disp.h} width={lane.w * disp.w} height={lane.h * disp.h}
-                        fill={sel ? "rgba(25,118,210,0.16)" : "rgba(25,118,210,0.08)"}
-                        stroke={lane.isReference ? "#e53935" : "#1976d2"} strokeWidth={sel ? 2 : 1.5}
+                        fill={col} fillOpacity={sel ? 0.22 : 0.1}
+                        stroke={col} strokeWidth={sel ? 2.5 : 1.5}
+                        strokeDasharray={isLC ? "4 2" : undefined}
                         style={{ cursor: "move" }} />
                       <text x={lane.x * disp.w + 3} y={lane.y * disp.h + 12} fontSize={11}
-                        fill={lane.isReference ? "#e53935" : "#1976d2"} style={{ pointerEvents: "none", fontWeight: 600 }}>
-                        {i + 1}{lane.isReference ? " ★" : ""}
+                        fill={col} style={{ pointerEvents: "none", fontWeight: 700 }}>
+                        {lane.label || "?"}{isLC ? " (LC)" : ""}
                       </text>
                       {sel && handlesFor(lane, lane.id, "handle")}
                     </g>
@@ -588,37 +636,70 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
             )}
           </Box>
 
-          {/* Lane list */}
+          {/* Levels & loading control */}
+          <Box sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, p: 1, display: "flex", alignItems: "center", gap: 1, flexWrap: "wrap" }}>
+            <Tooltip title="The target row whose band each lane is divided by, for loading-control normalisation. Bands on the same row share one level.">
+              <Typography variant="caption" sx={{ fontWeight: 700 }}>Loading control level</Typography>
+            </Tooltip>
+            <TextField select size="small" value={cfg.loadingControlLevel ?? ""}
+              onChange={(e) => setLoadingControlLevel(e.target.value === "" ? null : e.target.value)}
+              disabled={levelOrder.length === 0}
+              sx={{ minWidth: 130 }}
+              SelectProps={{ displayEmpty: true }}
+              inputProps={{ style: { fontSize: "0.78rem", padding: "4px 8px" } }}>
+              <MenuItem value=""><em>None (raw IOD)</em></MenuItem>
+              {levelOrder.map((lv) => (
+                <MenuItem key={lv} value={lv} sx={{ fontSize: "0.8rem" }}>
+                  <Box component="span" sx={{ display: "inline-block", width: 10, height: 10, mr: 0.75, borderRadius: 0.3, bgcolor: levelColor(lv, levelOrder) }} />
+                  {lv}
+                </MenuItem>
+              ))}
+            </TextField>
+            <Typography variant="caption" sx={{ color: "text.secondary", ml: "auto" }}>
+              {levelOrder.length} level(s)
+            </Typography>
+          </Box>
+
+          {/* Band list */}
           <Box sx={{ flex: 1, overflow: "auto", maxHeight: 360, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
-            <Box sx={{ display: "grid", gridTemplateColumns: "24px 1fr 70px 28px 28px", alignItems: "center", gap: 0.5, px: 1, py: 0.5, position: "sticky", top: 0, bgcolor: "background.paper", borderBottom: "1px solid", borderColor: "divider" }}>
+            <Box sx={{ display: "grid", gridTemplateColumns: "20px 1fr 1fr 60px 28px", alignItems: "center", gap: 0.5, px: 1, py: 0.5, position: "sticky", top: 0, bgcolor: "background.paper", borderBottom: "1px solid", borderColor: "divider" }}>
               <Typography variant="caption" sx={{ fontWeight: 700 }}>#</Typography>
-              <Typography variant="caption" sx={{ fontWeight: 700 }}>Label</Typography>
+              <Tooltip title="Lane / sample (the column)"><Typography variant="caption" sx={{ fontWeight: 700 }}>Lane</Typography></Tooltip>
+              <Tooltip title="Target / protein row — 'lanes of the same level' are compared to each other"><Typography variant="caption" sx={{ fontWeight: 700 }}>Level</Typography></Tooltip>
               <Typography variant="caption" sx={{ fontWeight: 700 }}>IOD</Typography>
-              <Tooltip title="Loading control (reference)"><Typography variant="caption" sx={{ fontWeight: 700 }}>Ref</Typography></Tooltip>
               <span />
             </Box>
             {cfg.lanes.length === 0 ? (
               <Typography variant="caption" sx={{ display: "block", p: 1.5, color: "text.secondary", fontStyle: "italic" }}>
                 No bands yet. Click “Auto-detect bands”, or drag rectangles on the blot.
               </Typography>
-            ) : cfg.lanes.map((lane, i) => (
-              <Box key={lane.id}
-                onMouseEnter={() => setSelId(lane.id)}
-                sx={{ display: "grid", gridTemplateColumns: "24px 1fr 70px 28px 28px", alignItems: "center", gap: 0.5, px: 1, py: 0.4,
-                  bgcolor: lane.id === selId ? "action.hover" : undefined, borderBottom: "1px solid", borderColor: "divider" }}>
-                <Typography variant="caption">{i + 1}</Typography>
-                <TextField variant="standard" value={lane.label} placeholder={`Lane ${i + 1}`}
-                  onChange={(e) => setLabel(lane.id, e.target.value)} inputProps={{ style: { fontSize: "0.78rem" } }} />
-                <Typography variant="caption" sx={{ fontVariantNumeric: "tabular-nums", color: "text.secondary" }}>
-                  {iodById[lane.id] != null ? Math.round(iodById[lane.id]).toLocaleString() : "—"}
-                </Typography>
-                <Radio size="small" checked={lane.isReference} onChange={() => setReference(lane.id)} sx={{ p: 0.25 }} />
-                <IconButton size="small" onClick={() => deleteLane(lane.id)}><DeleteOutlineIcon sx={{ fontSize: 16 }} /></IconButton>
-              </Box>
-            ))}
+            ) : cfg.lanes.map((lane, i) => {
+              const lv = roiLevel(lane);
+              const col = levelColor(lv, levelOrder);
+              const isLC = cfg.loadingControlLevel != null && lv === cfg.loadingControlLevel;
+              return (
+                <Box key={lane.id}
+                  onMouseEnter={() => setSelId(lane.id)}
+                  sx={{ display: "grid", gridTemplateColumns: "20px 1fr 1fr 60px 28px", alignItems: "center", gap: 0.5, px: 1, py: 0.4,
+                    bgcolor: lane.id === selId ? "action.hover" : undefined, borderBottom: "1px solid", borderColor: "divider" }}>
+                  <Box sx={{ width: 9, height: 9, borderRadius: 0.3, bgcolor: col, border: isLC ? "1.5px dashed" : "none", borderColor: "text.primary" }} />
+                  <TextField variant="standard" value={lane.label} placeholder={`S${i + 1}`}
+                    onChange={(e) => setLabel(lane.id, e.target.value)} inputProps={{ style: { fontSize: "0.78rem" } }} />
+                  <TextField variant="standard" value={lv} placeholder="Target"
+                    onChange={(e) => setLevel(lane.id, e.target.value)}
+                    inputProps={{ style: { fontSize: "0.78rem", color: col, fontWeight: 600 } }} />
+                  <Typography variant="caption" sx={{ fontVariantNumeric: "tabular-nums", color: "text.secondary" }}>
+                    {iodById[lane.id] != null ? Math.round(iodById[lane.id]).toLocaleString() : "—"}
+                  </Typography>
+                  <IconButton size="small" onClick={() => deleteLane(lane.id)}><DeleteOutlineIcon sx={{ fontSize: 16 }} /></IconButton>
+                </Box>
+              );
+            })}
           </Box>
           <Typography variant="caption" sx={{ color: "text.secondary", lineHeight: 1.4 }}>
-            IOD shown is a quick preview from the display image; the run recomputes it on the full-resolution membrane.
+            Set a <b>Level</b> per band (same level = same protein row, compared across lanes). Pick the
+            <b> loading control level</b> for per-lane normalisation. IOD here is a display-image preview; the
+            run recomputes on the full-resolution membrane.
           </Typography>
         </Box>
       </DialogContent>

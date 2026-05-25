@@ -2489,67 +2489,187 @@ function buildIntensityWorkflow(): SavedWorkflow {
 }
 
 // ── Western blot quantification ──────────────────────────────
-// 3-stage pipeline: interactive Band picker (per-lane integrated
-// density, background-subtracted) → normalise to a control lane →
-// bar plot.  The picker designates the loading control explicitly
-// (a per-lane "reference" radio), so quantification no longer
-// depends on the order bands were wired.
-const WB_NORMALIZE_PY = `# @name: Normalize to reference
-# Divide every band's IOD by the reference band's IOD (the first
-# input).  Output is "relative_density" — unitless ratio used in
-# western-blot comparison plots.
+// 4-stage pipeline: interactive Band picker (per-band integrated
+// density, background-subtracted, tagged with LANE + LEVEL) →
+// normalise each lane to its loading-control LEVEL → grouped bar
+// plot (mean ± SD, significance) where the user chooses which lanes
+// are replicates of which condition, compared within each level.
+const WB_NORMALIZE_PY = `# @name: Normalize to loading control
+# For each LANE (sample / column) divide every target LEVEL's IOD by
+# that lane's loading-control LEVEL IOD → loading-control-corrected
+# signal ("normalized").  If no loading-control level was chosen in the
+# band picker, the raw IOD passes through unchanged (normalized == iod).
+# Output columns: lane, level, iod, lc_iod, normalized, is_loading_control
 table = None
 for v in inputs.values():
     if isinstance(v, dict) and "table" in v:
         table = v["table"]; break
 if not table:
-    raise SystemExit("No upstream table — wire 'Band density' into the table input.")
+    raise SystemExit("No upstream table — wire 'Band picker' into the table input.")
 
-ref = next((r for r in table if str(r.get("is_reference")).lower() == "true"), table[0])
-ref_iod = float(ref["iod"]) or 1.0
-print(f"reference = {ref.get('source')!r} (IOD = {ref_iod:.0f})")
+def _truthy(x):
+    return str(x).strip().lower() in ("1", "true", "yes", "y", "t")
+def _num(x):
+    try: return float(x)
+    except Exception: return 0.0
+
+# Per-lane loading-control IOD: the band whose level is the loading control.
+lc_by_lane = {}
+for r in table:
+    if _truthy(r.get("is_loading_control")):
+        lc_by_lane[str(r.get("lane"))] = _num(r.get("iod"))
+
+have_lc = len(lc_by_lane) > 0
+if have_lc:
+    print(f"loading control present in {len(lc_by_lane)} lane(s)")
+else:
+    print("no loading-control level set — passing raw IOD through (normalized == iod)")
 
 rows = []
 for r in table:
-    rows.append({**r, "relative_density": float(r["iod"]) / ref_iod})
-mpfig_data(rows, name="band_relative_density")
+    lane = str(r.get("lane", ""))
+    iod = _num(r.get("iod"))
+    lc = lc_by_lane.get(lane, 0.0)
+    norm = (iod / lc) if (have_lc and lc > 0) else iod
+    rows.append({**r, "lc_iod": lc, "normalized": norm})
+
+# Keep ALL rows (incl. the loading-control level, which normalises to 1);
+# the plot node excludes the loading-control level from the comparison.
+mpfig_data(rows, name="band_normalized")
 `;
 
-const WB_PLOT_R = `# @name: Plot relative band density
-library(ggplot2); library(ggprism)
+const WB_PLOT_R = `# @name: Plot band comparison (mean +/- SD, significance)
+suppressWarnings(suppressMessages({ library(ggplot2); library(ggprism) }))
 
-# Defensive: if the upstream Python "Band density" / "Normalize"
-# chain failed (e.g. no band images were wired into the Source node)
-# no table reaches this node and inputs[[1]] would crash with a
-# cryptic "subscript out of bounds".  Surface a clear message and
-# emit a placeholder plot so the run reports something useful.
+# ════════════════════════ EDIT THIS ════════════════════════
+# Map each CONDITION to its replicate LANES (use the lane labels you
+# set in the band picker). Lanes in the same condition are treated as
+# replicates -> bar = mean, error bar = SD, and conditions are tested
+# for significance. Leave the list EMPTY {} to compare every lane on
+# its own (one bar per lane within each level; no SD / significance).
+conditions <- list(
+  # Control   = c("S1", "S2", "S3"),
+  # Treatment = c("S4", "S5", "S6")
+)
+# Which LEVELS (target rows) to plot. NULL = all (loading control auto-excluded).
+levels_to_plot <- NULL
+# Condition that defines 1.0 within each level (NULL = first condition).
+ref_condition <- NULL
+# Draw significance brackets between conditions?
+show_significance <- TRUE
+# ════════════════════════════════════════════════════════════
+
 if (length(inputs) == 0 || is.null(inputs[[1]]) || nrow(inputs[[1]]) == 0) {
-  message("No relative-density table reached this node — wire band insets into the Source node, then Source -> Band density -> Normalize -> this R node.")
-  mpfig_plot("wb_relative_density.png", width = 1500, height = 1100, res = 300)
+  message("No band table reached this node — run Source -> Band picker -> Normalize -> this R node.")
+  mpfig_plot("wb_band_comparison.png", width = 1600, height = 1100, res = 300)
   print(ggplot() + theme_void() +
-    annotate("text", x = 0.5, y = 0.55, size = 6,
-             label = "No band-density table reached this node.") +
+    annotate("text", x = 0.5, y = 0.55, size = 6, label = "No band table reached this node.") +
     annotate("text", x = 0.5, y = 0.40, size = 4, color = "grey40",
-             label = "Drop band insets into Source, then run Source -> Band density -> Normalize -> Plot.") +
+             label = "Run Source -> Band picker -> Normalize -> Plot.") +
     xlim(0, 1) + ylim(0, 1))
 } else {
 
-data <- inputs[[1]]
-data$is_reference <- as.logical(toupper(as.character(data$is_reference)))
-data$source <- factor(data$source, levels = unique(data$source))
+df <- inputs[[1]]
 
-mpfig_plot("wb_relative_density.png", width = 1500, height = 1100, res = 300)
-p <- ggplot(data, aes(x = source, y = relative_density, fill = is_reference)) +
-  geom_col(width = 0.65, color = "grey25", linewidth = 0.3) +
-  geom_hline(yintercept = 1, linetype = "dashed", color = "grey50", linewidth = 0.4) +
-  scale_fill_manual(values = c("TRUE" = "#cfd8dc", "FALSE" = "#4a7c59"),
-                    name = NULL,
-                    labels = c("TRUE" = "Reference (loading)", "FALSE" = "Sample")) +
+# Value column: prefer loading-control-normalized, fall back gracefully.
+val_col <- if ("normalized" %in% names(df)) "normalized" else
+           if ("relative_density" %in% names(df)) "relative_density" else "iod"
+df$value <- suppressWarnings(as.numeric(df[[val_col]]))
+if (!"level" %in% names(df)) df$level <- "Target"
+if (!"lane"  %in% names(df)) df$lane <- if ("source" %in% names(df)) as.character(df$source) else as.character(seq_len(nrow(df)))
+df$level <- as.character(df$level); df$lane <- as.character(df$lane)
+
+# Drop the loading-control level itself (normalises to 1 by definition).
+if ("is_loading_control" %in% names(df)) {
+  is_lc <- tolower(as.character(df$is_loading_control)) %in% c("true", "1", "yes")
+  df <- df[!is_lc, , drop = FALSE]
+}
+df <- df[is.finite(df$value), , drop = FALSE]
+if (!is.null(levels_to_plot)) df <- df[df$level %in% levels_to_plot, , drop = FALSE]
+if (nrow(df) == 0) stop("No target bands to plot after filtering (check levels_to_plot / loading control).")
+
+# Assign each lane to a condition. Default: each lane is its own condition.
+lane2cond <- character(0)
+if (length(conditions) > 0) for (cn in names(conditions)) for (ln in conditions[[cn]]) lane2cond[ln] <- cn
+df$condition <- ifelse(df$lane %in% names(lane2cond), lane2cond[df$lane], df$lane)
+cond_levels <- if (length(conditions) > 0) names(conditions) else unique(df$lane)
+cond_levels <- cond_levels[cond_levels %in% unique(df$condition)]
+df$condition <- factor(df$condition, levels = cond_levels)
+df <- df[!is.na(df$condition), , drop = FALSE]   # explicit groups: keep only assigned lanes
+if (nrow(df) == 0) stop("No lanes matched your 'conditions' mapping — check the lane labels.")
+
+# Scale within each level so the reference condition mean = 1.
+ref_c <- if (!is.null(ref_condition)) ref_condition else cond_levels[1]
+for (lv in unique(df$level)) {
+  sel <- df$level == lv
+  ref_vals <- df$value[sel & df$condition == ref_c]
+  base <- if (length(ref_vals) > 0) mean(ref_vals, na.rm = TRUE) else mean(df$value[sel], na.rm = TRUE)
+  if (is.finite(base) && base != 0) df$value[sel] <- df$value[sel] / base
+}
+
+# Summary per (level, condition): mean, SD, n.
+agg <- aggregate(value ~ level + condition, data = df,
+                 FUN = function(v) c(m = mean(v), s = sd(v), n = length(v)))
+summ <- data.frame(level = agg$level, condition = agg$condition,
+                   mean = agg$value[, "m"], sd = agg$value[, "s"], n = agg$value[, "n"])
+summ$sd[is.na(summ$sd)] <- 0
+
+# Pairwise t-tests between conditions, within each level (needs n>=2 each).
+stat_df <- NULL
+if (show_significance && nlevels(df$condition) >= 2) {
+  pieces <- list()
+  for (lv in unique(df$level)) {
+    sub <- df[df$level == lv, ]
+    conds <- intersect(cond_levels, unique(as.character(sub$condition)))
+    usable <- conds[vapply(conds, function(cc) sum(sub$condition == cc) >= 2, logical(1))]
+    if (length(usable) < 2) next
+    ymax <- max(summ$mean[summ$level == lv] + summ$sd[summ$level == lv], na.rm = TRUE)
+    step <- 0.13 * ymax; k <- 0
+    combs <- combn(usable, 2)
+    for (j in seq_len(ncol(combs))) {
+      a <- combs[1, j]; b <- combs[2, j]
+      p <- tryCatch(t.test(sub$value[sub$condition == a], sub$value[sub$condition == b])$p.value,
+                    error = function(e) NA_real_)
+      if (is.na(p)) next
+      lab <- if (p < 0.001) "***" else if (p < 0.01) "**" else if (p < 0.05) "*" else "ns"
+      k <- k + 1
+      pieces[[length(pieces) + 1]] <- data.frame(
+        level = lv, group1 = a, group2 = b, p.label = lab, y.position = ymax + step * k)
+    }
+  }
+  if (length(pieces) > 0) stat_df <- do.call(rbind, pieces)
+}
+
+n_facets <- length(unique(df$level))
+mpfig_plot("wb_band_comparison.png",
+           width = max(1100, 520 * min(n_facets, 3)), height = 1150, res = 300)
+# Per-layer data/aes (no global default mapping) so the significance
+# layer below does not inherit fill=condition and choke on stat_df.
+p <- ggplot() +
+  geom_col(data = summ, aes(x = condition, y = mean, fill = condition),
+           width = 0.7, color = "grey25", linewidth = 0.3) +
+  geom_errorbar(data = summ, aes(x = condition, ymin = pmax(0, mean - sd), ymax = mean + sd),
+                width = 0.2, linewidth = 0.4) +
+  geom_jitter(data = df, aes(x = condition, y = value), width = 0.12, height = 0,
+              size = 1.1, color = "grey20", alpha = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey55", linewidth = 0.4) +
+  facet_wrap(~ level, scales = "free_y") +
   theme_prism(base_size = 11) +
-  theme(legend.position = "top",
+  theme(legend.position = "none",
         axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
         plot.margin = margin(10, 10, 6, 10)) +
-  labs(x = NULL, y = "Relative band density (× reference)")
+  labs(x = NULL,
+       y = paste0("Relative density (vs ", ref_c, ")"),
+       subtitle = if (val_col == "normalized") "loading-control corrected" else "raw IOD (no loading control set)")
+
+if (!is.null(stat_df)) {
+  p <- tryCatch(
+    p + ggprism::add_pvalue(stat_df, label = "p.label",
+                            xmin = "group1", xmax = "group2",
+                            y.position = "y.position",
+                            tip.length = 0.01, label.size = 3.0, bracket.size = 0.3),
+    error = function(e) { message("add_pvalue failed: ", conditionMessage(e)); p })
+}
 print(p)
 }
 `;
@@ -2574,12 +2694,12 @@ function buildWesternBlotWorkflow(): SavedWorkflow {
     },
     {
       id: normId, type: "python", position: { x: 620, y: 60 },
-      data: { label: "Normalize to reference", kind: "python", code: WB_NORMALIZE_PY,
+      data: { label: "Normalize to loading control", kind: "python", code: WB_NORMALIZE_PY,
               outputs: [], inputs: [], status: "idle", currentPreset: "custom" } as NodeData,
     },
     {
       id: plotId, type: "r", position: { x: 880, y: 60 },
-      data: { label: "Plot relative density", kind: "r", code: WB_PLOT_R,
+      data: { label: "Plot band comparison", kind: "r", code: WB_PLOT_R,
               outputs: [], inputs: [], status: "idle", currentPreset: "custom" } as NodeData,
     },
   ];

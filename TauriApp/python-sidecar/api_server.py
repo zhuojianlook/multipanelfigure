@@ -6448,6 +6448,14 @@ def wb_detect_bands(body: WbBandDetectRequest):
 
     try:
         lanes, bands, (H, W) = _wb.detect_wb_bands(rgb, signal_polarity=polarity)
+        # Tag each band with a molecular-weight ROW group (G1, G2…) so the UI
+        # can offer a "level" (target row): "lanes of the same level" are bands
+        # at the same apparent MW across columns. assign_band_groups leaves
+        # marker/ladder bands with an empty group, which we surface as "Ladder".
+        try:
+            _wb.assign_band_groups(bands, _wb.DEFAULT_GROUP_TOLERANCE, set(_wb.DEFAULT_MARKER_LANES))
+        except Exception:
+            pass
     except Exception as _e:
         print(f"[wb-detect] detect_wb_bands failed: {_e}", file=__s.stderr, flush=True)
         return {"lanes": [], "mode": "auto", "polarity": polarity, "error": str(_e)}
@@ -6458,7 +6466,15 @@ def wb_detect_bands(body: WbBandDetectRequest):
         x0n = max(0.0, b["x1"] / W); x1n = min(1.0, b["x2"] / W)
         y0n = max(0.0, (b["y"] - pad) / H); y1n = min(1.0, (b["y"] + pad) / H)
         if x1n - x0n > 0.004 and y1n - y0n > 0.003:
-            out.append({"x": round(x0n, 4), "y": round(y0n, 4), "w": round(x1n - x0n, 4), "h": round(y1n - y0n, 4)})
+            lane_name = str(b.get("lane") or "")
+            grp = str(b.get("band_group") or "")
+            is_marker = lane_name in _wb.DEFAULT_MARKER_LANES
+            level = "Ladder" if is_marker else (grp or "Target")
+            out.append({
+                "x": round(x0n, 4), "y": round(y0n, 4),
+                "w": round(x1n - x0n, 4), "h": round(y1n - y0n, 4),
+                "lane": lane_name, "level": level,
+            })
     return {
         "lanes": out,
         "mode": "auto",
