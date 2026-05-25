@@ -3626,6 +3626,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // Figure-store + collage-store wiring for the "Add to main timeline"
   // / "Add to collage" actions on selected outputs.
   const uploadImages = useFigureStore((s) => s.uploadImages);
+  const uploadImagesFromPaths = useFigureStore((s) => s.uploadImagesFromPaths);
   const removeImage = useFigureStore((s) => s.removeImage);
   const addCollageItem = useCollageStore((s) => s.addItem);
   void removeImage;  // wired below in discard flow
@@ -3971,48 +3972,67 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // (in the Tauri webview we use the native file dialog, which actually opens).
   const analysisUploadRef = useRef<HTMLInputElement | null>(null);
 
-  /** Turn an upload response (names + thumbnails) into standalone source-library
-   *  entries (full bit depth retained on the backend) and add them to the
-   *  Sources panel, deduped by key, newest on top. */
-  const addUploadedSources = useCallback(async (names: string[], thumbs: Record<string, string>) => {
+  /** Log a line to the unified analysis console so upload status/errors are
+   *  visible to the user (the upload isn't tied to any one node). */
+  const logUpload = useCallback((msg: string) => {
+    consoleRef.current += (consoleRef.current ? "\n" : "") + msg;
+    setConsoleOut(consoleRef.current);
+  }, []);
+
+  /** Resolve names → standalone source-library entries (full bit depth on the
+   *  backend) and add them to the Sources panel, deduped, newest on top.
+   *  Thumbnails are fetched per-name (the backend regenerates them). */
+  const addUploadedSources = useCallback(async (names: string[]) => {
+    if (!names.length) { logUpload("[upload] no images were returned by the backend"); return; }
     const entries: InsetSource[] = [];
     for (const name of names) {
-      let w = 0, h = 0;
+      let w = 0, h = 0, thumb = "";
       try { const info = await api.getImageInfo(name); w = info.width; h = info.height; } catch { /* size unknown */ }
+      try { thumb = (await api.getImageThumbnail(name)).thumbnail || ""; } catch { /* no thumb */ }
       entries.push({
         key: `img:${name}`, name, row: -1, col: -1, inset_index: -1,
-        label: name, natural_width: w, natural_height: h, thumbnail: thumbs[name] || "",
+        label: name, natural_width: w, natural_height: h, thumbnail: thumb,
       });
     }
-    if (!entries.length) return;
     setInsetSources((cur) => {
       const have = new Set(cur.map((s) => s.key));
       const add = entries.filter((e) => !have.has(e.key));
       return add.length ? [...add, ...cur] : cur;
     });
-  }, []);
+    logUpload(`[upload] added ${entries.length} source(s): ${names.join(", ")}`);
+  }, [logUpload]);
 
   /** Browser/dev fallback: upload File objects from the hidden <input>. */
   const uploadAnalysisImages = useCallback(async (files: File[]) => {
     if (!files.length) return;
     try {
+      logUpload(`[upload] uploading ${files.length} file(s)…`);
       const res = await api.uploadImages(files);
-      await addUploadedSources(res.names || [], (res as { thumbnails?: Record<string, string> }).thumbnails || {});
+      await addUploadedSources(res.names || []);
     } catch (e) {
-      console.error("analysis image upload failed", e);
+      logUpload(`[upload] FAILED: ${e instanceof Error ? e.message : String(e)}`);
     }
-  }, [addUploadedSources]);
+  }, [addUploadedSources, logUpload]);
 
   /** Upload image file(s) DIRECTLY into the Analysis tab as standalone
-   *  whole-image sources. Uses the Tauri NATIVE file dialog (which reliably
-   *  opens in the webview and returns paths, avoiding base64/IPC limits);
-   *  falls back to the hidden HTML <input> in a plain browser / dev. The
-   *  uploads land in the SOURCES library — drag them onto a Source node. */
+   *  whole-image sources. Uses the Tauri NATIVE file dialog (returns paths,
+   *  avoids base64/IPC limits) and the proven store upload action (which
+   *  surfaces a visible error banner on failure); falls back to the hidden
+   *  HTML <input> only when the dialog plugin isn't available (dev/browser).
+   *  Uploads land in the SOURCES library — drag them onto a Source node. */
   const openAnalysisUpload = useCallback(async () => {
+    let dialogMod: typeof import("@tauri-apps/plugin-dialog") | null = null;
     try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const selected = await open({
+      dialogMod = await import("@tauri-apps/plugin-dialog");
+    } catch (e) {
+      logUpload(`[upload] native dialog unavailable, using browser picker (${e instanceof Error ? e.message : String(e)})`);
+      analysisUploadRef.current?.click();
+      return;
+    }
+    try {
+      const selected = await dialogMod.open({
         multiple: true,
+        title: "Upload image(s) to Analysis",
         filters: [{
           name: "Images",
           extensions: ["tif", "tiff", "png", "jpg", "jpeg", "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2", "pef", "raf", "nd2"],
@@ -4021,17 +4041,17 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       if (!selected) return;  // user cancelled
       const items = Array.isArray(selected) ? selected : [selected];
       const paths = items
-        .map((it: unknown) => (typeof it === "string" ? it : (it as { path: string }).path))
-        .filter(Boolean) as string[];
-      if (!paths.length) return;
-      const res = await api.uploadImagesFromPaths(paths);
-      await addUploadedSources(res.names || [], (res as { thumbnails?: Record<string, string> }).thumbnails || {});
+        .map((it) => (typeof it === "string" ? it : (it as { path?: string })?.path))
+        .filter((p): p is string => !!p);
+      if (!paths.length) { logUpload("[upload] no file paths from the dialog"); return; }
+      logUpload(`[upload] uploading ${paths.length} file(s)…`);
+      // Proven store action — sets the apiError banner if the POST fails.
+      const names = await uploadImagesFromPaths(paths);
+      await addUploadedSources(names || []);
     } catch (e) {
-      // Dialog plugin unavailable (dev/browser) → HTML file input fallback.
-      console.warn("native upload dialog unavailable, falling back to <input>", e);
-      analysisUploadRef.current?.click();
+      logUpload(`[upload] FAILED: ${e instanceof Error ? e.message : String(e)}`);
     }
-  }, [addUploadedSources]);
+  }, [addUploadedSources, logUpload, uploadImagesFromPaths]);
 
   // ── Output viewer plumbing ─────────────────────────────────────
 
