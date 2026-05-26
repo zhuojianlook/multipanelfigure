@@ -195,6 +195,13 @@ class ApiClient {
     await apiRequest(`/api/images/${encodeURIComponent(name)}`, "DELETE");
   }
 
+  /** Hide an image from the builder's media timeline (kept on the backend for
+   *  analysis use). The /api/images endpoint filters hidden names out of
+   *  `names`, so the builder UI doesn't show it. */
+  async hideImage(name: string): Promise<void> {
+    await apiRequest(`/api/images/${encodeURIComponent(name)}/hide`, "POST");
+  }
+
   async listImages(): Promise<ImagesListResponse> {
     return apiJson<ImagesListResponse>("/api/images");
   }

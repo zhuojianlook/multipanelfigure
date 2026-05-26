@@ -3626,7 +3626,6 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // Figure-store + collage-store wiring for the "Add to main timeline"
   // / "Add to collage" actions on selected outputs.
   const uploadImages = useFigureStore((s) => s.uploadImages);
-  const uploadImagesFromPaths = useFigureStore((s) => s.uploadImagesFromPaths);
   const removeImage = useFigureStore((s) => s.removeImage);
   const addCollageItem = useCollageStore((s) => s.addItem);
   void removeImage;  // wired below in discard flow
@@ -3980,12 +3979,15 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   }, []);
 
   /** Resolve names → standalone source-library entries (full bit depth on the
-   *  backend) and add them to the Sources panel, deduped, newest on top.
-   *  Thumbnails are fetched per-name (the backend regenerates them). */
+   *  backend) and add them to the Sources panel, deduped, newest on top. Marks
+   *  each backend image HIDDEN from the builder's media timeline (Analysis
+   *  uploads are analysis-only). Thumbnails fetched per-name. */
   const addUploadedSources = useCallback(async (names: string[]) => {
     if (!names.length) { logUpload("[upload] no images were returned by the backend"); return; }
     const entries: InsetSource[] = [];
     for (const name of names) {
+      // Keep these out of the builder's media timeline — analysis-only.
+      try { await api.hideImage(name); } catch { /* best-effort */ }
       let w = 0, h = 0, thumb = "";
       try { const info = await api.getImageInfo(name); w = info.width; h = info.height; } catch { /* size unknown */ }
       try { thumb = (await api.getImageThumbnail(name)).thumbnail || ""; } catch { /* no thumb */ }
@@ -4002,7 +4004,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     logUpload(`[upload] added ${entries.length} source(s): ${names.join(", ")}`);
   }, [logUpload]);
 
-  /** Browser/dev fallback: upload File objects from the hidden <input>. */
+  /** Browser/dev fallback: upload File objects from the hidden <input>. Uses
+   *  the RAW api.uploadImages (no figureStore pollution → builder timeline
+   *  stays clean); addUploadedSources marks each name hidden too. */
   const uploadAnalysisImages = useCallback(async (files: File[]) => {
     if (!files.length) return;
     try {
@@ -4045,13 +4049,16 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         .filter((p): p is string => !!p);
       if (!paths.length) { logUpload("[upload] no file paths from the dialog"); return; }
       logUpload(`[upload] uploading ${paths.length} file(s)…`);
-      // Proven store action — sets the apiError banner if the POST fails.
-      const names = await uploadImagesFromPaths(paths);
-      await addUploadedSources(names || []);
+      // RAW api (NOT the store action) — analysis uploads must NOT populate
+      // figureStore.loadedImages or trigger requestPreview; we want them
+      // analysis-only. addUploadedSources also marks each name hidden so
+      // /api/images excludes them from the builder timeline.
+      const res = await api.uploadImagesFromPaths(paths);
+      await addUploadedSources(res.names || []);
     } catch (e) {
       logUpload(`[upload] FAILED: ${e instanceof Error ? e.message : String(e)}`);
     }
-  }, [addUploadedSources, logUpload, uploadImagesFromPaths]);
+  }, [addUploadedSources, logUpload]);
 
   // ── Output viewer plumbing ─────────────────────────────────────
 

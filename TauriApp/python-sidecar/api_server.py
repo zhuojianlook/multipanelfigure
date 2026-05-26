@@ -2870,6 +2870,18 @@ def get_image_info(name: str):
     return {"width": img.size[0], "height": img.size[1]}
 
 
+@app.post("/api/images/{name}/hide")
+def hide_image(name: str):
+    """Mark `name` as hidden from the builder's media timeline. The image
+    stays in loaded_images (analysis/sidecar can still use it by name); the
+    /api/images endpoint filters it out of `names` so the builder UI doesn't
+    show it. Used by Analysis-only uploads to keep the builder timeline clean."""
+    if name not in loaded_images:
+        raise HTTPException(404, f"Image '{name}' not found")
+    hidden_images.add(name)
+    return {"ok": True, "name": name, "hidden": True}
+
+
 def _thumb_b64(img: Image.Image, max_side: int = 256) -> str:
     thumb = img.copy()
     thumb.thumbnail((max_side, max_side), Image.LANCZOS)
