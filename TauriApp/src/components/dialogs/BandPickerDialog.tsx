@@ -584,6 +584,58 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     }
   };
 
+  /** Import a lanes CSV (detect_bands.py schema: `lane,x1,x2,y1,y2` in the
+   *  source's native pixels) and detect bands WITHIN those lanes — matches the
+   *  script's --lanes pipeline exactly (no auto-detect, no consensus filter,
+   *  full ladder kept). This reproduces band_quantification_auto_lanes_annotated.png. */
+  const runDetectFromCsv = async () => {
+    if (detecting) return;
+    if (!source) {
+      setDetectInfo("⚠ Import lanes needs a wired source — drop the blot onto a Source node first.");
+      return;
+    }
+    setDetecting(true);
+    setDetectInfo(null);
+    try {
+      // Native dialog → CSV path; the sidecar reads the file directly.
+      let csvPath: string | null = null;
+      try {
+        const { open } = await import("@tauri-apps/plugin-dialog");
+        const selected = await open({
+          multiple: false,
+          title: "Import lanes CSV (lane,x1,x2,y1,y2 in source pixels)",
+          filters: [{ name: "CSV", extensions: ["csv"] }],
+        });
+        if (!selected) return;
+        csvPath = typeof selected === "string" ? selected : (selected as { path?: string }).path || null;
+      } catch (e) {
+        setDetectInfo(`⚠ Native file dialog unavailable: ${e instanceof Error ? e.message : String(e)}`);
+        return;
+      }
+      if (!csvPath) { setDetectInfo("⚠ No CSV path from the dialog."); return; }
+      const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
+      const resp = await fetch(`${apiBase}/api/analysis/wb-detect-bands`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source, lanes_csv_path: csvPath }),
+      });
+      if (!resp.ok) {
+        setDetectInfo(`⚠ Detection failed: HTTP ${resp.status}`);
+        return;
+      }
+      const data = await resp.json();
+      if (data.error) { setDetectInfo(`⚠ ${data.error}`); return; }
+      if (Array.isArray(data.lanes) && applyDetectedLanes(data.lanes)) {
+        if (data.preview_b64) setPreviewSrc(`data:image/png;base64,${data.preview_b64}`);
+        const sw = Number(data.src_w) || 0;
+        setDetectInfo(`Detected ${data.band_count ?? data.lanes.length} band(s) in your CSV lanes (${sw}px source).`);
+      } else {
+        setDetectInfo("⚠ No bands returned for these lanes (check the CSV matches this blot).");
+      }
+    } finally {
+      setDetecting(false);
+    }
+  };
+
   // Snap each existing lane's vertical position to its actual band, keeping the
   // user's x-grid. Sends the current lanes to the backend's per-lane detector
   // Render an 8-handle set for a normalised rect.
@@ -671,6 +723,14 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
               onClick={runAutoDetect} disabled={!srcUrl || detecting}>
               {detecting ? "Detecting…" : "Auto-detect bands"}
             </Button>
+            <Tooltip title="Import a lanes CSV (detect_bands.py schema: lane,x1,x2,y1,y2 in source pixels) and detect bands within those lanes — matches the script's --lanes pipeline exactly, including the full ladder.">
+              <span>
+                <Button size="small" variant="outlined" onClick={runDetectFromCsv} disabled={!source || detecting}
+                  sx={{ textTransform: "none" }}>
+                  Import lanes (CSV)
+                </Button>
+              </span>
+            </Tooltip>
             <Typography variant="caption" sx={{ color: "text.secondary", ml: "auto" }}>
               {cfg.lanes.length} band(s) — delete / drag / resize to clean up
             </Typography>

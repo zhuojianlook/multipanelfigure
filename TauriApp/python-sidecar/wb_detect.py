@@ -546,6 +546,40 @@ def detect_ladder_lane(signal: np.ndarray, sample_lanes: list, min_bands: int = 
     return (int(x0), int(x1), int(min(gy1, ytop)), int(max(gy2, ybot)))
 
 
+def detect_wb_bands_in_lanes(
+    rgb: np.ndarray,
+    lanes,
+    signal_polarity: str = DEFAULT_SIGNAL_POLARITY,
+    marker_lanes=None,
+):
+    """detect_bands.py's --lanes pipeline: detect bands WITHIN user-defined lane
+    boxes — NO auto lane detection and NO cross-lane consensus filter (the script
+    only applies that filter in auto mode). `lanes` is a list of
+    (name, x1, x2, y1, y2) in pixels of the analysed image. Returns
+    (clamped_lanes, bands, (H, W))."""
+    if marker_lanes is None:
+        marker_lanes = set(DEFAULT_MARKER_LANES)
+    rgb = np.asarray(rgb)
+    if rgb.ndim != 3 or rgb.shape[2] < 3:
+        raise ValueError("expected an HxWx3 RGB image")
+    rgb = rgb[:, :, :3].astype(np.float32)
+
+    _display, analysis = contrast_scale(rgb)
+    signal = horizontal_signal(analysis, signal_polarity)
+    height, width = signal.shape
+
+    clamped = []
+    for (name, x1, x2, y1, y2) in lanes:
+        x1 = max(0, min(int(round(x1)), width - 1))
+        x2 = max(x1 + 1, min(int(round(x2)), width))
+        y1 = max(0, min(int(round(y1)), height - 1))
+        y2 = max(y1 + 1, min(int(round(y2)), height))
+        clamped.append((str(name) or "Lane", x1, x2, y1, y2))
+
+    bands = detect_lane_bands(signal, clamped, marker_lanes)
+    return clamped, bands, signal.shape
+
+
 def detect_wb_bands(
     rgb: np.ndarray,
     signal_polarity: str = DEFAULT_SIGNAL_POLARITY,

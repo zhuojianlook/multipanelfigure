@@ -6532,6 +6532,14 @@ class WbBandDetectRequest(BaseModel):
     # 2 = balanced, 1 = relaxed (keep isolated/faint bands). The app defaults to
     # 1 ("catch more, clean up") when unset.
     min_group_lanes: Optional[int] = None
+    # DEFINED-LANES path = detect_bands.py --lanes: detect bands WITHIN
+    # user-defined lane boxes (skips auto_detect_lanes + the consensus filter).
+    # Either `lanes_csv_path` (server-side path to a CSV with the same schema
+    # as detect_bands.py: `lane,x1,x2,y1,y2` in the SOURCE's native pixels) OR
+    # `lanes` (normalised 0..1 boxes drawn in the picker) drives this mode.
+    # When neither is set the endpoint runs the normal auto pipeline.
+    lanes_csv_path: Optional[str] = None
+    lanes: Optional[List[Dict[str, object]]] = None
 
 
 @app.post("/api/analysis/wb-detect-bands")
@@ -6637,8 +6645,61 @@ def wb_detect_bands(body: WbBandDetectRequest):
         mgl = 3
     mgl = max(1, min(3, mgl))
 
+    # ──── Defined-lanes mode (detect_bands.py --lanes) ────────────────────
+    # If the user supplied a lanes CSV (server-side path) or drew lane boxes
+    # (normalised), detect bands WITHIN them — no auto-detect, no consensus
+    # filter (matching the script's --lanes path). This reproduces the user's
+    # band_quantification_auto_lanes_annotated.png exactly.
+    aH, aW = rgb.shape[:2]  # analysed-image dims (after the safety resize)
+    defined_lanes_px = None  # type: Optional[list]
+    if body.lanes_csv_path:
+        try:
+            import csv as _csv
+            with open(str(body.lanes_csv_path), newline="", encoding="utf-8") as _f:
+                reader = _csv.DictReader(_f)
+                rows = []
+                for r in reader:
+                    rows.append((
+                        str(r.get("lane") or "Lane").strip() or "Lane",
+                        float(r["x1"]), float(r["x2"]),
+                        float(r["y1"]), float(r["y2"]),
+                    ))
+            # CSV px are in the SOURCE's native pixels (the image the CSV was
+            # made for). Scale to the analysed image (a no-op unless the
+            # safety-resize cap fired).
+            sx = (aW / float(src_w)) if src_w else 1.0
+            sy = (aH / float(src_h)) if src_h else 1.0
+            defined_lanes_px = [
+                (n, x1 * sx, x2 * sx, y1 * sy, y2 * sy)
+                for (n, x1, x2, y1, y2) in rows
+            ]
+        except Exception as _e:
+            print(f"[wb-detect] lanes_csv_path parse failed ({body.lanes_csv_path}): {_e}", file=__s.stderr, flush=True)
+            defined_lanes_px = None
+    elif body.lanes:
+        try:
+            lanes_in = []
+            for L in body.lanes:
+                if not isinstance(L, dict):
+                    continue
+                n = str(L.get("name") or L.get("label") or "Lane")
+                x = float(L.get("x", 0.0)); y = float(L.get("y", 0.0))
+                w = float(L.get("w", 0.0)); h = float(L.get("h", 0.0))
+                lanes_in.append((n, x * aW, (x + w) * aW, y * aH, (y + h) * aH))
+            defined_lanes_px = lanes_in if lanes_in else None
+        except Exception as _e:
+            print(f"[wb-detect] normalised lanes parse failed: {_e}", file=__s.stderr, flush=True)
+            defined_lanes_px = None
+
+    mode = "auto"
     try:
-        lanes, bands, (H, W) = _wb.detect_wb_bands(rgb, signal_polarity=polarity, min_group_lanes=mgl)
+        if defined_lanes_px:
+            lanes, bands, (H, W) = _wb.detect_wb_bands_in_lanes(
+                rgb, defined_lanes_px, signal_polarity=polarity,
+            )
+            mode = "lanes"
+        else:
+            lanes, bands, (H, W) = _wb.detect_wb_bands(rgb, signal_polarity=polarity, min_group_lanes=mgl)
         # Tag each band with a molecular-weight ROW group (G1, G2…) so the UI
         # can offer a "level" (target row): "lanes of the same level" are bands
         # at the same apparent MW across columns. assign_band_groups leaves
@@ -6648,8 +6709,8 @@ def wb_detect_bands(body: WbBandDetectRequest):
         except Exception:
             pass
     except Exception as _e:
-        print(f"[wb-detect] detect_wb_bands failed: {_e}", file=__s.stderr, flush=True)
-        return {"lanes": [], "mode": "auto", "polarity": polarity, "error": str(_e)}
+        print(f"[wb-detect] detection failed: {_e}", file=__s.stderr, flush=True)
+        return {"lanes": [], "mode": mode, "polarity": polarity, "error": str(_e)}
 
     # Band ROI box geometry — MATCH detect_bands.py's quantify_bands defaults:
     # a UNIFORM height of (roi_half_height * 2 + 1) centred on the band y, and
@@ -6692,7 +6753,7 @@ def wb_detect_bands(body: WbBandDetectRequest):
 
     return {
         "lanes": out,
-        "mode": "auto",
+        "mode": mode,
         "polarity": polarity,
         "lane_count": len(lanes),
         "band_count": len(out),
