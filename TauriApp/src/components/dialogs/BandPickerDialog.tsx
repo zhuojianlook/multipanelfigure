@@ -568,7 +568,11 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
                   `Re-drop the original blot onto the Source node (and make sure the backend is connected), then auto-detect again.`,
                 );
               } else {
-                setDetectInfo(`Detected on the full-resolution membrane (${sw}px).`);
+                setDetectInfo(
+                  `Auto mode (${sw}px source) — ${data.band_count ?? data.lanes.length} band(s). ` +
+                  `This matches detect_bands.py's AUTO defaults (sparse — no auto-ladder, consensus filter on). ` +
+                  `For the dense detect_bands.py --lanes result (full ladder + every lane's bands), click "Import lanes (CSV)" and pick your lanes file.`,
+                );
               }
               return;
             }
