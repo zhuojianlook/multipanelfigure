@@ -32,7 +32,13 @@ export interface BandRoi {
   id: string;
   /** Normalised 0..1 rect over the membrane image (top-left origin). */
   x: number; y: number; w: number; h: number;
-  /** Lane / sample name (the COLUMN), e.g. "S1". */
+  /** UNIQUE display name for this band, e.g. "B1". Auto-generated so every
+   *  row in the table is distinguishable even when multiple bands share a
+   *  lane (column). User-editable. Falls back to `label` for old configs. */
+  name?: string;
+  /** Lane / sample name (the COLUMN), e.g. "S1". Shared across bands in the
+   *  same column — this is the GROUPING key for loading-control normalisation
+   *  and the user-defined group→condition mapping. */
   label: string;
   /** Target / protein row (the LEVEL): "lanes of the same level" are bands
    *  at the same apparent molecular weight across columns. e.g. "G1" / "GAPDH". */
@@ -41,6 +47,16 @@ export interface BandRoi {
    *  (BandPickerConfig.loadingControlLevel). Kept so older saved nodes load. */
   isReference?: boolean;
 }
+
+/** A user-defined experimental group — maps a condition NAME to the set of
+ *  lane labels that are its biological replicates. Used by the R plot node
+ *  to build the `conditions <- list(...)` mapping automatically. */
+export interface BandGroup {
+  id: string;
+  name: string;          // condition name shown on the x-axis
+  lanes: string[];       // lane LABELs (the "column" identity) in this group
+}
+
 export interface BandPickerConfig {
   version: 1;
   lanes: BandRoi[];
@@ -54,14 +70,39 @@ export interface BandPickerConfig {
   bgRoi?: { x: number; y: number; w: number; h: number } | null;
   /** Percentile (0..100) used when bgMode === "percentile". */
   bgPercentile: number;
+  /** User-defined experimental groups for the downstream R plot. The picker
+   *  emits a per-row `group` column on the band_iod table; the plot uses it
+   *  to draw grouped bars + significance. Empty → every lane is its own
+   *  group (the old behaviour). */
+  groups?: BandGroup[];
+  /** Default box dimensions (NORMALISED 0..1) used for the "+ Band" button
+   *  and snap-on-release after drag — so every box matches the auto-detect
+   *  74×33 px ROI regardless of the source's resolution. */
+  defaultBoxW?: number;
+  defaultBoxH?: number;
 }
 
 export function emptyBandConfig(): BandPickerConfig {
-  return { version: 1, lanes: [], loadingControlLevel: null, bgMode: "percentile", bgRoi: null, bgPercentile: 5 };
+  return {
+    version: 1, lanes: [], loadingControlLevel: null,
+    bgMode: "percentile", bgRoi: null, bgPercentile: 5,
+    groups: [],
+  };
 }
 
-const uid = () => `lane_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+// Unique-id generator with a process-wide counter so same-millisecond
+// auto-detect / import-CSV loops can't collide. (The previous 4-char
+// random suffix produced ~1.7M combinations → birthday-collisions
+// became plausible for >100 IDs/tick, which manifested as missing-IOD
+// rows in the table because multiple bands shared one map key.)
+let _uidCounter = 0;
+const uid = (prefix = "lane") =>
+  `${prefix}_${Date.now().toString(36)}_${(_uidCounter++).toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+
+/** Read a ROI's displayed name with back-compat for old saved configs that
+ *  only have `label`. New rows always have an explicit `name`. */
+const roiName = (l: BandRoi): string => (l.name || l.label || "Band");
 
 // Distinct, color-blind-friendly palette to tint ROIs by their level (row), so
 // "lanes of the same level" share a color in the editor.
@@ -138,6 +179,15 @@ def _robust_background(values):
     return float(np.mean(flat))
 
 lc_level = CFG.get("loadingControlLevel")          # which level is the loading control
+
+# Lane → experimental group (condition name) from the picker's Groups UI.
+lane2group = {}
+for g in CFG.get("groups", []) or []:
+    name = (g.get("name") or "").strip()
+    if not name: continue
+    for ln in g.get("lanes", []) or []:
+        lane2group[str(ln)] = name
+
 rows = []
 for i, band in enumerate(CFG.get("lanes", [])):
     x0, y0, x1, y1 = _px(band)
@@ -159,9 +209,12 @@ for i, band in enumerate(CFG.get("lanes", [])):
     corrected = raw_sum - bg_mean * area
     lane = (band.get("label") or "").strip() or f"Lane {i + 1}"
     level = (band.get("level") or "").strip() or "Target"
+    band_name = (band.get("name") or "").strip() or f"B{i + 1}"
     rows.append({
-        "lane": lane,                              # column / sample
+        "band": band_name,                         # UNIQUE per-row identifier
+        "lane": lane,                              # column / sample (group key)
         "level": level,                            # target / MW row
+        "group": lane2group.get(lane, ""),         # condition / experimental group
         "is_loading_control": bool(lc_level is not None and level == lc_level),
         "iod": float(max(corrected, 0.0)),
         "raw_integrated_density": raw_sum,
@@ -328,6 +381,12 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   const [previewSrc, setPreviewSrc] = useState<string | null>(null);
   // Measured size of the image area so the image fills it (no empty space).
   const [box, setBox] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+  // Zoom + pan over the membrane preview. zoom = 1 fits the image to the
+  // available area (the previous behaviour); >1 magnifies, centred via panX/Y
+  // (translation in CSS-pixel space — applied as a CSS transform on the
+  // image+overlay wrapper, so the SVG geometry stays in disp-pixel coords
+  // and pointer→normalised math doesn't need to know about zoom).
+  const [view, setView] = useState<{ zoom: number; panX: number; panY: number }>({ zoom: 1, panX: 0, panY: 0 });
   const svgRef = useRef<SVGSVGElement | null>(null);
   const imgAreaRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<DragState | null>(null);
@@ -339,6 +398,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
       setSelId(null);
       setDetectInfo(null);
       setPreviewSrc(null);
+      setView({ zoom: 1, panX: 0, panY: 0 });
     }
   }, [open, initial]);
 
@@ -415,6 +475,118 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     const r = el.getBoundingClientRect();
     return { nx: clamp01((clientX - r.left) / r.width), ny: clamp01((clientY - r.top) / r.height) };
   }, []);
+
+  /** Add a new band of the same size as the rest at a convenient spot
+   *  (offset from the selected box, or centred on the image). Triggered by
+   *  the "+ Band" toolbar button — keeps every box uniform with auto-detect
+   *  so quantification stays apples-to-apples across the membrane. */
+  const addBand = useCallback(() => {
+    // Same box dimensions as auto-detect (or median of existing boxes,
+    // falling back to a reasonable 5%×3% default).
+    const stored = cfg.defaultBoxW && cfg.defaultBoxH;
+    let bw = stored ? cfg.defaultBoxW! : 0;
+    let bh = stored ? cfg.defaultBoxH! : 0;
+    if (!stored && cfg.lanes.length > 0) {
+      const ws = cfg.lanes.map((l) => l.w).sort((a, b) => a - b);
+      const hs = cfg.lanes.map((l) => l.h).sort((a, b) => a - b);
+      bw = ws[Math.floor(ws.length / 2)] || 0.05;
+      bh = hs[Math.floor(hs.length / 2)] || 0.03;
+    }
+    if (!bw || !bh) { bw = 0.05; bh = 0.03; }
+
+    // Anchor near the selected box (offset by one box-height below) so
+    // the user can build a column quickly; fall back to centre.
+    const sel = cfg.lanes.find((l) => l.id === selId);
+    let x: number, y: number;
+    if (sel) {
+      x = clamp01(sel.x);
+      y = clamp01(sel.y + sel.h + bh * 0.4);
+      if (y + bh > 1) y = clamp01(sel.y - bh * 1.4);
+    } else {
+      x = 0.5 - bw / 2; y = 0.5 - bh / 2;
+    }
+    const lastLevel = cfg.lanes.length ? cfg.lanes[cfg.lanes.length - 1].level || "Target" : "Target";
+    const newId = uid("band");
+    // Inherit the LANE label from the band directly above (same column)
+    // when there's an aligned candidate, otherwise pick "S{n}".
+    let lane = `S${cfg.lanes.filter((l) => !/^L\d*$|^Ladder|^Marker/i.test(l.label)).length + 1}`;
+    const aligned = cfg.lanes.find((l) => Math.abs((l.x + l.w / 2) - (x + bw / 2)) < bw * 0.5);
+    if (aligned) lane = aligned.label;
+    const newBand: BandRoi = {
+      id: newId, x, y, w: bw, h: bh,
+      name: `B${cfg.lanes.length + 1}`,
+      label: lane, level: lastLevel,
+    };
+    setCfg((c) => ({ ...c, lanes: [...c.lanes, newBand] }));
+    setSelId(newId);
+  }, [cfg.lanes, cfg.defaultBoxW, cfg.defaultBoxH, selId]);
+
+  /** Wheel → zoom around the cursor (cursor stays anchored to the same
+   *  point in image space). Trackpad pinches arrive as ctrl+wheel; both
+   *  paths route through here. */
+  const onWheel = useCallback((e: React.WheelEvent) => {
+    if (!disp.w || !disp.h) return;
+    e.preventDefault();
+    const ar = imgAreaRef.current?.getBoundingClientRect();
+    if (!ar) return;
+    const cx = e.clientX - ar.left;   // cursor in imgArea coords
+    const cy = e.clientY - ar.top;
+    // Center offset — the wrapper is positioned at (cxOff, cyOff) within
+    // imgArea when pan=0, so it appears flex-centred at zoom=1.
+    const cxOff = Math.max(0, (ar.width - disp.w) / 2);
+    const cyOff = Math.max(0, (ar.height - disp.h) / 2);
+    setView((v) => {
+      const factor = Math.exp(-e.deltaY * 0.0015);
+      const next = Math.max(1, Math.min(8, v.zoom * factor));
+      // Anchor the cursor: cursor in pre-transform wrapper coords is
+      //   (cx - cxOff - panX) / zoom
+      // After zoom change we want that same wrapper-coord to land at (cx).
+      const wx = (cx - cxOff - v.panX) / v.zoom;
+      const wy = (cy - cyOff - v.panY) / v.zoom;
+      let panX = cx - cxOff - wx * next;
+      let panY = cy - cyOff - wy * next;
+      // Clamp pan so the wrapper edge doesn't leave the viewport.
+      const minX = ar.width - cxOff - disp.w * next;
+      const minY = ar.height - cyOff - disp.h * next;
+      panX = Math.min(-cxOff > 0 ? 0 : -cxOff, Math.max(minX < 0 ? minX : 0, panX));
+      panY = Math.min(-cyOff > 0 ? 0 : -cyOff, Math.max(minY < 0 ? minY : 0, panY));
+      // Reset pan to 0 when we're back at zoom=1 so the image re-centres.
+      if (next <= 1.001) return { zoom: 1, panX: 0, panY: 0 };
+      return { zoom: next, panX, panY };
+    });
+  }, [disp.w, disp.h]);
+
+  /** Keyboard-driven nudging + delete for the currently selected box. */
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      // Don't hijack arrow keys when the user is typing into a TextField.
+      const t = e.target as HTMLElement | null;
+      const tag = (t?.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || (t as HTMLElement)?.isContentEditable) return;
+      if (!selId) return;
+      const step = e.shiftKey ? 0.01 : 0.002;  // shift = coarser step
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        setCfg((c) => ({ ...c, lanes: c.lanes.map((l) => l.id === selId ? { ...l, x: clamp01(l.x - step) } : l) }));
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        setCfg((c) => ({ ...c, lanes: c.lanes.map((l) => l.id === selId ? { ...l, x: clamp01(Math.min(1 - l.w, l.x + step)) } : l) }));
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setCfg((c) => ({ ...c, lanes: c.lanes.map((l) => l.id === selId ? { ...l, y: clamp01(l.y - step) } : l) }));
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setCfg((c) => ({ ...c, lanes: c.lanes.map((l) => l.id === selId ? { ...l, y: clamp01(Math.min(1 - l.h, l.y + step)) } : l) }));
+      } else if (e.key === "Delete" || e.key === "Backspace") {
+        e.preventDefault();
+        setCfg((c) => ({ ...c, lanes: c.lanes.filter((l) => l.id !== selId) }));
+        setSelId(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, selId]);
 
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     const t = e.target as Element;
@@ -495,6 +667,8 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     }
   }, []);
 
+  const setName = (id: string, name: string) =>
+    setCfg((c) => ({ ...c, lanes: c.lanes.map((l) => l.id === id ? { ...l, name } : l) }));
   const setLabel = (id: string, label: string) =>
     setCfg((c) => ({ ...c, lanes: c.lanes.map((l) => l.id === id ? { ...l, label } : l) }));
   const setLevel = (id: string, level: string) =>
@@ -503,6 +677,35 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     setCfg((c) => ({ ...c, loadingControlLevel: level }));
   const deleteLane = (id: string) =>
     setCfg((c) => ({ ...c, lanes: c.lanes.filter((l) => l.id !== id) }));
+
+  // Groups (condition mappings used by the downstream R plot to build
+  // `conditions <- list(...)` automatically).
+  const groups = cfg.groups ?? [];
+  const addGroup = () => {
+    const used = new Set(groups.map((g) => g.name));
+    let n = 1; while (used.has(`G${n}`)) n++;
+    const g: BandGroup = { id: uid("group"), name: `G${n}`, lanes: [] };
+    setCfg((c) => ({ ...c, groups: [...(c.groups ?? []), g] }));
+  };
+  const renameGroup = (id: string, name: string) =>
+    setCfg((c) => ({ ...c, groups: (c.groups ?? []).map((g) => g.id === id ? { ...g, name } : g) }));
+  const deleteGroup = (id: string) =>
+    setCfg((c) => ({ ...c, groups: (c.groups ?? []).filter((g) => g.id !== id) }));
+  const toggleLaneInGroup = (gid: string, laneLabel: string) =>
+    setCfg((c) => ({
+      ...c,
+      groups: (c.groups ?? []).map((g) => {
+        if (g.id !== gid) return g;
+        const has = g.lanes.includes(laneLabel);
+        return { ...g, lanes: has ? g.lanes.filter((l) => l !== laneLabel) : [...g.lanes, laneLabel] };
+      }),
+    }));
+  // Distinct lane labels available to assign — built from the bands.
+  const laneLabels = useMemo(() => {
+    const seen: string[] = [];
+    for (const l of cfg.lanes) if (l.label && !seen.includes(l.label)) seen.push(l.label);
+    return seen;
+  }, [cfg.lanes]);
 
   // Distinct levels (rows) present, in first-seen order, for coloring + the
   // loading-control selector.
@@ -516,14 +719,22 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     rects: Array<{ x: number; y: number; w: number; h: number; lane?: string; level?: string }>,
   ): boolean => {
     if (!rects.length) return false;
-    // Keep ALL detected ROIs including the molecular-weight ladder (lane "L",
-    // level "Ladder") — it's a useful MW reference. It carries its own level so
-    // it's excluded from the sample comparison downstream.
+    // Each band gets a UNIQUE display name (B1..BN) AND a lane label (the
+    // column identity, shared across same-column bands so the loading-control
+    // normalisation can group them). Keep the ladder (lane "L", level "Ladder").
     const lanes: BandRoi[] = rects.map((r, i) => ({
-      id: uid(), x: clamp01(r.x), y: clamp01(r.y), w: clamp01(r.w), h: clamp01(r.h),
+      id: uid("band"), x: clamp01(r.x), y: clamp01(r.y), w: clamp01(r.w), h: clamp01(r.h),
+      name: `B${i + 1}`,
       label: (r.lane || `S${i + 1}`), level: (r.level || "Target"),
     }));
-    setCfg((c) => ({ ...c, lanes }));
+    // Median ROI size from the detector = the auto-detect 74×33 box at this
+    // image's resolution. Stored so the "+ Band" button and snap-to-uniform
+    // on drag-release keep every box exactly the same size as the rest.
+    const ws = rects.map((r) => r.w).sort((a, b) => a - b);
+    const hs = rects.map((r) => r.h).sort((a, b) => a - b);
+    const defaultBoxW = ws[Math.floor(ws.length / 2)] || 0.05;
+    const defaultBoxH = hs[Math.floor(hs.length / 2)] || 0.03;
+    setCfg((c) => ({ ...c, lanes, defaultBoxW, defaultBoxH }));
     setSelId(lanes[0]?.id ?? null);
     return true;
   };
@@ -580,18 +791,32 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     }
   };
 
-  // Render an 8-handle set for a normalised rect.
-  const handlesFor = (rect: { x: number; y: number; w: number; h: number }, id: string | null, roleHandle: string) => {
+  // Render an 8-handle set for a normalised rect. When a band is selected
+  // (`selected`) the handles are notably larger (14×14 vs 8×8) and use a
+  // wider hit area so they're easy to grab — small handles on a zoomable
+  // canvas were unforgiving (the previous 8 px square at 1× already fell
+  // below the macOS pointer's effective grab radius).
+  const handlesFor = (
+    rect: { x: number; y: number; w: number; h: number },
+    id: string | null,
+    roleHandle: string,
+    selected: boolean = false,
+  ) => {
     const hs = [
       { h: "nw", cx: rect.x, cy: rect.y }, { h: "n", cx: rect.x + rect.w / 2, cy: rect.y }, { h: "ne", cx: rect.x + rect.w, cy: rect.y },
       { h: "w", cx: rect.x, cy: rect.y + rect.h / 2 }, { h: "e", cx: rect.x + rect.w, cy: rect.y + rect.h / 2 },
       { h: "sw", cx: rect.x, cy: rect.y + rect.h }, { h: "s", cx: rect.x + rect.w / 2, cy: rect.y + rect.h }, { h: "se", cx: rect.x + rect.w, cy: rect.y + rect.h },
     ];
     const cur: Record<string, string> = { nw: "nwse-resize", se: "nwse-resize", ne: "nesw-resize", sw: "nesw-resize", n: "ns-resize", s: "ns-resize", e: "ew-resize", w: "ew-resize" };
+    // Zoom-aware handle size — keep the on-screen size constant so handles
+    // don't visually shrink/disappear when the user zooms in/out.
+    const sz = (selected ? 14 : 8) / Math.max(1, view.zoom);
+    const half = sz / 2;
     return hs.map((hh) => (
       <rect key={hh.h} data-role={roleHandle} data-id={id ?? undefined} data-handle={hh.h}
-        x={hh.cx * disp.w - 4} y={hh.cy * disp.h - 4} width={8} height={8}
-        fill="#fff" stroke="#1976d2" strokeWidth={1.5} style={{ cursor: cur[hh.h] }} />
+        x={hh.cx * disp.w - half} y={hh.cy * disp.h - half} width={sz} height={sz}
+        fill="#fff" stroke="#1976d2" strokeWidth={selected ? 2 : 1.5} rx={2}
+        style={{ cursor: cur[hh.h] }} />
     ));
   };
 
@@ -600,7 +825,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
       <DialogTitle sx={{ fontSize: "1rem", py: 1.25 }}>
         🩻 Pick bands
         <Typography component="span" variant="caption" sx={{ ml: 1.5, color: "text.secondary" }}>
-          Auto-detect bands, then clean up: drag to move · handles to resize · select + Delete to remove · drag on the blot to add
+          Auto-detect, then refine — scroll to zoom · drag empty area to add · arrow keys nudge selected box · Delete to remove
         </Typography>
       </DialogTitle>
       {/* Image on the RIGHT and FLEX-FILLING, so the user gets a clear look at
@@ -608,33 +833,58 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
       <DialogContent dividers sx={{ display: "flex", flexDirection: "row-reverse", gap: 2, alignItems: "stretch", height: "80vh" }}>
         {/* Image + ROI overlay — flex-fills the remaining width/height, image
             centred and scaled to fill it (see `disp`, measured from this box). */}
-        <Box ref={imgAreaRef} sx={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
+        <Box ref={imgAreaRef} onWheel={onWheel}
+          sx={{ flex: 1, minWidth: 0, minHeight: 0, overflow: "hidden", position: "relative" }}>
+          {/* Zoom-out control — visible only when zoomed in; resets the view. */}
+          {dispUrl && view.zoom > 1.0001 && (
+            <Box sx={{ position: "absolute", top: 6, left: 6, zIndex: 5, display: "flex", gap: 0.5 }}>
+              <Button size="small" variant="contained" color="inherit" sx={{ fontSize: "0.65rem", py: 0.2, px: 1, minWidth: 0, textTransform: "none" }}
+                onClick={() => setView({ zoom: 1, panX: 0, panY: 0 })}>
+                ⤢ Reset zoom ({view.zoom.toFixed(1)}×)
+              </Button>
+            </Box>
+          )}
           {dispUrl ? (
-            <Box sx={{ position: "relative", width: disp.w, height: disp.h, userSelect: "none", border: "1px solid", borderColor: "divider" }}>
+            <Box sx={{
+              position: "absolute",
+              // Center the wrapper at zoom=1 (cxOff/cyOff baked in here);
+              // panX/Y from the wheel handler adds on top. Box dims fall back
+              // to 0 when the measurement isn't ready (initial mount).
+              left: Math.max(0, ((box.w || 0) - disp.w) / 2),
+              top: Math.max(0, ((box.h || 0) - disp.h) / 2),
+              width: disp.w, height: disp.h, userSelect: "none",
+              border: "1px solid", borderColor: "divider",
+              transform: `translate(${view.panX}px, ${view.panY}px) scale(${view.zoom})`,
+              transformOrigin: "0 0",
+            }}>
               <Box component="img" src={dispUrl} alt="blot" draggable={false}
                 sx={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "fill", pointerEvents: "none" }} />
               <svg ref={svgRef} width={disp.w} height={disp.h}
                 style={{ position: "absolute", inset: 0, cursor: "crosshair", touchAction: "none" }}
                 onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}>
-                {/* Bands — colored by level (row); same level = same color */}
+                {/* Bands — colored by level (row); same level = same color.
+                    Stroke widths are scaled by 1/zoom so the visible thickness
+                    stays constant when the user zooms in. */}
                 {cfg.lanes.map((lane) => {
                   const sel = lane.id === selId;
                   const lv = roiLevel(lane);
                   const col = levelColor(lv, levelOrder);
                   const isLC = cfg.loadingControlLevel != null && lv === cfg.loadingControlLevel;
+                  const sw = (sel ? 2.5 : 1.5) / Math.max(1, view.zoom);
+                  const fs = 11 / Math.max(1, view.zoom);
                   return (
                     <g key={lane.id}>
                       <rect data-role="lane" data-id={lane.id}
                         x={lane.x * disp.w} y={lane.y * disp.h} width={lane.w * disp.w} height={lane.h * disp.h}
                         fill={col} fillOpacity={sel ? 0.22 : 0.1}
-                        stroke={col} strokeWidth={sel ? 2.5 : 1.5}
-                        strokeDasharray={isLC ? "4 2" : undefined}
+                        stroke={col} strokeWidth={sw}
+                        strokeDasharray={isLC ? `${4 / view.zoom} ${2 / view.zoom}` : undefined}
                         style={{ cursor: "move" }} />
-                      <text x={lane.x * disp.w + 3} y={lane.y * disp.h + 12} fontSize={11}
-                        fill={col} style={{ pointerEvents: "none", fontWeight: 700 }}>
-                        {lane.label || "?"}{isLC ? " (LC)" : ""}
+                      <text x={lane.x * disp.w + 3 / view.zoom} y={lane.y * disp.h + 12 / view.zoom}
+                        fontSize={fs} fill={col} style={{ pointerEvents: "none", fontWeight: 700 }}>
+                        {roiName(lane)}{isLC ? " (LC)" : ""}
                       </text>
-                      {sel && handlesFor(lane, lane.id, "handle")}
+                      {sel && handlesFor(lane, lane.id, "handle", true)}
                     </g>
                   );
                 })}
@@ -651,13 +901,21 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
 
         {/* Controls — fixed-width column on the left, scrolls if tall. */}
         <Box sx={{ width: 380, flexShrink: 0, display: "flex", flexDirection: "column", gap: 1.25, overflowY: "auto", overflowX: "hidden" }}>
-          <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
+          <Box sx={{ display: "flex", gap: 1, alignItems: "center", flexWrap: "wrap" }}>
             <Button size="small" variant="contained" startIcon={<AutoFixHighIcon sx={{ fontSize: 16 }} />}
               onClick={runAutoDetect} disabled={!srcUrl || detecting}>
-              {detecting ? "Detecting…" : "Auto-detect bands"}
+              {detecting ? "Detecting…" : "Auto-detect"}
             </Button>
+            <Tooltip title="Add a new band of the same size as the rest. The new box is offset below the selected one (or centred when nothing is selected); same column/lane as the box above it.">
+              <span>
+                <Button size="small" variant="outlined" onClick={addBand} disabled={!dispUrl}
+                  sx={{ textTransform: "none" }}>
+                  + Band
+                </Button>
+              </span>
+            </Tooltip>
             <Typography variant="caption" sx={{ color: "text.secondary", ml: "auto" }}>
-              {cfg.lanes.length} band(s) — delete / drag / resize to clean up
+              {cfg.lanes.length} band(s)
             </Typography>
           </Box>
           {detectInfo && (
@@ -693,18 +951,66 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
             </Typography>
           </Box>
 
+          {/* Groups (experimental conditions) — defines which LANES are
+              replicates of which condition. The downstream R plot turns
+              this into grouped bars (mean ± SD + significance) with no
+              R-code editing required. */}
+          <Box sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, p: 1 }}>
+            <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 0.5 }}>
+              <Tooltip title="Group replicate lanes into experimental conditions (Control, Treatment, …). The downstream R plot draws one bar per group per level with mean ± SD and pairwise significance. Lanes left out of every group plot individually.">
+                <Typography variant="caption" sx={{ fontWeight: 700 }}>Groups (conditions)</Typography>
+              </Tooltip>
+              <Button size="small" variant="outlined" onClick={addGroup} disabled={laneLabels.length === 0}
+                sx={{ textTransform: "none", fontSize: "0.65rem", py: 0.1, px: 0.75, ml: "auto" }}>
+                + Group
+              </Button>
+            </Box>
+            {groups.length === 0 ? (
+              <Typography variant="caption" sx={{ color: "text.disabled", fontStyle: "italic", display: "block" }}>
+                {laneLabels.length === 0
+                  ? "Add bands first, then group lanes into conditions."
+                  : "No groups yet — click + Group, then tick the lanes (e.g. S1 S2 S3) that are replicates of one condition."}
+              </Typography>
+            ) : groups.map((g) => (
+              <Box key={g.id} sx={{ display: "flex", alignItems: "flex-start", gap: 0.75, py: 0.4, borderTop: "1px dashed", borderColor: "divider" }}>
+                <TextField variant="standard" value={g.name}
+                  onChange={(e) => renameGroup(g.id, e.target.value)}
+                  inputProps={{ style: { fontSize: "0.78rem", fontWeight: 700, width: 80 } }} />
+                <Box sx={{ flex: 1, display: "flex", flexWrap: "wrap", gap: 0.4 }}>
+                  {laneLabels.map((ln) => {
+                    const on = g.lanes.includes(ln);
+                    return (
+                      <Box key={ln} onClick={() => toggleLaneInGroup(g.id, ln)}
+                        sx={{
+                          fontSize: "0.66rem", px: 0.6, py: 0.1, borderRadius: 0.75,
+                          cursor: "pointer", userSelect: "none",
+                          bgcolor: on ? "primary.main" : "transparent",
+                          color: on ? "primary.contrastText" : "text.secondary",
+                          border: "1px solid", borderColor: on ? "primary.main" : "divider",
+                          fontWeight: on ? 700 : 500,
+                        }}>
+                        {ln}
+                      </Box>
+                    );
+                  })}
+                </Box>
+                <IconButton size="small" onClick={() => deleteGroup(g.id)}><DeleteOutlineIcon sx={{ fontSize: 16 }} /></IconButton>
+              </Box>
+            ))}
+          </Box>
+
           {/* Band list */}
           <Box sx={{ flex: 1, overflow: "auto", maxHeight: 520, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
-            <Box sx={{ display: "grid", gridTemplateColumns: "20px 1fr 1fr 60px 28px", alignItems: "center", gap: 0.5, px: 1, py: 0.5, position: "sticky", top: 0, bgcolor: "background.paper", borderBottom: "1px solid", borderColor: "divider" }}>
-              <Typography variant="caption" sx={{ fontWeight: 700 }}>#</Typography>
-              <Tooltip title="Lane / sample (the column)"><Typography variant="caption" sx={{ fontWeight: 700 }}>Lane</Typography></Tooltip>
+            <Box sx={{ display: "grid", gridTemplateColumns: "55px 70px 1fr 60px 28px", alignItems: "center", gap: 0.5, px: 1, py: 0.5, position: "sticky", top: 0, bgcolor: "background.paper", borderBottom: "1px solid", borderColor: "divider" }}>
+              <Tooltip title="Unique band name — each row is distinct, even when multiple bands share a lane"><Typography variant="caption" sx={{ fontWeight: 700 }}>Name</Typography></Tooltip>
+              <Tooltip title="Lane / sample (the column) — shared across bands in the same column for loading-control normalisation"><Typography variant="caption" sx={{ fontWeight: 700 }}>Lane</Typography></Tooltip>
               <Tooltip title="Target / protein row — 'lanes of the same level' are compared to each other"><Typography variant="caption" sx={{ fontWeight: 700 }}>Level</Typography></Tooltip>
               <Typography variant="caption" sx={{ fontWeight: 700 }}>IOD</Typography>
               <span />
             </Box>
             {cfg.lanes.length === 0 ? (
               <Typography variant="caption" sx={{ display: "block", p: 1.5, color: "text.secondary", fontStyle: "italic" }}>
-                No bands yet. Click “Auto-detect bands”, or drag rectangles on the blot.
+                No bands yet. Click <b>Auto-detect</b>, drag on the blot, or <b>+ Band</b> for a same-size box.
               </Typography>
             ) : cfg.lanes.map((lane, i) => {
               const lv = roiLevel(lane);
@@ -713,16 +1019,22 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
               return (
                 <Box key={lane.id}
                   onMouseEnter={() => setSelId(lane.id)}
-                  sx={{ display: "grid", gridTemplateColumns: "20px 1fr 1fr 60px 28px", alignItems: "center", gap: 0.5, px: 1, py: 0.4,
+                  sx={{ display: "grid", gridTemplateColumns: "55px 70px 1fr 60px 28px", alignItems: "center", gap: 0.5, px: 1, py: 0.4,
                     bgcolor: lane.id === selId ? "action.hover" : undefined, borderBottom: "1px solid", borderColor: "divider" }}>
-                  <Box sx={{ width: 9, height: 9, borderRadius: 0.3, bgcolor: col, border: isLC ? "1.5px dashed" : "none", borderColor: "text.primary" }} />
+                  <TextField variant="standard" value={roiName(lane)} placeholder={`B${i + 1}`}
+                    onChange={(e) => setName(lane.id, e.target.value)}
+                    inputProps={{ style: { fontSize: "0.74rem", fontWeight: 700, color: col } }} />
                   <TextField variant="standard" value={lane.label} placeholder={`S${i + 1}`}
-                    onChange={(e) => setLabel(lane.id, e.target.value)} inputProps={{ style: { fontSize: "0.78rem" } }} />
+                    onChange={(e) => setLabel(lane.id, e.target.value)}
+                    inputProps={{ style: { fontSize: "0.74rem" } }} />
                   <TextField variant="standard" value={lv} placeholder="Target"
                     onChange={(e) => setLevel(lane.id, e.target.value)}
-                    inputProps={{ style: { fontSize: "0.78rem", color: col, fontWeight: 600 } }} />
+                    inputProps={{ style: { fontSize: "0.74rem", color: col, fontWeight: 600 } }} />
                   <Typography variant="caption" sx={{ fontVariantNumeric: "tabular-nums", color: "text.secondary" }}>
-                    {iodById[lane.id] != null ? Math.round(iodById[lane.id]).toLocaleString() : "—"}
+                    {Number.isFinite(iodById[lane.id])
+                      ? Math.round(iodById[lane.id]).toLocaleString()
+                      : (lane.w < 0.001 || lane.h < 0.001 ? "0" : "—")}
+                    {isLC && <span title="loading control" style={{ marginLeft: 4 }}>★</span>}
                   </Typography>
                   <IconButton size="small" onClick={() => deleteLane(lane.id)}><DeleteOutlineIcon sx={{ fontSize: 16 }} /></IconButton>
                 </Box>
@@ -730,9 +1042,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
             })}
           </Box>
           <Typography variant="caption" sx={{ color: "text.secondary", lineHeight: 1.4 }}>
-            Set a <b>Level</b> per band (same level = same protein row, compared across lanes). Pick the
-            <b> loading control level</b> for per-lane normalisation. IOD here is a display-image preview; the
-            run recomputes on the full-resolution membrane.
+            <b>Name</b> uniquely identifies a band · <b>Lane</b> is the column (shared with same-column bands; used for loading-control normalisation) · <b>Level</b> is the protein row (compared across lanes). IOD shown here is a display-image preview; the run recomputes on the full-resolution membrane.
           </Typography>
         </Box>
       </DialogContent>

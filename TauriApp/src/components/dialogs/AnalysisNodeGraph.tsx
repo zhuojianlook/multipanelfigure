@@ -2546,12 +2546,14 @@ mpfig_data(rows, name="band_normalized")
 const WB_PLOT_R = `# @name: Plot band comparison (mean +/- SD, significance)
 suppressWarnings(suppressMessages({ library(ggplot2); library(ggprism) }))
 
-# ════════════════════════ EDIT THIS ════════════════════════
-# Map each CONDITION to its replicate LANES (use the lane labels you
-# set in the band picker). Lanes in the same condition are treated as
-# replicates -> bar = mean, error bar = SD, and conditions are tested
-# for significance. Leave the list EMPTY {} to compare every lane on
-# its own (one bar per lane within each level; no SD / significance).
+# ════════════════════════════════════════════════════════════
+# GROUPS / CONDITIONS — define these in the BAND PICKER UI (the
+# "Groups (conditions)" panel). The picker adds a 'group' column to
+# each band row, and this script picks it up automatically.
+#
+# Fallback: if you want to override here (e.g. for a one-off plot)
+# fill the 'conditions' list below and it replaces what came from
+# the picker. Leave it empty {} to use the picker's groups.
 conditions <- list(
   # Control   = c("S1", "S2", "S3"),
   # Treatment = c("S4", "S5", "S6")
@@ -2595,15 +2597,27 @@ df <- df[is.finite(df$value), , drop = FALSE]
 if (!is.null(levels_to_plot)) df <- df[df$level %in% levels_to_plot, , drop = FALSE]
 if (nrow(df) == 0) stop("No target bands to plot after filtering (check levels_to_plot / loading control).")
 
-# Assign each lane to a condition. Default: each lane is its own condition.
+# Assign each lane to a condition. Priority order:
+#   1. The R-side \`conditions\` override above (if non-empty).
+#   2. The \`group\` column emitted by the Band picker UI (its Groups panel).
+#   3. Fall back: every lane is its own condition (one bar per lane).
 lane2cond <- character(0)
-if (length(conditions) > 0) for (cn in names(conditions)) for (ln in conditions[[cn]]) lane2cond[ln] <- cn
-df$condition <- ifelse(df$lane %in% names(lane2cond), lane2cond[df$lane], df$lane)
-cond_levels <- if (length(conditions) > 0) names(conditions) else unique(df$lane)
+if (length(conditions) > 0) {
+  for (cn in names(conditions)) for (ln in conditions[[cn]]) lane2cond[ln] <- cn
+  df$condition <- ifelse(df$lane %in% names(lane2cond), lane2cond[df$lane], NA)
+  cond_levels <- names(conditions)
+} else if ("group" %in% names(df) && any(nzchar(as.character(df$group)))) {
+  # Picker-driven groups: every band already carries its condition.
+  df$condition <- ifelse(nzchar(as.character(df$group)), as.character(df$group), NA)
+  cond_levels <- unique(df$condition[!is.na(df$condition)])
+} else {
+  df$condition <- df$lane
+  cond_levels <- unique(df$lane)
+}
 cond_levels <- cond_levels[cond_levels %in% unique(df$condition)]
 df$condition <- factor(df$condition, levels = cond_levels)
 df <- df[!is.na(df$condition), , drop = FALSE]   # explicit groups: keep only assigned lanes
-if (nrow(df) == 0) stop("No lanes matched your 'conditions' mapping — check the lane labels.")
+if (nrow(df) == 0) stop("No lanes matched any condition — set Groups in the Band picker or fill the 'conditions' list above.")
 
 # Scale within each level so the reference condition mean = 1.
 ref_c <- if (!is.null(ref_condition)) ref_condition else cond_levels[1]
