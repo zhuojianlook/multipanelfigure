@@ -442,10 +442,15 @@ const NodeInternalsRefresher = forwardRef<RFInternalsHandle, {
 // title fallback / popover that shows the parent panel with the
 // inset's bounding box highlighted, so the user can see at a
 // glance where on the source the region comes from.
-function SourceLibraryRow({ source, isUngrouped, onRemoveFromGroup }: {
+function SourceLibraryRow({ source, isUngrouped, onRemoveFromGroup, onDelete }: {
   source: InsetSource;
   isUngrouped: boolean;
   onRemoveFromGroup: () => void;
+  /** Only set for user-uploaded analysis sources (those with a `name` and
+   *  row === -1) — clicking 🗑 unloads the image from the backend AND
+   *  removes the source library entry. Builder-flagged insets can't be
+   *  deleted from here; they live in the parent figure. */
+  onDelete?: () => void;
 }) {
   const cbs = useGraphCallbacks();
   const overrides = cbs?.sourceNameOverrides || {};
@@ -527,6 +532,14 @@ function SourceLibraryRow({ source, isUngrouped, onRemoveFromGroup }: {
             sx={{ fontSize: "0.6rem", cursor: "pointer", color: "text.disabled", px: 0.25, "&:hover": { color: "error.main" } }}
             title="Move back to Ungrouped"
           >×</Box>
+        )}
+        {onDelete && (
+          <Box
+            component="span"
+            onClick={(e) => { e.stopPropagation(); onDelete(); }}
+            sx={{ fontSize: "0.65rem", cursor: "pointer", color: "text.disabled", px: 0.25, "&:hover": { color: "error.main" } }}
+            title="Permanently remove this source from Analysis"
+          >🗑</Box>
         )}
       </Box>
     </Tooltip>
@@ -623,7 +636,7 @@ function SourceHoverPreview({ source, name }: { source: InsetSource; name: strin
 // this group (removes from any prior group).  The × on each row
 // pops the inset back to Ungrouped.  Local open state per group.
 function UserSourceGroup({
-  group, items, onAssignKey, onRemoveKey, onRename, onDelete, isUngrouped,
+  group, items, onAssignKey, onRemoveKey, onRename, onDelete, isUngrouped, onDeleteSource,
 }: {
   group: SourceGroup;
   items: InsetSource[];
@@ -632,6 +645,9 @@ function UserSourceGroup({
   onRename?: () => void;
   onDelete?: () => void;
   isUngrouped?: boolean;
+  /** Per-source delete (only set for analysis uploads — calls the backend
+   *  to evict the image and removes the source library entry). */
+  onDeleteSource?: (source: InsetSource) => void;
 }) {
   const [open, setOpen] = useState(true);
   const [hovered, setHovered] = useState(false);
@@ -700,6 +716,10 @@ function UserSourceGroup({
               source={s}
               isUngrouped={!!isUngrouped}
               onRemoveFromGroup={() => onRemoveKey(s.key)}
+              // Only analysis-uploaded sources (those with a `name` field
+              // and row === -1) can be permanently deleted from here.
+              // Builder-flagged insets live in the parent figure.
+              onDelete={(s.name && s.row === -1 && onDeleteSource) ? () => onDeleteSource(s) : undefined}
             />
           ))}
         </Box>
@@ -2731,29 +2751,53 @@ plot_subtitle <- if (val_col == "normalized")
   "loading-control corrected (each band ÷ its lane's LC band)"
 else "raw IOD — no loading-control normalisation"
 
-mpfig_plot("wb_band_comparison.png",
-           width = max(1200, 500 * min(n_facets, 3)),
-           height = 350 * ceiling(n_facets / 3) + 200, res = 300)
-p <- ggplot() +
-  geom_col(data = summ, aes(x = band, y = mean, fill = band),
-           width = 0.75, color = "grey25", linewidth = 0.3) +
-  geom_errorbar(data = summ, aes(x = band, ymin = pmax(0, mean - sd), ymax = mean + sd),
-                width = 0.2, linewidth = 0.4) +
-  geom_jitter(data = df, aes(x = band, y = value),
-              width = 0.12, height = 0, size = 1.1, alpha = 0.65,
-              color = "grey20", stroke = 0) +
-  facet_wrap(~ group, scales = "free", ncol = min(3, n_facets)) +
-  theme_prism(base_size = 11) +
-  theme(legend.position = "none",
-        axis.text.x = element_text(angle = 35, hjust = 1, size = 8.5),
-        strip.text = element_text(face = "bold", size = 11),
-        plot.margin = margin(10, 12, 8, 10)) +
-  labs(x = NULL, y = y_lab, subtitle = plot_subtitle)
+# Picker toggle "Plot layout" — one figure per group vs combined facets.
+plot_per_group <- "plot_per_group" %in% names(df) &&
+  any(tolower(as.character(df$plot_per_group)) %in% c("true", "1", "yes"))
 
-if (val_col == "normalized") {
-  p <- p + geom_hline(yintercept = 1, linetype = "dashed", color = "grey55", linewidth = 0.4)
+# Helper: render one ggplot for either a single group's subset of df /
+# summ (per-group mode) or the whole thing (combined mode).
+render_one <- function(d_sub, s_sub, facet_var, w, h, fname) {
+  p <- ggplot() +
+    geom_col(data = s_sub, aes(x = band, y = mean, fill = band),
+             width = 0.75, color = "grey25", linewidth = 0.3) +
+    geom_errorbar(data = s_sub, aes(x = band, ymin = pmax(0, mean - sd), ymax = mean + sd),
+                  width = 0.2, linewidth = 0.4) +
+    geom_jitter(data = d_sub, aes(x = band, y = value),
+                width = 0.12, height = 0, size = 1.1, alpha = 0.65,
+                color = "grey20", stroke = 0) +
+    theme_prism(base_size = 11) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 35, hjust = 1, size = 8.5),
+          strip.text = element_text(face = "bold", size = 11),
+          plot.margin = margin(10, 12, 8, 10)) +
+    labs(x = NULL, y = y_lab, subtitle = plot_subtitle)
+  if (!is.null(facet_var)) p <- p + facet_wrap(as.formula(paste("~", facet_var)),
+                                                scales = "free", ncol = min(3, n_facets))
+  if (val_col == "normalized") {
+    p <- p + geom_hline(yintercept = 1, linetype = "dashed", color = "grey55", linewidth = 0.4)
+  }
+  mpfig_plot(fname, width = w, height = h, res = 300)
+  print(p)
 }
-print(p)
+
+if (plot_per_group) {
+  # One PNG per group, each named "wb_<group>.png". Each one is movable
+  # into the figure timeline independently — useful when you want one
+  # panel per protein/condition rather than a shared grid.
+  for (g in groups) {
+    d_sub <- df[df$group == g, , drop = FALSE]
+    s_sub <- summ[summ$group == g, , drop = FALSE]
+    safe_name <- gsub("[^A-Za-z0-9_-]", "_", g)
+    render_one(d_sub, s_sub, NULL,
+               w = 700, h = 900, fname = paste0("wb_", safe_name, ".png"))
+  }
+} else {
+  render_one(df, summ, "group",
+             w = max(1200, 500 * min(n_facets, 3)),
+             h = 350 * ceiling(n_facets / 3) + 200,
+             fname = "wb_band_comparison.png")
+}
 }
 `;
 
@@ -4141,6 +4185,36 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     setConsoleOut(consoleRef.current);
   }, []);
 
+  /** Permanently delete an analysis-uploaded source from the Sources panel.
+   *  Evicts the underlying image from the backend so it doesn't linger in
+   *  loaded_images, drops the source library entry, and removes the key
+   *  from any user-defined source group (incl. "Direct upload"). Also
+   *  removes any source nodes' references to it. */
+  const deleteUploadedSource = useCallback(async (s: InsetSource) => {
+    if (!s.name || s.row !== -1) return;   // only analysis uploads
+    const name = s.name;
+    const key = s.key;
+    // Evict on the backend first so quick re-uploads of the same filename
+    // get a fresh slot. Best-effort: still drop the UI entry on failure.
+    try { await api.deleteImage(name); }
+    catch (e) { logUpload(`[upload] backend delete failed for ${name}: ${e instanceof Error ? e.message : String(e)}`); }
+    // Drop from the library list.
+    setInsetSources((cur) => cur.filter((x) => x.key !== key));
+    // Pull out of any group (Direct upload, etc.) — keeps the localStorage
+    // group state consistent with what's now in the library.
+    persistSourceGroups(sourceGroups.map((g) => ({
+      ...g, sourceKeys: g.sourceKeys.filter((k) => k !== key),
+    })));
+    // Detach from any source nodes that had this source attached.
+    setNodes((cur) => cur.map((n) => {
+      if (n.data.kind !== "source") return n;
+      const next = (n.data.sources || []).filter((x) => x.key !== key);
+      if (next.length === (n.data.sources || []).length) return n;
+      return { ...n, data: { ...n.data, sources: next } };
+    }));
+    logUpload(`[upload] removed "${name}" from Analysis`);
+  }, [logUpload, sourceGroups, persistSourceGroups, setNodes]);
+
   /** Resolve names → standalone source-library entries (full bit depth on the
    *  backend) and add them to the Sources panel, deduped, newest on top. Marks
    *  each backend image HIDDEN from the builder's media timeline (Analysis
@@ -5284,6 +5358,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
                     onRemoveKey={(key) => removeSourceFromGroup(g.id, key)}
                     onRename={() => renameSourceGroupHandler(g.id)}
                     onDelete={() => removeSourceGroup(g.id)}
+                    onDeleteSource={deleteUploadedSource}
                   />
                 ))}
                 {/* "Ungrouped" — anything not assigned to a group. */}
@@ -5295,6 +5370,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
                     onAssignKey={() => {/* drops on ungrouped are a no-op */}}
                     onRemoveKey={() => {/* not in a group → nothing to remove */}}
                     isUngrouped
+                    onDeleteSource={deleteUploadedSource}
                   />
                 )}
               </>

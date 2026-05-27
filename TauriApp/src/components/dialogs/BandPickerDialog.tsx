@@ -104,6 +104,10 @@ export interface BandPickerConfig {
   /** Lane geometry returned by the detection endpoint — drives the lane
    *  guide lines + snap-to-lane on new boxes. */
   laneBounds?: LaneBound[];
+  /** Plot layout: "combined" (default) faceted side-by-side in one figure,
+   *  "separate" emits one PNG per group so each group can be moved into
+   *  the figure timeline independently. */
+  plotPerGroup?: boolean;
 }
 
 export function emptyBandConfig(): BandPickerConfig {
@@ -113,6 +117,7 @@ export function emptyBandConfig(): BandPickerConfig {
     loadingControlLevel: null,
     bgMode: "percentile", bgRoi: null, bgPercentile: 5,
     groups: [], laneBounds: [],
+    plotPerGroup: false,
   };
 }
 
@@ -247,6 +252,7 @@ def _robust_background(values):
 #   - Legacy fallback: loadingControlLevel string flags any band whose level
 #       matches (kept so older saved nodes still normalise correctly).
 lc_enabled = bool(CFG.get("loadingControlEnabled"))
+plot_per_group = bool(CFG.get("plotPerGroup"))
 lc_by_lane = {str(k): str(v) for k, v in (CFG.get("lcBandByLane") or {}).items()}
 lc_level   = CFG.get("loadingControlLevel")          # legacy
 
@@ -333,6 +339,7 @@ for i, band in enumerate(CFG.get("lanes", [])):
         "level": level,                            # target / MW row
         "group": grp,                              # condition / experimental group
         "lc_enabled": bool(lc_enabled),            # plot picks normalised vs raw
+        "plot_per_group": bool(plot_per_group),    # split groups across figures
         "is_loading_control": bool(is_lc),
         "iod": float(max(corrected, 0.0)),
         "raw_integrated_density": raw_sum,
@@ -1189,11 +1196,44 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
                       : "raw IOD will be plotted (Normalize step skipped)"}
                   </Typography>
                 </Box>
+                {/* Plot layout: combined facets vs one figure per group. */}
+                <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5, pt: 0.5, borderTop: "1px dashed", borderColor: "divider" }}>
+                  <Tooltip title="Combined: all groups share one figure (faceted side-by-side). Separate: emit one PNG per group, each can be moved into the figure timeline independently.">
+                    <Typography variant="caption" sx={{ fontWeight: 700 }}>
+                      Plot layout
+                    </Typography>
+                  </Tooltip>
+                  <Box
+                    role="switch"
+                    aria-checked={!!cfg.plotPerGroup}
+                    onClick={() => setCfg((c) => ({ ...c, plotPerGroup: !c.plotPerGroup }))}
+                    sx={{
+                      cursor: "pointer", width: 32, height: 18, borderRadius: 9,
+                      bgcolor: cfg.plotPerGroup ? "primary.main" : "divider",
+                      position: "relative", transition: "background 0.15s",
+                      "&:before": {
+                        content: '""', position: "absolute", top: 2,
+                        left: cfg.plotPerGroup ? 16 : 2, width: 14, height: 14,
+                        borderRadius: "50%", bgcolor: "background.paper",
+                        transition: "left 0.15s",
+                      },
+                    }}
+                  />
+                  <Typography variant="caption" sx={{ color: "text.secondary", ml: "auto", fontSize: "0.65rem" }}>
+                    {cfg.plotPerGroup ? "one figure per group" : "combined (faceted)"}
+                  </Typography>
+                </Box>
                 {lcEnabled && lanesPresent.length > 0 && (
                   <Box sx={{ mt: 0.75, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 0.75 }}>
                     {lanesPresent.map((ln) => {
-                      const bandsInLane = cfg.lanes.filter((l) => (l.label || "Lane") === ln);
                       const chosen = lcMap[ln] || "";
+                      // Show ALL bands as candidates (not just same-lane) so the
+                      // user can pick a custom-drawn box even if its label
+                      // doesn't match a detected lane. Bands in the SAME lane
+                      // sort first; everything else falls below in a secondary
+                      // group so the natural pick is at the top.
+                      const sameLane = cfg.lanes.filter((l) => (l.label || "Lane") === ln);
+                      const otherBands = cfg.lanes.filter((l) => (l.label || "Lane") !== ln);
                       return (
                         <Box key={ln} sx={{ display: "flex", flexDirection: "column", gap: 0.2 }}>
                           <Typography variant="caption" sx={{ fontSize: "0.62rem", fontWeight: 700, color: "text.secondary" }}>
@@ -1206,9 +1246,19 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
                             inputProps={{ style: { fontSize: "0.74rem", padding: "4px 8px" } }}
                             SelectProps={{ displayEmpty: true }}>
                             <MenuItem value=""><em>—</em></MenuItem>
-                            {bandsInLane.map((b) => (
+                            {sameLane.map((b) => (
                               <MenuItem key={b.id} value={roiName(b)} sx={{ fontSize: "0.78rem" }}>
                                 {roiName(b)} ({roiLevel(b)})
+                              </MenuItem>
+                            ))}
+                            {otherBands.length > 0 && (
+                              <MenuItem disabled value="__sep__" sx={{ fontSize: "0.62rem", opacity: 0.6, py: 0.2 }}>
+                                — other lanes —
+                              </MenuItem>
+                            )}
+                            {otherBands.map((b) => (
+                              <MenuItem key={b.id} value={roiName(b)} sx={{ fontSize: "0.78rem", color: "text.secondary" }}>
+                                {roiName(b)} · lane {b.label || "Lane"} ({roiLevel(b)})
                               </MenuItem>
                             ))}
                           </TextField>
@@ -1321,8 +1371,11 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
             )}
           </Box>
 
-          {/* Band list */}
-          <Box sx={{ flex: 1, overflow: "auto", maxHeight: 520, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
+          {/* Band list — fixed scrolling viewport so it doesn't get squashed
+              when the Groups panel above grows tall. The whole controls
+              column is already overflow-auto, so anything beyond fits via
+              the column's own scrollbar. */}
+          <Box sx={{ minHeight: 280, maxHeight: 520, overflow: "auto", border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
             <Box sx={{ display: "grid", gridTemplateColumns: "55px 70px 1fr 60px 28px", alignItems: "center", gap: 0.5, px: 1, py: 0.5, position: "sticky", top: 0, bgcolor: "background.paper", borderBottom: "1px solid", borderColor: "divider" }}>
               <Tooltip title="Unique band name — each row is distinct, even when multiple bands share a lane"><Typography variant="caption" sx={{ fontWeight: 700 }}>Name</Typography></Tooltip>
               <Tooltip title="Lane / sample (the column) — shared across bands in the same column for loading-control normalisation"><Typography variant="caption" sx={{ fontWeight: 700 }}>Lane</Typography></Tooltip>
