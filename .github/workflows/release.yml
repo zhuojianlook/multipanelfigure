@@ -203,7 +203,21 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npx tauri build
+        # On macOS we skip Tauri's built-in DMG bundler — it shells out to
+        # bundle_dmg.sh → hdiutil and the macos-14 runner intermittently fails
+        # there with "diskimages-help" orphans (and Tauri swallows the actual
+        # stderr, so we can't even retry meaningfully). The post-signing step
+        # below rebuilds the DMG ourselves from the signed .app via hdiutil,
+        # which has been reliable. Building "app" still produces the
+        # .app.tar.gz updater artifact (createUpdaterArtifacts in the conf).
+        # Windows keeps the default target set so NSIS still builds.
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            npx tauri build --bundles app
+          else
+            npx tauri build
+          fi
+        shell: bash
       # Cert path: sign with our self-signed cert WITHOUT hardened runtime (so the
       # PyInstaller sidecar still loads), then rebuild the DMG and regenerate +
       # re-sign the updater bundle so both install paths carry the stable identity.
@@ -228,14 +242,21 @@ jobs:
           codesign --force -s "$ID" "$APP_PATH"
           codesign --verify --deep --strict "$APP_PATH" && echo "Signature valid"
           codesign -dv --verbose=2 "$APP_PATH" 2>&1 | grep -iE "Authority|Identifier=" || true
-          # Rebuild the DMG from the signed app
-          DMG_PATH=$(find "$WS/TauriApp/src-tauri/target/release/bundle/dmg" -maxdepth 1 -name "*.dmg")
-          DMG_NAME=$(basename "$DMG_PATH")
-          rm "$DMG_PATH"
+          # Build the DMG from the signed app. Tauri's own DMG bundler is
+          # disabled on macOS (it's flaky on the runner) so we make it here
+          # from scratch via hdiutil. Read the version from package.json so
+          # the filename matches what the updater + release page expect.
+          DMG_DIR="$WS/TauriApp/src-tauri/target/release/bundle/dmg"
+          mkdir -p "$DMG_DIR"
+          VERSION=$(node -p "require('$WS/TauriApp/package.json').version")
+          ARCH_TAG="aarch64"   # macos-14 runners are arm64
+          DMG_NAME="Multi-Panel Figure Builder_${VERSION}_${ARCH_TAG}.dmg"
+          # If Tauri ever resumes building one, replace it for consistency.
+          rm -f "$DMG_DIR/$DMG_NAME"
           STAGE=$(mktemp -d)
           cp -R "$APP_PATH" "$STAGE/"
           ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname "Multi-Panel Figure Builder" -srcfolder "$STAGE" -ov -format UDZO "$WS/TauriApp/src-tauri/target/release/bundle/dmg/$DMG_NAME"
+          hdiutil create -volname "Multi-Panel Figure Builder" -srcfolder "$STAGE" -ov -format UDZO "$DMG_DIR/$DMG_NAME"
           rm -rf "$STAGE"
           # Regenerate the updater bundle (.app.tar.gz) from the signed app + re-sign it
           ( cd "$MACOS_DIR" && rm -f "$APP_NAME.tar.gz" "$APP_NAME.tar.gz.sig" && COPYFILE_DISABLE=1 tar czf "$APP_NAME.tar.gz" "$APP_NAME" )
@@ -250,14 +271,19 @@ jobs:
           echo "Signing $APP_PATH"
           codesign --force --deep -s - "$APP_PATH"
           codesign --verify "$APP_PATH" && echo "Signature valid"
-          # Rebuild DMG with signed app + Applications symlink
-          DMG_PATH=$(find TauriApp/src-tauri/target/release/bundle/dmg -name "*.dmg" -maxdepth 1)
-          DMG_NAME=$(basename "$DMG_PATH")
-          rm "$DMG_PATH"
+          # Make DMG from scratch (Tauri's DMG bundler is skipped on macOS —
+          # see the build step). Filename matches the previous Tauri output
+          # so the release page asset paths stay consistent.
+          DMG_DIR="TauriApp/src-tauri/target/release/bundle/dmg"
+          mkdir -p "$DMG_DIR"
+          VERSION=$(node -p "require('./TauriApp/package.json').version")
+          ARCH_TAG="aarch64"
+          DMG_NAME="Multi-Panel Figure Builder_${VERSION}_${ARCH_TAG}.dmg"
+          rm -f "$DMG_DIR/$DMG_NAME"
           STAGE_DIR=$(mktemp -d)
           cp -R "$APP_PATH" "$STAGE_DIR/"
           ln -s /Applications "$STAGE_DIR/Applications"
-          hdiutil create -volname "Multi-Panel Figure Builder" -srcfolder "$STAGE_DIR" -ov -format UDZO "TauriApp/src-tauri/target/release/bundle/dmg/$DMG_NAME"
+          hdiutil create -volname "Multi-Panel Figure Builder" -srcfolder "$STAGE_DIR" -ov -format UDZO "$DMG_DIR/$DMG_NAME"
           rm -rf "$STAGE_DIR"
         shell: bash
       - name: Upload artifacts
