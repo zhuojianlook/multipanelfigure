@@ -22,7 +22,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Box, Typography, Button, IconButton, Dialog, DialogTitle, DialogContent,
-  DialogActions, TextField, Tooltip, ToggleButton, ToggleButtonGroup, MenuItem,
+  DialogActions, TextField, Tooltip, MenuItem,
 } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AutoFixHighIcon from "@mui/icons-material/AutoFixHigh";
@@ -86,6 +86,15 @@ export function generateBandPickerCode(cfg: BandPickerConfig): string {
 # Auto-generated from the interactive band picker.  Edit lanes via
 # the "Pick bands…" button on the node rather than by hand — manual
 # edits here are overwritten the next time you open the picker.
+#
+# Quantification matches detect_bands_equal_boxes.py's quantify():
+#   * raw_integrated_density = sum of measurement-plane pixels in each ROI box,
+#   * background = robust mean of the same-width slabs immediately ABOVE and
+#     BELOW the band (with a 6 px gap), computed with median + MAD outlier reject
+#     so neighbouring bands don't bias it,
+#   * background_corrected_integrated_density = raw - bg_mean * area.
+# This is the same number the CLI's annotated CSV emits — so you can sanity
+# check by running the script and comparing the values.
 import numpy as np, json
 
 CFG = json.loads(r'''${json}''')
@@ -94,21 +103,19 @@ imgs = [v for v in inputs.values() if isinstance(v, dict) and ("image_raw" in v 
 if not imgs:
     raise SystemExit("No membrane image — wire the blot (Source) into this node.")
 src = imgs[0]
-# Prefer FULL-BIT-DEPTH pixels (e.g. 16-bit) for quantitative IOD; fall back to
-# the 8-bit display image when raw isn't available.
+# FULL-BIT-DEPTH pixels (e.g. 16-bit) for quantitative IOD; fall back to the
+# 8-bit display image only when raw isn't available.
 use_raw = "image_raw" in src
 arr = np.asarray(src["image_raw"] if use_raw else src["image"]).astype(np.float32)
-if arr.ndim == 3:
-    gray = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2] if arr.shape[2] >= 3 else arr[..., 0]
+# Measurement plane — max over RGB to match detect_bands_equal_boxes.py
+# (--measurement-channel max default).
+if arr.ndim == 3 and arr.shape[2] >= 3:
+    plane = np.max(arr[..., :3], axis=2)
+elif arr.ndim == 3:
+    plane = arr[..., 0]
 else:
-    gray = arr
-H, W = gray.shape[:2]
-# Invert relative to the white level so dark protein bands -> bright signal,
-# preserving the native dynamic range (16-bit) when available.
-white = float(src.get("raw_max") or 0) if use_raw else 255.0
-if white <= 0:
-    white = float(gray.max()) or 1.0
-inv_full = white - gray
+    plane = arr
+H, W = plane.shape[:2]
 
 def _px(rect):
     x0 = int(round(rect["x"] * W)); x1 = int(round((rect["x"] + rect["w"]) * W))
@@ -117,32 +124,51 @@ def _px(rect):
     y0, y1 = sorted((max(0, min(H, y0)), max(0, min(H, y1))))
     return x0, y0, x1, y1
 
-# Optional global background from a user-drawn ROI.
-bg_global = None
-if CFG.get("bgMode") == "roi" and CFG.get("bgRoi"):
-    bx0, by0, bx1, by1 = _px(CFG["bgRoi"])
-    if bx1 > bx0 and by1 > by0:
-        bg_global = float(inv_full[by0:by1, bx0:bx1].mean())
+def _robust_background(values):
+    flat = np.asarray(values).reshape(-1).astype(np.float64)
+    if flat.size == 0:
+        return 0.0
+    median = float(np.median(flat))
+    mad = float(np.median(np.abs(flat - median)))
+    if mad > 0:
+        sigma = 1.4826 * mad
+        keep = np.abs(flat - median) <= 3.0 * sigma
+        if int(np.sum(keep)) >= max(20, flat.size // 5):
+            flat = flat[keep]
+    return float(np.mean(flat))
 
-pct = float(CFG.get("bgPercentile", 5))
 lc_level = CFG.get("loadingControlLevel")          # which level is the loading control
 rows = []
 for i, band in enumerate(CFG.get("lanes", [])):
     x0, y0, x1, y1 = _px(band)
     if x1 <= x0 or y1 <= y0:
         continue
-    inv = inv_full[y0:y1, x0:x1]
-    bg = bg_global if bg_global is not None else float(np.percentile(inv, pct))
-    signal = np.clip(inv - bg, 0, None)
+    roi = plane[y0:y1, x0:x1].astype(np.float64)
+    area = int(roi.size)
+    # Local background: slabs above and below the ROI, same width, gap=6
+    # — matches detect_bands_equal_boxes.py quantify().
+    gap, hh = 6, (y1 - y0)
+    above_y2 = max(0, y0 - gap); above_y1 = max(0, above_y2 - hh)
+    below_y1 = min(H, y1 + gap); below_y2 = min(H, below_y1 + hh)
+    parts = []
+    if above_y2 > above_y1: parts.append(plane[above_y1:above_y2, x0:x1].reshape(-1))
+    if below_y2 > below_y1: parts.append(plane[below_y1:below_y2, x0:x1].reshape(-1))
+    bg_pixels = np.concatenate(parts) if parts else np.array([])
+    bg_mean = _robust_background(bg_pixels)
+    raw_sum = float(np.sum(roi))
+    corrected = raw_sum - bg_mean * area
     lane = (band.get("label") or "").strip() or f"Lane {i + 1}"
     level = (band.get("level") or "").strip() or "Target"
     rows.append({
         "lane": lane,                              # column / sample
         "level": level,                            # target / MW row
         "is_loading_control": bool(lc_level is not None and level == lc_level),
-        "iod": float(signal.sum()),
-        "mean_signal": float(signal.mean()),
-        "area_px": int(inv.size),
+        "iod": float(max(corrected, 0.0)),
+        "raw_integrated_density": raw_sum,
+        "background_corrected_integrated_density": corrected,
+        "background_mean": bg_mean,
+        "mean_signal": float(roi.mean()) if area else 0.0,
+        "area_px": area,
     })
 
 if not rows:
@@ -236,39 +262,35 @@ function autoDetectLanes(gray: Float32Array, w: number, h: number): BandRoi[] {
 }
 
 // ── Approximate IOD for the live readout (display-res, guidance) ─
+// Mirrors the emitted Python's quantify(): measurement-plane sum minus the
+// mean of the slabs immediately above + below the ROI. The display-image
+// readout is APPROXIMATE — the run-time recomputes at full bit depth.
 function approxIod(
   gray: Float32Array, w: number, h: number,
   lane: { x: number; y: number; w: number; h: number },
-  cfg: BandPickerConfig,
 ): number {
   const x0 = Math.max(0, Math.round(lane.x * w));
   const x1 = Math.min(w, Math.round((lane.x + lane.w) * w));
   const y0 = Math.max(0, Math.round(lane.y * h));
   const y1 = Math.min(h, Math.round((lane.y + lane.h) * h));
   if (x1 <= x0 || y1 <= y0) return 0;
-  const vals: number[] = [];
-  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) vals.push(255 - gray[y * w + x]);
-  let bg: number;
-  if (cfg.bgMode === "roi" && cfg.bgRoi) {
-    const bx0 = Math.max(0, Math.round(cfg.bgRoi.x * w));
-    const bx1 = Math.min(w, Math.round((cfg.bgRoi.x + cfg.bgRoi.w) * w));
-    const by0 = Math.max(0, Math.round(cfg.bgRoi.y * h));
-    const by1 = Math.min(h, Math.round((cfg.bgRoi.y + cfg.bgRoi.h) * h));
-    let s = 0, n = 0;
-    for (let y = by0; y < by1; y++) for (let x = bx0; x < bx1; x++) { s += 255 - gray[y * w + x]; n++; }
-    bg = n > 0 ? s / n : 0;
-  } else {
-    const sorted = [...vals].sort((a, b) => a - b);
-    const idx = Math.min(sorted.length - 1, Math.floor((cfg.bgPercentile / 100) * sorted.length));
-    bg = sorted[idx] || 0;
-  }
-  let sum = 0;
-  for (const v of vals) { const s = v - bg; if (s > 0) sum += s; }
-  return sum;
+  const hh = y1 - y0;
+  // ROI raw sum on the inverted (dark→bright) display plane.
+  let roiSum = 0; let n = 0;
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { roiSum += 255 - gray[y * w + x]; n++; }
+  // Local background: slabs above + below, same width, gap=6 px.
+  const gap = 6;
+  const ay2 = Math.max(0, y0 - gap), ay1 = Math.max(0, ay2 - hh);
+  const by1Lo = Math.min(h, y1 + gap), by2 = Math.min(h, by1Lo + hh);
+  let bgSum = 0, bgN = 0;
+  for (let y = ay1; y < ay2; y++) for (let x = x0; x < x1; x++) { bgSum += 255 - gray[y * w + x]; bgN++; }
+  for (let y = by1Lo; y < by2; y++) for (let x = x0; x < x1; x++) { bgSum += 255 - gray[y * w + x]; bgN++; }
+  const bgMean = bgN > 0 ? bgSum / bgN : 0;
+  return Math.max(0, roiSum - bgMean * n);
 }
 
 interface DragState {
-  mode: "move" | "resize" | "draw" | "drawbg" | "movebg" | "resizebg";
+  mode: "move" | "resize" | "draw";
   id: string | null;
   handle?: string;
   startNx: number; startNy: number;
@@ -296,13 +318,8 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   const { open, imageSrc, source, initial, onClose, onSave } = props;
   const [cfg, setCfg] = useState<BandPickerConfig>(initial ?? emptyBandConfig());
   const [selId, setSelId] = useState<string | null>(null);
-  const [drawingBg, setDrawingBg] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [detectInfo, setDetectInfo] = useState<string | null>(null);
-  // Auto-detect sensitivity → the cross-lane consensus filter (min_group_lanes).
-  // Default "strict" == detect_bands.py's --auto-min-group-lanes=3 (faithful to
-  // the script). "balanced"/"relaxed" (2/1) keep more isolated/faint bands.
-  const [sensitivity, setSensitivity] = useState<"strict" | "balanced" | "relaxed">("strict");
   const [natW, setNatW] = useState(0);
   const [natH, setNatH] = useState(0);
   const [gray, setGray] = useState<Float32Array | null>(null);
@@ -320,7 +337,6 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     if (open) {
       setCfg(initial ? structuredClone(initial) : emptyBandConfig());
       setSelId(null);
-      setDrawingBg(false);
       setDetectInfo(null);
       setPreviewSrc(null);
     }
@@ -388,7 +404,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   const iodById = useMemo(() => {
     const out: Record<string, number> = {};
     if (gray && natW && natH) {
-      for (const lane of cfg.lanes) out[lane.id] = approxIod(gray, natW, natH, lane, cfg);
+      for (const lane of cfg.lanes) out[lane.id] = approxIod(gray, natW, natH, lane);
     }
     return out;
   }, [gray, natW, natH, cfg]);
@@ -413,38 +429,26 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
       if (lane) { setSelId(id); dragRef.current = { mode: "resize", id, handle, startNx: nx, startNy: ny, orig: { ...lane } }; }
       return;
     }
-    if (role === "bg-handle" && cfg.bgRoi) {
-      dragRef.current = { mode: "resizebg", id: null, handle, startNx: nx, startNy: ny, orig: { ...cfg.bgRoi } };
-      return;
-    }
     if (role === "lane" && id) {
       const lane = cfg.lanes.find((l) => l.id === id);
       if (lane) { setSelId(id); dragRef.current = { mode: "move", id, startNx: nx, startNy: ny, orig: { ...lane } }; }
       return;
     }
-    if (role === "bg" && cfg.bgRoi) {
-      dragRef.current = { mode: "movebg", id: null, startNx: nx, startNy: ny, orig: { ...cfg.bgRoi } };
-      return;
-    }
-    // Empty area → draw a new lane (or background rect if in bg-draw mode).
-    if (drawingBg) {
-      dragRef.current = { mode: "drawbg", id: null, startNx: nx, startNy: ny, orig: { x: nx, y: ny, w: 0, h: 0 } };
-    } else {
-      const newId = uid();
-      dragRef.current = { mode: "draw", id: newId, startNx: nx, startNy: ny, orig: { x: nx, y: ny, w: 0, h: 0 } };
-      setCfg((c) => {
-        // Inherit the level (row) from the selected band so you can add more
-        // bands to the same level by drawing; fall back to the last band's level.
-        const sel = c.lanes.find((l) => l.id === selId);
-        const defLevel = sel ? roiLevel(sel) : (c.lanes.length ? roiLevel(c.lanes[c.lanes.length - 1]) : "Target");
-        return {
-          ...c,
-          lanes: [...c.lanes, { id: newId, x: nx, y: ny, w: 0, h: 0, label: `S${c.lanes.length + 1}`, level: defLevel }],
-        };
-      });
-      setSelId(newId);
-    }
-  }, [cfg.lanes, cfg.bgRoi, clientToNorm, drawingBg, selId]);
+    // Empty area → draw a new band rectangle.
+    const newId = uid();
+    dragRef.current = { mode: "draw", id: newId, startNx: nx, startNy: ny, orig: { x: nx, y: ny, w: 0, h: 0 } };
+    setCfg((c) => {
+      // Inherit the level (row) from the selected band so you can add more
+      // bands to the same level by drawing; fall back to the last band's level.
+      const sel = c.lanes.find((l) => l.id === selId);
+      const defLevel = sel ? roiLevel(sel) : (c.lanes.length ? roiLevel(c.lanes[c.lanes.length - 1]) : "Target");
+      return {
+        ...c,
+        lanes: [...c.lanes, { id: newId, x: nx, y: ny, w: 0, h: 0, label: `S${c.lanes.length + 1}`, level: defLevel }],
+      };
+    });
+    setSelId(newId);
+  }, [cfg.lanes, clientToNorm, selId]);
 
   const onPointerMove = useCallback((e: React.PointerEvent) => {
     const d = dragRef.current;
@@ -462,13 +466,11 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
       return { x, y, w: Math.max(0, w), h: Math.max(0, h) };
     };
 
-    if (d.mode === "draw" || d.mode === "drawbg") {
+    if (d.mode === "draw") {
       const x = Math.min(d.startNx, nx), y = Math.min(d.startNy, ny);
       const w = Math.abs(nx - d.startNx), h = Math.abs(ny - d.startNy);
-      if (d.mode === "draw" && d.id) {
+      if (d.id) {
         setCfg((c) => ({ ...c, lanes: c.lanes.map((l) => l.id === d.id ? { ...l, x, y, w, h } : l) }));
-      } else {
-        setCfg((c) => ({ ...c, bgRoi: { x, y, w, h } }));
       }
     } else if (d.mode === "move" && d.id) {
       const x = clamp01(d.orig.x + dx), y = clamp01(d.orig.y + dy);
@@ -476,12 +478,6 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     } else if (d.mode === "resize" && d.id) {
       const r = resizeRect(d.orig, d.handle);
       setCfg((c) => ({ ...c, lanes: c.lanes.map((l) => l.id === d.id ? { ...l, ...r } : l) }));
-    } else if (d.mode === "movebg") {
-      const x = clamp01(d.orig.x + dx), y = clamp01(d.orig.y + dy);
-      setCfg((c) => c.bgRoi ? ({ ...c, bgRoi: { ...c.bgRoi, x: Math.min(x, 1 - c.bgRoi.w), y: Math.min(y, 1 - c.bgRoi.h) } }) : c);
-    } else if (d.mode === "resizebg") {
-      const r = resizeRect(d.orig, d.handle);
-      setCfg((c) => ({ ...c, bgRoi: r }));
     }
   }, [clientToNorm]);
 
@@ -496,10 +492,6 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
         if (lane && (lane.w < 0.01 || lane.h < 0.01)) return { ...c, lanes: c.lanes.filter((l) => l.id !== d.id) };
         return c;
       });
-    }
-    if (d.mode === "drawbg") {
-      setCfg((c) => (c.bgRoi && (c.bgRoi.w < 0.01 || c.bgRoi.h < 0.01)) ? { ...c, bgRoi: null } : c);
-      setDrawingBg(false);
     }
   }, []);
 
@@ -541,37 +533,37 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     setDetecting(true);
     setDetectInfo(null);
     try {
-      // Prefer the backend detector (robust band-row-constrained algorithm,
-      // pure-numpy so it ships in the frozen sidecar). Fall back to the local
-      // heuristic if the endpoint isn't reachable (e.g. older sidecar / no backend).
+      // Backend detector — vendored detect_bands_equal_boxes.py. Defaults
+      // mirror the CLI exactly (expected_lanes=8, threshold_percentile=98,
+      // min_gap=45, min_group_lanes=3, roi 74×33, channel=max), so the
+      // result is byte-for-byte what the reference script's annotated PNG /
+      // CSV would emit on the same input.
       if (imageSrc || source) {
         try {
           const b64 = imageSrc ? (imageSrc.startsWith("data:") ? imageSrc.split(",")[1] : imageSrc) : "";
           const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
-          const mgl = sensitivity === "strict" ? 3 : sensitivity === "balanced" ? 2 : 1;
           const resp = await fetch(`${apiBase}/api/analysis/wb-detect-bands`, {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ image_b64: b64, source: source ?? undefined, min_group_lanes: mgl }),
+            body: JSON.stringify({ image_b64: b64, source: source ?? undefined }),
           });
           if (resp.ok) {
             const data = await resp.json();
             if (Array.isArray(data.lanes) && applyDetectedLanes(data.lanes)) {
-              // Swap the display to the bright contrast-stretched preview so
-              // the user can clearly see the bands the detector found.
               if (data.preview_b64) setPreviewSrc(`data:image/png;base64,${data.preview_b64}`);
-              // Warn if detection ran on a low-res preview rather than the
-              // full-res membrane — the single biggest cause of poor results.
               const sw = Number(data.src_w) || 0;
-              if (!data.used_source || (sw > 0 && sw < 700)) {
+              const sh = Number(data.src_h) || 0;
+              const raw = !!data.raw_depth;
+              const used = !!data.used_source;
+              if (!used || (sw > 0 && sw < 700)) {
                 setDetectInfo(
-                  `⚠ Detected on a ${sw || "low"}px preview — the full-resolution membrane wasn't available, so results are coarse. ` +
-                  `Re-drop the original blot onto the Source node (and make sure the backend is connected), then auto-detect again.`,
+                  `⚠ Detected on a ${sw || "low"}px preview — the full-resolution membrane wasn't available, ` +
+                  `so results are coarse. Re-drop the original blot onto the Source node and auto-detect again.`,
                 );
               } else {
                 setDetectInfo(
-                  `Auto mode (${sw}px source) — ${data.band_count ?? data.lanes.length} band(s). ` +
-                  `This matches detect_bands.py's AUTO defaults (sparse — no auto-ladder, consensus filter on). ` +
-                  `For the dense detect_bands.py --lanes result (full ladder + every lane's bands), click "Import lanes (CSV)" and pick your lanes file.`,
+                  `Detected ${data.band_count ?? data.lanes.length} band(s) on ${sw}×${sh} px ` +
+                  `(${raw ? "16-bit raw" : "8-bit display"} pixels). ` +
+                  `Same pipeline + defaults as detect_bands_equal_boxes.py — drag any box to fine-tune.`,
                 );
               }
               return;
@@ -588,60 +580,6 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     }
   };
 
-  /** Import a lanes CSV (detect_bands.py schema: `lane,x1,x2,y1,y2` in the
-   *  source's native pixels) and detect bands WITHIN those lanes — matches the
-   *  script's --lanes pipeline exactly (no auto-detect, no consensus filter,
-   *  full ladder kept). This reproduces band_quantification_auto_lanes_annotated.png. */
-  const runDetectFromCsv = async () => {
-    if (detecting) return;
-    if (!source) {
-      setDetectInfo("⚠ Import lanes needs a wired source — drop the blot onto a Source node first.");
-      return;
-    }
-    setDetecting(true);
-    setDetectInfo(null);
-    try {
-      // Native dialog → CSV path; the sidecar reads the file directly.
-      let csvPath: string | null = null;
-      try {
-        const { open } = await import("@tauri-apps/plugin-dialog");
-        const selected = await open({
-          multiple: false,
-          title: "Import lanes CSV (lane,x1,x2,y1,y2 in source pixels)",
-          filters: [{ name: "CSV", extensions: ["csv"] }],
-        });
-        if (!selected) return;
-        csvPath = typeof selected === "string" ? selected : (selected as { path?: string }).path || null;
-      } catch (e) {
-        setDetectInfo(`⚠ Native file dialog unavailable: ${e instanceof Error ? e.message : String(e)}`);
-        return;
-      }
-      if (!csvPath) { setDetectInfo("⚠ No CSV path from the dialog."); return; }
-      const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
-      const resp = await fetch(`${apiBase}/api/analysis/wb-detect-bands`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source, lanes_csv_path: csvPath }),
-      });
-      if (!resp.ok) {
-        setDetectInfo(`⚠ Detection failed: HTTP ${resp.status}`);
-        return;
-      }
-      const data = await resp.json();
-      if (data.error) { setDetectInfo(`⚠ ${data.error}`); return; }
-      if (Array.isArray(data.lanes) && applyDetectedLanes(data.lanes)) {
-        if (data.preview_b64) setPreviewSrc(`data:image/png;base64,${data.preview_b64}`);
-        const sw = Number(data.src_w) || 0;
-        setDetectInfo(`Detected ${data.band_count ?? data.lanes.length} band(s) in your CSV lanes (${sw}px source).`);
-      } else {
-        setDetectInfo("⚠ No bands returned for these lanes (check the CSV matches this blot).");
-      }
-    } finally {
-      setDetecting(false);
-    }
-  };
-
-  // Snap each existing lane's vertical position to its actual band, keeping the
-  // user's x-grid. Sends the current lanes to the backend's per-lane detector
   // Render an 8-handle set for a normalised rect.
   const handlesFor = (rect: { x: number; y: number; w: number; h: number }, id: string | null, roleHandle: string) => {
     const hs = [
@@ -676,17 +614,8 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
               <Box component="img" src={dispUrl} alt="blot" draggable={false}
                 sx={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "fill", pointerEvents: "none" }} />
               <svg ref={svgRef} width={disp.w} height={disp.h}
-                style={{ position: "absolute", inset: 0, cursor: drawingBg ? "crosshair" : "crosshair", touchAction: "none" }}
+                style={{ position: "absolute", inset: 0, cursor: "crosshair", touchAction: "none" }}
                 onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}>
-                {/* Background ROI */}
-                {cfg.bgRoi && (
-                  <>
-                    <rect data-role="bg" x={cfg.bgRoi.x * disp.w} y={cfg.bgRoi.y * disp.h}
-                      width={cfg.bgRoi.w * disp.w} height={cfg.bgRoi.h * disp.h}
-                      fill="rgba(255,193,7,0.12)" stroke="#ffc107" strokeDasharray="4 3" strokeWidth={1.5} style={{ cursor: "move" }} />
-                    {handlesFor(cfg.bgRoi, null, "bg-handle")}
-                  </>
-                )}
                 {/* Bands — colored by level (row); same level = same color */}
                 {cfg.lanes.map((lane) => {
                   const sel = lane.id === selId;
@@ -727,28 +656,9 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
               onClick={runAutoDetect} disabled={!srcUrl || detecting}>
               {detecting ? "Detecting…" : "Auto-detect bands"}
             </Button>
-            <Tooltip title="Import a lanes CSV (detect_bands.py schema: lane,x1,x2,y1,y2 in source pixels) and detect bands within those lanes — matches the script's --lanes pipeline exactly, including the full ladder.">
-              <span>
-                <Button size="small" variant="outlined" onClick={runDetectFromCsv} disabled={!source || detecting}
-                  sx={{ textTransform: "none" }}>
-                  Import lanes (CSV)
-                </Button>
-              </span>
-            </Tooltip>
             <Typography variant="caption" sx={{ color: "text.secondary", ml: "auto" }}>
               {cfg.lanes.length} band(s) — delete / drag / resize to clean up
             </Typography>
-          </Box>
-          <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-            <Tooltip title="How readily a band is kept. Relaxed keeps isolated / faint bands (catch more, then delete extras). Strict only keeps bands shared across ≥3 lanes — the detect_bands.py default.">
-              <Typography variant="caption" sx={{ fontWeight: 700 }}>Sensitivity</Typography>
-            </Tooltip>
-            <ToggleButtonGroup size="small" exclusive value={sensitivity}
-              onChange={(_, v) => { if (v) setSensitivity(v); }}>
-              <ToggleButton value="relaxed" sx={{ textTransform: "none", fontSize: "0.68rem", py: 0.1 }}>Relaxed</ToggleButton>
-              <ToggleButton value="balanced" sx={{ textTransform: "none", fontSize: "0.68rem", py: 0.1 }}>Balanced</ToggleButton>
-              <ToggleButton value="strict" sx={{ textTransform: "none", fontSize: "0.68rem", py: 0.1 }}>Strict</ToggleButton>
-            </ToggleButtonGroup>
           </Box>
           {detectInfo && (
             <Typography variant="caption" sx={{
@@ -758,34 +668,6 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
               {detectInfo}
             </Typography>
           )}
-
-          {/* Background subtraction */}
-          <Box sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, p: 1 }}>
-            <Typography variant="caption" sx={{ fontWeight: 700, display: "block", mb: 0.5 }}>Background subtraction</Typography>
-            <ToggleButtonGroup size="small" exclusive value={cfg.bgMode}
-              onChange={(_, v) => { if (v) setCfg((c) => ({ ...c, bgMode: v })); }}>
-              <ToggleButton value="percentile" sx={{ textTransform: "none", fontSize: "0.7rem" }}>Per-lane percentile</ToggleButton>
-              <ToggleButton value="roi" sx={{ textTransform: "none", fontSize: "0.7rem" }}>Background ROI</ToggleButton>
-            </ToggleButtonGroup>
-            {cfg.bgMode === "percentile" ? (
-              <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.75 }}>
-                <Typography variant="caption">Floor percentile</Typography>
-                <TextField type="number" size="small" value={cfg.bgPercentile}
-                  onChange={(e) => setCfg((c) => ({ ...c, bgPercentile: Math.max(0, Math.min(100, Number(e.target.value) || 0)) }))}
-                  inputProps={{ min: 0, max: 100, step: 1, style: { width: 56, padding: "4px 6px" } }} />
-              </Box>
-            ) : (
-              <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.75 }}>
-                <Button size="small" variant={drawingBg ? "contained" : "outlined"} color="warning"
-                  onClick={() => setDrawingBg((v) => !v)} sx={{ textTransform: "none", fontSize: "0.7rem" }}>
-                  {drawingBg ? "Click-drag on blot…" : cfg.bgRoi ? "Redraw background" : "Draw background"}
-                </Button>
-                {cfg.bgRoi && (
-                  <IconButton size="small" onClick={() => setCfg((c) => ({ ...c, bgRoi: null }))}><DeleteOutlineIcon sx={{ fontSize: 16 }} /></IconButton>
-                )}
-              </Box>
-            )}
-          </Box>
 
           {/* Levels & loading control */}
           <Box sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, p: 1, display: "flex", alignItems: "center", gap: 1, flexWrap: "wrap" }}>

@@ -3236,6 +3236,11 @@ export interface AggregatedOutput {
 export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: Props) {
   // Inset sources from the backend (image ports for the source node).
   const [insetSources, setInsetSources] = useState<InsetSource[]>([]);
+  // Skeleton placeholders shown while an Analysis upload is in flight.
+  // Each entry is a (best-effort) basename so the user sees WHICH file is
+  // still landing — analysis-image reads (esp. 16-bit TIFFs) can take a few
+  // seconds and silent UIs make the user click upload twice.
+  const [uploading, setUploading] = useState<string[]>([]);
   const [matlabKind, setMatlabKind] = useState<string>("");
 
   // Code-editor font size (px) for the selected node's code panel — a display
@@ -4009,12 +4014,16 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
    *  stays clean); addUploadedSources marks each name hidden too. */
   const uploadAnalysisImages = useCallback(async (files: File[]) => {
     if (!files.length) return;
+    const names = files.map((f) => f.name);
+    setUploading((cur) => [...cur, ...names]);
     try {
       logUpload(`[upload] uploading ${files.length} file(s)…`);
       const res = await api.uploadImages(files);
       await addUploadedSources(res.names || []);
     } catch (e) {
       logUpload(`[upload] FAILED: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setUploading((cur) => cur.filter((n) => !names.includes(n)));
     }
   }, [addUploadedSources, logUpload]);
 
@@ -4048,13 +4057,19 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         .map((it) => (typeof it === "string" ? it : (it as { path?: string })?.path))
         .filter((p): p is string => !!p);
       if (!paths.length) { logUpload("[upload] no file paths from the dialog"); return; }
+      const basenames = paths.map((p) => p.split(/[/\\]/).pop() || p);
+      setUploading((cur) => [...cur, ...basenames]);
       logUpload(`[upload] uploading ${paths.length} file(s)…`);
-      // RAW api (NOT the store action) — analysis uploads must NOT populate
-      // figureStore.loadedImages or trigger requestPreview; we want them
-      // analysis-only. addUploadedSources also marks each name hidden so
-      // /api/images excludes them from the builder timeline.
-      const res = await api.uploadImagesFromPaths(paths);
-      await addUploadedSources(res.names || []);
+      try {
+        // RAW api (NOT the store action) — analysis uploads must NOT populate
+        // figureStore.loadedImages or trigger requestPreview; we want them
+        // analysis-only. addUploadedSources also marks each name hidden so
+        // /api/images excludes them from the builder timeline.
+        const res = await api.uploadImagesFromPaths(paths);
+        await addUploadedSources(res.names || []);
+      } finally {
+        setUploading((cur) => cur.filter((n) => !basenames.includes(n)));
+      }
     } catch (e) {
       logUpload(`[upload] FAILED: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -4908,7 +4923,38 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           </Tooltip>
         </Box>
         <Box sx={{ flex: 1, overflow: "auto", p: 0.5 }}>
-          {insetSources.length === 0 ? (
+          {/* Upload-in-flight skeletons — appear the moment the user picks
+              file(s), so the wait between dialog-close and the source thumb
+              showing up is visible feedback rather than silence. */}
+          {uploading.length > 0 && (
+            <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5, mb: 0.5, px: 0.5 }}>
+              {uploading.map((nm, i) => (
+                <Box key={`upl-${i}-${nm}`}
+                  sx={{
+                    display: "flex", alignItems: "center", gap: 0.75,
+                    border: "1px dashed", borderColor: "divider", borderRadius: 0.75,
+                    p: 0.5, bgcolor: "action.hover", opacity: 0.85,
+                  }}>
+                  <Box sx={{
+                    width: 14, height: 14, borderRadius: "50%",
+                    border: "2px solid", borderColor: "primary.main",
+                    borderTopColor: "transparent",
+                    animation: "mpfig-spin 0.9s linear infinite",
+                    "@keyframes mpfig-spin": { from: { transform: "rotate(0deg)" }, to: { transform: "rotate(360deg)" } },
+                  }} />
+                  <Box sx={{ flex: 1, minWidth: 0 }}>
+                    <Typography variant="caption" sx={{ display: "block", fontSize: "0.62rem", fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {nm}
+                    </Typography>
+                    <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", fontStyle: "italic" }}>
+                      uploading…
+                    </Typography>
+                  </Box>
+                </Box>
+              ))}
+            </Box>
+          )}
+          {insetSources.length === 0 && uploading.length === 0 ? (
             <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.disabled", fontStyle: "italic", display: "block", px: 0.5, py: 1, lineHeight: 1.35 }}>
               No flagged insets yet. Open <strong>Edit Panel → Zoom Inset</strong> and tick <em>Include in Analysis</em>.
             </Typography>
