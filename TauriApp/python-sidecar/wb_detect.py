@@ -1,24 +1,18 @@
-"""Vendored western-blot lane/band detection.
+"""Vendored western-blot lane/band detection — VERBATIM copy of the user's
+detect_bands_equal_boxes.py (equal-size sample band boxes). Keep in sync with
+/Users/zhuojian/Documents/New project/detect_bands_equal_boxes.py.
 
-These functions are a faithful, verbatim copy of the user's validated
-``detect_bands.py`` (the lane-detection + band-detection half). Only the CLI,
-file I/O, and densitometry/quantification have been omitted — the geometry
-detection is identical so the in-app "Auto-detect bands" button reproduces the
-script's results exactly.
+The geometric defaults (roi_width=74, roi_height=33, expected_lanes=8,
+threshold_percentile=98.0, min_gap=45, group min_lanes=3, group tolerance=35,
+channel="max") match the CLI exactly so the in-app result reproduces the user's
+annotated reference. Thin wrappers expose two entry points the endpoint uses:
 
-Default pipeline (matches ``detect_bands.py main()`` with default args):
+    detect_wb_bands(rgb, ...)           # auto-detect + refine + uniform boxes
+    detect_wb_bands_in_lanes(rgb, ...)  # --lanes mode (skip auto-detect)
 
-    display_rgb, analysis_rgb = contrast_scale(rgb)
-    signal = horizontal_signal(analysis_rgb, signal_polarity)
-    lanes  = auto_detect_lanes(signal, ...defaults...)
-    lanes  = name_auto_lanes(lanes, None, first_lane_marker=True)
-    bands  = detect_lane_bands(signal, lanes, marker_lanes)
-    bands  = filter_sample_band_groups(bands, 35, marker_lanes, 3, 24)
-
-``detect_wb_bands(rgb)`` runs that whole default path and returns
-``(lanes, bands, signal_shape)``.
-
-Keep this file in sync with /Users/zhuojian/Documents/New project/detect_bands.py.
+Both return (lanes, bands, (H, W)) where each band carries `roi_x1`,
+`roi_y1`, `roi_x2_exclusive`, `roi_y2_exclusive` for the endpoint to project
+into normalised picker coordinates.
 """
 from __future__ import annotations
 
@@ -29,56 +23,38 @@ import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
 
+
 # (lane_name, x1, x2, y1, y2)
 Lane = tuple
 
-# Defaults mirrored from detect_bands.py argparse.
-DEFAULT_SIGNAL_POLARITY = "bright"
+# Defaults mirrored from detect_bands_equal_boxes.py argparse + main.
+DEFAULT_SIGNAL_POLARITY = "bright"        # accepted for API back-compat; script is bright-only
 DEFAULT_MARKER_LANES = {"L", "Ladder", "Marker"}
-DEFAULT_AUTO_LANE_MIN_GAP = 45
-# detect_bands.py --auto-lane-threshold-percentile default is 98.0 (NOT 99.0).
-# 99.0 rejects too many band components and collapses adjacent lanes (e.g.
-# 6 lanes → 4 on f35t_nrf2-5000ms-m2.tiff), so this must stay 98.0 for parity.
+DEFAULT_EXPECTED_LANES = 8                # --expected-lanes default
 DEFAULT_AUTO_LANE_THRESHOLD_PERCENTILE = 98.0
-DEFAULT_AUTO_LANE_MAX_BAND_WIDTH = 0
+DEFAULT_AUTO_LANE_MIN_GAP = 45             # main() hard-codes this
+DEFAULT_AUTO_LANE_MAX_BAND_WIDTH = 0       # kept for compatibility; unused
 DEFAULT_AUTO_MIN_GROUP_LANES = 3
-DEFAULT_AUTO_CONSENSUS_TOLERANCE = 24
 DEFAULT_GROUP_TOLERANCE = 35
+DEFAULT_AUTO_CONSENSUS_TOLERANCE = 24      # kept for compatibility; not used by new script
+DEFAULT_ROI_WIDTH = 74
+DEFAULT_ROI_HEIGHT = 33
+DEFAULT_MEASUREMENT_CHANNEL = "max"
 
 
 def contrast_scale(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Convert high-bit-depth data to display/analysis images.
-
-    The TIFF is 16-bit and very dark. Percentile scaling avoids letting
-    a few saturated pixels dominate the contrast.
-    """
     lo, hi = np.percentile(rgb, [0.5, 99.95])
-    denom = float(hi - lo)
-    if denom <= 1e-6:
-        denom = 1e-6
-    scaled = np.clip((rgb - lo) / denom, 0, 1)
-    display_rgb = np.clip(scaled ** 0.5 * 255, 0, 255).astype(np.uint8)
-    analysis_rgb = np.clip(scaled * 255, 0, 255).astype(np.uint8)
-    return display_rgb, analysis_rgb
+    scaled = np.clip((rgb - lo) / max(hi - lo, 1), 0, 1)
+    display = np.clip(scaled ** 0.5 * 255, 0, 255).astype(np.uint8)
+    analysis = np.clip(scaled * 255, 0, 255).astype(np.uint8)
+    return display, analysis
 
 
-def horizontal_signal(
-    analysis_rgb: np.ndarray,
-    signal_polarity: str,
-) -> np.ndarray:
-    """
-    Build a band-enhanced image.
-
-    1. Use max RGB channel so colored ladder bands and white bands both count.
-    2. Blur slightly to reduce pixel noise.
-    3. Estimate broad background with a large Gaussian blur.
-    4. Subtract background and clamp negatives to zero.
-    5. Smooth more along x than y, favoring horizontal band-like structures.
-    """
+def horizontal_signal(analysis_rgb: np.ndarray, signal_polarity: str = "bright") -> np.ndarray:
+    """The script is bright-only (max-channel + bg-subtract). The polarity
+    parameter is accepted for API back-compat and currently ignored."""
+    _ = signal_polarity
     gray = np.max(analysis_rgb, axis=2)
-    if signal_polarity == "dark":
-        gray = 255 - gray
     blur = cv2.GaussianBlur(gray, (0, 0), 1.0)
     background = cv2.GaussianBlur(blur, (0, 0), 28)
     signal = blur.astype(np.float32) - background.astype(np.float32)
@@ -86,170 +62,122 @@ def horizontal_signal(
     return cv2.GaussianBlur(signal, (0, 0), sigmaX=3, sigmaY=1)
 
 
-def parse_name_set(text: str) -> set:
-    return {item.strip() for item in text.split(",") if item.strip()}
+def measurement_plane(rgb: np.ndarray, channel: str) -> np.ndarray:
+    if channel == "max":
+        return np.max(rgb, axis=2)
+    if channel == "mean":
+        return np.mean(rgb, axis=2)
+    if channel == "red":
+        return rgb[..., 0]
+    if channel == "green":
+        return rgb[..., 1]
+    if channel == "blue":
+        return rgb[..., 2]
+    raise ValueError(channel)
 
 
-def is_marker_lane(lane_name: str, marker_lanes: set) -> bool:
-    return lane_name in marker_lanes
+def robust_background(values: np.ndarray) -> tuple[float, float, int]:
+    flat = values.reshape(-1).astype(np.float64)
+    if flat.size == 0:
+        return 0.0, 0.0, 0
+    median = float(np.median(flat))
+    mad = float(np.median(np.abs(flat - median)))
+    if mad > 0:
+        sigma = 1.4826 * mad
+        keep = np.abs(flat - median) <= 3.0 * sigma
+        if int(np.sum(keep)) >= max(20, flat.size // 5):
+            flat = flat[keep]
+    sd = float(np.std(flat, ddof=1)) if flat.size > 1 else 0.0
+    return float(np.mean(flat)), sd, int(flat.size)
 
 
 def complete_lane_grid(
-    lane_candidates: list,
+    candidates: list,
     expected_lanes,
     image_width: int,
-    lane_width=None,
+    lane_width,
 ) -> list:
-    """
-    Fill missing lane boxes when strong band anchors skip a faint lane.
-
-    Automatic lane detection starts from band components. That is reliable for
-    visible lanes, but faint lanes can be absent from the component set. When
-    the expected lane count is known, large center-to-center gaps are split to
-    preserve the lane grid before edge refinement tightens each lane.
-    """
-    completed = sorted(lane_candidates, key=lambda item: item[1])
-    if expected_lanes is None:
-        return completed
-    if len(completed) < 2:
-        return completed
-
-    while len(completed) < expected_lanes and len(completed) >= 2:
-        centers = np.array([item[1] for item in completed], dtype=np.float64)
+    candidates = sorted(candidates, key=lambda item: item[1])
+    if expected_lanes is None or len(candidates) < 2:
+        return candidates
+    while len(candidates) < expected_lanes:
+        centers = np.array([item[1] for item in candidates], dtype=np.float64)
         gaps = np.diff(centers)
         if gaps.size == 0:
             break
         gap_index = int(np.argmax(gaps))
-        left = completed[gap_index]
-        right = completed[gap_index + 1]
+        left = candidates[gap_index]
+        right = candidates[gap_index + 1]
         center = int(round((left[1] + right[1]) / 2))
-        width = int(round(np.median([max(1, item[3] - item[2]) for item in completed])))
+        width = int(round(np.median([item[3] - item[2] for item in candidates])))
         x1 = max(0, center - width // 2)
         x2 = min(image_width, x1 + width)
-        if x2 - x1 < width and x2 == image_width:
-            x1 = max(0, x2 - width)
-        y1 = int(round((left[4] + right[4]) / 2))
-        y2 = int(round((left[5] + right[5]) / 2))
-        completed.append((0.0, center, int(x1), int(x2), y1, y2))
-        completed.sort(key=lambda item: item[1])
+        candidates.append((0.0, center, x1, x2, left[4], left[5]))
+        candidates.sort(key=lambda item: item[1])
 
-    if len(completed) == expected_lanes:
-        centers = np.array([item[1] for item in completed], dtype=np.float64)
+    if len(candidates) == expected_lanes:
+        centers = np.array([item[1] for item in candidates], dtype=np.float64)
         gaps = np.diff(centers)
-        small_gaps = gaps[gaps <= np.percentile(gaps, 75)] if gaps.size else gaps
-        pitch = float(np.median(small_gaps if small_gaps.size else gaps))
-        observed_width = float(np.median([max(1, item[3] - item[2]) for item in completed]))
-        target_width = int(lane_width) if lane_width is not None else int(
-            round(max(observed_width, pitch * 0.82))
-        )
-        target_width = max(40, min(image_width, target_width))
+        pitch = float(np.median(gaps[gaps <= np.percentile(gaps, 75)])) if gaps.size else 80
+        observed = float(np.median([item[3] - item[2] for item in candidates]))
+        width = int(lane_width) if lane_width else int(round(max(observed, pitch * 0.82)))
+        width = max(40, min(image_width, width))
         normalized = []
-        for score, center, _x1, _x2, y1, y2 in completed:
-            x1 = max(0, int(center) - target_width // 2)
-            x2 = min(image_width, x1 + target_width)
-            if x2 - x1 < target_width and x2 == image_width:
-                x1 = max(0, x2 - target_width)
-            normalized.append((score, int(center), int(x1), int(x2), int(y1), int(y2)))
-        completed = normalized
-
-    return completed
-
-
-def name_auto_lanes(
-    lanes: list,
-    lane_names,
-    first_lane_marker: bool,
-) -> list:
-    """Apply stable names to auto-detected lanes."""
-    parsed_names = [item.strip() for item in (lane_names or "").split(",") if item.strip()]
-    if parsed_names:
-        if len(parsed_names) != len(lanes):
-            raise ValueError(
-                f"--auto-lane-names provided {len(parsed_names)} names for "
-                f"{len(lanes)} detected lanes"
-            )
-        return [
-            (parsed_names[index], x1, x2, y1, y2)
-            for index, (_name, x1, x2, y1, y2) in enumerate(lanes)
-        ]
-
-    named = []
-    for index, (_name, x1, x2, y1, y2) in enumerate(lanes):
-        if index == 0 and first_lane_marker:
-            lane_name = "L"
-        elif first_lane_marker:
-            lane_name = f"S{index}"
-        else:
-            lane_name = f"Lane{index + 1}"
-        named.append((lane_name, x1, x2, y1, y2))
-    return named
+        for score, center, _x1, _x2, y1, y2 in candidates:
+            x1 = max(0, int(center) - width // 2)
+            x2 = min(image_width, x1 + width)
+            if x2 - x1 < width and x2 == image_width:
+                x1 = max(0, x2 - width)
+            normalized.append((score, int(center), x1, x2, y1, y2))
+        candidates = normalized
+    return candidates[:expected_lanes]
 
 
 def auto_detect_lanes(
     signal: np.ndarray,
     expected_lanes,
     lane_width,
-    lane_y1,
-    lane_y2,
-    min_gap: int,
     threshold_percentile: float,
-    max_band_width: int,
+    min_gap: int,
 ) -> list:
-    """
-    Infer lane boxes from horizontally extended band components.
-
-    This is intentionally conservative and parameterized. It is not a
-    substitute for reviewing lane geometry on publication-quality analyses.
-    """
     height, width = signal.shape
-    threshold = float(np.percentile(signal, threshold_percentile))
-    threshold = max(threshold, 1.0)
+    threshold = max(float(np.percentile(signal, threshold_percentile)), 1.0)
     feature = cv2.morphologyEx(
         signal.astype(np.uint8),
         cv2.MORPH_OPEN,
         cv2.getStructuringElement(cv2.MORPH_RECT, (11, 3)),
     )
-    mask = (feature > threshold).astype(np.uint8) * 255
+    mask = (feature > threshold).astype(np.uint8)
     mask = cv2.morphologyEx(
         mask,
         cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3)),
     )
-
     num, labels, stats, cents = cv2.connectedComponentsWithStats(mask, 8)
     components = []
-    min_band_width = max(12, int(width * 0.01))
-    if max_band_width <= 0:
-        max_band_width = max(50, int(width * 0.16))
-
     for label in range(1, num):
-        x, y, comp_width, comp_height, area = stats[label]
+        x, y, w, h, area = stats[label]
+        if w < 12 or w > max(50, int(width * 0.16)):
+            continue
+        if h < 3 or h > max(60, int(height * 0.08)):
+            continue
+        if area < max(30, w):
+            continue
+        if w / max(h, 1) < 2.0:
+            continue
         cx, cy = cents[label]
-        if comp_width < min_band_width or comp_width > max_band_width:
-            continue
-        if comp_height < 3 or comp_height > max(60, int(height * 0.08)):
-            continue
-        if area < max(30, min_band_width * 2):
-            continue
-        if comp_width / max(comp_height, 1) < 2.0:
-            continue
-        mean_signal = float(signal[labels == label].mean())
         components.append(
             {
                 "cx": float(cx),
-                "cy": float(cy),
                 "x1": int(x),
-                "x2": int(x + comp_width),
+                "x2": int(x + w),
                 "y1": int(y),
-                "y2": int(y + comp_height),
-                "score": float(area * mean_signal),
+                "y2": int(y + h),
+                "score": float(area * signal[labels == label].mean()),
             }
         )
-
     if not components:
-        raise ValueError(
-            "Auto-lane detection found no band-like components. Provide --lanes."
-        )
+        raise ValueError("No lane seed components found")
 
     components.sort(key=lambda item: item["cx"])
     clusters = []
@@ -259,115 +187,121 @@ def auto_detect_lanes(
         else:
             clusters[-1].append(component)
 
-    lane_candidates = []
-    global_y1 = (
-        int(lane_y1)
-        if lane_y1 is not None
-        else max(0, min(component["y1"] for component in components) - 35)
-    )
-    global_y2 = (
-        int(lane_y2)
-        if lane_y2 is not None
-        else min(height, max(component["y2"] for component in components) + 35)
-    )
-
+    global_y1 = max(0, min(item["y1"] for item in components) - 35)
+    global_y2 = min(height, max(item["y2"] for item in components) + 35)
+    candidates = []
     for cluster in clusters:
         centers = np.array([item["cx"] for item in cluster])
         scores = np.array([max(item["score"], 1.0) for item in cluster])
         center = int(round(float(np.average(centers, weights=scores))))
         score = float(np.sum(scores))
-        candidate_width = (
-            int(lane_width)
-            if lane_width is not None
-            else max(
-                40,
-                int(np.percentile([item["x2"] - item["x1"] for item in cluster], 75))
-                + 24,
-            )
+        width_guess = int(lane_width) if lane_width else max(
+            40, int(np.percentile([item["x2"] - item["x1"] for item in cluster], 75)) + 24
         )
-        x1 = max(0, center - candidate_width // 2)
-        x2 = min(width, x1 + candidate_width)
-        if x2 - x1 < candidate_width and x2 == width:
-            x1 = max(0, x2 - candidate_width)
-        lane_candidates.append((score, center, x1, x2, global_y1, global_y2))
+        x1 = max(0, center - width_guess // 2)
+        x2 = min(width, x1 + width_guess)
+        candidates.append((score, center, x1, x2, global_y1, global_y2))
 
-    lane_candidates.sort(key=lambda item: item[0], reverse=True)
+    candidates.sort(key=lambda item: item[0], reverse=True)
     if expected_lanes is not None:
-        lane_candidates = lane_candidates[:expected_lanes]
+        candidates = candidates[:expected_lanes]
     else:
-        strongest = lane_candidates[0][0]
-        lane_candidates = [
-            item for item in lane_candidates if item[0] >= strongest * 0.015
-        ]
+        strongest = candidates[0][0]
+        candidates = [item for item in candidates if item[0] >= strongest * 0.015]
+    candidates = complete_lane_grid(candidates, expected_lanes, width, lane_width)
+    candidates.sort(key=lambda item: item[1])
 
-    lane_candidates = complete_lane_grid(
-        lane_candidates,
-        expected_lanes,
-        width,
-        lane_width=lane_width,
-    )
-    lane_candidates.sort(key=lambda item: item[1])
-    return [
-        (f"Lane{index}", int(x1), int(x2), int(y1), int(y2))
-        for index, (_, _center, x1, x2, y1, y2) in enumerate(lane_candidates, start=1)
-    ]
+    lanes = []
+    for index, (_score, _center, x1, x2, y1, y2) in enumerate(candidates):
+        name = "L" if index == 0 else f"S{index}"
+        lanes.append((name, int(x1), int(x2), int(y1), int(y2)))
+    return lanes
 
 
-def detect_lane_bands(
-    signal: np.ndarray,
-    lanes: list,
-    marker_lanes: set,
-) -> list:
-    """
-    Detect y-position peaks inside each lane.
+def refine_lane_edges(signal: np.ndarray, lanes: list) -> list:
+    image_height, image_width = signal.shape
+    refined = []
+    for lane_name, x1, x2, y1, y2 in lanes:
+        lane_width = x2 - x1
+        sx1 = max(0, x1 - 24)
+        sx2 = min(image_width, x2 + 24)
+        roi = signal[max(0, y1):min(image_height, y2), sx1:sx2]
+        if roi.size == 0:
+            refined.append((lane_name, x1, x2, y1, y2))
+            continue
+        high = np.percentile(roi, 85, axis=0)
+        low = np.percentile(roi, 40, axis=0)
+        profile = gaussian_filter1d(high - low, 3)
+        center = (x1 + x2) / 2 - sx1
+        local_left = max(0, int(center - lane_width / 2))
+        local_right = min(len(profile), int(center + lane_width / 2) + 1)
+        peak_idx = local_left + int(np.argmax(profile[local_left:local_right]))
+        baseline = float(np.percentile(profile, 20))
+        peak = float(profile[peak_idx])
+        if peak <= baseline:
+            refined.append((lane_name, x1, x2, y1, y2))
+            continue
+        threshold = baseline + 0.2 * (peak - baseline)
+        left = peak_idx
+        right = peak_idx
+        while left > 0 and profile[left] > threshold:
+            left -= 1
+        while right < len(profile) - 1 and profile[right] > threshold:
+            right += 1
+        rx1 = max(0, sx1 + left - 4)
+        rx2 = min(image_width, sx1 + right + 4)
+        if rx2 - rx1 < lane_width * 0.75 or rx2 - rx1 > lane_width * 1.35:
+            refined.append((lane_name, x1, x2, y1, y2))
+        else:
+            refined.append((lane_name, int(rx1), int(rx2), y1, y2))
+    return refined
 
-    For each lane, the horizontal signal is collapsed into a vertical
-    profile using the 65th percentile across lane width. This keeps bands
-    that span much of the lane while reducing single-pixel speckles.
-    """
+
+def is_marker(lane_name: str) -> bool:
+    return lane_name in {"L", "Ladder", "Marker"}
+
+
+def is_marker_lane(lane_name: str, marker_lanes=None) -> bool:
+    """API back-compat — accepts a marker set or uses the default."""
+    if marker_lanes is None:
+        return is_marker(lane_name)
+    return lane_name in marker_lanes
+
+
+def detect_lane_bands(signal: np.ndarray, lanes: list, marker_lanes=None) -> list:
+    """Detect band peaks in each lane. `marker_lanes` is accepted for
+    API back-compat; the script uses the hardcoded {L,Ladder,Marker} set."""
+    _ = marker_lanes
     bands = []
-
     for lane_name, x1, x2, y1, y2 in lanes:
         lane = signal[y1:y2, x1:x2]
         if lane.size == 0:
             continue
-
-        vertical_profile = np.percentile(lane, 65, axis=1)
-        vertical_profile = gaussian_filter1d(vertical_profile, 2.2)
-
-        baseline = gaussian_filter1d(vertical_profile, 18)
-        peak_profile = vertical_profile - baseline
+        profile = np.percentile(lane, 65, axis=1)
+        profile = gaussian_filter1d(profile, 2.2)
+        baseline = gaussian_filter1d(profile, 18)
+        peak_profile = profile - baseline
         peak_profile[peak_profile < 0] = 0
-
         min_prominence = max(np.percentile(peak_profile, 90) * 0.45, 1.5)
         min_distance = 18
-
-        # The colored ladder has many strong bands packed more tightly and
-        # should use a slightly more permissive lane-specific threshold.
-        if is_marker_lane(lane_name, marker_lanes):
+        if is_marker(lane_name):
             min_prominence = max(np.percentile(peak_profile, 80) * 0.30, 2.0)
             min_distance = 20
-
-        peaks, properties = find_peaks(
+        peaks, props = find_peaks(
             peak_profile,
             distance=min_distance,
             prominence=min_prominence,
             width=(3, 35),
         )
-
-        for index, peak in enumerate(peaks):
-            prominence = float(properties["prominences"][index])
-            width = float(properties["widths"][index])
-
-            if is_marker_lane(lane_name, marker_lanes) or prominence >= 10:
+        for i, peak in enumerate(peaks):
+            prominence = float(props["prominences"][i])
+            width = float(props["widths"][i])
+            if is_marker(lane_name) or prominence >= 10:
                 confidence = "clear"
             elif prominence >= 4:
                 confidence = "faint"
             else:
-                # These were shown as tentative during tuning, but excluded
-                # from the final probable-band count.
                 continue
-
             bands.append(
                 {
                     "lane": lane_name,
@@ -379,205 +313,182 @@ def detect_lane_bands(
                     "confidence": confidence,
                 }
             )
-
     return bands
 
 
-def assign_band_groups(
-    bands: list,
-    tolerance: int,
-    marker_lanes: set,
-) -> None:
-    """
-    Group sample bands by vertical position.
-
-    The group labels are useful for comparing the same apparent molecular
-    weight across lanes. The ladder is left ungrouped because it is a marker.
-    """
-    sample_bands = [
-        band for band in bands if not is_marker_lane(band["lane"], marker_lanes)
-    ]
-    sample_bands.sort(key=lambda band: band["y"])
+def assign_groups(bands: list, tolerance: int) -> None:
+    sample = [band for band in bands if not is_marker(band["lane"])]
+    sample.sort(key=lambda band: band["y"])
     groups = []
-
-    for band in sample_bands:
+    for band in sample:
         if not groups:
             groups.append([band])
             continue
-
-        current_center = float(np.median([item["y"] for item in groups[-1]]))
-        if abs(band["y"] - current_center) <= tolerance:
+        center = float(np.median([item["y"] for item in groups[-1]]))
+        if abs(band["y"] - center) <= tolerance:
             groups[-1].append(band)
         else:
             groups.append([band])
-
     for group_index, group in enumerate(groups, start=1):
-        group_name = f"G{group_index}"
         for band in group:
-            band["band_group"] = group_name
-
+            band["band_group"] = f"G{group_index}"
     for band in bands:
         band.setdefault("band_group", "")
 
 
-def filter_sample_band_groups(
-    bands: list,
-    group_tolerance: int,
-    marker_lanes: set,
-    min_lanes: int,
-    consensus_tolerance: int,
-) -> list:
-    """
-    Remove weak automatic detections that do not form a cross-lane band row.
+def assign_band_groups(bands: list, tolerance: int, marker_lanes=None) -> None:
+    """API back-compat — wraps assign_groups (ignores marker_lanes; the script
+    uses the hardcoded {L,Ladder,Marker} set via is_marker)."""
+    _ = marker_lanes
+    assign_groups(bands, tolerance)
 
-    A quantitative blot normally compares the same molecular-weight region
-    across lanes. In fully automatic mode this consensus filter suppresses
-    isolated dust/hot spots while keeping marker bands untouched.
-    """
-    if min_lanes <= 1:
-        return bands
 
-    assign_band_groups(bands, group_tolerance, marker_lanes)
+def filter_sample_groups(bands: list, min_lanes: int, tolerance: int) -> list:
+    assign_groups(bands, tolerance)
     grouped = defaultdict(list)
-    kept_marker = [band for band in bands if is_marker_lane(band["lane"], marker_lanes)]
+    kept = [band for band in bands if is_marker(band["lane"])]
     for band in bands:
-        if band.get("band_group") and not is_marker_lane(band["lane"], marker_lanes):
+        if band["band_group"] and not is_marker(band["lane"]):
             grouped[band["band_group"]].append(band)
-
-    kept_sample = []
     for group_bands in grouped.values():
-        median_y = float(np.median([band["y"] for band in group_bands]))
-        close_bands = [
-            band for band in group_bands if abs(band["y"] - median_y) <= consensus_tolerance
-        ]
-        close_lanes = {band["lane"] for band in close_bands}
-        if len(close_lanes) < min_lanes:
+        lanes = {band["lane"] for band in group_bands}
+        if len(lanes) < min_lanes:
             continue
-
+        median_y = float(np.median([band["y"] for band in group_bands]))
         by_lane = defaultdict(list)
         for band in group_bands:
-            if abs(band["y"] - median_y) <= group_tolerance:
+            if abs(band["y"] - median_y) <= tolerance:
                 by_lane[band["lane"]].append(band)
-
         for lane_bands in by_lane.values():
-            kept_sample.append(
-                max(
-                    lane_bands,
-                    key=lambda band: (
-                        -abs(band["y"] - median_y),
-                        float(band.get("prominence", 0.0)),
-                    ),
-                )
-            )
-
-    kept = kept_marker + kept_sample
+            kept.append(max(lane_bands, key=lambda band: band["prominence"]))
     kept.sort(key=lambda band: (band["x1"], band["y"]))
     for band in kept:
         band.pop("band_group", None)
+    assign_groups(kept, tolerance)
     return kept
 
 
-def detect_ladder_lane(signal: np.ndarray, sample_lanes: list, min_bands: int = 5):
-    """Locate the MOLECULAR-WEIGHT LADDER column, which auto_detect_lanes can't
-    find (the ladder is a tall vertical marker strip whose bands merge into
-    vertical blobs that fail the horizontal band-shape filter).
-
-    The ladder is conventionally the LEFTMOST lane, so we search only the region
-    LEFT of the leftmost detected sample lane — this both (a) avoids the
-    right-edge membrane noise that can fake a dense column, and (b) means a blot
-    whose ladder was already detected as the leftmost lane (nothing to its left)
-    correctly adds nothing. We pick the window with the most band-like peaks,
-    scored by total peak strength so a faint noisy patch can't win.
-
-    Returns (x1, x2, y1, y2) for the ladder lane box, or None."""
-    height, width = signal.shape
-    if not sample_lanes:
-        return None
-
-    def _count_bands(x0, x1, y0, y1):
-        sub = signal[y0:y1, x0:x1]
-        if sub.size == 0:
-            return 0
-        vp = gaussian_filter1d(np.percentile(sub, 65, axis=1), 2.2)
-        base = gaussian_filter1d(vp, 18)
-        pp = vp - base
-        pp[pp < 0] = 0
-        mp = max(np.percentile(pp, 80) * 0.30, 2.0)
-        pk, _p = find_peaks(pp, distance=20, prominence=mp, width=(3, 35))
-        return int(len(pk))
-
-    # If the leftmost detected lane is ALREADY ladder-like (many bands), the
-    # ladder was captured by auto_detect_lanes — don't add a duplicate.
-    left_lane = min(sample_lanes, key=lambda l: l[1])
-    if _count_bands(left_lane[1], left_lane[2], left_lane[3], left_lane[4]) >= min_bands:
-        return None
-
-    sx1 = min(l[1] for l in sample_lanes)
-    if sx1 < 30:
-        return None  # no room left of the leftmost lane → ladder already leftmost
-    gy1 = min(l[3] for l in sample_lanes)
-    gy2 = max(l[4] for l in sample_lanes)
-
-    best = None  # (score, x0, x1, ytop, ybot)
-    for win in (32, 40, 48):
-        step = max(4, win // 6)
-        x = 0
-        while x + win <= sx1:
-            col = signal[:, x:x + win]
-            vp = gaussian_filter1d(np.percentile(col, 65, axis=1), 2.2)
-            base = gaussian_filter1d(vp, 18)
-            pp = vp - base
-            pp[pp < 0] = 0
-            min_prom = max(np.percentile(pp, 80) * 0.30, 2.0)
-            peaks, props = find_peaks(pp, distance=20, prominence=min_prom, width=(3, 35))
-            if len(peaks) >= min_bands:
-                score = float(np.sum(props["prominences"]))  # total band strength
-                if best is None or score > best[0]:
-                    ytop = int(max(0, int(peaks.min()) - 25))
-                    ybot = int(min(height, int(peaks.max()) + 25))
-                    best = (score, x, x + win, ytop, ybot)
-            x += step
-
-    if best is None:
-        return None
-    _, x0, x1, ytop, ybot = best
-    # Expand the lane box to cover both the sample y-range and the ladder's own
-    # (taller) extent so detect_lane_bands sees every marker band.
-    return (int(x0), int(x1), int(min(gy1, ytop)), int(max(gy2, ybot)))
+def filter_sample_band_groups(bands, group_tolerance, marker_lanes, min_lanes, consensus_tolerance):
+    """API back-compat alias for filter_sample_groups."""
+    _ = marker_lanes
+    _ = consensus_tolerance
+    return filter_sample_groups(bands, min_lanes=min_lanes, tolerance=group_tolerance)
 
 
-def detect_wb_bands_in_lanes(
+def centered_bounds(center: int, size: int, lower: int, upper: int) -> tuple:
+    size = max(1, min(int(size), upper - lower))
+    start = int(round(center - (size - 1) / 2))
+    end = start + size
+    if start < lower:
+        start = lower
+        end = start + size
+    if end > upper:
+        end = upper
+        start = end - size
+    return int(start), int(end)
+
+
+def estimate_lane_centers(plane: np.ndarray, lanes: list, bands: list) -> dict:
+    centers = {}
+    for lane_name, x1, x2, y1, y2 in lanes:
+        centers[lane_name] = int(round((x1 + x2 - 1) / 2))
+        if is_marker(lane_name):
+            continue
+        estimates = []
+        for band in bands:
+            if band["lane"] != lane_name or band["confidence"] != "clear":
+                continue
+            sy1 = max(y1, band["y"] - 14)
+            sy2 = min(y2, band["y"] + 15)
+            sx1 = max(0, x1 - 10)
+            sx2 = min(plane.shape[1], x2 + 10)
+            roi = plane[sy1:sy2, sx1:sx2].astype(np.float64)
+            bg = robust_background(roi)[0]
+            residual = roi - bg
+            residual[residual < 0] = 0
+            if not np.any(residual):
+                continue
+            profile = gaussian_filter1d(np.percentile(residual, 70, axis=0), 1.2)
+            baseline = float(np.percentile(profile, 20))
+            peak = float(np.max(profile))
+            threshold = baseline + 0.22 * (peak - baseline)
+            cols = np.where(profile > threshold)[0]
+            if cols.size:
+                weights = np.maximum(profile[cols], 1e-6)
+                estimates.append(int(round(float(np.average(cols + sx1, weights=weights)))))
+        if estimates:
+            centers[lane_name] = int(round(float(np.median(estimates))))
+    return centers
+
+
+def quantify(
     rgb: np.ndarray,
-    lanes,
-    signal_polarity: str = DEFAULT_SIGNAL_POLARITY,
-    marker_lanes=None,
-):
-    """detect_bands.py's --lanes pipeline: detect bands WITHIN user-defined lane
-    boxes — NO auto lane detection and NO cross-lane consensus filter (the script
-    only applies that filter in auto mode). `lanes` is a list of
-    (name, x1, x2, y1, y2) in pixels of the analysed image. Returns
-    (clamped_lanes, bands, (H, W))."""
-    if marker_lanes is None:
-        marker_lanes = set(DEFAULT_MARKER_LANES)
+    lanes: list,
+    bands: list,
+    roi_width: int,
+    roi_height: int,
+    channel: str,
+) -> list:
+    plane = measurement_plane(rgb, channel)
+    lane_centers = estimate_lane_centers(plane, lanes, bands)
+    lane_lookup = {lane[0]: lane for lane in lanes}
+    rows = []
+    for index, band in enumerate(bands, start=1):
+        if band["lane"] not in lane_lookup:
+            continue
+        lane_name, lane_x1, lane_x2, lane_y1, lane_y2 = lane_lookup[band["lane"]]
+        if is_marker(band["lane"]):
+            x1, x2 = lane_x1 + 4, lane_x2 - 4
+            y1, y2 = centered_bounds(band["y"], roi_height, lane_y1, lane_y2)
+        else:
+            x1, x2 = centered_bounds(lane_centers[band["lane"]], roi_width, 0, plane.shape[1])
+            y1, y2 = centered_bounds(band["y"], roi_height, lane_y1, lane_y2)
+        roi = plane[y1:y2, x1:x2].astype(np.float64)
+        area = int(roi.size)
+        gap = 6
+        above_y2 = max(lane_y1, y1 - gap)
+        above_y1 = max(lane_y1, above_y2 - (y2 - y1))
+        below_y1 = min(lane_y2, y2 + gap)
+        below_y2 = min(lane_y2, below_y1 + (y2 - y1))
+        parts = []
+        if above_y2 > above_y1:
+            parts.append(plane[above_y1:above_y2, x1:x2].reshape(-1))
+        if below_y2 > below_y1:
+            parts.append(plane[below_y1:below_y2, x1:x2].reshape(-1))
+        bg_pixels = np.concatenate(parts) if parts else np.array([])
+        bg_mean, bg_sd, bg_area = robust_background(bg_pixels)
+        raw_sum = float(np.sum(roi))
+        corrected = raw_sum - bg_mean * area
+        row = dict(band)
+        row.update(
+            {
+                "band_index": index,
+                "roi_x1": int(x1),
+                "roi_x2_exclusive": int(x2),
+                "roi_y1": int(y1),
+                "roi_y2_exclusive": int(y2),
+                "roi_area": area,
+                "background_area": bg_area,
+                "raw_integrated_density": round(raw_sum, 3),
+                "background_mean": round(bg_mean, 3),
+                "background_sd": round(bg_sd, 3),
+                "background_corrected_integrated_density": round(corrected, 3),
+                "background_corrected_mean": round(corrected / area, 3) if area else None,
+                "qc_flags": "ladder_reference" if is_marker(band["lane"]) else "",
+            }
+        )
+        rows.append(row)
+    return rows
+
+
+# ───────────────── API wrappers used by the wb-detect-bands endpoint ──────
+
+
+def _coerce_rgb(rgb: np.ndarray) -> np.ndarray:
     rgb = np.asarray(rgb)
     if rgb.ndim != 3 or rgb.shape[2] < 3:
         raise ValueError("expected an HxWx3 RGB image")
-    rgb = rgb[:, :, :3].astype(np.float32)
-
-    _display, analysis = contrast_scale(rgb)
-    signal = horizontal_signal(analysis, signal_polarity)
-    height, width = signal.shape
-
-    clamped = []
-    for (name, x1, x2, y1, y2) in lanes:
-        x1 = max(0, min(int(round(x1)), width - 1))
-        x2 = max(x1 + 1, min(int(round(x2)), width))
-        y1 = max(0, min(int(round(y1)), height - 1))
-        y2 = max(y1 + 1, min(int(round(y2)), height))
-        clamped.append((str(name) or "Lane", x1, x2, y1, y2))
-
-    bands = detect_lane_bands(signal, clamped, marker_lanes)
-    return clamped, bands, signal.shape
+    return rgb[:, :, :3].astype(np.float32)
 
 
 def detect_wb_bands(
@@ -591,54 +502,77 @@ def detect_wb_bands(
     threshold_percentile: float = DEFAULT_AUTO_LANE_THRESHOLD_PERCENTILE,
     max_band_width: int = DEFAULT_AUTO_LANE_MAX_BAND_WIDTH,
     first_lane_marker: bool = True,
-    detect_ladder: bool = False,  # NOT in detect_bands.py auto mode; off for parity
+    detect_ladder: bool = False,
+    expected_lanes=DEFAULT_EXPECTED_LANES,
+    lane_width=None,
+    roi_width: int = DEFAULT_ROI_WIDTH,
+    roi_height: int = DEFAULT_ROI_HEIGHT,
+    channel: str = DEFAULT_MEASUREMENT_CHANNEL,
 ):
-    """Run the script's default auto-detect path and return (lanes, bands, (H, W)).
+    """Run detect_bands_equal_boxes.py's full pipeline on an HxWx3 image. The
+    optional kwargs are accepted for API back-compat with the previous module
+    (signal_polarity / consensus_tolerance / max_band_width / first_lane_marker
+    / detect_ladder / marker_lanes are not used by the new script). Returns
+    (lanes, quantified_bands, signal.shape)."""
+    _ = signal_polarity, marker_lanes, consensus_tolerance, max_band_width, first_lane_marker, detect_ladder
 
-    ``rgb`` is an ``HxWx3`` array (any numeric dtype). Returns the named lanes
-    (list of ``(name, x1, x2, y1, y2)``) and the consensus-filtered bands
-    (list of dicts with lane/x1/x2/y/width/confidence/prominence), plus the
-    signal shape so callers can normalise coordinates.
-    """
-    if marker_lanes is None:
-        marker_lanes = set(DEFAULT_MARKER_LANES)
-
-    rgb = np.asarray(rgb)
-    if rgb.ndim != 3 or rgb.shape[2] < 3:
-        raise ValueError("expected an HxWx3 RGB image")
-    rgb = rgb[:, :, :3].astype(np.float32)
-
-    _display, analysis = contrast_scale(rgb)
-    signal = horizontal_signal(analysis, signal_polarity)
+    rgb_f = _coerce_rgb(rgb)
+    _display, analysis = contrast_scale(rgb_f)
+    signal = horizontal_signal(analysis)
 
     lanes = auto_detect_lanes(
-        signal=signal,
-        expected_lanes=None,
-        lane_width=None,
-        lane_y1=None,
-        lane_y2=None,
-        min_gap=min_gap,
+        signal,
+        expected_lanes=expected_lanes,
+        lane_width=lane_width,
         threshold_percentile=threshold_percentile,
-        max_band_width=max_band_width,
+        min_gap=min_gap,
     )
-    # Add the MW ladder column (auto_detect_lanes only finds horizontal sample
-    # bands, never the vertical marker strip). Inserted leftmost so the
-    # first-lane-marker naming labels it "L" and its bands are quantified.
-    if detect_ladder:
-        ladder = detect_ladder_lane(signal, lanes)
-        if ladder is not None:
-            lanes = list(lanes) + [("Ladder", ladder[0], ladder[1], ladder[2], ladder[3])]
-            lanes.sort(key=lambda lane: lane[1])
-    lanes = name_auto_lanes(lanes, lane_names=None, first_lane_marker=first_lane_marker)
-
-    bands = detect_lane_bands(signal, lanes, marker_lanes)
+    lanes = refine_lane_edges(signal, lanes)
+    bands = detect_lane_bands(signal, lanes)
     if min_group_lanes > 1:
-        bands = filter_sample_band_groups(
-            bands,
-            group_tolerance=group_tolerance,
-            marker_lanes=marker_lanes,
-            min_lanes=min_group_lanes,
-            consensus_tolerance=consensus_tolerance,
-        )
+        bands = filter_sample_groups(bands, min_lanes=min_group_lanes, tolerance=group_tolerance)
+    else:
+        assign_groups(bands, group_tolerance)
+    quantified = quantify(rgb_f, lanes, bands, roi_width, roi_height, channel)
+    return lanes, quantified, signal.shape
 
-    return lanes, bands, signal.shape
+
+def detect_wb_bands_in_lanes(
+    rgb: np.ndarray,
+    lanes,
+    signal_polarity: str = DEFAULT_SIGNAL_POLARITY,
+    marker_lanes=None,
+    roi_width: int = DEFAULT_ROI_WIDTH,
+    roi_height: int = DEFAULT_ROI_HEIGHT,
+    channel: str = DEFAULT_MEASUREMENT_CHANNEL,
+    group_tolerance: int = DEFAULT_GROUP_TOLERANCE,
+):
+    """--lanes mode: detect bands WITHIN user-defined lane boxes (skips auto-
+    detect + consensus filter). `lanes` is a list of (name, x1, x2, y1, y2)
+    in analysed-image pixels. Returns (clamped_lanes, quantified_bands, shape)."""
+    _ = signal_polarity, marker_lanes
+
+    rgb_f = _coerce_rgb(rgb)
+    _display, analysis = contrast_scale(rgb_f)
+    signal = horizontal_signal(analysis)
+    height, width = signal.shape
+
+    clamped = []
+    for (name, x1, x2, y1, y2) in lanes:
+        x1c = max(0, min(int(round(x1)), width - 1))
+        x2c = max(x1c + 1, min(int(round(x2)), width))
+        y1c = max(0, min(int(round(y1)), height - 1))
+        y2c = max(y1c + 1, min(int(round(y2)), height))
+        clamped.append((str(name) or "Lane", x1c, x2c, y1c, y2c))
+
+    bands = detect_lane_bands(signal, clamped)
+    assign_groups(bands, group_tolerance)
+    quantified = quantify(rgb_f, clamped, bands, roi_width, roi_height, channel)
+    return clamped, quantified, signal.shape
+
+
+def detect_ladder_lane(*args, **kwargs):
+    """Back-compat shim — the new script handles the ladder via the leftmost
+    auto-detected lane being named "L" (no separate ladder heuristic)."""
+    _ = args, kwargs
+    return None

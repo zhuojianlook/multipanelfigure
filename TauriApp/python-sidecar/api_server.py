@@ -6724,17 +6724,23 @@ def wb_detect_bands(body: WbBandDetectRequest):
         print(f"[wb-detect] detection failed: {_e}", file=__s.stderr, flush=True)
         return {"lanes": [], "mode": mode, "polarity": polarity, "error": str(_e)}
 
-    # Band ROI box geometry — MATCH detect_bands.py's quantify_bands defaults:
-    # a UNIFORM height of (roi_half_height * 2 + 1) centred on the band y, and
-    # the full lane width. (--roi-half-height default = 12 → 25 px.) This
-    # replaces the old variable y±(width·1.2) slivers so boxes look like the
-    # script's. Detection runs at native resolution, so 25 px matches 1:1.
-    ROI_HALF_H = 12
+    # Band ROI box geometry — use the UNIFORM equal-size boxes that
+    # detect_bands_equal_boxes.py's `quantify` produces directly. The script
+    # builds each sample-lane ROI as 74×33 px centred on the lane's *estimated*
+    # x-centre (peak-driven, not just lane midpoint) and the band's y, then
+    # ladder lanes use lane-width × roi_height. We surface those exact pixel
+    # boxes (roi_x1 / roi_y1 / roi_x2_exclusive / roi_y2_exclusive) as
+    # normalised 0..1 rectangles for the UI — byte-for-byte the same boxes the
+    # CLI would emit in band_quantification_*_annotated.png.
     out = []
     for b in bands:
-        x0n = max(0.0, b["x1"] / W); x1n = min(1.0, b["x2"] / W)
-        y0n = max(0.0, (b["y"] - ROI_HALF_H) / H)
-        y1n = min(1.0, (b["y"] + ROI_HALF_H + 1) / H)
+        try:
+            rx1 = int(b["roi_x1"]); rx2 = int(b["roi_x2_exclusive"])
+            ry1 = int(b["roi_y1"]); ry2 = int(b["roi_y2_exclusive"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        x0n = max(0.0, rx1 / W); x1n = min(1.0, rx2 / W)
+        y0n = max(0.0, ry1 / H); y1n = min(1.0, ry2 / H)
         if x1n - x0n > 0.004 and y1n - y0n > 0.003:
             lane_name = str(b.get("lane") or "")
             grp = str(b.get("band_group") or "")
