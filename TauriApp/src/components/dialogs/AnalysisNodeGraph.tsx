@@ -4011,17 +4011,60 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
 
   /** Attach an inset (looked up by InsetSource.key) to a source node. */
   const addSourceToNode = useCallback((nodeId: string, sourceKey: string) => {
-    setNodes((cur) => {
-      const inset = insetSources.find((s) => s.key === sourceKey);
-      if (!inset) return cur;
-      return cur.map((n) => {
-        if (n.id !== nodeId || n.data.kind !== "source") return n;
-        const existing = n.data.sources || [];
-        // Avoid duplicating the same inset into the same source.
-        if (existing.some((s) => s.key === sourceKey)) return n;
-        return { ...n, data: { ...n.data, sources: [...existing, inset] } };
+    const inset = insetSources.find((s) => s.key === sourceKey);
+    if (!inset) return;
+    // Snapshot the BEFORE-attach state so we can decide whether to auto-wire.
+    // We use the closed-over `nodes` here — the template layout (positions +
+    // process-node kinds) doesn't depend on whether this attach has landed
+    // yet, only on the existing graph.
+    const src = nodes.find((n) => n.id === nodeId);
+    const srcExisting = (src?.data.sources || []);
+    const firstAttachOnEmpty = src?.data.kind === "source"
+      && srcExisting.length === 0
+      && !srcExisting.some((s) => s.key === sourceKey);
+
+    setNodes((cur) => cur.map((n) => {
+      if (n.id !== nodeId || n.data.kind !== "source") return n;
+      const existing = n.data.sources || [];
+      if (existing.some((s) => s.key === sourceKey)) return n;   // dedup
+      return { ...n, data: { ...n.data, sources: [...existing, inset] } };
+    }));
+
+    // Auto-wire: templates put Source + downstream chain on the canvas, but
+    // the source has no output handle until a file is dropped, so the
+    // template can't pre-wire the first edge. As soon as the first source
+    // lands, create the edge to the closest downstream process node that's
+    // expecting an image input and isn't already wired. Heuristic: smallest
+    // Δx where the process node is to the RIGHT of this source (natural
+    // template layout). Skipped if the user has already drawn their own
+    // edges off this source.
+    if (firstAttachOnEmpty && src) {
+      setEdges((eds) => {
+        if (eds.some((e) => e.source === nodeId && (e.sourceHandle || "").startsWith("out_image_"))) {
+          return eds;   // user already wired something off this source
+        }
+        const candidates = nodes
+          .filter((n) =>
+            n.id !== nodeId &&
+            n.data.kind !== "source" &&
+            n.position.x > src.position.x &&
+            !eds.some((e) => e.target === n.id && (e.targetHandle || "").startsWith("in_image"))
+          )
+          .sort((a, b) => (a.position.x - src.position.x) - (b.position.x - src.position.x));
+        const target = candidates[0];
+        if (!target) return eds;
+        const newEdge: Edge = {
+          id: `e_${nodeId}_out_image_0__${target.id}_in_image`,
+          source: nodeId, sourceHandle: "out_image_0",
+          target: target.id, targetHandle: "in_image",
+          type: "deletable", animated: false,
+          style: { stroke: PORT_COLOR.image, strokeWidth: 2 },
+        };
+        consoleRef.current += `\n[auto-wire] ${src.data.label || nodeId} → ${target.data.label || target.id}\n`;
+        setConsoleOut(consoleRef.current);
+        return [...eds, newEdge];
       });
-    });
+    }
     // Adding an inset spawns a new output handle on this source
     // node (`out_image_<idx>`).  RF v12's internal handle-cache
     // can serve stale data even after useUpdateNodeInternals — the
@@ -4031,7 +4074,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     // definitively kills the "have to exit + re-enter analysis to
     // connect source → first node" bug.
     setHandleRev((r) => r + 1);
-  }, [insetSources, setNodes]);
+  }, [insetSources, nodes, setNodes, setEdges]);
 
   /** Detach the inset at `idx` from a source node. Also removes
    *  any edges that were wired off the now-defunct output handle. */
@@ -4121,8 +4164,35 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       const add = entries.filter((e) => !have.has(e.key));
       return add.length ? [...add, ...cur] : cur;
     });
-    logUpload(`[upload] added ${entries.length} source(s): ${names.join(", ")}`);
-  }, [logUpload]);
+    // Auto-park direct uploads under a dedicated "Direct upload" folder so
+    // they're visually separated from builder-flagged insets (which appear
+    // in the "All sources" / Ungrouped section). Folder is created on first
+    // upload and re-used after that. Idempotent: existing keys aren't
+    // duplicated; pre-existing user folders aren't touched.
+    const newKeys = entries.map((e) => e.key);
+    if (newKeys.length > 0) {
+      persistSourceGroups(((): SourceGroup[] => {
+        const existing = sourceGroups.find((g) => g.name === "Direct upload");
+        if (existing) {
+          // Move newly-uploaded keys into "Direct upload"; pull them out of
+          // any other group so each source stays in exactly one place.
+          return sourceGroups.map((g) => {
+            if (g.id === existing.id) {
+              const merged = Array.from(new Set([...g.sourceKeys, ...newKeys]));
+              return { ...g, sourceKeys: merged };
+            }
+            return { ...g, sourceKeys: g.sourceKeys.filter((k) => !newKeys.includes(k)) };
+          });
+        }
+        // First upload → create the folder and seed it.
+        return [
+          { id: `grp_direct_${Date.now().toString(36)}`, name: "Direct upload", sourceKeys: newKeys },
+          ...sourceGroups,
+        ];
+      })());
+    }
+    logUpload(`[upload] added ${entries.length} source(s) to "Direct upload": ${names.join(", ")}`);
+  }, [logUpload, sourceGroups, persistSourceGroups]);
 
   /** Browser/dev fallback: upload File objects from the hidden <input>. Uses
    *  the RAW api.uploadImages (no figureStore pollution → builder timeline
