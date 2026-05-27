@@ -81,6 +81,7 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import { api } from "../../api/client";
 import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
+import { switchToDocument } from "../../utils/projectNav";
 import BandPickerDialog, {
   type BandPickerConfig,
   generateBandPickerCode,
@@ -214,7 +215,7 @@ function NodeConsolePanel({ nodeId, text, status }: {
 // Drop target for output cards from the left grid.  Lists the
 // staged items as small chips with an × to unstage; a Commit
 // button at the bottom pushes the whole batch to its destination.
-function StagingZone({ title, hint, bucket, staged, allOutputs, onAdd, onRemove, onCommit }: {
+function StagingZone({ title, hint, bucket, staged, allOutputs, onAdd, onRemove, onCommit, openDocs, defaultTargetDocId, onTargetDocChange, targetDocId }: {
   title: string;
   hint: string;
   bucket: "main" | "collage";
@@ -223,9 +224,15 @@ function StagingZone({ title, hint, bucket, staged, allOutputs, onAdd, onRemove,
   onAdd: (key: string) => void;
   onRemove: (key: string) => void;
   onCommit: () => void;
+  // Target-MPF picker — only used for bucket === "main"; ignored otherwise.
+  openDocs?: { id: string; name: string }[];
+  defaultTargetDocId?: string | null;
+  onTargetDocChange?: (id: string) => void;
+  targetDocId?: string;
 }) {
   const [hovered, setHovered] = useState(false);
   const stagedList = allOutputs.filter((o) => staged.has(`${o.nodeId}-${o.outputId}`));
+  const targetDocName = (openDocs || []).find((d) => d.id === (targetDocId || defaultTargetDocId))?.name;
   return (
     <Box
       onDragOver={(e) => {
@@ -290,11 +297,36 @@ function StagingZone({ title, hint, bucket, staged, allOutputs, onAdd, onRemove,
           })
         )}
       </Box>
+      {/* Target-doc picker (only for the "Main timeline" zone). Lets the
+          user choose WHICH open MPF tab the outputs land in. Defaults to
+          the active doc. The commit step switches to the target,
+          uploads, and switches back so the user doesn't leave their
+          current tab. */}
+      {bucket === "main" && openDocs && openDocs.length > 1 && (
+        <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, mt: 0.4 }}>
+          <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.disabled", flexShrink: 0 }}>
+            Target:
+          </Typography>
+          <TextField select size="small" value={targetDocId || defaultTargetDocId || ""}
+            onChange={(e) => onTargetDocChange?.(e.target.value)}
+            SelectProps={{ MenuProps: { PaperProps: { sx: { maxHeight: 240 } } } }}
+            inputProps={{ style: { fontSize: "0.6rem", padding: "2px 4px" } }}
+            sx={{ flex: 1, minWidth: 0, "& .MuiInputBase-root": { fontSize: "0.6rem" } }}>
+            {openDocs.map((d) => (
+              <MenuItem key={d.id} value={d.id} sx={{ fontSize: "0.7rem", py: 0.25 }}>
+                {d.name}
+              </MenuItem>
+            ))}
+          </TextField>
+        </Box>
+      )}
       <Button size="small" variant="contained" color="primary"
         onClick={onCommit}
         disabled={stagedList.length === 0}
         sx={{ mt: 0.5, fontSize: "0.6rem", textTransform: "none", py: 0.25 }}>
-        Send {stagedList.length || ""} to {bucket === "main" ? "main timeline" : "collage"}
+        Send {stagedList.length || ""} to {bucket === "main"
+          ? (targetDocName ? `MPF · ${targetDocName}` : "main timeline")
+          : "collage"}
       </Button>
     </Box>
   );
@@ -854,7 +886,9 @@ export interface InsetSource {
 
 export interface NodeOutput {
   /** Stable id within a node — `out_image_<idx>`, `out_table_<name>`,
-   *  `out_plot_<idx>`. Used as the handle id. */
+   *  `out_plot_<idx>`. Used as the handle id. Archived previous-run
+   *  outputs append a __v<N> suffix to keep them distinct from the
+   *  newest run's outputs (which use the canonical id). */
   id: string;
   kind: DataKind;
   name: string;
@@ -869,6 +903,18 @@ export interface NodeOutput {
   rCode?: string;
   rInterpreter?: string | null;
   rPlotIndex?: number;
+  /** Destinations this output has already been committed to (one entry
+   *  per "Send" click). Surfaced as small chips on the output card so
+   *  the user can see at a glance "sent to → My Figure / Collage".
+   *  The output stays in the drawer after a send so it can be re-used
+   *  on a different destination later. */
+  sentTo?: string[];
+  /** Empty/undefined = current run. Set to "v1", "v2", ... when a node
+   *  re-run pushes the previous output here so the user can compare
+   *  old vs new without losing the old one. Capped at v2 per output
+   *  slot (older versions drop on the next re-run). Image / plot only;
+   *  tables aren't archived. */
+  versionLabel?: string;
 }
 
 /** Placeholder output entry — what the code DECLARES it will produce.
@@ -3269,6 +3315,10 @@ export interface AggregatedOutput {
   rCode?: string;
   rInterpreter?: string | null;
   rPlotIndex?: number;
+  /** Mirrors NodeOutput.sentTo — destinations this output was committed to. */
+  sentTo?: string[];
+  /** Mirrors NodeOutput.versionLabel — "v1" / "v2" for previous-run archives. */
+  versionLabel?: string;
 }
 
 export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: Props) {
@@ -3497,6 +3547,13 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // toolbar buttons.
   const [stagedForMain, setStagedForMain] = useState<Set<string>>(new Set());
   const [stagedForCollage, setStagedForCollage] = useState<Set<string>>(new Set());
+  // Target MPF tab for the "Send to main timeline" commit. null → use the
+  // currently-active doc. Picker lets the user route outputs to any open
+  // .mpf tab without having to leave the Analysis workspace.
+  const [mainTargetDocId, setMainTargetDocId] = useState<string | null>(null);
+  // Open MPF docs from the collage store (the tab strip is rendered there).
+  const openDocs = useCollageStore((s) => s.openDocs);
+  const activeDocId = useCollageStore((s) => s.activeDocId);
 
   // ImageJ availability — surfaced like checkMatlab.
   const [imagejKind, setImagejKind] = useState<string>("");
@@ -4712,16 +4769,38 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       const nodeOut = stdout.trim() ? stdout : "(no console output)";
       consoleRef.current += stdout.trim() ? stdout + "\n" : "(no console output)\n";
       setConsoleOut(consoleRef.current);
-      setNodes((cur) => cur.map((n) => n.id === node.id ? {
-        ...n,
-        data: {
-          ...n.data,
-          outputs: newOutputs,
-          status: result.success ? "ok" : "error",
-          error: result.success ? undefined : (result.stderr || "Run failed").slice(0, 200),
-          consoleOut: nodeOut,
-        },
-      } : n));
+      setNodes((cur) => cur.map((n) => {
+        if (n.id !== node.id) return n;
+        // Archive previous-run image/plot outputs as v1 / v2 so the user
+        // can compare old vs new in the drawer without losing the old
+        // one. Tables are NOT archived (CSVs replace cleanly; rarely
+        // compared visually). Cap at v2: the newest run is current,
+        // the prior run becomes v1, and pre-v1 falls off.
+        const prev = n.data.outputs || [];
+        const archived: NodeOutput[] = [];
+        for (const o of prev) {
+          if (o.kind === "table") continue;          // newest only
+          if (!o.versionLabel) {
+            archived.push({ ...o, id: `${o.id}__v1`, versionLabel: "v1" });
+          } else {
+            const m = o.versionLabel.match(/^v(\d+)$/);
+            const next = m ? Number(m[1]) + 1 : 2;
+            if (next > 2) continue;                  // drop too-old
+            const base = o.id.replace(/__v\d+$/, "");
+            archived.push({ ...o, id: `${base}__v${next}`, versionLabel: `v${next}` });
+          }
+        }
+        return {
+          ...n,
+          data: {
+            ...n.data,
+            outputs: [...newOutputs, ...archived],
+            status: result.success ? "ok" : "error",
+            error: result.success ? undefined : (result.stderr || "Run failed").slice(0, 200),
+            consoleOut: nodeOut,
+          },
+        };
+      }));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       consoleRef.current += `error: ${msg}\n`;
@@ -4776,6 +4855,8 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       rCode: o.rCode,
       rInterpreter: o.rInterpreter,
       rPlotIndex: o.rPlotIndex,
+      sentTo: o.sentTo || [],
+      versionLabel: o.versionLabel,
     })));
   }, [nodes]);
   // Notify parent (for save/load) — debounce by deferring to a microtask.
@@ -4862,20 +4943,63 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       return next;
     });
   }, []);
-  const commitStaged = useCallback(async (bucket: "main" | "collage") => {
+  /** Mark each committed output with its destination so the drawer card
+   *  shows "→ <destination>" chips. The output itself is NOT removed —
+   *  the user can send the same output to other destinations later. */
+  const tagSentTo = useCallback((items: AggregatedOutput[], dest: string) => {
+    setNodes((cur) => cur.map((n) => {
+      const idsInNode = new Set(items.filter((i) => i.nodeId === n.id).map((i) => i.outputId));
+      if (idsInNode.size === 0) return n;
+      return {
+        ...n,
+        data: {
+          ...n.data,
+          outputs: (n.data.outputs || []).map((o) => {
+            if (!idsInNode.has(o.id)) return o;
+            const cur = o.sentTo || [];
+            return cur.includes(dest) ? o : { ...o, sentTo: [...cur, dest] };
+          }),
+        },
+      };
+    }));
+  }, [setNodes]);
+
+  const commitStaged = useCallback(async (bucket: "main" | "collage", mainTargetDocId?: string) => {
     const keys = bucket === "main" ? stagedForMain : stagedForCollage;
     const list = allOutputsRef.current.filter(
       (o) => keys.has(`${o.nodeId}-${o.outputId}`) && (o.kind === "plot" || o.kind === "image")
     );
     if (list.length === 0) return;
     if (bucket === "main") {
-      const stamp = Date.now();
-      const files = list.map((o) => b64ToFile(o.payload, `${outputFilename(o)}_${stamp}.png`));
+      // Pick destination MPF tab. Default = currently-active doc. If the
+      // user picked a DIFFERENT tab in the dropdown we switch there first
+      // (figureStore.uploadImages always writes to the active doc), then
+      // switch back to where they were so they're not surprised by the
+      // builder swap. switchToDocument handles snapshot/restore.
+      const cs = useCollageStore.getState();
+      const originalDocId = cs.activeDocId;
+      const targetDocId = mainTargetDocId || originalDocId || "";
+      const docName = cs.openDocs.find((d) => d.id === targetDocId)?.name || "MPF";
+      let switched = false;
       try {
+        if (targetDocId && targetDocId !== originalDocId) {
+          await switchToDocument(targetDocId);
+          switched = true;
+        }
+        const stamp = Date.now();
+        const files = list.map((o) => b64ToFile(o.payload, `${outputFilename(o)}_${stamp}.png`));
         const names = await uploadImages(files);
-        consoleRef.current += `\n[${names.length} output(s) committed to main image timeline.]\n`;
+        consoleRef.current += `\n[${names.length} output(s) sent to "${docName}".]\n`;
+        // Tag the kept outputs with the destination chip — user sees
+        // "→ docName" on each card and can re-send later if needed.
+        tagSentTo(list, `MPF · ${docName}`);
       } catch (err) {
-        consoleRef.current += `\n[Main-timeline commit failed: ${err instanceof Error ? err.message : String(err)}]\n`;
+        consoleRef.current += `\n[Send to MPF failed: ${err instanceof Error ? err.message : String(err)}]\n`;
+      } finally {
+        // Restore the user's original tab if we wandered off.
+        if (switched && originalDocId && originalDocId !== targetDocId) {
+          try { await switchToDocument(originalDocId); } catch { /* best-effort */ }
+        }
       }
       setStagedForMain(new Set());
     } else {
@@ -4894,10 +5018,6 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           h: Math.round(h * scale),
           naturalW: w,
           naturalH: h,
-          // R plot re-run provenance (self-contained script + interpreter) so
-          // the collage's "Synchronize headers" can re-render it at a new size.
-          // The data CSV just needs a header row to satisfy the run-r
-          // boilerplate's read.csv — the real inputs are inlined in rCode.
           ...(o.rCode ? {
             rCode: o.rCode,
             rDataCsv: "Panel,Name,Group,Value,Unit\n",
@@ -4907,11 +5027,12 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         });
         placed++;
       }
-      consoleRef.current += `\n[${placed} output(s) committed to Collage Assembly.]\n`;
+      consoleRef.current += `\n[${placed} output(s) sent to Collage.]\n`;
+      tagSentTo(list, "Collage");
       setStagedForCollage(new Set());
     }
     setConsoleOut(consoleRef.current);
-  }, [stagedForMain, stagedForCollage, outputFilename, uploadImages, addCollageItem]);
+  }, [stagedForMain, stagedForCollage, outputFilename, uploadImages, addCollageItem, tagSentTo]);
 
   // ── Render ─────────────────────────────────────────────────
 
@@ -5954,6 +6075,38 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
                               staged{inMain && inCollage ? " (main+collage)" : inMain ? " (main)" : " (collage)"}
                             </Typography>
                           )}
+                          {/* "Sent to" chips — one per destination committed.
+                              The output stays visible after a send so the
+                              user can route the same asset to another tab. */}
+                          {(o.sentTo || []).length > 0 && (
+                            <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.25, mt: 0.25 }}>
+                              {(o.sentTo || []).map((dest, i) => (
+                                <Box key={`${dest}-${i}`}
+                                  sx={{
+                                    fontSize: "0.5rem", px: 0.5, py: 0.05, borderRadius: 0.5,
+                                    bgcolor: "success.dark", color: "common.white",
+                                    maxWidth: 140, overflow: "hidden",
+                                    textOverflow: "ellipsis", whiteSpace: "nowrap",
+                                  }}>
+                                  → {dest}
+                                </Box>
+                              ))}
+                            </Box>
+                          )}
+                          {/* Previous-run archive tag. Pinned to the bottom-
+                              right corner of the thumb so it's clearly NOT
+                              the current run when comparing side-by-side. */}
+                          {o.versionLabel && (
+                            <Box sx={{
+                              position: "absolute", bottom: 26, right: 4,
+                              bgcolor: "rgba(0,0,0,0.65)", color: "common.white",
+                              fontSize: "0.55rem", fontWeight: 700,
+                              px: 0.5, borderRadius: 0.4, lineHeight: 1.3,
+                              border: "1px solid rgba(255,255,255,0.3)",
+                            }}>
+                              {o.versionLabel}
+                            </Box>
+                          )}
                           <Button size="small" component="a"
                             href={o.kind === "table"
                               ? `data:text/csv;base64,${btoa(unescape(encodeURIComponent(o.payload)))}`
@@ -5972,14 +6125,18 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               {/* Right: staging column with two drop zones */}
               <Box sx={{ width: 280, flexShrink: 0, borderLeft: "1px solid", borderColor: "divider", display: "flex", flexDirection: "column", bgcolor: "background.paper" }}>
                 <StagingZone
-                  title="📤 Main timeline"
-                  hint="Drop plots / images here to queue for the main figure's image timeline."
+                  title="📤 Send to MPF"
+                  hint="Drop plots / images here to queue for the chosen MPF tab's image timeline. The outputs stay in this drawer after sending so you can re-use them in another tab."
                   bucket="main"
                   staged={stagedForMain}
                   allOutputs={allOutputs}
                   onAdd={(k) => toggleStaged("main", k)}
                   onRemove={(k) => toggleStaged("main", k)}
-                  onCommit={() => commitStaged("main")}
+                  onCommit={() => commitStaged("main", mainTargetDocId || activeDocId || undefined)}
+                  openDocs={openDocs}
+                  defaultTargetDocId={activeDocId}
+                  targetDocId={mainTargetDocId || activeDocId || undefined}
+                  onTargetDocChange={(id) => setMainTargetDocId(id)}
                 />
                 <StagingZone
                   title="🖼 Collage"
