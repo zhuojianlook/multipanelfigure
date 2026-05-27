@@ -2597,16 +2597,17 @@ df <- df[is.finite(df$value), , drop = FALSE]
 if (!is.null(levels_to_plot)) df <- df[df$level %in% levels_to_plot, , drop = FALSE]
 if (nrow(df) == 0) stop("No target bands to plot after filtering (check levels_to_plot / loading control).")
 
-# Assign each lane to a condition. Priority order:
+# Assign each band to a condition. Priority order:
 #   1. The R-side \`conditions\` override above (if non-empty).
 #   2. The \`group\` column emitted by the Band picker UI (its Groups panel).
 #   3. Fall back: every lane is its own condition (one bar per lane).
 lane2cond <- character(0)
+picker_groups <- "group" %in% names(df) && any(nzchar(as.character(df$group)))
 if (length(conditions) > 0) {
   for (cn in names(conditions)) for (ln in conditions[[cn]]) lane2cond[ln] <- cn
   df$condition <- ifelse(df$lane %in% names(lane2cond), lane2cond[df$lane], NA)
   cond_levels <- names(conditions)
-} else if ("group" %in% names(df) && any(nzchar(as.character(df$group)))) {
+} else if (picker_groups) {
   # Picker-driven groups: every band already carries its condition.
   df$condition <- ifelse(nzchar(as.character(df$group)), as.character(df$group), NA)
   cond_levels <- unique(df$condition[!is.na(df$condition)])
@@ -2616,8 +2617,21 @@ if (length(conditions) > 0) {
 }
 cond_levels <- cond_levels[cond_levels %in% unique(df$condition)]
 df$condition <- factor(df$condition, levels = cond_levels)
-df <- df[!is.na(df$condition), , drop = FALSE]   # explicit groups: keep only assigned lanes
-if (nrow(df) == 0) stop("No lanes matched any condition — set Groups in the Band picker or fill the 'conditions' list above.")
+df <- df[!is.na(df$condition), , drop = FALSE]   # explicit groups: keep only assigned bands
+if (nrow(df) == 0) stop("No bands matched any condition — set Groups in the Band picker or fill the 'conditions' list above.")
+
+# When the picker provides free-form groups, bands inside one group can come
+# from MULTIPLE levels — that's the point of "compare any band-set vs any
+# other". In that case we plot one bar per group across ALL its bands
+# (no level faceting). Otherwise (lane-driven conditions) we keep the
+# per-level facet behaviour so identical proteins stay in their own panel.
+free_form_groups <- picker_groups && length(conditions) == 0 &&
+  any(tapply(as.character(df$level), as.character(df$condition), function(v) length(unique(v))) > 1)
+
+# For free-form picker groups, collapse all bands into a single facet so
+# bars compare across the whole picker (across levels). Otherwise keep
+# per-level facets (lane-driven workflows = one comparison per protein).
+if (free_form_groups) df$level <- "All bands"
 
 # Scale within each level so the reference condition mean = 1.
 ref_c <- if (!is.null(ref_condition)) ref_condition else cond_levels[1]

@@ -48,13 +48,16 @@ export interface BandRoi {
   isReference?: boolean;
 }
 
-/** A user-defined experimental group — maps a condition NAME to the set of
- *  lane labels that are its biological replicates. Used by the R plot node
- *  to build the `conditions <- list(...)` mapping automatically. */
+/** A user-defined experimental group — maps a condition NAME to a set of
+ *  individual BANDS (by `name`, e.g. "B5", "B12") that get compared
+ *  against other groups in the downstream R plot. `lanes` is kept for
+ *  back-compat with older saved configs (whole-lane membership); new UI
+ *  populates `bands` exclusively. */
 export interface BandGroup {
   id: string;
   name: string;          // condition name shown on the x-axis
-  lanes: string[];       // lane LABELs (the "column" identity) in this group
+  bands?: string[];      // band NAMES (B1, B5, …) — preferred
+  lanes?: string[];      // legacy: lane LABELs (S1, …) — fallback for old configs
 }
 
 export interface BandPickerConfig {
@@ -180,13 +183,26 @@ def _robust_background(values):
 
 lc_level = CFG.get("loadingControlLevel")          # which level is the loading control
 
-# Lane → experimental group (condition name) from the picker's Groups UI.
-lane2group = {}
+# Band → group(s) and lane → group fallback from the picker's Groups UI.
+# Groups can now contain band NAMES (B1, B5, ...) for arbitrary band-set
+# comparisons, OR lane labels (S1, S2, ...) for the older lane-based form.
+band2group = {}; lane2group = {}
 for g in CFG.get("groups", []) or []:
-    name = (g.get("name") or "").strip()
-    if not name: continue
+    nm = (g.get("name") or "").strip()
+    if not nm: continue
+    for bn in g.get("bands", []) or []:
+        band2group[str(bn)] = nm
     for ln in g.get("lanes", []) or []:
-        lane2group[str(ln)] = name
+        lane2group[str(ln)] = nm
+
+# Pre-compute ALL ROI rects in pixel space so the background sampling can
+# exclude pixels that fall inside ANOTHER band's box. Without this, densely
+# packed bands (3-row blots etc.) get IOD = 0 because the above/below
+# slabs land on neighbouring bands and inflate the background.
+def _band_px(b):
+    bx0, by0, bx1, by1 = _px(b)
+    return (bx0, by0, bx1, by1)
+all_rects = [(_band_px(b), id(b)) for b in (CFG.get("lanes", []) or [])]
 
 rows = []
 for i, band in enumerate(CFG.get("lanes", [])):
@@ -195,26 +211,52 @@ for i, band in enumerate(CFG.get("lanes", [])):
         continue
     roi = plane[y0:y1, x0:x1].astype(np.float64)
     area = int(roi.size)
-    # Local background: slabs above and below the ROI, same width, gap=6
-    # — matches detect_bands_equal_boxes.py quantify().
+    # Other-band exclusion mask for the bg slabs.
+    others = [r for (r, ref) in all_rects if ref != id(band)]
+    def _excluded_mask(yslab1, yslab2):
+        if yslab2 <= yslab1: return np.zeros((0, x1 - x0), dtype=bool)
+        m = np.zeros((yslab2 - yslab1, x1 - x0), dtype=bool)
+        for (ox0, oy0, ox1, oy1) in others:
+            ix0 = max(x0, ox0); ix1 = min(x1, ox1)
+            iy0 = max(yslab1, oy0); iy1 = min(yslab2, oy1)
+            if ix1 > ix0 and iy1 > iy0:
+                m[iy0 - yslab1:iy1 - yslab1, ix0 - x0:ix1 - x0] = True
+        return m
+    # Local background: slabs above and below the ROI, same width, gap=6.
     gap, hh = 6, (y1 - y0)
     above_y2 = max(0, y0 - gap); above_y1 = max(0, above_y2 - hh)
     below_y1 = min(H, y1 + gap); below_y2 = min(H, below_y1 + hh)
     parts = []
-    if above_y2 > above_y1: parts.append(plane[above_y1:above_y2, x0:x1].reshape(-1))
-    if below_y2 > below_y1: parts.append(plane[below_y1:below_y2, x0:x1].reshape(-1))
+    if above_y2 > above_y1:
+        slab = plane[above_y1:above_y2, x0:x1]
+        msk = _excluded_mask(above_y1, above_y2)
+        parts.append(slab[~msk].reshape(-1))
+    if below_y2 > below_y1:
+        slab = plane[below_y1:below_y2, x0:x1]
+        msk = _excluded_mask(below_y1, below_y2)
+        parts.append(slab[~msk].reshape(-1))
     bg_pixels = np.concatenate(parts) if parts else np.array([])
-    bg_mean = _robust_background(bg_pixels)
+    # If neighbouring boxes ate too much of the slab, fall back to a per-ROI
+    # 5th-percentile floor — guarantees a meaningful (non-zero) IOD even
+    # when bands are packed shoulder-to-shoulder.
+    if bg_pixels.size >= max(20, area // 4):
+        bg_mean = _robust_background(bg_pixels)
+    else:
+        bg_mean = float(np.percentile(roi, 5)) if area else 0.0
     raw_sum = float(np.sum(roi))
     corrected = raw_sum - bg_mean * area
     lane = (band.get("label") or "").strip() or f"Lane {i + 1}"
     level = (band.get("level") or "").strip() or "Target"
     band_name = (band.get("name") or "").strip() or f"B{i + 1}"
+    # Group resolution: band-name match wins over lane match. Empty string
+    # means "ungrouped" — the downstream R plot leaves these out of the
+    # grouped bars (or shows them as their own bar, depending on plot mode).
+    grp = band2group.get(band_name) or lane2group.get(lane) or ""
     rows.append({
         "band": band_name,                         # UNIQUE per-row identifier
-        "lane": lane,                              # column / sample (group key)
+        "lane": lane,                              # column / sample
         "level": level,                            # target / MW row
-        "group": lane2group.get(lane, ""),         # condition / experimental group
+        "group": grp,                              # condition / experimental group
         "is_loading_control": bool(lc_level is not None and level == lc_level),
         "iod": float(max(corrected, 0.0)),
         "raw_integrated_density": raw_sum,
@@ -316,11 +358,17 @@ function autoDetectLanes(gray: Float32Array, w: number, h: number): BandRoi[] {
 
 // ── Approximate IOD for the live readout (display-res, guidance) ─
 // Mirrors the emitted Python's quantify(): measurement-plane sum minus the
-// mean of the slabs immediately above + below the ROI. The display-image
-// readout is APPROXIMATE — the run-time recomputes at full bit depth.
+// mean of the slabs immediately above + below the ROI, but with neighbour
+// exclusion — when bands are packed close together (3-row WB blots etc.)
+// the above/below slabs sit on TOP of other bands, so a naive mean is too
+// high and the corrected IOD clamps to 0. We skip pixels that fall inside
+// any other box, and if too few clean pixels remain, fall back to a 5th-
+// percentile-of-ROI floor (a per-band background that doesn't depend on
+// neighbouring regions at all).
 function approxIod(
   gray: Float32Array, w: number, h: number,
   lane: { x: number; y: number; w: number; h: number },
+  others: Array<{ x: number; y: number; w: number; h: number }>,
 ): number {
   const x0 = Math.max(0, Math.round(lane.x * w));
   const x1 = Math.min(w, Math.round((lane.x + lane.w) * w));
@@ -328,17 +376,43 @@ function approxIod(
   const y1 = Math.min(h, Math.round((lane.y + lane.h) * h));
   if (x1 <= x0 || y1 <= y0) return 0;
   const hh = y1 - y0;
-  // ROI raw sum on the inverted (dark→bright) display plane.
-  let roiSum = 0; let n = 0;
-  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { roiSum += 255 - gray[y * w + x]; n++; }
-  // Local background: slabs above + below, same width, gap=6 px.
+  // ROI: raw sum + the values themselves (for the percentile fallback).
+  let roiSum = 0; const roiVals: number[] = [];
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+    const v = 255 - gray[y * w + x];
+    roiSum += v; roiVals.push(v);
+  }
+  const n = roiVals.length;
+  // Other-box rects in pixel coords for fast point-in-box checks.
+  const others_px = others.map((o) => ({
+    x0: Math.round(o.x * w), x1: Math.round((o.x + o.w) * w),
+    y0: Math.round(o.y * h), y1: Math.round((o.y + o.h) * h),
+  }));
+  const inOther = (x: number, y: number) => {
+    for (const o of others_px) if (x >= o.x0 && x < o.x1 && y >= o.y0 && y < o.y1) return true;
+    return false;
+  };
+  // Local background slabs above + below, same width, gap=6, neighbour-excluded.
   const gap = 6;
   const ay2 = Math.max(0, y0 - gap), ay1 = Math.max(0, ay2 - hh);
   const by1Lo = Math.min(h, y1 + gap), by2 = Math.min(h, by1Lo + hh);
   let bgSum = 0, bgN = 0;
-  for (let y = ay1; y < ay2; y++) for (let x = x0; x < x1; x++) { bgSum += 255 - gray[y * w + x]; bgN++; }
-  for (let y = by1Lo; y < by2; y++) for (let x = x0; x < x1; x++) { bgSum += 255 - gray[y * w + x]; bgN++; }
-  const bgMean = bgN > 0 ? bgSum / bgN : 0;
+  for (let y = ay1; y < ay2; y++) for (let x = x0; x < x1; x++) {
+    if (!inOther(x, y)) { bgSum += 255 - gray[y * w + x]; bgN++; }
+  }
+  for (let y = by1Lo; y < by2; y++) for (let x = x0; x < x1; x++) {
+    if (!inOther(x, y)) { bgSum += 255 - gray[y * w + x]; bgN++; }
+  }
+  let bgMean: number;
+  if (bgN >= Math.max(20, Math.floor(n / 4))) {
+    bgMean = bgSum / bgN;
+  } else {
+    // Densely-packed bands → no clean slab pixels. Fall back to the 5th
+    // percentile of the ROI itself (per-band floor — what the picker used
+    // before the slab method was introduced).
+    const sorted = roiVals.slice().sort((a, b) => a - b);
+    bgMean = sorted[Math.floor(sorted.length * 0.05)] || 0;
+  }
   return Math.max(0, roiSum - bgMean * n);
 }
 
@@ -387,6 +461,9 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   // image+overlay wrapper, so the SVG geometry stays in disp-pixel coords
   // and pointer→normalised math doesn't need to know about zoom).
   const [view, setView] = useState<{ zoom: number; panX: number; panY: number }>({ zoom: 1, panX: 0, panY: 0 });
+  // Optional level filter for the Groups chip rows (so picking from many
+  // bands at the same MW row stays manageable).
+  const [groupLevelFilter, setGroupLevelFilter] = useState<string | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const imgAreaRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<DragState | null>(null);
@@ -464,7 +541,10 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   const iodById = useMemo(() => {
     const out: Record<string, number> = {};
     if (gray && natW && natH) {
-      for (const lane of cfg.lanes) out[lane.id] = approxIod(gray, natW, natH, lane);
+      for (const lane of cfg.lanes) {
+        const others = cfg.lanes.filter((o) => o.id !== lane.id);
+        out[lane.id] = approxIod(gray, natW, natH, lane, others);
+      }
     }
     return out;
   }, [gray, natW, natH, cfg]);
@@ -679,33 +759,36 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     setCfg((c) => ({ ...c, lanes: c.lanes.filter((l) => l.id !== id) }));
 
   // Groups (condition mappings used by the downstream R plot to build
-  // `conditions <- list(...)` automatically).
-  const groups = cfg.groups ?? [];
+  // `conditions <- list(...)` automatically). Each group is a free-form
+  // set of individual BAND names — so the user can compare any subset of
+  // bands against any other subset, regardless of lane or level.
+  const groups: BandGroup[] = cfg.groups ?? [];
+  // Helper: membership in a group is "bands" first, "lanes" fallback (so
+  // old saved configs still light up correctly until the user re-assigns).
+  const groupBands = (g: BandGroup): string[] => g.bands ?? [];
+  const isBandInGroup = (g: BandGroup, bandName: string, laneLabel: string) =>
+    (g.bands ?? []).includes(bandName) || (g.lanes ?? []).includes(laneLabel);
+
   const addGroup = () => {
     const used = new Set(groups.map((g) => g.name));
     let n = 1; while (used.has(`G${n}`)) n++;
-    const g: BandGroup = { id: uid("group"), name: `G${n}`, lanes: [] };
+    const g: BandGroup = { id: uid("group"), name: `G${n}`, bands: [] };
     setCfg((c) => ({ ...c, groups: [...(c.groups ?? []), g] }));
   };
   const renameGroup = (id: string, name: string) =>
     setCfg((c) => ({ ...c, groups: (c.groups ?? []).map((g) => g.id === id ? { ...g, name } : g) }));
   const deleteGroup = (id: string) =>
     setCfg((c) => ({ ...c, groups: (c.groups ?? []).filter((g) => g.id !== id) }));
-  const toggleLaneInGroup = (gid: string, laneLabel: string) =>
+  const toggleBandInGroup = (gid: string, bandName: string) =>
     setCfg((c) => ({
       ...c,
       groups: (c.groups ?? []).map((g) => {
         if (g.id !== gid) return g;
-        const has = g.lanes.includes(laneLabel);
-        return { ...g, lanes: has ? g.lanes.filter((l) => l !== laneLabel) : [...g.lanes, laneLabel] };
+        const current = g.bands ?? [];
+        const has = current.includes(bandName);
+        return { ...g, bands: has ? current.filter((b) => b !== bandName) : [...current, bandName] };
       }),
     }));
-  // Distinct lane labels available to assign — built from the bands.
-  const laneLabels = useMemo(() => {
-    const seen: string[] = [];
-    for (const l of cfg.lanes) if (l.label && !seen.includes(l.label)) seen.push(l.label);
-    return seen;
-  }, [cfg.lanes]);
 
   // Distinct levels (rows) present, in first-seen order, for coloring + the
   // loading-control selector.
@@ -791,33 +874,44 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     }
   };
 
-  // Render an 8-handle set for a normalised rect. When a band is selected
-  // (`selected`) the handles are notably larger (14×14 vs 8×8) and use a
-  // wider hit area so they're easy to grab — small handles on a zoomable
-  // canvas were unforgiving (the previous 8 px square at 1× already fell
-  // below the macOS pointer's effective grab radius).
+  // Render the 4 CORNER handles only — small dots placed slightly OUTSIDE
+  // the box so they don't obscure the band underneath. A large transparent
+  // hit-area square (~14 px) sits over each dot to keep them easy to grab.
+  // Edge midpoint handles are gone (they were rarely used and the corners
+  // already let you change both axes; cleaner band view, less clutter).
   const handlesFor = (
     rect: { x: number; y: number; w: number; h: number },
     id: string | null,
     roleHandle: string,
-    selected: boolean = false,
+    _selected: boolean = false,
   ) => {
-    const hs = [
-      { h: "nw", cx: rect.x, cy: rect.y }, { h: "n", cx: rect.x + rect.w / 2, cy: rect.y }, { h: "ne", cx: rect.x + rect.w, cy: rect.y },
-      { h: "w", cx: rect.x, cy: rect.y + rect.h / 2 }, { h: "e", cx: rect.x + rect.w, cy: rect.y + rect.h / 2 },
-      { h: "sw", cx: rect.x, cy: rect.y + rect.h }, { h: "s", cx: rect.x + rect.w / 2, cy: rect.y + rect.h }, { h: "se", cx: rect.x + rect.w, cy: rect.y + rect.h },
+    const corners = [
+      { h: "nw", cx: rect.x,            cy: rect.y,            ox: -1, oy: -1 },
+      { h: "ne", cx: rect.x + rect.w,   cy: rect.y,            ox:  1, oy: -1 },
+      { h: "sw", cx: rect.x,            cy: rect.y + rect.h,   ox: -1, oy:  1 },
+      { h: "se", cx: rect.x + rect.w,   cy: rect.y + rect.h,   ox:  1, oy:  1 },
     ];
-    const cur: Record<string, string> = { nw: "nwse-resize", se: "nwse-resize", ne: "nesw-resize", sw: "nesw-resize", n: "ns-resize", s: "ns-resize", e: "ew-resize", w: "ew-resize" };
-    // Zoom-aware handle size — keep the on-screen size constant so handles
-    // don't visually shrink/disappear when the user zooms in/out.
-    const sz = (selected ? 14 : 8) / Math.max(1, view.zoom);
-    const half = sz / 2;
-    return hs.map((hh) => (
-      <rect key={hh.h} data-role={roleHandle} data-id={id ?? undefined} data-handle={hh.h}
-        x={hh.cx * disp.w - half} y={hh.cy * disp.h - half} width={sz} height={sz}
-        fill="#fff" stroke="#1976d2" strokeWidth={selected ? 2 : 1.5} rx={2}
-        style={{ cursor: cur[hh.h] }} />
-    ));
+    const cur: Record<string, string> = { nw: "nwse-resize", se: "nwse-resize", ne: "nesw-resize", sw: "nesw-resize" };
+    // Visible dot stays ~5 px on-screen at any zoom. Hit-target is ~14 px so
+    // grabbing stays easy. Both are positioned slightly OUTSIDE the corner.
+    const z = Math.max(1, view.zoom);
+    const dotSz = 5 / z;
+    const hitSz = 14 / z;
+    const dotOff = 3 / z;   // how far the dot sits outside the corner
+    return corners.flatMap((c) => {
+      const cxPx = c.cx * disp.w + c.ox * dotOff;
+      const cyPx = c.cy * disp.h + c.oy * dotOff;
+      return [
+        // Generous hit area (invisible).
+        <rect key={`${c.h}-hit`} data-role={roleHandle} data-id={id ?? undefined} data-handle={c.h}
+          x={cxPx - hitSz / 2} y={cyPx - hitSz / 2} width={hitSz} height={hitSz}
+          fill="transparent" style={{ cursor: cur[c.h] }} />,
+        // Tiny visible dot — pointer-events none so the hit rect catches clicks.
+        <rect key={`${c.h}-dot`} pointerEvents="none"
+          x={cxPx - dotSz / 2} y={cyPx - dotSz / 2} width={dotSz} height={dotSz}
+          fill="#fff" stroke="#1976d2" strokeWidth={1.2 / z} rx={1 / z} />,
+      ];
+    });
   };
 
   return (
@@ -951,52 +1045,104 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
             </Typography>
           </Box>
 
-          {/* Groups (experimental conditions) — defines which LANES are
-              replicates of which condition. The downstream R plot turns
-              this into grouped bars (mean ± SD + significance) with no
-              R-code editing required. */}
+          {/* Groups (experimental conditions) — FREE assignment of any band
+              (by its unique Name) to any group, across levels and lanes.
+              The downstream R plot makes one bar per group from the bands
+              in it, with mean ± SD + pairwise significance — no R editing. */}
           <Box sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, p: 1 }}>
             <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 0.5 }}>
-              <Tooltip title="Group replicate lanes into experimental conditions (Control, Treatment, …). The downstream R plot draws one bar per group per level with mean ± SD and pairwise significance. Lanes left out of every group plot individually.">
-                <Typography variant="caption" sx={{ fontWeight: 700 }}>Groups (conditions)</Typography>
+              <Tooltip title="Click bands by NAME (B1, B2, …) into groups — any subset across any lane / level. The downstream R plot draws one bar per group with mean ± SD and pairwise significance.">
+                <Typography variant="caption" sx={{ fontWeight: 700 }}>Groups (free band selection)</Typography>
               </Tooltip>
-              <Button size="small" variant="outlined" onClick={addGroup} disabled={laneLabels.length === 0}
+              <Button size="small" variant="outlined" onClick={addGroup} disabled={cfg.lanes.length === 0}
                 sx={{ textTransform: "none", fontSize: "0.65rem", py: 0.1, px: 0.75, ml: "auto" }}>
                 + Group
               </Button>
             </Box>
             {groups.length === 0 ? (
               <Typography variant="caption" sx={{ color: "text.disabled", fontStyle: "italic", display: "block" }}>
-                {laneLabels.length === 0
-                  ? "Add bands first, then group lanes into conditions."
-                  : "No groups yet — click + Group, then tick the lanes (e.g. S1 S2 S3) that are replicates of one condition."}
+                {cfg.lanes.length === 0
+                  ? "Add bands first, then group them into conditions."
+                  : "No groups yet — click + Group, then click each band (B1, B2, …) you want in that group."}
               </Typography>
-            ) : groups.map((g) => (
-              <Box key={g.id} sx={{ display: "flex", alignItems: "flex-start", gap: 0.75, py: 0.4, borderTop: "1px dashed", borderColor: "divider" }}>
-                <TextField variant="standard" value={g.name}
-                  onChange={(e) => renameGroup(g.id, e.target.value)}
-                  inputProps={{ style: { fontSize: "0.78rem", fontWeight: 700, width: 80 } }} />
-                <Box sx={{ flex: 1, display: "flex", flexWrap: "wrap", gap: 0.4 }}>
-                  {laneLabels.map((ln) => {
-                    const on = g.lanes.includes(ln);
-                    return (
-                      <Box key={ln} onClick={() => toggleLaneInGroup(g.id, ln)}
-                        sx={{
-                          fontSize: "0.66rem", px: 0.6, py: 0.1, borderRadius: 0.75,
-                          cursor: "pointer", userSelect: "none",
-                          bgcolor: on ? "primary.main" : "transparent",
-                          color: on ? "primary.contrastText" : "text.secondary",
-                          border: "1px solid", borderColor: on ? "primary.main" : "divider",
-                          fontWeight: on ? 700 : 500,
-                        }}>
-                        {ln}
+            ) : (
+              <Box sx={{ display: "flex", flexDirection: "column", gap: 0.6 }}>
+                {/* Per-level "Filter to level" pills make picking from many
+                    bands easier — click a level to show only its bands in the
+                    chip rows below. */}
+                {levelOrder.length > 1 && (
+                  <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.4, alignItems: "center" }}>
+                    <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.disabled", mr: 0.4 }}>
+                      Show:
+                    </Typography>
+                    {(["__all__", ...levelOrder] as const).map((lv) => {
+                      const on = (groupLevelFilter || "__all__") === lv;
+                      return (
+                        <Box key={lv} onClick={() => setGroupLevelFilter(lv === "__all__" ? null : lv)}
+                          sx={{
+                            fontSize: "0.6rem", px: 0.55, py: 0.05, borderRadius: 0.75,
+                            cursor: "pointer", userSelect: "none",
+                            bgcolor: on ? "action.selected" : "transparent",
+                            border: "1px solid", borderColor: on ? "primary.main" : "divider",
+                            color: on ? "primary.main" : "text.secondary",
+                            fontWeight: on ? 700 : 500,
+                          }}>
+                          {lv === "__all__" ? "all levels" : lv}
+                        </Box>
+                      );
+                    })}
+                  </Box>
+                )}
+                {groups.map((g) => {
+                  const filteredBands = cfg.lanes.filter((l) => !groupLevelFilter || roiLevel(l) === groupLevelFilter);
+                  return (
+                    <Box key={g.id} sx={{ display: "flex", alignItems: "flex-start", gap: 0.75, py: 0.4, borderTop: "1px dashed", borderColor: "divider" }}>
+                      <TextField variant="standard" value={g.name}
+                        onChange={(e) => renameGroup(g.id, e.target.value)}
+                        inputProps={{ style: { fontSize: "0.78rem", fontWeight: 700, width: 80 } }} />
+                      <Box sx={{ flex: 1, display: "flex", flexWrap: "wrap", gap: 0.4 }}>
+                        {filteredBands.length === 0 ? (
+                          <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.disabled", fontStyle: "italic" }}>
+                            No bands at this level.
+                          </Typography>
+                        ) : filteredBands.map((b) => {
+                          const bn = roiName(b);
+                          const on = isBandInGroup(g, bn, b.label);
+                          const lv = roiLevel(b);
+                          const col = levelColor(lv, levelOrder);
+                          return (
+                            <Tooltip key={b.id} title={`${bn}  ·  Lane ${b.label}  ·  Level ${lv}`}>
+                              <Box onClick={() => toggleBandInGroup(g.id, bn)}
+                                sx={{
+                                  fontSize: "0.66rem", px: 0.55, py: 0.1, borderRadius: 0.75,
+                                  cursor: "pointer", userSelect: "none",
+                                  bgcolor: on ? col : "transparent",
+                                  color: on ? "primary.contrastText" : "text.secondary",
+                                  border: "1px solid", borderColor: on ? col : "divider",
+                                  fontWeight: on ? 700 : 500,
+                                  display: "inline-flex", alignItems: "center", gap: 0.3,
+                                }}>
+                                <Box component="span" sx={{ width: 6, height: 6, borderRadius: 0.3, bgcolor: col, opacity: on ? 0 : 1 }} />
+                                {bn}
+                              </Box>
+                            </Tooltip>
+                          );
+                        })}
                       </Box>
-                    );
-                  })}
+                      <IconButton size="small" onClick={() => deleteGroup(g.id)}><DeleteOutlineIcon sx={{ fontSize: 16 }} /></IconButton>
+                    </Box>
+                  );
+                })}
+                {/* "Bands in this group" summary count */}
+                <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, mt: 0.3 }}>
+                  {groups.map((g) => (
+                    <Typography key={g.id} variant="caption" sx={{ fontSize: "0.58rem", color: "text.disabled" }}>
+                      {g.name}: {groupBands(g).length} band(s)
+                    </Typography>
+                  ))}
                 </Box>
-                <IconButton size="small" onClick={() => deleteGroup(g.id)}><DeleteOutlineIcon sx={{ fontSize: 16 }} /></IconButton>
               </Box>
-            ))}
+            )}
           </Box>
 
           {/* Band list */}
