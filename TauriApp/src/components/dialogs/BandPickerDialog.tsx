@@ -253,7 +253,16 @@ def _robust_background(values):
 #       matches (kept so older saved nodes still normalise correctly).
 lc_enabled = bool(CFG.get("loadingControlEnabled"))
 plot_per_group = bool(CFG.get("plotPerGroup"))
-lc_by_lane = {str(k): str(v) for k, v in (CFG.get("lcBandByLane") or {}).items()}
+# Picker UI saves { lane_being_normalized: band_name_to_use_as_LC }, which
+# CAN be cross-lane (user-drawn box in lane S2 chosen as the LC for lane S1).
+lc_pick_for_lane = {str(k): str(v) for k, v in (CFG.get("lcBandByLane") or {}).items()}
+# Reverse map: bandName → set of lanes it serves as the LC for. A single
+# band MAY serve multiple lanes (e.g. when the user has only one good
+# housekeeping band on the membrane and reuses it).
+lc_for_by_band: dict = {}
+for _ln, _bn in lc_pick_for_lane.items():
+    if _bn:
+        lc_for_by_band.setdefault(_bn, []).append(_ln)
 lc_level   = CFG.get("loadingControlLevel")          # legacy
 
 # Band → group(s) and lane → group fallback from the picker's Groups UI.
@@ -325,10 +334,16 @@ for i, band in enumerate(CFG.get("lanes", [])):
     # means "ungrouped" — the downstream R plot leaves these out of the
     # grouped bars (or shows them as their own bar, depending on plot mode).
     grp = band2group.get(band_name) or lane2group.get(lane) or ""
-    # is_loading_control: per-lane band pick wins; legacy level fallback
-    # only used when the new toggle is off but a legacy level is set.
+    # is_loading_control: new path uses the picker's per-lane band pick,
+    # which can be CROSS-LANE (user picks B5 in lane S2 as the LC for
+    # lane S1). A band is "an LC" if it serves as the chosen LC for any
+    # lane. lc_for_lane carries the comma-joined list of lanes this band
+    # serves, so the downstream Normalize node can divide the correct
+    # rows by THIS band's IOD — without it, cross-lane picks silently
+    # fell through and the user's custom LC pixel went unused.
+    target_lanes_for_this_band = lc_for_by_band.get(band_name, []) if lc_enabled else []
     if lc_enabled:
-        is_lc = (lc_by_lane.get(lane, "") == band_name)
+        is_lc = len(target_lanes_for_this_band) > 0
     elif lc_level:
         is_lc = (level == lc_level)
     else:
@@ -341,6 +356,7 @@ for i, band in enumerate(CFG.get("lanes", [])):
         "lc_enabled": bool(lc_enabled),            # plot picks normalised vs raw
         "plot_per_group": bool(plot_per_group),    # split groups across figures
         "is_loading_control": bool(is_lc),
+        "lc_for_lane": ",".join(target_lanes_for_this_band),  # lanes this band normalises
         "iod": float(max(corrected, 0.0)),
         "raw_integrated_density": raw_sum,
         "background_corrected_integrated_density": corrected,

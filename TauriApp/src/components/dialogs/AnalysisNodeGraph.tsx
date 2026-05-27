@@ -2647,17 +2647,32 @@ def _num(x):
     try: return float(x)
     except Exception: return 0.0
 
-# Per-lane loading-control IOD: the band whose level is the loading control.
+# Loading-control IOD lookup keyed by the lane being NORMALISED (not by
+# the LC band's own lane — those CAN differ when the user picks a
+# cross-lane LC, e.g. lane S1's bands divided by a band from S2). The
+# picker emits a "lc_for_lane" column per row listing every lane this
+# row serves as the LC for; we reverse it here.
 lc_by_lane = {}
 for r in table:
-    if _truthy(r.get("is_loading_control")):
-        lc_by_lane[str(r.get("lane"))] = _num(r.get("iod"))
+    targets = str(r.get("lc_for_lane") or "").strip()
+    if not targets: continue
+    for ln in targets.split(","):
+        ln = ln.strip()
+        if ln: lc_by_lane[ln] = _num(r.get("iod"))
+
+# Legacy fallback: older picker output (or a non-picker workflow) carries
+# only is_loading_control, with no cross-lane mapping. Treat each LC band
+# as the normaliser for its OWN lane — same as the previous logic.
+if not lc_by_lane:
+    for r in table:
+        if _truthy(r.get("is_loading_control")):
+            lc_by_lane[str(r.get("lane"))] = _num(r.get("iod"))
 
 have_lc = len(lc_by_lane) > 0
 if have_lc:
-    print(f"loading control present in {len(lc_by_lane)} lane(s)")
+    print(f"loading control present for {len(lc_by_lane)} lane(s): {sorted(lc_by_lane.keys())}")
 else:
-    print("no loading-control level set — passing raw IOD through (normalized == iod)")
+    print("no loading-control set — passing raw IOD through (normalized == iod)")
 
 rows = []
 for r in table:
@@ -2756,24 +2771,49 @@ plot_per_group <- "plot_per_group" %in% names(df) &&
   any(tolower(as.character(df$plot_per_group)) %in% c("true", "1", "yes"))
 
 # Helper: render one ggplot for either a single group's subset of df /
-# summ (per-group mode) or the whole thing (combined mode).
+# summ (per-group mode) or the whole thing (combined mode). Layout
+# decisions are picked to avoid the chronic cut-off-axes problem that
+# ggplot's default margins inflict on dense bar charts:
+#   • Generous plot margins (top 18, right 18, bottom 22, left 22) so
+#     angled x labels + Y axis titles never clip the edge of the PNG.
+#   • Y-axis scale uses expansion(mult = c(0, 0.10)) — starts hard at
+#     0 (so the bar bases sit on the axis) but adds 10% headroom on
+#     top so the tallest bar + error whisker + jittered points don't
+#     touch the top edge.
+#   • Y-axis label formatter switches between scientific (very large
+#     IODs) and compact decimal (relative density) based on the value
+#     range, so labels stay readable.
+#   • Smaller-but-still-legible facet titles + 10-pt body so 3-up
+#     panels don't squish the y-axis ticks into noise.
 render_one <- function(d_sub, s_sub, facet_var, w, h, fname) {
+  # Pick a y-tick formatter based on the magnitude of values.
+  ymax_v <- if (nrow(s_sub) > 0) max(s_sub$mean + s_sub$sd, na.rm = TRUE) else 1
+  y_fmt <- if (val_col == "normalized") scales::label_number(accuracy = 0.1)
+           else if (is.finite(ymax_v) && ymax_v >= 1e5) scales::label_scientific(digits = 2)
+           else scales::label_number(big.mark = ",", accuracy = 1)
   p <- ggplot() +
     geom_col(data = s_sub, aes(x = band, y = mean, fill = band),
              width = 0.75, color = "grey25", linewidth = 0.3) +
     geom_errorbar(data = s_sub, aes(x = band, ymin = pmax(0, mean - sd), ymax = mean + sd),
                   width = 0.2, linewidth = 0.4) +
     geom_jitter(data = d_sub, aes(x = band, y = value),
-                width = 0.12, height = 0, size = 1.1, alpha = 0.65,
+                width = 0.12, height = 0, size = 1.2, alpha = 0.7,
                 color = "grey20", stroke = 0) +
-    theme_prism(base_size = 11) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.10)),
+                       labels = y_fmt) +
+    theme_prism(base_size = 12) +
     theme(legend.position = "none",
-          axis.text.x = element_text(angle = 35, hjust = 1, size = 8.5),
-          strip.text = element_text(face = "bold", size = 11),
-          plot.margin = margin(10, 12, 8, 10)) +
+          axis.title.y = element_text(margin = margin(r = 8)),
+          axis.text.x  = element_text(angle = 30, hjust = 1, vjust = 1, size = 9),
+          axis.text.y  = element_text(size = 9),
+          strip.text   = element_text(face = "bold", size = 11),
+          plot.subtitle = element_text(size = 9, color = "grey35",
+                                       margin = margin(b = 6)),
+          plot.margin = margin(t = 18, r = 18, b = 22, l = 22)) +
     labs(x = NULL, y = y_lab, subtitle = plot_subtitle)
   if (!is.null(facet_var)) p <- p + facet_wrap(as.formula(paste("~", facet_var)),
-                                                scales = "free", ncol = min(3, n_facets))
+                                                scales = "free_y",
+                                                ncol = min(3, n_facets))
   if (val_col == "normalized") {
     p <- p + geom_hline(yintercept = 1, linetype = "dashed", color = "grey55", linewidth = 0.4)
   }
@@ -2784,18 +2824,27 @@ render_one <- function(d_sub, s_sub, facet_var, w, h, fname) {
 if (plot_per_group) {
   # One PNG per group, each named "wb_<group>.png". Each one is movable
   # into the figure timeline independently — useful when you want one
-  # panel per protein/condition rather than a shared grid.
+  # panel per protein/condition rather than a shared grid. Per-panel
+  # canvas is slightly wider/taller than the old 700×900 so axes have
+  # the room they need for big-number IOD labels.
   for (g in groups) {
     d_sub <- df[df$group == g, , drop = FALSE]
     s_sub <- summ[summ$group == g, , drop = FALSE]
+    n_bands <- length(unique(as.character(d_sub$band)))
     safe_name <- gsub("[^A-Za-z0-9_-]", "_", g)
     render_one(d_sub, s_sub, NULL,
-               w = 700, h = 900, fname = paste0("wb_", safe_name, ".png"))
+               w = max(900, 120 * n_bands + 480),
+               h = 1000, fname = paste0("wb_", safe_name, ".png"))
   }
 } else {
+  # Combined facets — width scales with facet count, height with the
+  # number of rows (max 3 columns). Generous baseline so the y-axis
+  # labels never get crowded out by the bars.
+  n_bands_max <- max(vapply(groups, function(g) length(unique(as.character(df$band[df$group == g]))), integer(1)))
+  per_panel_w <- max(520, 110 * n_bands_max + 280)
   render_one(df, summ, "group",
-             w = max(1200, 500 * min(n_facets, 3)),
-             h = 350 * ceiling(n_facets / 3) + 200,
+             w = per_panel_w * min(n_facets, 3) + 80,
+             h = 1000 * ceiling(n_facets / 3),
              fname = "wb_band_comparison.png")
 }
 }
