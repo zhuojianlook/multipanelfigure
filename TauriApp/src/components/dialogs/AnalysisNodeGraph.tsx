@@ -2030,6 +2030,38 @@ function saveSourceGroups(gs: SourceGroup[]) {
   try { localStorage.setItem(SOURCE_GROUPS_KEY, JSON.stringify(gs)); } catch { /* ignore */ }
 }
 
+// Analysis-tab uploads (standalone images dropped directly onto the Analysis
+// tab via "+ Upload") live in component-local React state. When the user
+// switches tabs (Analysis → Collage → back), the AnalysisView UNMOUNTS, that
+// state is destroyed, and on remount the backend's listInsetAnalysisSources()
+// only returns BUILDER inset sources — so user uploads vanish.
+// Fix: persist their metadata to localStorage. The underlying image bytes
+// stay on the backend's loaded_images for the session, so on remount we can
+// re-show the tiles immediately and the workflow's name-based source
+// resolution still works. Stored key holds an array of upload InsetSource
+// entries (the subset where `name` is set and row/col are -1).
+const ANALYSIS_UPLOADS_KEY = "mpfig.analysis.uploads";
+// Per-source name-overrides (rename source in the Sources panel) persist too,
+// so the displayed labels survive a tab switch (the Sources panel re-renders
+// from the restored uploads + the override map).
+function loadAnalysisUploads(): InsetSource[] {
+  try {
+    const raw = localStorage.getItem(ANALYSIS_UPLOADS_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    // Light shape validation — drop entries that don't look like an upload.
+    return arr.filter((s): s is InsetSource =>
+      s && typeof s.key === "string" && typeof s.name === "string"
+      && (s.row === -1 || s.row === undefined),
+    );
+  } catch { return []; }
+}
+function saveAnalysisUploads(uploads: InsetSource[]) {
+  try { localStorage.setItem(ANALYSIS_UPLOADS_KEY, JSON.stringify(uploads)); }
+  catch { /* localStorage quota / disabled */ }
+}
+
 interface SavedWorkflow {
   id: string;
   name: string;
@@ -3213,7 +3245,15 @@ let analysisSessionStarted = false;
 function restoreSessionUnlessFreshLaunch(): WorkflowSession | null {
   if (!analysisSessionStarted) {
     analysisSessionStarted = true;
-    try { localStorage.removeItem(SESSION_KEY); } catch { /* ignore */ }
+    try {
+      localStorage.removeItem(SESSION_KEY);
+      // The backend's loaded_images is in-memory and doesn't survive a
+      // sidecar restart, so persisted analysis-upload tiles from a previous
+      // app run would be ghosts (clicking them would 404). Clear them on a
+      // fresh app launch — within a SINGLE run, leaving + returning to the
+      // Analysis tab still restores them (the flag is already set).
+      localStorage.removeItem(ANALYSIS_UPLOADS_KEY);
+    } catch { /* ignore */ }
     return null;
   }
   return loadWorkflowSession();
@@ -3262,8 +3302,11 @@ export interface AggregatedOutput {
 }
 
 export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: Props) {
-  // Inset sources from the backend (image ports for the source node).
-  const [insetSources, setInsetSources] = useState<InsetSource[]>([]);
+  // Inset sources from the backend (image ports for the source node). On
+  // mount we restore any analysis-tab uploads that were persisted before the
+  // last tab switch — they live in component-local state, so without this
+  // the user's uploaded files disappear every time the tab is left.
+  const [insetSources, setInsetSources] = useState<InsetSource[]>(() => loadAnalysisUploads());
   // Skeleton placeholders shown while an Analysis upload is in flight.
   // Each entry is a (best-effort) basename so the user sees WHICH file is
   // still landing — analysis-image reads (esp. 16-bit TIFFs) can take a few
@@ -3662,6 +3705,16 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   const removeImage = useFigureStore((s) => s.removeImage);
   const addCollageItem = useCollageStore((s) => s.addItem);
   void removeImage;  // wired below in discard flow
+
+  // Persist the analysis-upload subset of insetSources to localStorage so it
+  // survives a tab switch (the AnalysisView component unmounts when the user
+  // navigates to Collage or a builder tab, destroying all local React state).
+  // Filter: only entries with `name` set AND row === -1 — those are the
+  // standalone analysis uploads. Builder insets re-fetch from the backend.
+  useEffect(() => {
+    const uploads = insetSources.filter((s) => s.name && s.row === -1);
+    saveAnalysisUploads(uploads);
+  }, [insetSources]);
 
   // Load inset sources + MATLAB availability on open.
   useEffect(() => {
