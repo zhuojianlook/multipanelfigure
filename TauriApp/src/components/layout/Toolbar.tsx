@@ -34,7 +34,7 @@ import SystemUpdateAltIcon from "@mui/icons-material/SystemUpdateAlt";
 import DownloadIcon from "@mui/icons-material/Download";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import LibraryAddIcon from "@mui/icons-material/LibraryAdd";
-import { useCollageStore, PT_TO_PX, DEFAULT_TEXT_PT, PANEL_LABEL_DEFAULT_PT, panelLabelTextMap } from "../../store/collageStore";
+import { useCollageStore, PT_TO_PX, DEFAULT_TEXT_PT, PANEL_LABEL_DEFAULT_PT, panelLabelTextMap, panelReadingOrder } from "../../store/collageStore";
 import type { CollageItem } from "../../store/collageStore";
 import { api } from "../../api/client";
 import { check } from "@tauri-apps/plugin-updater";
@@ -408,19 +408,85 @@ function SaveCollageButton() {
   const setExportFormat = useCollageStore((s) => s.setExportFormat);
   const panelLabelUpper = useCollageStore((s) => s.panelLabelUpper);
   const panelLabelParen = useCollageStore((s) => s.panelLabelParen);
+  // Multi-page collage support (Phase 2). When >1 page exists the dialog
+  // shows a Scope toggle (Current page / All pages); for TIFF + PDF an
+  // extra "single multi-page file" checkbox lets the user pack every
+  // page into one file. PNG / JPEG always write one file per page.
+  const pages = useCollageStore((s) => s.pages);
+  const activePageId = useCollageStore((s) => s.activePageId);
+  const panelLabelNumberingMode = useCollageStore((s) => s.panelLabelNumberingMode);
+  const pageSyncFlat = useCollageStore((s) => s.pageSyncFlat);
   const [exporting, setExporting] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
+  const [scope, setScope] = useState<"current" | "all">("current");
+  const [multiPageFile, setMultiPageFile] = useState<boolean>(true);
+  // Auto-pick All pages by default when the collage has multiple pages and
+  // the modal opens — that's the natural intent of multi-page authoring.
+  useEffect(() => {
+    if (modalOpen) setScope(pages.length > 1 ? "all" : "current");
+  }, [modalOpen, pages.length]);
 
   const handleSave = async () => {
-    if (items.length === 0) {
+    // ── Build the page list we'll export. ──────────────────────
+    // Snapshot the active page so its current items + canvas live in the
+    // pages array (otherwise we'd read a stale snapshot for the active page).
+    pageSyncFlat();
+    const freshPages = useCollageStore.getState().pages;
+    const activePageIdx = freshPages.findIndex((p) => p.id === activePageId);
+    // Scope = "current" exports only the active page; "all" iterates every
+    // page in left-to-right order.
+    type ExportPage = {
+      name: string; items: CollageItem[]; canvasW: number; canvasH: number;
+      background: string; labelStart: number;
+    };
+    const exportPages: ExportPage[] = [];
+    if (scope === "current") {
+      const p = freshPages[activePageIdx] ?? null;
+      const name = p?.name ?? "page";
+      // For continuous numbering, even the "current page only" export honours
+      // the offset so its letters match what's on-screen.
+      const labelStart = panelLabelNumberingMode === "continuous"
+        ? freshPages.slice(0, activePageIdx >= 0 ? activePageIdx : 0)
+            .reduce((acc, pp) => acc + panelReadingOrder(pp.snapshot.items).length, 0)
+        : 0;
+      exportPages.push({
+        name, items, canvasW, canvasH, background, labelStart,
+      });
+    } else {
+      let offset = 0;
+      for (const p of freshPages) {
+        exportPages.push({
+          name: p.name,
+          items: p.snapshot.items,
+          canvasW: p.snapshot.canvasW,
+          canvasH: p.snapshot.canvasH,
+          background: p.snapshot.background,
+          labelStart: panelLabelNumberingMode === "continuous" ? offset : 0,
+        });
+        offset += panelReadingOrder(p.snapshot.items).length;
+      }
+    }
+    // Drop pages that are completely empty when "all" is selected (no point
+    // emitting blank files). Keep them in current-page mode so the user
+    // sees the empty-collage alert below.
+    const nonEmpty = scope === "all"
+      ? exportPages.filter((p) => p.items.length > 0)
+      : exportPages;
+    if (nonEmpty.length === 0) {
       await alertDialog({
         title: "Empty collage",
-        body: "No items in the collage to save. Add a figure or image first.",
+        body: scope === "all"
+          ? "No items on any page to save. Add a figure or image to at least one page first."
+          : "No items in the collage to save. Add a figure or image first.",
       });
       return;
     }
+
     const fmt = (exportFormat || "png").toLowerCase();
     const dlgExt = fmt === "jpeg" ? "jpg" : fmt;
+    // Pack-into-one-file only applies to TIFF / PDF (multi-page formats).
+    const packOneFile = scope === "all" && nonEmpty.length > 1
+      && (fmt === "tiff" || fmt === "pdf") && multiPageFile;
     // Ask WHERE to save first, so the native dialog appears immediately — the
     // high-DPI render below can take several seconds and we don't want the user
     // to think nothing happened.
@@ -429,7 +495,10 @@ function SaveCollageButton() {
     try {
       const { save } = await import("@tauri-apps/plugin-dialog");
       savePath = await save({
-        defaultPath: `collage.${dlgExt}`,
+        defaultPath: nonEmpty.length === 1 || packOneFile
+          ? `collage.${dlgExt}`
+          // Multiple files: ask for a "base path" — we'll append _<pagename> below.
+          : `collage_pages.${dlgExt}`,
         filters: [{ name: dlgExt.toUpperCase(), extensions: [dlgExt] }],
       });
       inTauri = true;
@@ -441,7 +510,19 @@ function SaveCollageButton() {
     // Output scale: the canvas is a 300-DPI page, so factor = DPI/300.
     const factor = Math.max(0.25, Math.min(4, exportDpi / 300));
     setExporting(true);
+    // Rasterise every page in `nonEmpty` to a base64 PNG (DPI-tagged).
+    // The render uses the page's own items / canvas dims / background.
+    const renderedPng: { name: string; b64: string; canvasWpx: number; canvasHpx: number }[] = [];
     try {
+    for (const __pg of nonEmpty) {
+    // Per-page aliases — shadow the outer closure-captured values so the
+    // existing rasterisation logic below can address them by their original
+    // names without any further renames.
+    const items = __pg.items;
+    const canvasW = __pg.canvasW;
+    const canvasH = __pg.canvasH;
+    const background = __pg.background;
+    const __labelStart = __pg.labelStart;
     const sorted = [...items].sort((a, b) => a.z - b.z);
 
     // ── Pre-render figures + R plots at the export resolution ──
@@ -561,7 +642,10 @@ function SaveCollageButton() {
       }
     };
     // Precompute each labeled item's letter (reading order + global format).
-    const labelTextById = panelLabelTextMap(sorted, panelLabelUpper, panelLabelParen);
+    // labelStart offsets the alphabet by the number of labelable items on
+    // all prior pages — so page 2's letters continue (continuous mode) or
+    // restart at A (per-page mode), matching the picker on-screen.
+    const labelTextById = panelLabelTextMap(sorted, panelLabelUpper, panelLabelParen, __labelStart);
     for (const it of sorted) {
       if (it.kind === "text") {
         withRotation(it, () => {
@@ -773,43 +857,96 @@ function SaveCollageButton() {
       });
     }
 
-    // Compose to a DPI-tagged PNG. For non-PNG formats, hand that PNG to the
-    // backend to convert (JPEG/TIFF/PDF) with the DPI embedded.
+    // Compose to a DPI-tagged PNG. For non-PNG formats, the conversion runs
+    // once for the whole batch below — collect the per-page PNG bytes here.
     const pngDataUrl = pngWithDpi(canvas.toDataURL("image/png"), exportDpi);
-    let b64 = pngDataUrl.split(",")[1] ?? "";
-    let ext = "png";
-    let mime = "image/png";
-    if (fmt !== "png") {
+    const b64 = pngDataUrl.split(",")[1] ?? "";
+    renderedPng.push({
+      name: __pg.name, b64,
+      canvasWpx: Math.round(canvasW * factor),
+      canvasHpx: Math.round(canvasH * factor),
+    });
+    }   // ← end per-page rasterisation loop
+
+    // ── Convert + write the final file(s). ─────────────────────────
+    // PNG: no backend conversion needed (PNG is already what we have).
+    // Otherwise: send all per-page PNGs to /api/collage/convert with the
+    // chosen format, multi_page=true when packing into one file.
+    type Out = { ext: string; mime: string; b64: string; pageName: string };
+    let outs: Out[] = [];
+    if (fmt === "png") {
+      outs = renderedPng.map((r) => ({ ext: "png", mime: "image/png", b64: r.b64, pageName: r.name }));
+    } else {
       try {
-        const conv = await api.convertCollage(
-          canvas.toDataURL("image/png").split(",")[1] ?? "",
-          fmt, exportDpi, background === "transparent" ? "#FFFFFF" : background,
-        );
-        b64 = conv.image;
-        ext = conv.ext || fmt;
-        mime = ext === "pdf" ? "application/pdf" : ext === "tiff" ? "image/tiff" : ext === "jpg" ? "image/jpeg" : "image/png";
+        const conv = await api.convertCollage({
+          image_b64s: renderedPng.map((r) => r.b64),
+          format: fmt, dpi: exportDpi,
+          background: background === "transparent" ? "#FFFFFF" : background,
+          multi_page: packOneFile,
+        });
+        const ext = conv.ext || fmt;
+        const mime = ext === "pdf" ? "application/pdf"
+          : ext === "tiff" ? "image/tiff"
+          : ext === "jpg" ? "image/jpeg" : "image/png";
+        // multi_page=true → one packed file. Otherwise: array, one per page.
+        const arr: string[] = Array.isArray(conv.images) ? conv.images
+          : (conv.image ? [conv.image] : []);
+        if (packOneFile && arr.length === 1) {
+          outs = [{ ext, mime, b64: arr[0], pageName: "" /* single file */ }];
+        } else {
+          outs = arr.map((b64, i) => ({
+            ext, mime, b64,
+            pageName: renderedPng[i]?.name ?? `page${i + 1}`,
+          }));
+        }
       } catch (e) {
         console.error("[collage] format convert failed", e);
-        await alertDialog({ title: "Convert failed", body: `Could not export as ${fmt.toUpperCase()} (is the backend running?). Saved as PNG instead.` });
+        await alertDialog({
+          title: "Convert failed",
+          body: `Could not export as ${fmt.toUpperCase()} (is the backend running?). Saving as PNG instead.`,
+        });
+        outs = renderedPng.map((r) => ({ ext: "png", mime: "image/png", b64: r.b64, pageName: r.name }));
       }
     }
+
+    // Filename helper: when we have >1 output file, suffix the base path
+    // with the page name. "savePath" was the user's chosen base; we strip
+    // the extension, append "_<page>", and put the new ext back.
+    const buildFilePath = (basePath: string, ext: string, pageName: string, idx: number, total: number) => {
+      if (total <= 1) return basePath;
+      // Strip extension (last ".xxx") and append the suffix.
+      const lastDot = basePath.lastIndexOf(".");
+      const stem = lastDot > 0 ? basePath.slice(0, lastDot) : basePath;
+      const safe = (pageName || `page${idx + 1}`).replace(/[\\/:*?"<>|]+/g, "_");
+      return `${stem}_${safe}.${ext}`;
+    };
 
     if (inTauri && savePath) {
       try {
         const { invoke } = await import("@tauri-apps/api/core");
-        await invoke("save_base64_to_path", { path: savePath, dataB64: b64 });
-        await alertDialog({ title: "Collage saved", body: `Collage saved to ${savePath}\n${Math.round(canvasW * factor)}×${Math.round(canvasH * factor)} px @ ${exportDpi} DPI` });
+        for (let i = 0; i < outs.length; i++) {
+          const o = outs[i];
+          const path = buildFilePath(savePath, o.ext, o.pageName, i, outs.length);
+          await invoke("save_base64_to_path", { path, dataB64: o.b64 });
+        }
+        const summary = outs.length === 1
+          ? `Saved ${outs[0].ext.toUpperCase()} to ${savePath}`
+          : `Saved ${outs.length} ${outs[0].ext.toUpperCase()} file(s) (one per page) next to ${savePath}`;
+        await alertDialog({ title: "Collage saved", body: `${summary}\n@ ${exportDpi} DPI` });
       } catch (e) {
         console.error("[collage] save failed", e);
-        await alertDialog({ title: "Save failed", body: `Could not write the file. ${e instanceof Error ? e.message : String(e)}` });
+        await alertDialog({ title: "Save failed", body: `Could not write the file(s). ${e instanceof Error ? e.message : String(e)}` });
       }
       return;
     }
-    // Browser preview — download.
-    const a = document.createElement("a");
-    a.href = `data:${mime};base64,${b64}`;
-    a.download = `collage.${ext}`;
-    a.click();
+    // Browser preview — download each file.
+    for (let i = 0; i < outs.length; i++) {
+      const o = outs[i];
+      const a = document.createElement("a");
+      a.href = `data:${o.mime};base64,${o.b64}`;
+      a.download = outs.length === 1 ? `collage.${o.ext}` : `collage_${o.pageName || `page${i + 1}`}.${o.ext}`;
+      a.click();
+    }
     } finally {
       setExporting(false);
     }
@@ -854,8 +991,36 @@ function SaveCollageButton() {
               ))}
             </Box>
           </Box>
+          {/* Multi-page collage controls — only shown when >1 page exists. */}
+          {pages.length > 1 && (
+            <Box>
+              <Typography variant="caption" sx={{ color: "text.secondary", mb: 0.5, display: "block" }}>
+                Scope
+              </Typography>
+              <Box component="select" value={scope}
+                onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setScope(e.target.value as "current" | "all")}
+                sx={selectSx}>
+                <option value="current">Current page only</option>
+                <option value="all">All {pages.length} pages</option>
+              </Box>
+              {scope === "all" && (exportFormat === "tiff" || exportFormat === "pdf") && (
+                <Box sx={{ mt: 1.5, display: "flex", alignItems: "center", gap: 1 }}>
+                  <input id="multi-page-file" type="checkbox" checked={multiPageFile}
+                    onChange={(e) => setMultiPageFile(e.target.checked)} />
+                  <label htmlFor="multi-page-file" style={{ fontSize: "0.78rem", cursor: "pointer" }}>
+                    Pack every page into one {exportFormat.toUpperCase()} file
+                  </label>
+                </Box>
+              )}
+              {scope === "all" && (exportFormat === "png" || exportFormat === "jpeg") && (
+                <Typography variant="caption" sx={{ color: "text.disabled", fontStyle: "italic", display: "block", mt: 0.75 }}>
+                  {exportFormat.toUpperCase()} writes one file per page (e.g. <code>collage_pages_Page 1.{exportFormat === "jpeg" ? "jpg" : exportFormat}</code>).
+                </Typography>
+              )}
+            </Box>
+          )}
           <Typography variant="caption" sx={{ color: "text.secondary", lineHeight: 1.4 }}>
-            Output: {Math.round(canvasW * Math.max(0.25, Math.min(4, exportDpi / 300)))}×{Math.round(canvasH * Math.max(0.25, Math.min(4, exportDpi / 300)))} px.
+            Output: {Math.round(canvasW * Math.max(0.25, Math.min(4, exportDpi / 300)))}×{Math.round(canvasH * Math.max(0.25, Math.min(4, exportDpi / 300)))} px per page.
             Figures and R plots are re-rendered at this resolution; higher DPI takes longer.
           </Typography>
         </DialogContent>

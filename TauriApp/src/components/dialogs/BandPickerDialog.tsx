@@ -636,7 +636,10 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   const [view, setView] = useState<{ zoom: number; panX: number; panY: number }>({ zoom: 1, panX: 0, panY: 0 });
   // Optional level filter for the Groups chip rows (so picking from many
   // bands at the same MW row stays manageable).
-  const [groupLevelFilter, setGroupLevelFilter] = useState<string | null>(null);
+  // Per-group "Show: <level>" filter. Each group has its own chip row, so
+  // narrowing group A's band candidates to level G1 doesn't change what
+  // group B can see. Map: groupId → level (or "" / undefined = show all).
+  const [groupLevelFilter, setGroupLevelFilter] = useState<Record<string, string>>({});
   const svgRef = useRef<SVGSVGElement | null>(null);
   const imgAreaRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<DragState | null>(null);
@@ -1383,40 +1386,51 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
               </Typography>
             ) : (
               <Box sx={{ display: "flex", flexDirection: "column", gap: 0.6 }}>
-                {/* Per-level "Filter to level" pills make picking from many
-                    bands easier — click a level to show only its bands in the
-                    chip rows below. */}
-                {levelOrder.length > 1 && (
-                  <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.4, alignItems: "center" }}>
-                    <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.disabled", mr: 0.4 }}>
-                      Show:
-                    </Typography>
-                    {(["__all__", ...levelOrder] as const).map((lv) => {
-                      const on = (groupLevelFilter || "__all__") === lv;
-                      return (
-                        <Box key={lv} onClick={() => setGroupLevelFilter(lv === "__all__" ? null : lv)}
-                          sx={{
-                            fontSize: "0.6rem", px: 0.55, py: 0.05, borderRadius: 0.75,
-                            cursor: "pointer", userSelect: "none",
-                            bgcolor: on ? "action.selected" : "transparent",
-                            border: "1px solid", borderColor: on ? "primary.main" : "divider",
-                            color: on ? "primary.main" : "text.secondary",
-                            fontWeight: on ? 700 : 500,
-                          }}>
-                          {lv === "__all__" ? "all levels" : lv}
-                        </Box>
-                      );
-                    })}
-                  </Box>
-                )}
                 {groups.map((g) => {
-                  const filteredBands = cfg.lanes.filter((l) => !groupLevelFilter || roiLevel(l) === groupLevelFilter);
+                  const groupFilter = groupLevelFilter[g.id] || "";   // "" = show all
+                  const filteredBands = cfg.lanes.filter((l) => !groupFilter || roiLevel(l) === groupFilter);
                   return (
-                    <Box key={g.id} sx={{ display: "flex", alignItems: "flex-start", gap: 0.75, py: 0.4, borderTop: "1px dashed", borderColor: "divider" }}>
-                      <TextField variant="standard" value={g.name}
-                        onChange={(e) => renameGroup(g.id, e.target.value)}
-                        inputProps={{ style: { fontSize: "0.78rem", fontWeight: 700, width: 80 } }} />
-                      <Box sx={{ flex: 1, display: "flex", flexWrap: "wrap", gap: 0.4 }}>
+                    <Box key={g.id} sx={{ display: "flex", flexDirection: "column", gap: 0.3, py: 0.5, borderTop: "1px dashed", borderColor: "divider" }}>
+                      <Box sx={{ display: "flex", alignItems: "flex-start", gap: 0.75 }}>
+                        <TextField variant="standard" value={g.name}
+                          onChange={(e) => renameGroup(g.id, e.target.value)}
+                          inputProps={{ style: { fontSize: "0.78rem", fontWeight: 700, width: 80 } }} />
+                        {/* Per-GROUP "Show: <level>" pill row — independent
+                            per group so narrowing one doesn't affect siblings. */}
+                        {levelOrder.length > 1 && (
+                          <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.3, alignItems: "center", flex: 1 }}>
+                            <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.disabled", mr: 0.3 }}>
+                              Show:
+                            </Typography>
+                            {(["__all__", ...levelOrder] as const).map((lv) => {
+                              const on = (groupFilter || "__all__") === lv;
+                              return (
+                                <Box key={lv}
+                                  onClick={() => setGroupLevelFilter((prev) => {
+                                    const next = { ...prev };
+                                    if (lv === "__all__") delete next[g.id];
+                                    else next[g.id] = lv;
+                                    return next;
+                                  })}
+                                  sx={{
+                                    fontSize: "0.55rem", px: 0.5, py: 0.05, borderRadius: 0.75,
+                                    cursor: "pointer", userSelect: "none",
+                                    bgcolor: on ? "action.selected" : "transparent",
+                                    border: "1px solid", borderColor: on ? "primary.main" : "divider",
+                                    color: on ? "primary.main" : "text.secondary",
+                                    fontWeight: on ? 700 : 500,
+                                  }}>
+                                  {lv === "__all__" ? "all" : lv}
+                                </Box>
+                              );
+                            })}
+                          </Box>
+                        )}
+                        <IconButton size="small" onClick={() => deleteGroup(g.id)}>
+                          <DeleteOutlineIcon sx={{ fontSize: 16 }} />
+                        </IconButton>
+                      </Box>
+                      <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.4, pl: 0.5 }}>
                         {filteredBands.length === 0 ? (
                           <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.disabled", fontStyle: "italic" }}>
                             No bands at this level.
@@ -1445,7 +1459,6 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
                           );
                         })}
                       </Box>
-                      <IconButton size="small" onClick={() => deleteGroup(g.id)}><DeleteOutlineIcon sx={{ fontSize: 16 }} /></IconButton>
                     </Box>
                   );
                 })}

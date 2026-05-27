@@ -443,21 +443,43 @@ class ApiClient {
     }));
   }
 
-  /** Convert a composed collage PNG (base64) to JPEG / TIFF / PDF with the
-   *  given DPI embedded (PNG is handled client-side). Returns the converted
-   *  bytes as base64 + the file extension. */
+  /** Convert one or more composed collage PNG pages (base64) to JPEG /
+   *  TIFF / PDF with the given DPI embedded (PNG is handled client-side).
+   *  Returns `{images: string[]}` — one per output file. When `multi_page`
+   *  is set and the format supports it (TIFF / PDF), every page is packed
+   *  into ONE output file (response has a single-element `images` array).
+   *
+   *  Back-compat overload: legacy callers may pass a single image_b64
+   *  string + format + dpi + background as positional args. */
   async convertCollage(
-    imageB64: string,
-    format: string,
-    dpi: number,
-    background: string,
-  ): Promise<{ image: string; ext: string }> {
-    return apiJson("/api/collage/convert", "POST", JSON.stringify({
-      image_b64: imageB64,
-      format,
-      dpi: dpi && dpi > 0 ? Math.round(dpi) : 300,
-      background: background || "#FFFFFF",
-    }));
+    opts: {
+      image_b64?: string;
+      image_b64s?: string[];
+      format: string;
+      dpi: number;
+      background?: string;
+      multi_page?: boolean;
+    } | string,
+    format?: string,
+    dpi?: number,
+    background?: string,
+  ): Promise<{ images: string[]; ext: string; multi_page?: boolean; image?: string }> {
+    const body = typeof opts === "string"
+      ? {
+          image_b64: opts,
+          format: format || "png",
+          dpi: dpi && dpi > 0 ? Math.round(dpi) : 300,
+          background: background || "#FFFFFF",
+        }
+      : {
+          image_b64: opts.image_b64,
+          image_b64s: opts.image_b64s,
+          format: opts.format || "png",
+          dpi: opts.dpi && opts.dpi > 0 ? Math.round(opts.dpi) : 300,
+          background: opts.background || "#FFFFFF",
+          multi_page: !!opts.multi_page,
+        };
+    return apiJson("/api/collage/convert", "POST", JSON.stringify(body));
   }
 
   /** List the editable text elements of a saved .mpf (column/row headers,

@@ -5211,13 +5211,25 @@ def render_collage_figure(body: CollageFigureRenderRequest):
 
 
 class CollageConvertRequest(BaseModel):
-    """Convert a composed collage PNG (base64) to another output format with
-    the chosen DPI embedded. PNG is handled client-side; this serves JPEG /
-    TIFF / PDF via PIL."""
-    image_b64: str
-    format: str = "png"          # jpeg | tiff | pdf
+    """Convert one or more composed collage page PNGs (base64) to another
+    output format with the chosen DPI embedded. PNG is handled client-side;
+    this serves JPEG / TIFF / PDF via PIL.
+
+    Single-page back-compat: `image_b64` (string) → one input page, one
+    output file. Multi-page input: `image_b64s` (array) — when
+    `multi_page=True` AND format is TIFF / PDF the response packs every
+    page into ONE file (PIL `save_all=True, append_images=...`); for
+    other formats the response carries a list and the client saves each
+    page to its own file."""
+    image_b64: Optional[str] = None
+    image_b64s: Optional[List[str]] = None
+    format: str = "png"          # jpeg | tiff | pdf | png
     dpi: int = 300
     background: str = "#FFFFFF"  # flatten transparency onto this for jpeg/pdf
+    # When True + format ∈ {tiff, pdf} → single multi-page file. Ignored
+    # for jpeg/png (always one file per page). Default False = one file
+    # per page even for TIFF/PDF (caller picks N filenames client-side).
+    multi_page: bool = False
 
 
 @app.post("/api/collage/convert")
@@ -5225,32 +5237,70 @@ def convert_collage(body: CollageConvertRequest):
     fmt = (body.format or "png").lower().lstrip(".")
     if fmt == "jpg":
         fmt = "jpeg"
-    raw = base64.b64decode(body.image_b64.split(",")[-1])
-    img = Image.open(io.BytesIO(raw))
     dpi = max(72, min(1200, int(body.dpi or 300)))
-    # JPEG and PDF can't carry alpha — flatten onto the background colour.
-    if fmt in ("jpeg", "pdf"):
+    bg_color = body.background or "#FFFFFF"
+
+    # Normalise to a list of input PNG byte buffers — single-image path
+    # stays compatible by treating image_b64 as a one-element list.
+    inputs_b64: List[str] = []
+    if body.image_b64s and len(body.image_b64s) > 0:
+        inputs_b64 = list(body.image_b64s)
+    elif body.image_b64:
+        inputs_b64 = [body.image_b64]
+    else:
+        return {"error": "no image data — pass image_b64 or image_b64s"}
+
+    def _flatten(img):
+        """JPEG/PDF can't carry alpha — composite onto bg_color."""
         if img.mode in ("RGBA", "LA", "P"):
             rgba = img.convert("RGBA")
-            bg = Image.new("RGB", rgba.size, body.background or "#FFFFFF")
+            bg = Image.new("RGB", rgba.size, bg_color)
             bg.paste(rgba, mask=rgba.split()[-1])
-            img = bg
+            return bg
+        return img.convert("RGB")
+
+    pages_img: List[Image.Image] = []
+    for b64 in inputs_b64:
+        raw = base64.b64decode(b64.split(",")[-1])
+        img = Image.open(io.BytesIO(raw))
+        if fmt in ("jpeg", "pdf"):
+            img = _flatten(img)
+        pages_img.append(img)
+
+    want_multi = bool(body.multi_page) and fmt in ("tiff", "pdf") and len(pages_img) > 1
+
+    if want_multi:
+        # Single output file containing every page.
+        out = io.BytesIO()
+        first, rest = pages_img[0], pages_img[1:]
+        if fmt == "tiff":
+            first.save(out, format="TIFF", dpi=(dpi, dpi),
+                       compression="tiff_lzw", save_all=True, append_images=rest)
+            ext = "tiff"
+        else:  # pdf
+            first.save(out, format="PDF", resolution=float(dpi),
+                       save_all=True, append_images=rest)
+            ext = "pdf"
+        return {"images": [base64.b64encode(out.getvalue()).decode("ascii")], "ext": ext, "multi_page": True}
+
+    # One output file per page.
+    results: List[str] = []
+    for img in pages_img:
+        out = io.BytesIO()
+        if fmt == "jpeg":
+            img.save(out, format="JPEG", quality=95, dpi=(dpi, dpi)); ext = "jpg"
+        elif fmt == "tiff":
+            img.save(out, format="TIFF", dpi=(dpi, dpi), compression="tiff_lzw"); ext = "tiff"
+        elif fmt == "pdf":
+            img.save(out, format="PDF", resolution=float(dpi)); ext = "pdf"
         else:
-            img = img.convert("RGB")
-    out = io.BytesIO()
-    if fmt == "jpeg":
-        img.save(out, format="JPEG", quality=95, dpi=(dpi, dpi))
-        ext = "jpg"
-    elif fmt == "tiff":
-        img.save(out, format="TIFF", dpi=(dpi, dpi), compression="tiff_lzw")
-        ext = "tiff"
-    elif fmt == "pdf":
-        img.save(out, format="PDF", resolution=float(dpi))
-        ext = "pdf"
-    else:  # png fallback
-        img.save(out, format="PNG", dpi=(dpi, dpi))
-        ext = "png"
-    return {"image": base64.b64encode(out.getvalue()).decode("ascii"), "ext": ext}
+            img.save(out, format="PNG", dpi=(dpi, dpi)); ext = "png"
+        results.append(base64.b64encode(out.getvalue()).decode("ascii"))
+    # Back-compat: single-input requests get the legacy `image` field too.
+    response = {"images": results, "ext": ext, "multi_page": False}
+    if len(results) == 1:
+        response["image"] = results[0]
+    return response
 
 
 class CollageDecomposeRequest(BaseModel):
