@@ -6754,12 +6754,15 @@ def wb_detect_bands(body: WbBandDetectRequest):
     # Contrast-stretched DISPLAY preview (the bright, gamma-corrected image the
     # detector effectively sees) so the band picker can show clearly-visible
     # bands instead of the dark raw thumbnail. ROIs are normalised 0..1 so any
-    # preview size maps correctly; cap width for a small transfer.
+    # preview size maps correctly; cap width for a moderate transfer. Bumped
+    # from 1100 to 2400 px — at 1100 the picker preview looked low-resolution
+    # against full-res blots (1.5k+ px wide), and band edges became muddy when
+    # the user zoomed in.
     preview_b64 = ""
     try:
         disp8 = _disp  # uint8 HxWx3 from contrast_scale (gamma-sqrt, bright)
         ph, pw = disp8.shape[:2]
-        PW = 1100
+        PW = 2400
         if pw > PW:
             pth = max(1, int(round(ph * PW / pw)))
             disp8 = _cv2.resize(disp8, (PW, pth), interpolation=_cv2.INTER_AREA)
