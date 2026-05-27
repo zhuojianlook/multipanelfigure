@@ -5068,6 +5068,24 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     }));
   }, []);
 
+  /** Remove one output from a node — the user's "tidy this up" lever for
+   *  the drawer. Also clears any staging-zone references so the deleted
+   *  card doesn't reappear as a stale entry. The next node re-run still
+   *  produces fresh outputs (with version-archive behaviour intact). */
+  const deleteOutput = useCallback((nodeId: string, outputId: string) => {
+    const key = `${nodeId}-${outputId}`;
+    setNodes((cur) => cur.map((n) => n.id !== nodeId ? n : {
+      ...n,
+      data: {
+        ...n.data,
+        outputs: (n.data.outputs || []).filter((o) => o.id !== outputId),
+      },
+    }));
+    setStagedForMain((s) => { if (!s.has(key)) return s; const n = new Set(s); n.delete(key); return n; });
+    setStagedForCollage((s) => { if (!s.has(key)) return s; const n = new Set(s); n.delete(key); return n; });
+    setSelectedOutputKeys((s) => { if (!s.has(key)) return s; const n = new Set(s); n.delete(key); return n; });
+  }, []);
+
   // ── Drawer selection + batch actions ──────────────────────────
 
   const toggleOutputSelected = useCallback((key: string) => {
@@ -6302,15 +6320,24 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
                               {o.versionLabel}
                             </Box>
                           )}
-                          <Button size="small" component="a"
-                            href={o.kind === "table"
-                              ? `data:text/csv;base64,${btoa(unescape(encodeURIComponent(o.payload)))}`
-                              : `data:image/png;base64,${o.payload}`}
-                            download={`${o.name}.${o.kind === "table" ? "csv" : "png"}`}
-                            startIcon={<DownloadIcon sx={{ fontSize: 12 }} />}
-                            sx={{ fontSize: "0.55rem", textTransform: "none", py: 0, minWidth: 0 }}>
-                            Download
-                          </Button>
+                          <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
+                            <Button size="small" component="a"
+                              href={o.kind === "table"
+                                ? `data:text/csv;base64,${btoa(unescape(encodeURIComponent(o.payload)))}`
+                                : `data:image/png;base64,${o.payload}`}
+                              download={`${o.name}.${o.kind === "table" ? "csv" : "png"}`}
+                              startIcon={<DownloadIcon sx={{ fontSize: 12 }} />}
+                              sx={{ flex: 1, fontSize: "0.55rem", textTransform: "none", py: 0, minWidth: 0 }}>
+                              Download
+                            </Button>
+                            <Tooltip placement="top" title="Remove this output from the drawer. The next node re-run will produce a fresh one (and the v1 archive is preserved separately).">
+                              <IconButton size="small"
+                                onClick={() => deleteOutput(o.nodeId, o.outputId)}
+                                sx={{ p: 0.25, color: "text.disabled", "&:hover": { color: "error.main" } }}>
+                                <DeleteOutlineIcon sx={{ fontSize: 14 }} />
+                              </IconButton>
+                            </Tooltip>
+                          </Box>
                         </Box>
                       );
                     })}
