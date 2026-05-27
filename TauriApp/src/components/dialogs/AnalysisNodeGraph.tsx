@@ -86,6 +86,11 @@ import BandPickerDialog, {
   generateBandPickerCode,
   emptyBandConfig,
 } from "./BandPickerDialog";
+import IntensityPickerDialog, {
+  type FluorIntensityConfig,
+  generateFluorCode,
+  emptyFluorConfig,
+} from "./IntensityPickerDialog";
 
 // ── Helper: base64 PNG → File (for main-timeline + collage uploads) ──
 function b64ToFile(b64: string, filename: string): File {
@@ -913,12 +918,16 @@ export interface NodeData {
   /** When true, the user has explicitly removed the node from
    *  the canvas — used to no-op stale auto-edges. */
   deleted?: boolean;
-  /** Marks a specialised interactive Python node.  "wb_bands" → the
-   *  western-blot band picker: its `code` is auto-generated from
-   *  `roi` (edited via the "Pick bands…" button) rather than typed. */
-  interactive?: "wb_bands";
+  /** Marks a specialised interactive Python node:
+   *    "wb_bands"        → western-blot band picker.
+   *    "fluor_intensity" → fluorescence channel intensity picker.
+   *  The node's `code` is auto-generated from the config (`roi` /
+   *  `intensity`) — manual edits are overwritten on the next save. */
+  interactive?: "wb_bands" | "fluor_intensity";
   /** Band-picker ROI config (only when interactive === "wb_bands"). */
   roi?: BandPickerConfig;
+  /** Fluorescence-intensity config (only when interactive === "fluor_intensity"). */
+  intensity?: FluorIntensityConfig;
   [key: string]: unknown;  // index signature for ReactFlow's Record
 }
 
@@ -2410,100 +2419,122 @@ function buildCornealHazeWorkflow(): SavedWorkflow {
 }
 
 // ── Intensity per channel (fluorescence) ─────────────────────
-// 3-node pipeline: per-image RGB-channel mean intensity → group
-// summary → faceted bar plot.  Each image's label is parsed for
-// group + (optional) channel suffix; if no suffix is given, all
-// three channels are emitted for every image.
-const INTENSITY_PYTHON = `# @name: Channel intensities
-# Per-image mean intensity in each of the R / G / B channels.
-# Group is inferred from the source label using the same
-# "<group>_<replicate>" convention the Corneal Haze workflow uses
-# (e.g. "GFP_1", "DAPI_3").  Falls back to the whole label when no
-# replicate suffix is present.
-import numpy as np, re
+// 3-node pipeline: interactive Intensity picker (channel renames +
+// per-image group assignment + simple-vs-Cellpose mode) → R plot
+// that compares groups within each renamed channel with pairwise
+// significance brackets.  The picker emits the Python body that
+// runs on the upstream Source images; the user reaches it via the
+// "Configure intensity…" button on the node (and a "Run graph"
+// pauses there until the user clicks Save).
 
-def infer_group(label):
-    label = label.rsplit("/", 1)[-1].strip()
-    m = re.match(r"^(.*?)[\s_\-]+\d+$", label)
-    return (m.group(1) if m else label).strip() or label
-
-imgs = [(k, v) for k, v in inputs.items() if isinstance(v, dict) and "image" in v]
-if not imgs:
-    raise SystemExit("No image inputs — wire your fluorescence panels into this node.")
-
-rows = []
-for key, src in imgs:
-    arr = src["image"].astype(np.float32)
-    if arr.ndim == 2:
-        arr = np.stack([arr, arr, arr], axis=-1)
-    h, w = arr.shape[:2]
-    # Central 80% ROI — drop edges to suppress vignetting.
-    roi = arr[int(h*0.10):int(h*0.90), int(w*0.10):int(w*0.90)]
-    label = src.get("label", key).rsplit("/", 1)[-1]
-    grp = infer_group(label)
-    for ch_idx, ch_name in [(0, "R"), (1, "G"), (2, "B")]:
-        rows.append({
-            "source": label,
-            "group": grp,
-            "channel": ch_name,
-            "mean_intensity": float(roi[..., ch_idx].mean()),
-            "max_intensity": float(roi[..., ch_idx].max()),
-        })
-print(f"computed channel means for {len(imgs)} image(s); groups = "
-      + ", ".join(sorted({r['group'] for r in rows})))
-mpfig_data(rows, name="channel_intensities")
-`;
-
-const INTENSITY_PLOT_R = `# @name: Plot intensities per channel
-# Faceted bar plot — one facet per channel, bars = per-group mean
-# intensity, jittered raw points overlaid.  Requires the "channel"
-# column from the upstream Python step.
-library(ggplot2); library(ggprism)
+const INTENSITY_PLOT_R = `# @name: Plot intensities (groups × channels)
+# Per-channel comparison across user-defined groups (set in the
+# Intensity picker UI). Bars = group mean, error = SD, jittered raw
+# points overlaid, pairwise t-test brackets per channel.
+suppressWarnings(suppressMessages({ library(ggplot2); library(ggprism) }))
 
 data <- inputs[[1]]
-data$channel <- factor(data$channel, levels = c("R", "G", "B"))
-data$group   <- factor(data$group, levels = unique(data$group))
+if (!"mean_intensity" %in% names(data)) data$mean_intensity <- 0
+if (!"channel" %in% names(data)) data$channel <- "Channel"
+if (!"group"   %in% names(data)) data$group   <- "all"
+data$mean_intensity <- suppressWarnings(as.numeric(data$mean_intensity))
+data <- data[is.finite(data$mean_intensity), , drop = FALSE]
+data$channel <- factor(data$channel, levels = unique(data$channel))
+data$group   <- factor(data$group,   levels = unique(data$group))
 
-summ <- aggregate(mean_intensity ~ group + channel, data = data,
-                  FUN = function(v) c(mean = mean(v),
-                                      sem  = if (length(v) > 1) sd(v)/sqrt(length(v)) else 0))
-summ <- do.call(data.frame, summ)
-names(summ) <- c("group", "channel", "mean_int", "sem_int")
+if (nrow(data) == 0) {
+  mpfig_plot("channel_intensity.png", width = 1100, height = 800, res = 300)
+  print(ggplot() + theme_void() + annotate("text", x = 0.5, y = 0.5,
+        label = "No intensity rows — wire images upstream and Configure intensity."))
+} else {
 
-mpfig_plot("channel_intensity.png", width = 1700, height = 900, res = 300)
+# Per-group, per-channel mean + SD. (For Cellpose mode each row is
+# already one cell, so SD reflects cell-to-cell variation; for
+# simple mode each row is one image, so SD reflects between-image
+# variation.)
+agg <- aggregate(mean_intensity ~ group + channel, data = data,
+                 FUN = function(v) c(m = mean(v), s = sd(v), n = length(v)))
+summ <- data.frame(group = agg$group, channel = agg$channel,
+                   mean = agg$mean_intensity[, "m"],
+                   sd   = agg$mean_intensity[, "s"],
+                   n    = agg$mean_intensity[, "n"])
+summ$sd[is.na(summ$sd)] <- 0
+
+# Pairwise t-tests between groups, within each channel (needs n>=2 each).
+stat_df <- NULL
+if (nlevels(data$group) >= 2) {
+  pieces <- list()
+  for (ch in levels(data$channel)) {
+    sub <- data[data$channel == ch, ]
+    grps <- intersect(levels(data$group), unique(as.character(sub$group)))
+    usable <- grps[vapply(grps, function(gg) sum(sub$group == gg) >= 2, logical(1))]
+    if (length(usable) < 2) next
+    ymax <- max(summ$mean[summ$channel == ch] + summ$sd[summ$channel == ch], na.rm = TRUE)
+    step <- 0.13 * ymax; k <- 0
+    combs <- combn(usable, 2)
+    for (j in seq_len(ncol(combs))) {
+      a <- combs[1, j]; b <- combs[2, j]
+      pv <- tryCatch(t.test(sub$mean_intensity[sub$group == a], sub$mean_intensity[sub$group == b])$p.value,
+                     error = function(e) NA_real_)
+      if (is.na(pv)) next
+      lab <- if (pv < 0.001) "***" else if (pv < 0.01) "**" else if (pv < 0.05) "*" else "ns"
+      k <- k + 1
+      pieces[[length(pieces) + 1]] <- data.frame(
+        channel = ch, group1 = a, group2 = b, p.label = lab, y.position = ymax + step * k)
+    }
+  }
+  if (length(pieces) > 0) stat_df <- do.call(rbind, pieces)
+}
+
+n_facets <- length(unique(data$channel))
+mpfig_plot("channel_intensity.png",
+           width = max(1100, 520 * min(n_facets, 4)), height = 1050, res = 300)
 p <- ggplot() +
-  geom_col(data = summ, aes(x = group, y = mean_int, fill = channel),
-           width = 0.65, color = "grey25", linewidth = 0.3) +
-  geom_errorbar(data = summ,
-                aes(x = group, ymin = mean_int - sem_int, ymax = mean_int + sem_int),
-                width = 0.22, color = "grey25", linewidth = 0.4) +
-  geom_jitter(data = data,
-              aes(x = group, y = mean_intensity),
-              width = 0.13, height = 0, size = 1.4, alpha = 0.7,
+  geom_col(data = summ, aes(x = group, y = mean, fill = group),
+           width = 0.7, color = "grey25", linewidth = 0.3) +
+  geom_errorbar(data = summ, aes(x = group, ymin = pmax(0, mean - sd), ymax = mean + sd),
+                width = 0.22, linewidth = 0.4) +
+  geom_jitter(data = data, aes(x = group, y = mean_intensity),
+              width = 0.13, height = 0, size = 1.1, alpha = 0.7,
               color = "grey20", stroke = 0) +
-  scale_fill_manual(values = c("R" = "#d35454", "G" = "#5fa566", "B" = "#5d80c0"),
-                    name = NULL, guide = "none") +
-  facet_wrap(~ channel, nrow = 1) +
+  facet_wrap(~ channel, scales = "free_y", nrow = 1) +
   theme_prism(base_size = 11) +
-  theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
-        strip.text  = element_text(size = 11, face = "bold"),
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
         plot.margin = margin(10, 10, 6, 10)) +
-  labs(x = NULL, y = "Mean ROI intensity (0–255)")
+  labs(x = NULL, y = "Mean intensity")
+
+if (!is.null(stat_df)) {
+  p <- tryCatch(
+    p + ggprism::add_pvalue(stat_df, label = "p.label",
+                            xmin = "group1", xmax = "group2",
+                            y.position = "y.position",
+                            tip.length = 0.01, label.size = 3.0, bracket.size = 0.3),
+    error = function(e) { message("add_pvalue failed: ", conditionMessage(e)); p })
+}
 print(p)
+}
 `;
 
 function buildIntensityWorkflow(): SavedWorkflow {
   const srcId = "source", pyId = "intensity_py", rId = "intensity_plot";
+  const intCfg = emptyFluorConfig();
   const nodes: Node<NodeData>[] = [
     {
       id: srcId, type: "source", position: { x: 40, y: 60 },
-      data: { label: "Source — label as 'Group_replicate'", kind: "source", sources: [], status: "ok" } as NodeData,
+      data: {
+        label: "Source — drop your fluorescence images here",
+        kind: "source", sources: [], status: "ok",
+      } as NodeData,
       draggable: true, deletable: false,
     },
     {
       id: pyId, type: "python", position: { x: 360, y: 60 },
-      data: { label: "Channel intensities", kind: "python", code: INTENSITY_PYTHON,
-              outputs: [], inputs: [], status: "idle", currentPreset: "custom" } as NodeData,
+      data: {
+        label: "Intensity picker", kind: "python", interactive: "fluor_intensity",
+        intensity: intCfg, code: generateFluorCode(intCfg),
+        outputs: [], inputs: [], status: "idle", currentPreset: "custom",
+      } as NodeData,
     },
     {
       id: rId, type: "r", position: { x: 680, y: 60 },
@@ -2518,7 +2549,7 @@ function buildIntensityWorkflow(): SavedWorkflow {
   });
   return {
     id: "builtin:intensity_per_channel",
-    name: "Intensity per channel (fluorescence R / G / B)",
+    name: "Fluorescence intensity (renameable channels + groups)",
     nodes,
     edges: [mkEdge(pyId, "out_table", rId, "in_table", "table")],
     createdAt: 0,
@@ -3451,6 +3482,13 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // picker). runAll checks it after each node and breaks instead of running the
   // downstream Normalize/Plot with no bands.
   const runAbortRef = useRef(false);
+  // Fluorescence intensity picker modal state — mirrors bandPicker.
+  // `images` is the upstream image labels resolved at open time so the
+  // group-assignment UI can show chips for the right files.
+  const [intensityPicker, setIntensityPicker] = useState<{
+    open: boolean; nodeId: string | null; images: string[]; cfg: FluorIntensityConfig | null;
+  }>(() => ({ open: false, nodeId: null, images: [], cfg: null }));
+  const intensityPickerResolveRef = useRef<((cfg: FluorIntensityConfig | null) => void) | null>(null);
   // Set of currently-selected node ids + edge ids — populated by
   // React Flow's onSelectionChange.  Drives the visible "Delete
   // selected" affordance in the canvas toolbar (the only reliable
@@ -4469,6 +4507,48 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     return new Promise((resolve) => { bandPickerResolveRef.current = resolve; });
   }, [openBandPicker]);
 
+  // ── Intensity picker (fluorescence channel intensity comparison) ──
+  const openIntensityPicker = useCallback((nodeId: string) => {
+    const nm = new Map(nodes.map((n) => [n.id, n]));
+    const ins = collectInputs(nodeId, nm);
+    // List of distinct upstream image labels so the picker can show them
+    // as chips for group assignment.
+    const seen = new Set<string>();
+    const labels: string[] = [];
+    for (const x of ins) {
+      if (x.kind !== "image") continue;
+      const lbl = (x.label || "").split("/").pop() || x.label;
+      if (lbl && !seen.has(lbl)) { seen.add(lbl); labels.push(lbl); }
+    }
+    const node = nm.get(nodeId);
+    const initialCfg = (node?.data.intensity as FluorIntensityConfig | undefined) || emptyFluorConfig();
+    setIntensityPicker({ open: true, nodeId, images: labels, cfg: initialCfg });
+  }, [nodes, collectInputs]);
+
+  const saveIntensityPicker = useCallback((cfg: FluorIntensityConfig) => {
+    setIntensityPicker((ip) => {
+      if (ip.nodeId) {
+        setNodes((cur) => cur.map((n) => n.id === ip.nodeId
+          ? { ...n, data: { ...n.data, intensity: cfg, code: generateFluorCode(cfg), status: "idle" as const } }
+          : n));
+      }
+      return { open: false, nodeId: null, images: [], cfg: null };
+    });
+    const r = intensityPickerResolveRef.current; intensityPickerResolveRef.current = null;
+    if (r) r(cfg);
+  }, [setNodes]);
+
+  const closeIntensityPicker = useCallback(() => {
+    setIntensityPicker({ open: false, nodeId: null, images: [], cfg: null });
+    const r = intensityPickerResolveRef.current; intensityPickerResolveRef.current = null;
+    if (r) r(null);
+  }, []);
+
+  const openIntensityPickerAndWait = useCallback((nodeId: string): Promise<FluorIntensityConfig | null> => {
+    openIntensityPicker(nodeId);
+    return new Promise((resolve) => { intensityPickerResolveRef.current = resolve; });
+  }, [openIntensityPicker]);
+
   const runNode = useCallback(async (node: Node<NodeData>, nodeMap: Map<string, Node<NodeData>>) => {
     const engine = node.data.kind as EngineKind;
     if (engine !== "python" && engine !== "matlab" && engine !== "r" && engine !== "imagej" && engine !== "cellpose") return;
@@ -4490,6 +4570,22 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       // Continue the run with the freshly-picked config (state was already
       // updated by saveBandPicker; refresh our local node too).
       node = { ...node, data: { ...node.data, roi: picked, code: generateBandPickerCode(picked) } };
+    }
+    // Interactive intensity-picker not yet configured (no groups defined) →
+    // pause and open the picker so the run has meaningful group labels.
+    if (node.data.interactive === "fluor_intensity"
+        && (!node.data.intensity || (node.data.intensity.groups?.length ?? 0) === 0)) {
+      consoleRef.current += `\n=== ${node.data.label}: configure intensity first — opening the picker (rename channels, assign groups, pick mode) ===\n`;
+      setConsoleOut(consoleRef.current);
+      setNodes((cur) => cur.map((n) => n.id === node.id ? { ...n, data: { ...n.data, status: "idle" } } : n));
+      const picked = await openIntensityPickerAndWait(node.id);
+      if (!picked || (picked.groups?.length ?? 0) === 0) {
+        consoleRef.current += `=== ${node.data.label}: no groups assigned — run stopped ===\n`;
+        setConsoleOut(consoleRef.current);
+        runAbortRef.current = true;
+        return;
+      }
+      node = { ...node, data: { ...node.data, intensity: picked, code: generateFluorCode(picked) } };
     }
     // Parse a `# @name: <label>` / `// @name: <label>` marker from the
     // first 20 lines so users can name a node from within the code.
@@ -5503,6 +5599,22 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               </Typography>
             </Box>
           )}
+          {selectedNode.data.interactive === "fluor_intensity" && (() => {
+            const ic = selectedNode.data.intensity as FluorIntensityConfig | undefined;
+            const groupCount = ic?.groups?.length ?? 0;
+            const mode = ic?.mode === "cellpose" ? "Cellpose per-cell" : "Simple (mean intensity)";
+            return (
+              <Box sx={{ display: "flex", alignItems: "center", gap: 1, px: 1, py: 0.75, borderBottom: "1px solid", borderColor: "divider", bgcolor: "action.hover" }}>
+                <Button size="small" variant="contained" onClick={() => openIntensityPicker(selectedNode.id)}
+                  sx={{ textTransform: "none", fontSize: "0.7rem" }}>
+                  🌈 Configure intensity…
+                </Button>
+                <Typography variant="caption" sx={{ color: "text.secondary", lineHeight: 1.3 }}>
+                  {groupCount} group(s) · {mode} · wire image sources into this node
+                </Typography>
+              </Box>
+            );
+          })()}
           {/* Layer-1 preset selector — built-in snippets + user-
               saved presets stored per-engine in localStorage.  The
               Select is controlled by the node's currentPreset field
@@ -6073,6 +6185,14 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         initial={bandPicker.cfg}
         onClose={closeBandPicker}
         onSave={saveBandPicker}
+      />
+      {/* Fluorescence intensity picker — channel renames + group assignment. */}
+      <IntensityPickerDialog
+        open={intensityPicker.open}
+        imageLabels={intensityPicker.images}
+        initial={intensityPicker.cfg}
+        onClose={closeIntensityPicker}
+        onSave={saveIntensityPicker}
       />
     </Box>
   );
