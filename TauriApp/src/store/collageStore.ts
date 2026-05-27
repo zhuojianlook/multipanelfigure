@@ -261,17 +261,28 @@ export function formatPanelLetter(index: number, upper: boolean, paren: boolean)
 }
 
 /** Map of itemId → displayed label text, honoring per-label text overrides and
- *  the global case/paren format, computed in reading order. */
+ *  the global case/paren format, computed in reading order. `startIndex`
+ *  defaults to 0 (the natural start); for "continuous" multi-page numbering
+ *  the caller passes the count of labelable items on all PRIOR pages so this
+ *  page's letters pick up where the last page left off. */
 export function panelLabelTextMap(
   items: CollageItem[], upper: boolean, paren: boolean,
+  startIndex: number = 0,
 ): Record<string, string> {
   const order = panelReadingOrder(items);
   const out: Record<string, string> = {};
   order.forEach((it, i) => {
     const ov = it.panelLabel?.text;
-    out[it.id] = (ov !== undefined && ov !== "") ? ov : formatPanelLetter(i, upper, paren);
+    out[it.id] = (ov !== undefined && ov !== "") ? ov : formatPanelLetter(startIndex + i, upper, paren);
   });
   return out;
+}
+
+/** Count of items on a page that would PARTICIPATE in panel labelling (i.e.
+ *  appear in `panelReadingOrder`). Used by continuous multi-page numbering
+ *  to compute the offset for each page's letters. */
+export function countLabelableItems(items: CollageItem[]): number {
+  return panelReadingOrder(items).length;
 }
 
 /** A text element of an mpf figure, for per-element font sync. `geom`
@@ -310,6 +321,36 @@ export type DocTab = {
   path: string | null;
   name: string;
 };
+
+/** A single collage page. Each page has its own items + canvas dims +
+ *  background + guides. Pages are ordered left-to-right; the active page's
+ *  per-canvas fields ALSO live on the top-level store (the active page's
+ *  data and the top-level flat state are kept in sync by the page-switch
+ *  actions and by an on-persist snapshot). This dual storage avoids
+ *  rewriting every consumer that reads `items` / `canvasW` / etc.
+ *  directly from the store — those keep working unchanged. */
+export type CollagePageSnapshot = {
+  items: CollageItem[];
+  canvasW: number;
+  canvasH: number;
+  background: string;
+  guideColumns: number;
+  guideGutter: number;
+  guidesVisible: boolean;
+  panelLabelsOn: boolean;
+};
+
+export type CollagePage = {
+  id: string;
+  name: string;
+  snapshot: CollagePageSnapshot;
+};
+
+/** Panel-label numbering modes across multi-page collages:
+ *   - "continuous" → page 1 = A..F, page 2 = G..M, … (offset by previous-
+ *     page label count, naturally restarts at the start of each row order).
+ *   - "per-page" → every page starts at A independently. */
+export type PanelLabelNumberingMode = "continuous" | "per-page";
 
 /** Default canvas: Nature full-page proportions (183 mm × 247 mm) at 300 DPI
  *  → 2161 × 2917 px. Common scientific-publication target so users don't
@@ -383,6 +424,17 @@ export type CollageState = {
    *  pt regardless of how the user has scaled the figure. */
   globalHeaderPt: number | null;
 
+  /** Collage pages (multi-page collage). Always has length >= 1; the
+   *  "active page" is the one whose items + canvas dims + background
+   *  ALSO live on the top-level state (kept in sync by page-switch
+   *  actions). Persisted alongside the flat state. */
+  pages: CollagePage[];
+  /** Id of the currently-active page (must be in `pages`). */
+  activePageId: string;
+  /** Whether panel-label letters (A,B,C,…) continue across pages or
+   *  restart at A on every page. */
+  panelLabelNumberingMode: PanelLabelNumberingMode;
+
   /** Open .mpf documents shown as tabs. Order is stable. Session-only
    *  (not persisted) — rebuilt on mount from the current builder doc +
    *  collage figure items. */
@@ -453,6 +505,27 @@ export type CollageState = {
   movePanelLabel: (id: string, dx: number, dy: number) => void;
   setPanelLabelUpper: (v: boolean) => void;
   setPanelLabelParen: (v: boolean) => void;
+  setPanelLabelNumberingMode: (m: PanelLabelNumberingMode) => void;
+
+  // ── Pages (multi-page collage) ──
+  /** Add a new blank page to the right of the active one and switch to it.
+   *  Returns the new page's id. */
+  pageAdd: (name?: string) => string;
+  /** Duplicate the given page (or active if no id) and switch to the copy. */
+  pageDuplicate: (id?: string) => string;
+  /** Remove a page. Callers should confirm with the user if the page has
+   *  items (`page.snapshot.items.length > 0`); the store does NOT prompt. */
+  pageRemove: (id: string) => void;
+  /** Switch the active page. Snapshots the current flat fields into the
+   *  outgoing page, then loads the target's snapshot into flat fields. */
+  pageSetActive: (id: string) => void;
+  /** Rename a page (display label on the page-tab strip). */
+  pageRename: (id: string, name: string) => void;
+  /** Reorder pages (drag-to-reorder UI). */
+  pageReorder: (orderedIds: string[]) => void;
+  /** Snapshot the current top-level flat fields into the active page entry.
+   *  Called before persist / before reading multi-page state. Idempotent. */
+  pageSyncFlat: () => void;
 
   // ── Document tabs ──
   /** Append a new doc tab (stable order). Returns its id. */
@@ -495,7 +568,26 @@ export type CollageState = {
 
 const STORAGE_KEY = "mpfig_collage_v1";
 
-type Persisted = Pick<CollageState, "items" | "canvasW" | "canvasH" | "background" | "gridVisible" | "snapEnabled" | "gridStep" | "globalHeaderPt" | "guideColumns" | "guideGutter" | "guidesVisible" | "exportDpi" | "exportFormat" | "elemOverridesByItem" | "panelLabelUpper" | "panelLabelParen" | "panelLabelsOn" | "panelLabelsDefaultedOn">;
+type Persisted = Pick<CollageState, "items" | "canvasW" | "canvasH" | "background" | "gridVisible" | "snapEnabled" | "gridStep" | "globalHeaderPt" | "guideColumns" | "guideGutter" | "guidesVisible" | "exportDpi" | "exportFormat" | "elemOverridesByItem" | "panelLabelUpper" | "panelLabelParen" | "panelLabelsOn" | "panelLabelsDefaultedOn" | "pages" | "activePageId" | "panelLabelNumberingMode">;
+
+let _pageSeq = 1;
+const _newPageId = () => `page_${Date.now().toString(36)}_${_pageSeq++}`;
+
+function _snapshotFromFlat(s: {
+  items: CollageItem[]; canvasW: number; canvasH: number; background: string;
+  guideColumns: number; guideGutter: number; guidesVisible: boolean; panelLabelsOn: boolean;
+}): CollagePageSnapshot {
+  return {
+    items: s.items,
+    canvasW: s.canvasW,
+    canvasH: s.canvasH,
+    background: s.background,
+    guideColumns: s.guideColumns,
+    guideGutter: s.guideGutter,
+    guidesVisible: s.guidesVisible,
+    panelLabelsOn: s.panelLabelsOn,
+  };
+}
 
 function loadInitial(): Persisted {
   try {
@@ -537,59 +629,104 @@ function loadInitial(): Persisted {
           }
           return migrated;
         }) as CollageItem[];
-        return {
+        // Flat per-canvas fields for the ACTIVE page. With multi-page,
+        // these mirror the active page's snapshot.
+        const flat = {
           items,
           canvasW: data.canvasW || DEFAULT_CANVAS_W,
           canvasH: data.canvasH || DEFAULT_CANVAS_H,
           background: data.background || "#FFFFFF",
+          guideColumns: typeof data.guideColumns === "number" ? data.guideColumns : 0,
+          guideGutter: typeof data.guideGutter === "number" ? data.guideGutter : 0,
+          guidesVisible: data.guidesVisible ?? true,
+          panelLabelsOn: data.panelLabelsDefaultedOn ? !!data.panelLabelsOn : true,
+        };
+        // Pages migration: older saves don't carry `pages`. Wrap the flat
+        // state into a single page so the multi-page UI shows "Page 1"
+        // and behaves identically to the pre-pages collage.
+        let pages: CollagePage[] = [];
+        let activePageId = "";
+        if (Array.isArray(data.pages) && data.pages.length > 0) {
+          pages = data.pages.map((p: any, i: number) => ({
+            id: typeof p.id === "string" ? p.id : `page_${i}`,
+            name: typeof p.name === "string" ? p.name : `Page ${i + 1}`,
+            snapshot: {
+              items: Array.isArray(p?.snapshot?.items) ? p.snapshot.items : [],
+              canvasW: p?.snapshot?.canvasW || DEFAULT_CANVAS_W,
+              canvasH: p?.snapshot?.canvasH || DEFAULT_CANVAS_H,
+              background: p?.snapshot?.background || "#FFFFFF",
+              guideColumns: typeof p?.snapshot?.guideColumns === "number" ? p.snapshot.guideColumns : 0,
+              guideGutter: typeof p?.snapshot?.guideGutter === "number" ? p.snapshot.guideGutter : 0,
+              guidesVisible: p?.snapshot?.guidesVisible ?? true,
+              panelLabelsOn: p?.snapshot?.panelLabelsOn ?? true,
+            },
+          }));
+          activePageId = typeof data.activePageId === "string"
+            && pages.find((p) => p.id === data.activePageId) ? data.activePageId : pages[0].id;
+          // Restore the active page's snapshot into the flat fields so the
+          // UI displays the right page on reload.
+          const ap = pages.find((p) => p.id === activePageId);
+          if (ap) Object.assign(flat, ap.snapshot);
+        } else {
+          const id = _newPageId();
+          pages = [{ id, name: "Page 1", snapshot: _snapshotFromFlat(flat) }];
+          activePageId = id;
+        }
+        return {
+          ...flat,
           gridVisible: data.gridVisible ?? true,
           snapEnabled: data.snapEnabled ?? true,
           gridStep: data.gridStep || DEFAULT_GRID_STEP,
           globalHeaderPt: typeof data.globalHeaderPt === "number" ? data.globalHeaderPt : null,
-          guideColumns: typeof data.guideColumns === "number" ? data.guideColumns : 0,
-          guideGutter: typeof data.guideGutter === "number" ? data.guideGutter : 0,
-          guidesVisible: data.guidesVisible ?? true,
           exportDpi: typeof data.exportDpi === "number" && data.exportDpi > 0 ? data.exportDpi : 300,
-          exportFormat: typeof data.exportFormat === "string" ? data.exportFormat : "png",
+          // TIFF is now the default export format (lossless, single-page TIFF
+          // per page, multi-page TIFF supported when multiple pages exist).
+          exportFormat: typeof data.exportFormat === "string" ? data.exportFormat : "tiff",
           elemOverridesByItem: (data.elemOverridesByItem && typeof data.elemOverridesByItem === "object") ? data.elemOverridesByItem : {},
           panelLabelUpper: !!data.panelLabelUpper,
           panelLabelParen: !!data.panelLabelParen,
-          // On by default. Until the one-time default has been applied (legacy
-          // data, or data saved before labels-on-by-default), force ON so it
-          // also turns on for existing collages; after that, respect the
-          // user's explicit choice so they can turn it off persistently.
-          panelLabelsOn: data.panelLabelsDefaultedOn ? !!data.panelLabelsOn : true,
           panelLabelsDefaultedOn: true,
+          pages, activePageId,
+          panelLabelNumberingMode: (data.panelLabelNumberingMode === "per-page" ? "per-page" : "continuous") as PanelLabelNumberingMode,
         };
       }
     }
   } catch {
     /* ignore corrupt storage */
   }
+  const initialId = _newPageId();
+  const initialFlat = {
+    items: [], canvasW: DEFAULT_CANVAS_W, canvasH: DEFAULT_CANVAS_H,
+    background: "#FFFFFF", guideColumns: 0, guideGutter: 0, guidesVisible: true,
+    panelLabelsOn: true,
+  };
   return {
-    items: [],
-    canvasW: DEFAULT_CANVAS_W,
-    canvasH: DEFAULT_CANVAS_H,
-    background: "#FFFFFF",
+    ...initialFlat,
     gridVisible: true,
     snapEnabled: true,
     gridStep: DEFAULT_GRID_STEP,
     globalHeaderPt: null,
-    guideColumns: 0,
-    guideGutter: 0,
-    guidesVisible: true,
     exportDpi: 300,
-    exportFormat: "png",
+    exportFormat: "tiff",
     elemOverridesByItem: {},
     panelLabelUpper: false,
     panelLabelParen: false,
-    panelLabelsOn: true,
     panelLabelsDefaultedOn: true,
+    pages: [{ id: initialId, name: "Page 1", snapshot: _snapshotFromFlat(initialFlat) }],
+    activePageId: initialId,
+    panelLabelNumberingMode: "continuous",
   };
 }
 
 function persist(s: Persisted) {
   try {
+    // Refresh the active page entry with the current flat fields so the
+    // persisted multi-page state reflects what's actually on-screen
+    // (rather than a stale snapshot from the last page switch).
+    const pages = s.pages.map((p) =>
+      p.id === s.activePageId
+        ? { ...p, snapshot: _snapshotFromFlat(s) }
+        : p);
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
       items: s.items,
       canvasW: s.canvasW,
@@ -609,6 +746,9 @@ function persist(s: Persisted) {
       panelLabelParen: s.panelLabelParen,
       panelLabelsOn: s.panelLabelsOn,
       panelLabelsDefaultedOn: s.panelLabelsDefaultedOn,
+      pages,
+      activePageId: s.activePageId,
+      panelLabelNumberingMode: s.panelLabelNumberingMode,
     }));
   } catch {
     /* quota — ignore */
@@ -816,6 +956,181 @@ export const useCollageStore = create<CollageState>()(
 
     setPanelLabelUpper: (v) => { set((s) => { s.panelLabelUpper = v; }); persist(get()); },
     setPanelLabelParen: (v) => { set((s) => { s.panelLabelParen = v; }); persist(get()); },
+    setPanelLabelNumberingMode: (m) => { set((s) => { s.panelLabelNumberingMode = m; }); persist(get()); },
+
+    // ── Pages ─────────────────────────────────────────────────
+    pageSyncFlat: () => {
+      set((s) => {
+        const i = s.pages.findIndex((p) => p.id === s.activePageId);
+        if (i >= 0) {
+          s.pages[i].snapshot = _snapshotFromFlat(s);
+        }
+      });
+    },
+
+    pageAdd: (name) => {
+      const id = _newPageId();
+      set((s) => {
+        // Snapshot the active page's current state into the pages array
+        // BEFORE adding the new one (so we don't lose unsaved edits).
+        const ai = s.pages.findIndex((p) => p.id === s.activePageId);
+        if (ai >= 0) s.pages[ai].snapshot = _snapshotFromFlat(s);
+        // Pick a name that doesn't collide ("Page 1" / "Page 2" / ...).
+        const usedNames = new Set(s.pages.map((p) => p.name));
+        let auto = name?.trim() || "";
+        if (!auto) {
+          let n = s.pages.length + 1;
+          while (usedNames.has(`Page ${n}`)) n++;
+          auto = `Page ${n}`;
+        }
+        // Blank snapshot — inherit the canvas dims/background of the
+        // outgoing page so the new page visually matches.
+        const blank: CollagePageSnapshot = {
+          items: [],
+          canvasW: s.canvasW,
+          canvasH: s.canvasH,
+          background: s.background,
+          guideColumns: s.guideColumns,
+          guideGutter: s.guideGutter,
+          guidesVisible: s.guidesVisible,
+          panelLabelsOn: s.panelLabelsOn,
+        };
+        // Insert to the RIGHT of the currently-active page (user's request).
+        const insertAt = ai >= 0 ? ai + 1 : s.pages.length;
+        s.pages.splice(insertAt, 0, { id, name: auto, snapshot: blank });
+        // Activate the new page → load its (blank) snapshot into flat.
+        s.activePageId = id;
+        s.items = blank.items;
+        s.canvasW = blank.canvasW;
+        s.canvasH = blank.canvasH;
+        s.background = blank.background;
+        s.guideColumns = blank.guideColumns;
+        s.guideGutter = blank.guideGutter;
+        s.guidesVisible = blank.guidesVisible;
+        s.panelLabelsOn = blank.panelLabelsOn;
+        s.selectedId = null;
+        s.selectedIds = [];
+      });
+      persist(get());
+      return id;
+    },
+
+    pageDuplicate: (id) => {
+      const newId = _newPageId();
+      set((s) => {
+        const ai = s.pages.findIndex((p) => p.id === s.activePageId);
+        if (ai >= 0) s.pages[ai].snapshot = _snapshotFromFlat(s);
+        const src = s.pages.find((p) => p.id === (id || s.activePageId));
+        if (!src) return;
+        // Deep-clone items so the duplicate doesn't alias the original.
+        // structuredClone handles nested objects + arrays cleanly.
+        const cloned: CollagePageSnapshot = {
+          items: JSON.parse(JSON.stringify(src.snapshot.items)) as CollageItem[],
+          canvasW: src.snapshot.canvasW,
+          canvasH: src.snapshot.canvasH,
+          background: src.snapshot.background,
+          guideColumns: src.snapshot.guideColumns,
+          guideGutter: src.snapshot.guideGutter,
+          guidesVisible: src.snapshot.guidesVisible,
+          panelLabelsOn: src.snapshot.panelLabelsOn,
+        };
+        const srcIdx = s.pages.findIndex((p) => p.id === src.id);
+        const usedNames = new Set(s.pages.map((p) => p.name));
+        let copyName = `${src.name} copy`;
+        let i = 2;
+        while (usedNames.has(copyName)) { copyName = `${src.name} copy ${i++}`; }
+        s.pages.splice(srcIdx + 1, 0, { id: newId, name: copyName, snapshot: cloned });
+        // Activate the copy.
+        s.activePageId = newId;
+        s.items = cloned.items;
+        s.canvasW = cloned.canvasW;
+        s.canvasH = cloned.canvasH;
+        s.background = cloned.background;
+        s.guideColumns = cloned.guideColumns;
+        s.guideGutter = cloned.guideGutter;
+        s.guidesVisible = cloned.guidesVisible;
+        s.panelLabelsOn = cloned.panelLabelsOn;
+        s.selectedId = null;
+        s.selectedIds = [];
+      });
+      persist(get());
+      return newId;
+    },
+
+    pageRemove: (id) => {
+      set((s) => {
+        if (s.pages.length <= 1) return;  // never remove the last page
+        const idx = s.pages.findIndex((p) => p.id === id);
+        if (idx < 0) return;
+        const wasActive = s.activePageId === id;
+        s.pages.splice(idx, 1);
+        if (wasActive) {
+          // Activate the page that was to the LEFT of the removed one
+          // (or the new first page if the removed one was leftmost).
+          const next = s.pages[Math.max(0, idx - 1)];
+          s.activePageId = next.id;
+          s.items = next.snapshot.items;
+          s.canvasW = next.snapshot.canvasW;
+          s.canvasH = next.snapshot.canvasH;
+          s.background = next.snapshot.background;
+          s.guideColumns = next.snapshot.guideColumns;
+          s.guideGutter = next.snapshot.guideGutter;
+          s.guidesVisible = next.snapshot.guidesVisible;
+          s.panelLabelsOn = next.snapshot.panelLabelsOn;
+          s.selectedId = null;
+          s.selectedIds = [];
+        }
+      });
+      persist(get());
+    },
+
+    pageSetActive: (id) => {
+      set((s) => {
+        if (id === s.activePageId) return;
+        const target = s.pages.find((p) => p.id === id);
+        if (!target) return;
+        // Snapshot the outgoing page so its unsaved edits aren't lost.
+        const ai = s.pages.findIndex((p) => p.id === s.activePageId);
+        if (ai >= 0) s.pages[ai].snapshot = _snapshotFromFlat(s);
+        // Load the target page into the flat fields.
+        s.activePageId = id;
+        s.items = target.snapshot.items;
+        s.canvasW = target.snapshot.canvasW;
+        s.canvasH = target.snapshot.canvasH;
+        s.background = target.snapshot.background;
+        s.guideColumns = target.snapshot.guideColumns;
+        s.guideGutter = target.snapshot.guideGutter;
+        s.guidesVisible = target.snapshot.guidesVisible;
+        s.panelLabelsOn = target.snapshot.panelLabelsOn;
+        s.selectedId = null;
+        s.selectedIds = [];
+      });
+      persist(get());
+    },
+
+    pageRename: (id, name) => {
+      set((s) => {
+        const p = s.pages.find((x) => x.id === id);
+        const trimmed = name.trim();
+        if (p && trimmed) p.name = trimmed;
+      });
+      persist(get());
+    },
+
+    pageReorder: (orderedIds) => {
+      set((s) => {
+        const byId = new Map(s.pages.map((p) => [p.id, p] as const));
+        const next: CollagePage[] = [];
+        for (const id of orderedIds) {
+          const p = byId.get(id);
+          if (p) { next.push(p); byId.delete(id); }
+        }
+        // Append any pages not mentioned in `orderedIds` (defensive).
+        for (const p of byId.values()) next.push(p);
+        if (next.length === s.pages.length) s.pages = next;
+      });
+      persist(get());
+    },
 
     // ── Document tabs (session-only, not persisted) ──
     docAdd: (doc) => {

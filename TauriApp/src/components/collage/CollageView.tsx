@@ -24,6 +24,7 @@ import {
   ListSubheader,
   Popover,
 } from "@mui/material";
+import AddIcon from "@mui/icons-material/Add";
 import AddPhotoAlternateIcon from "@mui/icons-material/AddPhotoAlternate";
 import GridOnIcon from "@mui/icons-material/GridOn";
 import GridOffIcon from "@mui/icons-material/GridOff";
@@ -48,6 +49,7 @@ import {
   R_TEXT_BEARING,
   isLabelable,
   panelLabelTextMap,
+  panelReadingOrder,
 } from "../../store/collageStore";
 import type { CollageItem, RTextSlot, RTextOverride } from "../../store/collageStore";
 import { useFigureStore } from "../../store/figureStore";
@@ -309,9 +311,25 @@ export function CollageView() {
   // Inline panel-label editing: id of the item whose (a,b,c…) label is being
   // edited. Maps each labeled item to its displayed letter in reading order.
   const [editingLabelId, setEditingLabelId] = useState<string | null>(null);
+  // Multi-page panel-label numbering: in "continuous" mode each page's
+  // letters pick up where the previous pages left off (page 1 A..F → page 2
+  // G..M), in "per-page" mode every page restarts at A. The offset for the
+  // active page is the sum of labelable items on all pages BEFORE it.
+  const pages = useCollageStore((s) => s.pages);
+  const activePageId = useCollageStore((s) => s.activePageId);
+  const panelLabelNumberingMode = useCollageStore((s) => s.panelLabelNumberingMode);
+  const labelStartIndex = useMemo(() => {
+    if (panelLabelNumberingMode !== "continuous") return 0;
+    let n = 0;
+    for (const p of pages) {
+      if (p.id === activePageId) break;
+      n += panelReadingOrder(p.snapshot.items).length;
+    }
+    return n;
+  }, [pages, activePageId, panelLabelNumberingMode]);
   const labelTextMap = useMemo(
-    () => panelLabelTextMap(items, panelLabelUpper, panelLabelParen),
-    [items, panelLabelUpper, panelLabelParen],
+    () => panelLabelTextMap(items, panelLabelUpper, panelLabelParen, labelStartIndex),
+    [items, panelLabelUpper, panelLabelParen, labelStartIndex],
   );
   // Panel labels are ON by default — seed labels once for a collage that
   // predates the feature (or was just opened) so figures/images get a, b, c…
@@ -1955,6 +1973,7 @@ export function CollageView() {
         </Box>
       </Box>
 
+      <PageTabsBar />
       <CollageStrip />
 
       {/* Whole text-box rich editor (double-click a styled box, or the
@@ -2118,6 +2137,166 @@ export function CollageView() {
             </Box>
           </Box>
         </Popover>
+      )}
+    </Box>
+  );
+}
+
+// ── Page tabs (multi-page collage) ───────────────────────────────────
+// Spreadsheet-style strip at the bottom of CollageView. Each tab = one
+// collage page; click switches pages, double-click renames, × deletes
+// (with a warning when the page has items), + appends a blank page to
+// the right of the active one.
+function PageTabsBar() {
+  const pages = useCollageStore((s) => s.pages);
+  const activePageId = useCollageStore((s) => s.activePageId);
+  const pageAdd = useCollageStore((s) => s.pageAdd);
+  const pageDuplicate = useCollageStore((s) => s.pageDuplicate);
+  const pageRemove = useCollageStore((s) => s.pageRemove);
+  const pageSetActive = useCollageStore((s) => s.pageSetActive);
+  const pageRename = useCollageStore((s) => s.pageRename);
+  const numberingMode = useCollageStore((s) => s.panelLabelNumberingMode);
+  const setNumberingMode = useCollageStore((s) => s.setPanelLabelNumberingMode);
+
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState("");
+
+  const startEdit = (id: string, current: string) => {
+    setEditingId(id); setEditingName(current);
+  };
+  const commitEdit = () => {
+    if (editingId) { pageRename(editingId, editingName); }
+    setEditingId(null); setEditingName("");
+  };
+
+  const handleRemove = async (id: string) => {
+    if (pages.length <= 1) return;     // never remove the last page
+    const p = pages.find((x) => x.id === id);
+    if (!p) return;
+    const liveItems = (id === activePageId)
+      ? useCollageStore.getState().items
+      : p.snapshot.items;
+    if (liveItems && liveItems.length > 0) {
+      // Confirm — warns user before discarding work. Uses the MUI-styled
+      // confirm dialog because window.confirm is disabled in the Tauri
+      // webview.
+      const { confirm } = await import("../shared/ConfirmDialog");
+      const ok = await confirm({
+        title: `Delete "${p.name}"?`,
+        body: `This page has ${liveItems.length} item(s). They will be permanently removed.`,
+        confirmLabel: "Delete page",
+        cancelLabel: "Cancel",
+      });
+      if (!ok) return;
+    }
+    pageRemove(id);
+  };
+
+  return (
+    <Box
+      sx={{
+        display: "flex", alignItems: "center", gap: 0.25,
+        borderTop: "1px solid", borderColor: "divider",
+        bgcolor: "var(--c-surface, #1e1e1e)",
+        px: 0.5, py: 0.25, minHeight: 28, flexShrink: 0,
+        overflowX: "auto",
+      }}
+    >
+      {pages.map((p) => {
+        const active = p.id === activePageId;
+        const isEditing = editingId === p.id;
+        return (
+          <Box key={p.id}
+            onClick={() => !isEditing && pageSetActive(p.id)}
+            onDoubleClick={() => startEdit(p.id, p.name)}
+            sx={{
+              display: "flex", alignItems: "center", gap: 0.25,
+              px: 0.75, py: 0.25, borderRadius: "4px 4px 0 0",
+              cursor: isEditing ? "text" : "pointer",
+              bgcolor: active ? "background.paper" : "transparent",
+              borderTop: active ? "2px solid" : "2px solid transparent",
+              borderColor: active ? "primary.main" : "transparent",
+              "&:hover": { bgcolor: active ? "background.paper" : "action.hover" },
+              minWidth: 70, maxWidth: 220,
+            }}>
+            {isEditing ? (
+              <input
+                autoFocus
+                value={editingName}
+                onChange={(e) => setEditingName(e.target.value)}
+                onBlur={commitEdit}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") commitEdit();
+                  if (e.key === "Escape") { setEditingId(null); setEditingName(""); }
+                }}
+                style={{
+                  background: "transparent", border: "1px solid #888",
+                  color: "inherit", fontSize: "0.72rem", padding: "1px 4px",
+                  width: "100%", minWidth: 60, borderRadius: 3,
+                }}
+              />
+            ) : (
+              <>
+                <Typography variant="caption" sx={{
+                  fontSize: "0.72rem", fontWeight: active ? 700 : 500,
+                  overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                  maxWidth: 160,
+                }}>
+                  {p.name}
+                </Typography>
+                {p.snapshot.items.length > 0 && (
+                  <Typography component="span" sx={{ fontSize: "0.55rem", color: "text.disabled", ml: 0.25 }}>
+                    {p.snapshot.items.length}
+                  </Typography>
+                )}
+                {pages.length > 1 && (
+                  <Box component="span"
+                    onClick={(e) => { e.stopPropagation(); void handleRemove(p.id); }}
+                    sx={{
+                      ml: 0.5, fontSize: "0.85rem", lineHeight: 1, color: "text.disabled",
+                      cursor: "pointer", borderRadius: "50%", px: 0.4, py: 0.05,
+                      "&:hover": { color: "error.main", bgcolor: "action.hover" },
+                    }}
+                    title={`Delete ${p.name}`}>
+                    ×
+                  </Box>
+                )}
+              </>
+            )}
+          </Box>
+        );
+      })}
+      <Tooltip title="Add a new blank page to the right">
+        <IconButton size="small" onClick={() => pageAdd()} sx={{ p: 0.25, color: "text.secondary" }}>
+          <AddIcon sx={{ fontSize: 14 }} />
+        </IconButton>
+      </Tooltip>
+      <Tooltip title="Duplicate the active page">
+        <IconButton size="small" onClick={() => pageDuplicate()} sx={{ p: 0.25, color: "text.secondary" }}>
+          <Typography component="span" sx={{ fontSize: 13, lineHeight: 1 }}>⎘</Typography>
+        </IconButton>
+      </Tooltip>
+      {/* Numbering-mode toggle (only matters with >1 page). Hidden until
+          the user has multi-page state so the strip stays uncluttered for
+          single-page work. */}
+      {pages.length > 1 && (
+        <Box sx={{ display: "flex", alignItems: "center", gap: 0.25, ml: "auto", pl: 1, borderLeft: "1px solid", borderColor: "divider" }}>
+          <Tooltip title="Continuous: page 1 A..F, page 2 G..M. Per-page: every page restarts at A.">
+            <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary" }}>
+              Labels:
+            </Typography>
+          </Tooltip>
+          <Box
+            onClick={() => setNumberingMode(numberingMode === "continuous" ? "per-page" : "continuous")}
+            sx={{
+              cursor: "pointer", fontSize: "0.62rem", px: 0.5, py: 0.05, borderRadius: 0.5,
+              bgcolor: "action.hover", border: "1px solid", borderColor: "divider",
+              "&:hover": { borderColor: "primary.main", color: "primary.main" },
+              userSelect: "none",
+            }}>
+            {numberingMode === "continuous" ? "continuous (A → Z across pages)" : "per-page (each restarts at A)"}
+          </Box>
+        </Box>
       )}
     </Box>
   );
