@@ -2606,167 +2606,106 @@ for r in table:
 mpfig_data(rows, name="band_normalized")
 `;
 
-const WB_PLOT_R = `# @name: Plot band comparison (mean +/- SD, significance)
+const WB_PLOT_R = `# @name: Plot bands — one facet per group, one bar per band
+# One panel per user-defined GROUP from the Band picker. Within each
+# panel: one bar per BAND (its unique name from the picker). If the
+# picker has multiple bands sharing a name (replicates) the bar shows
+# mean ± SD across them; otherwise it's a single value.
+#
+# Y-axis:
+#   • Picker "Normalize to loading control" ON  → 'normalized' column
+#     (each band ÷ its lane's chosen LC band's IOD). Label "Relative
+#     density (vs LC)". The LC band itself is excluded (it's 1.0).
+#   • Picker LC OFF → raw 'iod' column. Label "IOD (a.u.)". The
+#     Normalize step is skipped upstream so what we receive IS the
+#     raw IOD table — same plot path, different value column.
 suppressWarnings(suppressMessages({ library(ggplot2); library(ggprism) }))
 
-# ════════════════════════════════════════════════════════════
-# GROUPS / CONDITIONS — define these in the BAND PICKER UI (the
-# "Groups (conditions)" panel). The picker adds a 'group' column to
-# each band row, and this script picks it up automatically.
-#
-# Fallback: if you want to override here (e.g. for a one-off plot)
-# fill the 'conditions' list below and it replaces what came from
-# the picker. Leave it empty {} to use the picker's groups.
-conditions <- list(
-  # Control   = c("S1", "S2", "S3"),
-  # Treatment = c("S4", "S5", "S6")
-)
-# Which LEVELS (target rows) to plot. NULL = all (loading control auto-excluded).
-levels_to_plot <- NULL
-# Condition that defines 1.0 within each level (NULL = first condition).
-ref_condition <- NULL
-# Draw significance brackets between conditions?
-show_significance <- TRUE
-# ════════════════════════════════════════════════════════════
-
 if (length(inputs) == 0 || is.null(inputs[[1]]) || nrow(inputs[[1]]) == 0) {
-  message("No band table reached this node — run Source -> Band picker -> Normalize -> this R node.")
-  mpfig_plot("wb_band_comparison.png", width = 1600, height = 1100, res = 300)
+  mpfig_plot("wb_band_comparison.png", width = 1400, height = 900, res = 300)
   print(ggplot() + theme_void() +
     annotate("text", x = 0.5, y = 0.55, size = 6, label = "No band table reached this node.") +
     annotate("text", x = 0.5, y = 0.40, size = 4, color = "grey40",
-             label = "Run Source -> Band picker -> Normalize -> Plot.") +
+             label = "Run Source -> Band picker -> Plot.") +
     xlim(0, 1) + ylim(0, 1))
 } else {
 
 df <- inputs[[1]]
 
-# Value column: prefer loading-control-normalized, fall back gracefully.
-val_col <- if ("normalized" %in% names(df)) "normalized" else
-           if ("relative_density" %in% names(df)) "relative_density" else "iod"
+# Detect LC mode from any of: lc_enabled flag, presence of normalized
+# column with a meaningful is_loading_control marker, or a fallback.
+lc_flag <- "lc_enabled" %in% names(df) &&
+  any(tolower(as.character(df$lc_enabled)) %in% c("true", "1", "yes"))
+has_normalised <- "normalized" %in% names(df)
+val_col <- if (lc_flag && has_normalised) "normalized" else "iod"
 df$value <- suppressWarnings(as.numeric(df[[val_col]]))
-if (!"level" %in% names(df)) df$level <- "Target"
-if (!"lane"  %in% names(df)) df$lane <- if ("source" %in% names(df)) as.character(df$source) else as.character(seq_len(nrow(df)))
-df$level <- as.character(df$level); df$lane <- as.character(df$lane)
 
-# Drop the loading-control level itself (normalises to 1 by definition).
-if ("is_loading_control" %in% names(df)) {
+# Make sure the columns we need exist with sensible defaults.
+if (!"band"  %in% names(df)) df$band  <- as.character(seq_len(nrow(df)))
+if (!"lane"  %in% names(df)) df$lane  <- df$band
+if (!"level" %in% names(df)) df$level <- "Target"
+if (!"group" %in% names(df)) df$group <- ""
+df$band  <- as.character(df$band)
+df$lane  <- as.character(df$lane)
+df$level <- as.character(df$level)
+df$group <- as.character(df$group)
+df <- df[is.finite(df$value), , drop = FALSE]
+
+# When LC mode is on, the LC band normalises to 1 by definition →
+# excluding it sharpens the comparison. When LC is off, keep all bands.
+if (lc_flag && "is_loading_control" %in% names(df)) {
   is_lc <- tolower(as.character(df$is_loading_control)) %in% c("true", "1", "yes")
   df <- df[!is_lc, , drop = FALSE]
 }
-# Drop the molecular-weight ladder — it's a size reference, not a sample.
+# Always drop the molecular-weight ladder (size reference, not a sample).
 df <- df[tolower(as.character(df$level)) != "ladder" & df$lane != "L", , drop = FALSE]
-df <- df[is.finite(df$value), , drop = FALSE]
-if (!is.null(levels_to_plot)) df <- df[df$level %in% levels_to_plot, , drop = FALSE]
-if (nrow(df) == 0) stop("No target bands to plot after filtering (check levels_to_plot / loading control).")
+# Keep only bands with a group assigned (user-defined). Ungrouped bands
+# fall into a virtual "(ungrouped)" facet so they're still visible.
+df$group[!nzchar(df$group)] <- "(ungrouped)"
 
-# Assign each band to a condition. Priority order:
-#   1. The R-side \`conditions\` override above (if non-empty).
-#   2. The \`group\` column emitted by the Band picker UI (its Groups panel).
-#   3. Fall back: every lane is its own condition (one bar per lane).
-lane2cond <- character(0)
-picker_groups <- "group" %in% names(df) && any(nzchar(as.character(df$group)))
-if (length(conditions) > 0) {
-  for (cn in names(conditions)) for (ln in conditions[[cn]]) lane2cond[ln] <- cn
-  df$condition <- ifelse(df$lane %in% names(lane2cond), lane2cond[df$lane], NA)
-  cond_levels <- names(conditions)
-} else if (picker_groups) {
-  # Picker-driven groups: every band already carries its condition.
-  df$condition <- ifelse(nzchar(as.character(df$group)), as.character(df$group), NA)
-  cond_levels <- unique(df$condition[!is.na(df$condition)])
-} else {
-  df$condition <- df$lane
-  cond_levels <- unique(df$lane)
-}
-cond_levels <- cond_levels[cond_levels %in% unique(df$condition)]
-df$condition <- factor(df$condition, levels = cond_levels)
-df <- df[!is.na(df$condition), , drop = FALSE]   # explicit groups: keep only assigned bands
-if (nrow(df) == 0) stop("No bands matched any condition — set Groups in the Band picker or fill the 'conditions' list above.")
+if (nrow(df) == 0)
+  stop("No bands left to plot after filtering — check the picker's Groups and (when LC is on) the lane LC picks.")
 
-# When the picker provides free-form groups, bands inside one group can come
-# from MULTIPLE levels — that's the point of "compare any band-set vs any
-# other". In that case we plot one bar per group across ALL its bands
-# (no level faceting). Otherwise (lane-driven conditions) we keep the
-# per-level facet behaviour so identical proteins stay in their own panel.
-free_form_groups <- picker_groups && length(conditions) == 0 &&
-  any(tapply(as.character(df$level), as.character(df$condition), function(v) length(unique(v))) > 1)
+groups <- unique(df$group)
 
-# For free-form picker groups, collapse all bands into a single facet so
-# bars compare across the whole picker (across levels). Otherwise keep
-# per-level facets (lane-driven workflows = one comparison per protein).
-if (free_form_groups) df$level <- "All bands"
-
-# Scale within each level so the reference condition mean = 1.
-ref_c <- if (!is.null(ref_condition)) ref_condition else cond_levels[1]
-for (lv in unique(df$level)) {
-  sel <- df$level == lv
-  ref_vals <- df$value[sel & df$condition == ref_c]
-  base <- if (length(ref_vals) > 0) mean(ref_vals, na.rm = TRUE) else mean(df$value[sel], na.rm = TRUE)
-  if (is.finite(base) && base != 0) df$value[sel] <- df$value[sel] / base
-}
-
-# Summary per (level, condition): mean, SD, n.
-agg <- aggregate(value ~ level + condition, data = df,
+# Per-(group, band) mean ± SD. Replicates of the same name within a
+# group → one bar with SD; unique bands → one bar with SD=0.
+agg <- aggregate(value ~ group + band, data = df,
                  FUN = function(v) c(m = mean(v), s = sd(v), n = length(v)))
-summ <- data.frame(level = agg$level, condition = agg$condition,
+summ <- data.frame(group = agg$group, band = agg$band,
                    mean = agg$value[, "m"], sd = agg$value[, "s"], n = agg$value[, "n"])
 summ$sd[is.na(summ$sd)] <- 0
+# Stable band order within each facet: first-appearance order in df.
+summ$band <- factor(summ$band, levels = unique(df$band))
+df$band   <- factor(df$band,   levels = unique(df$band))
 
-# Pairwise t-tests between conditions, within each level (needs n>=2 each).
-stat_df <- NULL
-if (show_significance && nlevels(df$condition) >= 2) {
-  pieces <- list()
-  for (lv in unique(df$level)) {
-    sub <- df[df$level == lv, ]
-    conds <- intersect(cond_levels, unique(as.character(sub$condition)))
-    usable <- conds[vapply(conds, function(cc) sum(sub$condition == cc) >= 2, logical(1))]
-    if (length(usable) < 2) next
-    ymax <- max(summ$mean[summ$level == lv] + summ$sd[summ$level == lv], na.rm = TRUE)
-    step <- 0.13 * ymax; k <- 0
-    combs <- combn(usable, 2)
-    for (j in seq_len(ncol(combs))) {
-      a <- combs[1, j]; b <- combs[2, j]
-      p <- tryCatch(t.test(sub$value[sub$condition == a], sub$value[sub$condition == b])$p.value,
-                    error = function(e) NA_real_)
-      if (is.na(p)) next
-      lab <- if (p < 0.001) "***" else if (p < 0.01) "**" else if (p < 0.05) "*" else "ns"
-      k <- k + 1
-      pieces[[length(pieces) + 1]] <- data.frame(
-        level = lv, group1 = a, group2 = b, p.label = lab, y.position = ymax + step * k)
-    }
-  }
-  if (length(pieces) > 0) stat_df <- do.call(rbind, pieces)
-}
+n_facets <- length(groups)
+y_lab <- if (val_col == "normalized") "Relative density (vs loading control)" else "Integrated optical density (a.u.)"
+plot_subtitle <- if (val_col == "normalized")
+  "loading-control corrected (each band ÷ its lane's LC band)"
+else "raw IOD — no loading-control normalisation"
 
-n_facets <- length(unique(df$level))
 mpfig_plot("wb_band_comparison.png",
-           width = max(1100, 520 * min(n_facets, 3)), height = 1150, res = 300)
-# Per-layer data/aes (no global default mapping) so the significance
-# layer below does not inherit fill=condition and choke on stat_df.
+           width = max(1200, 500 * min(n_facets, 3)),
+           height = 350 * ceiling(n_facets / 3) + 200, res = 300)
 p <- ggplot() +
-  geom_col(data = summ, aes(x = condition, y = mean, fill = condition),
-           width = 0.7, color = "grey25", linewidth = 0.3) +
-  geom_errorbar(data = summ, aes(x = condition, ymin = pmax(0, mean - sd), ymax = mean + sd),
+  geom_col(data = summ, aes(x = band, y = mean, fill = band),
+           width = 0.75, color = "grey25", linewidth = 0.3) +
+  geom_errorbar(data = summ, aes(x = band, ymin = pmax(0, mean - sd), ymax = mean + sd),
                 width = 0.2, linewidth = 0.4) +
-  geom_jitter(data = df, aes(x = condition, y = value), width = 0.12, height = 0,
-              size = 1.1, color = "grey20", alpha = 0.7) +
-  geom_hline(yintercept = 1, linetype = "dashed", color = "grey55", linewidth = 0.4) +
-  facet_wrap(~ level, scales = "free_y") +
+  geom_jitter(data = df, aes(x = band, y = value),
+              width = 0.12, height = 0, size = 1.1, alpha = 0.65,
+              color = "grey20", stroke = 0) +
+  facet_wrap(~ group, scales = "free", ncol = min(3, n_facets)) +
   theme_prism(base_size = 11) +
   theme(legend.position = "none",
-        axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
-        plot.margin = margin(10, 10, 6, 10)) +
-  labs(x = NULL,
-       y = paste0("Relative density (vs ", ref_c, ")"),
-       subtitle = if (val_col == "normalized") "loading-control corrected" else "raw IOD (no loading control set)")
+        axis.text.x = element_text(angle = 35, hjust = 1, size = 8.5),
+        strip.text = element_text(face = "bold", size = 11),
+        plot.margin = margin(10, 12, 8, 10)) +
+  labs(x = NULL, y = y_lab, subtitle = plot_subtitle)
 
-if (!is.null(stat_df)) {
-  p <- tryCatch(
-    p + ggprism::add_pvalue(stat_df, label = "p.label",
-                            xmin = "group1", xmax = "group2",
-                            y.position = "y.position",
-                            tip.length = 0.01, label.size = 3.0, bracket.size = 0.3),
-    error = function(e) { message("add_pvalue failed: ", conditionMessage(e)); p })
+if (val_col == "normalized") {
+  p <- p + geom_hline(yintercept = 1, linetype = "dashed", color = "grey55", linewidth = 0.4)
 }
 print(p)
 }

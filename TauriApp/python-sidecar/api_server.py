@@ -6769,8 +6769,24 @@ def wb_detect_bands(body: WbBandDetectRequest):
     except Exception as _e:
         print(f"[wb-detect] preview build failed: {_e}", file=__s.stderr, flush=True)
 
+    # Lane geometry — normalised 0..1 over the analysed image. The picker
+    # uses these to (a) render lane guide lines (so the user sees which
+    # vertical strip each box belongs to) and (b) snap newly-drawn boxes
+    # to the nearest lane so every box carries a lane identity (needed
+    # by the per-lane loading-control normalisation).
+    lane_bounds = []
+    for (lane_name, lx1, lx2, ly1, ly2) in lanes:
+        lx0n = max(0.0, lx1 / W); lx1n = min(1.0, lx2 / W)
+        ly0n = max(0.0, ly1 / H); ly1n = min(1.0, ly2 / H)
+        lane_bounds.append({
+            "name": str(lane_name),
+            "x1": round(lx0n, 4), "y1": round(ly0n, 4),
+            "x2": round(lx1n, 4), "y2": round(ly1n, 4),
+        })
+
     return {
         "lanes": out,
+        "lane_bounds": lane_bounds,
         "mode": mode,
         "polarity": polarity,
         "lane_count": len(lanes),

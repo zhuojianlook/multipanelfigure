@@ -60,12 +60,30 @@ export interface BandGroup {
   lanes?: string[];      // legacy: lane LABELs (S1, …) — fallback for old configs
 }
 
+/** Detected lane geometry (vertical strip on the membrane) returned by
+ *  the backend. Used for (a) on-preview guide lines and (b) snapping
+ *  freshly-drawn boxes to the nearest lane so every box has a lane
+ *  identity — required for per-lane loading-control normalisation. */
+export interface LaneBound {
+  name: string;
+  x1: number; y1: number; x2: number; y2: number;   // all 0..1 normalised
+}
+
 export interface BandPickerConfig {
   version: 1;
   lanes: BandRoi[];
-  /** Which `level` (target row) is the loading control. Per-lane normalisation
-   *  divides every other level's IOD by this level's IOD in the same lane.
-   *  null → no loading-control normalisation (raw IOD passes through). */
+  /** Master switch for loading-control normalisation. When true, downstream
+   *  Normalize divides each lane's bands by that lane's chosen LC band's
+   *  IOD → "relative density". When false, IOD passes through unchanged
+   *  and the R plot reports raw IOD values directly. */
+  loadingControlEnabled?: boolean;
+  /** When `loadingControlEnabled`, maps each LANE NAME → the BAND NAME
+   *  (B1, B5, …) chosen as that lane's loading control. Defaults to the
+   *  LOWEST-row (highest y) band in each lane (the canonical bottom-of-
+   *  membrane housekeeping band). */
+  lcBandByLane?: Record<string, string>;
+  /** Legacy: which `level` (target row) is the loading control. Kept so
+   *  older saved nodes still load; new picker UI uses lcBandByLane. */
   loadingControlLevel?: string | null;
   /** "percentile" → per-lane Nth-percentile floor (default);
    *  "roi" → subtract the mean of a user-drawn background rect. */
@@ -83,14 +101,54 @@ export interface BandPickerConfig {
    *  74×33 px ROI regardless of the source's resolution. */
   defaultBoxW?: number;
   defaultBoxH?: number;
+  /** Lane geometry returned by the detection endpoint — drives the lane
+   *  guide lines + snap-to-lane on new boxes. */
+  laneBounds?: LaneBound[];
 }
 
 export function emptyBandConfig(): BandPickerConfig {
   return {
-    version: 1, lanes: [], loadingControlLevel: null,
+    version: 1, lanes: [],
+    loadingControlEnabled: false, lcBandByLane: {},
+    loadingControlLevel: null,
     bgMode: "percentile", bgRoi: null, bgPercentile: 5,
-    groups: [],
+    groups: [], laneBounds: [],
   };
+}
+
+/** Pick a band's lane label from the laneBounds by x-center. Falls back to
+ *  the existing `desiredLabel` (or "Lane") when no bounds intersect. */
+function snapLaneFromBounds(
+  cx: number,
+  bounds: LaneBound[] | undefined,
+  desiredLabel: string,
+): string {
+  if (!bounds || bounds.length === 0) return desiredLabel || "Lane";
+  let best: LaneBound | null = null; let bestDist = Infinity;
+  for (const b of bounds) {
+    const x1 = Math.min(b.x1, b.x2), x2 = Math.max(b.x1, b.x2);
+    if (cx >= x1 && cx <= x2) return b.name;                 // inside → exact hit
+    const d = cx < x1 ? x1 - cx : cx - x2;
+    if (d < bestDist) { bestDist = d; best = b; }
+  }
+  return best ? best.name : (desiredLabel || "Lane");
+}
+
+/** Lowest-row (highest y-center) band per lane = the default LC pick when
+ *  the user first enables LC normalisation. Returns lane → band name. */
+function defaultLcByLane(lanes: BandRoi[]): Record<string, string> {
+  const byLane: Record<string, BandRoi[]> = {};
+  for (const l of lanes) {
+    const ln = (l.label || "Lane").trim() || "Lane";
+    (byLane[ln] = byLane[ln] || []).push(l);
+  }
+  const out: Record<string, string> = {};
+  for (const [ln, bands] of Object.entries(byLane)) {
+    const lowest = bands.reduce((a, b) =>
+      (a.y + a.h / 2) > (b.y + b.h / 2) ? a : b);
+    out[ln] = (lowest.name || lowest.label || "");
+  }
+  return out;
 }
 
 // Unique-id generator with a process-wide counter so same-millisecond
@@ -181,7 +239,16 @@ def _robust_background(values):
             flat = flat[keep]
     return float(np.mean(flat))
 
-lc_level = CFG.get("loadingControlLevel")          # which level is the loading control
+# Loading-control configuration:
+#   - loadingControlEnabled == True → use the per-lane band picks (lcBandByLane:
+#       { laneName → bandName }) to flag is_loading_control=True on those rows.
+#   - loadingControlEnabled == False → no LC flagging; downstream Normalize
+#       will pass IOD through unchanged.
+#   - Legacy fallback: loadingControlLevel string flags any band whose level
+#       matches (kept so older saved nodes still normalise correctly).
+lc_enabled = bool(CFG.get("loadingControlEnabled"))
+lc_by_lane = {str(k): str(v) for k, v in (CFG.get("lcBandByLane") or {}).items()}
+lc_level   = CFG.get("loadingControlLevel")          # legacy
 
 # Band → group(s) and lane → group fallback from the picker's Groups UI.
 # Groups can now contain band NAMES (B1, B5, ...) for arbitrary band-set
@@ -252,12 +319,21 @@ for i, band in enumerate(CFG.get("lanes", [])):
     # means "ungrouped" — the downstream R plot leaves these out of the
     # grouped bars (or shows them as their own bar, depending on plot mode).
     grp = band2group.get(band_name) or lane2group.get(lane) or ""
+    # is_loading_control: per-lane band pick wins; legacy level fallback
+    # only used when the new toggle is off but a legacy level is set.
+    if lc_enabled:
+        is_lc = (lc_by_lane.get(lane, "") == band_name)
+    elif lc_level:
+        is_lc = (level == lc_level)
+    else:
+        is_lc = False
     rows.append({
         "band": band_name,                         # UNIQUE per-row identifier
         "lane": lane,                              # column / sample
         "level": level,                            # target / MW row
         "group": grp,                              # condition / experimental group
-        "is_loading_control": bool(lc_level is not None and level == lc_level),
+        "lc_enabled": bool(lc_enabled),            # plot picks normalised vs raw
+        "is_loading_control": bool(is_lc),
         "iod": float(max(corrected, 0.0)),
         "raw_integrated_density": raw_sum,
         "background_corrected_integrated_density": corrected,
@@ -587,11 +663,13 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     }
     const lastLevel = cfg.lanes.length ? cfg.lanes[cfg.lanes.length - 1].level || "Target" : "Target";
     const newId = uid("band");
-    // Inherit the LANE label from the band directly above (same column)
-    // when there's an aligned candidate, otherwise pick "S{n}".
-    let lane = `S${cfg.lanes.filter((l) => !/^L\d*$|^Ladder|^Marker/i.test(l.label)).length + 1}`;
-    const aligned = cfg.lanes.find((l) => Math.abs((l.x + l.w / 2) - (x + bw / 2)) < bw * 0.5);
-    if (aligned) lane = aligned.label;
+    // Snap to lane: prefer the detected lane whose horizontal extent contains
+    // the new box's x-center. Falls back to an aligned existing box's lane,
+    // then to a fresh "S{n}" if there's nothing nearby.
+    const cx = x + bw / 2;
+    const aligned = cfg.lanes.find((l) => Math.abs((l.x + l.w / 2) - cx) < bw * 0.6);
+    let lane = aligned ? aligned.label : `S${cfg.lanes.filter((l) => !/^L\d*$|^Ladder|^Marker/i.test(l.label)).length + 1}`;
+    if (cfg.laneBounds && cfg.laneBounds.length > 0) lane = snapLaneFromBounds(cx, cfg.laneBounds, lane);
     const newBand: BandRoi = {
       id: newId, x, y, w: bw, h: bh,
       name: `B${cfg.lanes.length + 1}`,
@@ -599,7 +677,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     };
     setCfg((c) => ({ ...c, lanes: [...c.lanes, newBand] }));
     setSelId(newId);
-  }, [cfg.lanes, cfg.defaultBoxW, cfg.defaultBoxH, selId]);
+  }, [cfg.lanes, cfg.defaultBoxW, cfg.defaultBoxH, cfg.laneBounds, selId]);
 
   /** Wheel → zoom around the cursor (cursor stays anchored to the same
    *  point in image space). Trackpad pinches arrive as ctrl+wheel; both
@@ -694,9 +772,16 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
       // bands to the same level by drawing; fall back to the last band's level.
       const sel = c.lanes.find((l) => l.id === selId);
       const defLevel = sel ? roiLevel(sel) : (c.lanes.length ? roiLevel(c.lanes[c.lanes.length - 1]) : "Target");
+      // Snap the new box's lane label to the lane bounds at the click position
+      // (or default to "S{n}" when no detection has run yet).
+      const defLane = snapLaneFromBounds(nx, c.laneBounds, `S${c.lanes.length + 1}`);
+      const nextBandIdx = c.lanes.length + 1;
       return {
         ...c,
-        lanes: [...c.lanes, { id: newId, x: nx, y: ny, w: 0, h: 0, label: `S${c.lanes.length + 1}`, level: defLevel }],
+        lanes: [...c.lanes, {
+          id: newId, x: nx, y: ny, w: 0, h: 0,
+          name: `B${nextBandIdx}`, label: defLane, level: defLevel,
+        }],
       };
     });
     setSelId(newId);
@@ -800,6 +885,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
 
   const applyDetectedLanes = (
     rects: Array<{ x: number; y: number; w: number; h: number; lane?: string; level?: string }>,
+    bounds?: LaneBound[],
   ): boolean => {
     if (!rects.length) return false;
     // Each band gets a UNIQUE display name (B1..BN) AND a lane label (the
@@ -817,7 +903,16 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     const hs = rects.map((r) => r.h).sort((a, b) => a - b);
     const defaultBoxW = ws[Math.floor(ws.length / 2)] || 0.05;
     const defaultBoxH = hs[Math.floor(hs.length / 2)] || 0.03;
-    setCfg((c) => ({ ...c, lanes, defaultBoxW, defaultBoxH }));
+    // Seed sensible LC defaults: the LOWEST-row band in each lane (the
+    // canonical bottom-of-membrane housekeeping band). Doesn't enable LC
+    // — the user still has to toggle "Normalize to loading control" — but
+    // when they do, every lane already has a pre-picked LC band.
+    const seededLc = defaultLcByLane(lanes);
+    setCfg((c) => ({
+      ...c, lanes, defaultBoxW, defaultBoxH,
+      laneBounds: bounds && bounds.length ? bounds : (c.laneBounds ?? []),
+      lcBandByLane: seededLc,
+    }));
     setSelId(lanes[0]?.id ?? null);
     return true;
   };
@@ -842,7 +937,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
           });
           if (resp.ok) {
             const data = await resp.json();
-            if (Array.isArray(data.lanes) && applyDetectedLanes(data.lanes)) {
+            if (Array.isArray(data.lanes) && applyDetectedLanes(data.lanes, data.lane_bounds)) {
               if (data.preview_b64) setPreviewSrc(`data:image/png;base64,${data.preview_b64}`);
               const sw = Number(data.src_w) || 0;
               const sh = Number(data.src_h) || 0;
@@ -956,6 +1051,30 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
               <svg ref={svgRef} width={disp.w} height={disp.h}
                 style={{ position: "absolute", inset: 0, cursor: "crosshair", touchAction: "none" }}
                 onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}>
+                {/* Lane guide lines — visible when LC normalisation is on, so
+                    the user sees which vertical strip each box belongs to.
+                    Drawn UNDER the bands so they don't fight for attention. */}
+                {cfg.loadingControlEnabled && (cfg.laneBounds || []).map((lb) => {
+                  const x = lb.x1 * disp.w;
+                  const w = (lb.x2 - lb.x1) * disp.w;
+                  const y = lb.y1 * disp.h;
+                  const h = (lb.y2 - lb.y1) * disp.h;
+                  const sw = 1 / Math.max(1, view.zoom);
+                  const fs = 10 / Math.max(1, view.zoom);
+                  return (
+                    <g key={`lane-${lb.name}`} pointerEvents="none">
+                      <rect x={x} y={y} width={w} height={h}
+                        fill="rgba(33,150,243,0.04)"
+                        stroke="rgba(33,150,243,0.55)"
+                        strokeWidth={sw} strokeDasharray={`${4 / view.zoom} ${3 / view.zoom}`} />
+                      <text x={x + 2 / view.zoom} y={y - 2 / view.zoom}
+                        fontSize={fs} fill="rgba(33,150,243,0.85)"
+                        style={{ fontWeight: 700 }}>
+                        {lb.name}
+                      </text>
+                    </g>
+                  );
+                })}
                 {/* Bands — colored by level (row); same level = same color.
                     Stroke widths are scaled by 1/zoom so the visible thickness
                     stays constant when the user zooms in. */}
@@ -963,7 +1082,9 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
                   const sel = lane.id === selId;
                   const lv = roiLevel(lane);
                   const col = levelColor(lv, levelOrder);
-                  const isLC = cfg.loadingControlLevel != null && lv === cfg.loadingControlLevel;
+                  const isLC = cfg.loadingControlEnabled
+                    ? ((cfg.lcBandByLane || {})[lane.label || ""] === roiName(lane))
+                    : (cfg.loadingControlLevel != null && lv === cfg.loadingControlLevel);
                   const sw = (sel ? 2.5 : 1.5) / Math.max(1, view.zoom);
                   const fs = 11 / Math.max(1, view.zoom);
                   return (
@@ -1021,29 +1142,84 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
             </Typography>
           )}
 
-          {/* Levels & loading control */}
-          <Box sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, p: 1, display: "flex", alignItems: "center", gap: 1, flexWrap: "wrap" }}>
-            <Tooltip title="The target row whose band each lane is divided by, for loading-control normalisation. Bands on the same row share one level.">
-              <Typography variant="caption" sx={{ fontWeight: 700 }}>Loading control level</Typography>
-            </Tooltip>
-            <TextField select size="small" value={cfg.loadingControlLevel ?? ""}
-              onChange={(e) => setLoadingControlLevel(e.target.value === "" ? null : e.target.value)}
-              disabled={levelOrder.length === 0}
-              sx={{ minWidth: 130 }}
-              SelectProps={{ displayEmpty: true }}
-              inputProps={{ style: { fontSize: "0.78rem", padding: "4px 8px" } }}>
-              <MenuItem value=""><em>None (raw IOD)</em></MenuItem>
-              {levelOrder.map((lv) => (
-                <MenuItem key={lv} value={lv} sx={{ fontSize: "0.8rem" }}>
-                  <Box component="span" sx={{ display: "inline-block", width: 10, height: 10, mr: 0.75, borderRadius: 0.3, bgcolor: levelColor(lv, levelOrder) }} />
-                  {lv}
-                </MenuItem>
-              ))}
-            </TextField>
-            <Typography variant="caption" sx={{ color: "text.secondary", ml: "auto" }}>
-              {levelOrder.length} level(s)
-            </Typography>
-          </Box>
+          {/* Loading-control normalisation — opt-in toggle. OFF (default) →
+              raw IOD passes through, no Normalize step in the plot. ON →
+              user picks one BAND per lane as that lane's loading control;
+              every band in that lane is divided by its LC band's IOD. */}
+          {(() => {
+            const lcEnabled = !!cfg.loadingControlEnabled;
+            const lanesPresent = Array.from(new Set(cfg.lanes.map((l) => (l.label || "Lane").trim() || "Lane")));
+            const lcMap = cfg.lcBandByLane || {};
+            const lcCount = lanesPresent.filter((ln) => lcMap[ln]).length;
+            return (
+              <Box sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, p: 1 }}>
+                <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                  <Tooltip title="When ON: each lane's bands are divided by that lane's chosen loading-control band's IOD → relative density (vs LC). Pick a different LC band per lane below. When OFF: raw IOD is plotted directly (no Normalize step).">
+                    <Typography variant="caption" sx={{ fontWeight: 700 }}>
+                      Normalize to loading control
+                    </Typography>
+                  </Tooltip>
+                  <Box
+                    role="switch"
+                    aria-checked={lcEnabled}
+                    onClick={() => {
+                      setCfg((c) => {
+                        const next = !c.loadingControlEnabled;
+                        // First time enabling → seed defaults (lowest-row band per lane).
+                        const seed = next && Object.keys(c.lcBandByLane || {}).length === 0
+                          ? defaultLcByLane(c.lanes) : (c.lcBandByLane || {});
+                        return { ...c, loadingControlEnabled: next, lcBandByLane: seed };
+                      });
+                    }}
+                    sx={{
+                      cursor: "pointer", width: 32, height: 18, borderRadius: 9,
+                      bgcolor: lcEnabled ? "primary.main" : "divider",
+                      position: "relative", transition: "background 0.15s",
+                      "&:before": {
+                        content: '""', position: "absolute", top: 2,
+                        left: lcEnabled ? 16 : 2, width: 14, height: 14,
+                        borderRadius: "50%", bgcolor: "background.paper",
+                        transition: "left 0.15s",
+                      },
+                    }}
+                  />
+                  <Typography variant="caption" sx={{ color: "text.secondary", ml: "auto" }}>
+                    {lcEnabled
+                      ? `${lcCount}/${lanesPresent.length} lane(s) configured`
+                      : "raw IOD will be plotted (Normalize step skipped)"}
+                  </Typography>
+                </Box>
+                {lcEnabled && lanesPresent.length > 0 && (
+                  <Box sx={{ mt: 0.75, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 0.75 }}>
+                    {lanesPresent.map((ln) => {
+                      const bandsInLane = cfg.lanes.filter((l) => (l.label || "Lane") === ln);
+                      const chosen = lcMap[ln] || "";
+                      return (
+                        <Box key={ln} sx={{ display: "flex", flexDirection: "column", gap: 0.2 }}>
+                          <Typography variant="caption" sx={{ fontSize: "0.62rem", fontWeight: 700, color: "text.secondary" }}>
+                            Lane {ln}
+                          </Typography>
+                          <TextField select size="small" value={chosen}
+                            onChange={(e) => setCfg((c) => ({
+                              ...c, lcBandByLane: { ...(c.lcBandByLane || {}), [ln]: e.target.value },
+                            }))}
+                            inputProps={{ style: { fontSize: "0.74rem", padding: "4px 8px" } }}
+                            SelectProps={{ displayEmpty: true }}>
+                            <MenuItem value=""><em>—</em></MenuItem>
+                            {bandsInLane.map((b) => (
+                              <MenuItem key={b.id} value={roiName(b)} sx={{ fontSize: "0.78rem" }}>
+                                {roiName(b)} ({roiLevel(b)})
+                              </MenuItem>
+                            ))}
+                          </TextField>
+                        </Box>
+                      );
+                    })}
+                  </Box>
+                )}
+              </Box>
+            );
+          })()}
 
           {/* Groups (experimental conditions) — FREE assignment of any band
               (by its unique Name) to any group, across levels and lanes.
@@ -1161,7 +1337,9 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
             ) : cfg.lanes.map((lane, i) => {
               const lv = roiLevel(lane);
               const col = levelColor(lv, levelOrder);
-              const isLC = cfg.loadingControlLevel != null && lv === cfg.loadingControlLevel;
+              const isLC = cfg.loadingControlEnabled
+                ? ((cfg.lcBandByLane || {})[lane.label || ""] === roiName(lane))
+                : (cfg.loadingControlLevel != null && lv === cfg.loadingControlLevel);
               return (
                 <Box key={lane.id}
                   onMouseEnter={() => setSelId(lane.id)}
