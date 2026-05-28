@@ -3363,9 +3363,23 @@ function restoreSessionUnlessFreshLaunch(): WorkflowSession | null {
       // Analysis tab still restores them (the flag is already set).
       localStorage.removeItem(ANALYSIS_UPLOADS_KEY);
     } catch { /* ignore */ }
+    // Fresh launch — also reset the outputs cache since the matching
+    // workflow tabs are gone.
+    nodeOutputsCache.clear();
     return null;
   }
   return loadWorkflowSession();
+}
+
+/** Module-level cache of every node's outputs, keyed by `${tabId}:${nodeId}`.
+ *  Survives the AnalysisView unmount that happens when the user navigates to
+ *  Collage / Builder, so on return the drawer shows the same plots / tables
+ *  it had before (instead of an empty state — outputs are stripped from the
+ *  localStorage session-save because of their size). Within a SINGLE app
+ *  run this map sits in process memory; it's cleared on fresh-launch. */
+const nodeOutputsCache = new Map<string, NodeOutput[]>();
+function outputsCacheKey(tabId: string, nodeId: string): string {
+  return `${tabId}:${nodeId}`;
 }
 
 function newSourceNode(sources: InsetSource[], opts?: { id?: string; label?: string; position?: { x: number; y: number } }): Node<NodeData> {
@@ -3529,6 +3543,41 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       if (sessionSaveTimerRef.current) clearTimeout(sessionSaveTimerRef.current);
     };
   }, [workflowTabs, activeWfId]);
+
+  // ── Outputs survival cache ─────────────────────────────────────
+  // localStorage's session-save STRIPS outputs (they're often multi-MB
+  // PNGs that would blow the 5 MB quota in a couple of runs). To make
+  // outputs survive a tab switch (Analysis → Collage → Analysis), we
+  // also mirror them into a module-level Map keyed by (tabId, nodeId).
+  // The cache ALWAYS reflects the current state (incl. emptied lists)
+  // so user deletions persist correctly across tab switches.
+  useEffect(() => {
+    for (const t of workflowTabs) {
+      for (const n of t.nodes) {
+        nodeOutputsCache.set(outputsCacheKey(t.id, n.id), n.data.outputs || []);
+      }
+    }
+  }, [workflowTabs]);
+  // One-time rehydration on mount: paint cached outputs back onto the
+  // freshly-restored (stripped) nodes. Only fills nodes that currently
+  // have no outputs (so we don't trample fresh runs) and only when the
+  // cache has SOMETHING for them (empty cache → leave as-is).
+  const outputsHydratedRef = useRef(false);
+  useEffect(() => {
+    if (outputsHydratedRef.current) return;
+    if (workflowTabs.length === 0) return;
+    outputsHydratedRef.current = true;
+    setWorkflowTabs((tabs) => tabs.map((t) => ({
+      ...t,
+      nodes: t.nodes.map((n) => {
+        const cached = nodeOutputsCache.get(outputsCacheKey(t.id, n.id));
+        if (!cached || cached.length === 0) return n;
+        if (n.data.outputs && n.data.outputs.length > 0) return n;  // don't trample
+        return { ...n, data: { ...n.data, outputs: cached } };
+      }),
+    })));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Saved workflow library (localStorage).
   const [savedWorkflows, setSavedWorkflows] = useState<SavedWorkflow[]>(() => loadSavedWorkflows());
@@ -4745,20 +4794,31 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     // editor FIRST and WAIT for the user to finish, rather than running (and
     // hitting "No bands defined") or letting a full "Run graph" barrel on to the
     // downstream Normalize/Plot before any bands exist.
-    if (node.data.interactive === "wb_bands" && (!node.data.roi || (node.data.roi.lanes?.length ?? 0) === 0)) {
-      consoleRef.current += `\n=== ${node.data.label}: specify bands first — opening the picker (auto-detect / draw lanes, then Save bands) ===\n`;
-      setConsoleOut(consoleRef.current);
-      setNodes((cur) => cur.map((n) => n.id === node.id ? { ...n, data: { ...n.data, status: "idle" } } : n));
-      const picked = await openBandPickerAndWait(node.id);
-      if (!picked || (picked.lanes?.length ?? 0) === 0) {
-        consoleRef.current += `=== ${node.data.label}: no bands specified — run stopped ===\n`;
+    if (node.data.interactive === "wb_bands") {
+      const roiNow = node.data.roi as BandPickerConfig | undefined;
+      const needBands = !roiNow || (roiNow.lanes?.length ?? 0) === 0;
+      const needGroups = !needBands && (roiNow!.groups?.length ?? 0) === 0;
+      if (needBands || needGroups) {
+        const why = needBands
+          ? "specify bands first — opening the picker (auto-detect / draw lanes, then Save bands)"
+          : "define at least one group before running — opening the picker so you can fill the Groups panel";
+        consoleRef.current += `\n=== ${node.data.label}: ${why} ===\n`;
         setConsoleOut(consoleRef.current);
-        runAbortRef.current = true;   // stop a full "Run graph" here
-        return;
+        setNodes((cur) => cur.map((n) => n.id === node.id ? { ...n, data: { ...n.data, status: "idle" } } : n));
+        const picked = await openBandPickerAndWait(node.id);
+        if (!picked || (picked.lanes?.length ?? 0) === 0 || (picked.groups?.length ?? 0) === 0) {
+          const stop = !picked || (picked.lanes?.length ?? 0) === 0
+            ? "no bands specified"
+            : "no groups defined";
+          consoleRef.current += `=== ${node.data.label}: ${stop} — run stopped ===\n`;
+          setConsoleOut(consoleRef.current);
+          runAbortRef.current = true;   // stop a full "Run graph" here
+          return;
+        }
+        // Continue the run with the freshly-picked config (state was already
+        // updated by saveBandPicker; refresh our local node too).
+        node = { ...node, data: { ...node.data, roi: picked, code: generateBandPickerCode(picked) } };
       }
-      // Continue the run with the freshly-picked config (state was already
-      // updated by saveBandPicker; refresh our local node too).
-      node = { ...node, data: { ...node.data, roi: picked, code: generateBandPickerCode(picked) } };
     }
     // Interactive intensity-picker not yet configured (no groups defined) →
     // pause and open the picker so the run has meaningful group labels.
@@ -4964,30 +5024,38 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       setConsoleOut(consoleRef.current);
       setNodes((cur) => cur.map((n) => {
         if (n.id !== node.id) return n;
-        // Archive previous-run image/plot outputs as v1 / v2 so the user
-        // can compare old vs new in the drawer without losing the old
-        // one. Tables are NOT archived (CSVs replace cleanly; rarely
-        // compared visually). Cap at v2: the newest run is current,
-        // the prior run becomes v1, and pre-v1 falls off.
+        // Versioning model: every image/plot output gets a monotonically
+        // increasing version label — the FIRST run produces v1, the next
+        // v2, and so on. Older versions are kept (capped at the 3 most
+        // recent runs) so the user can compare old vs new in the drawer.
+        // Tables are NOT versioned (CSVs replace fresh — they're cheap
+        // and rarely compared visually).
         const prev = n.data.outputs || [];
-        const archived: NodeOutput[] = [];
-        for (const o of prev) {
-          if (o.kind === "table") continue;          // newest only
-          if (!o.versionLabel) {
-            archived.push({ ...o, id: `${o.id}__v1`, versionLabel: "v1" });
-          } else {
-            const m = o.versionLabel.match(/^v(\d+)$/);
-            const next = m ? Number(m[1]) + 1 : 2;
-            if (next > 2) continue;                  // drop too-old
-            const base = o.id.replace(/__v\d+$/, "");
-            archived.push({ ...o, id: `${base}__v${next}`, versionLabel: `v${next}` });
+        const versionOf = (o: NodeOutput): number => {
+          const m = (o.versionLabel || "").match(/^v(\d+)$/);
+          return m ? Number(m[1]) : 0;
+        };
+        const maxV = prev.reduce((acc, o) => Math.max(acc, versionOf(o)), 0);
+        const newV = maxV + 1;
+        const tagged: NodeOutput[] = newOutputs.map((o) => (
+          o.kind === "table" ? o : {
+            ...o, id: `${o.id}__v${newV}`, versionLabel: `v${newV}`,
           }
+        ));
+        // Keep the previous 2 versions of image/plot outputs (current = v(newV)
+        // → keep v(newV-1), v(newV-2); drop anything older). Tables: always
+        // replace with the fresh ones from this run.
+        const kept: NodeOutput[] = [];
+        for (const o of prev) {
+          if (o.kind === "table") continue;
+          const v = versionOf(o);
+          if (v > 0 && v >= newV - 2) kept.push(o);
         }
         return {
           ...n,
           data: {
             ...n.data,
-            outputs: [...newOutputs, ...archived],
+            outputs: [...tagged, ...kept],
             status: result.success ? "ok" : "error",
             error: result.success ? undefined : (result.stderr || "Run failed").slice(0, 200),
             consoleOut: nodeOut,
@@ -5084,7 +5152,17 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     setStagedForMain((s) => { if (!s.has(key)) return s; const n = new Set(s); n.delete(key); return n; });
     setStagedForCollage((s) => { if (!s.has(key)) return s; const n = new Set(s); n.delete(key); return n; });
     setSelectedOutputKeys((s) => { if (!s.has(key)) return s; const n = new Set(s); n.delete(key); return n; });
-  }, []);
+    // Mirror the deletion into the outputs cache too, so navigating away
+    // from the Analysis tab and back doesn't resurrect the just-deleted
+    // entry from a stale snapshot. (The workflowTabs-mirror useEffect
+    // will also catch this on the next tick, but doing it here is
+    // immediate + avoids a flash if the user switches tabs fast.)
+    const tabId = activeWf?.id;
+    if (tabId) {
+      const cur = nodeOutputsCache.get(outputsCacheKey(tabId, nodeId));
+      if (cur) nodeOutputsCache.set(outputsCacheKey(tabId, nodeId), cur.filter((o) => o.id !== outputId));
+    }
+  }, [setNodes, activeWf]);
 
   // ── Drawer selection + batch actions ──────────────────────────
 
@@ -6330,9 +6408,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
                               sx={{ flex: 1, fontSize: "0.55rem", textTransform: "none", py: 0, minWidth: 0 }}>
                               Download
                             </Button>
-                            <Tooltip placement="top" title="Remove this output from the drawer. The next node re-run will produce a fresh one (and the v1 archive is preserved separately).">
+                            <Tooltip placement="top" title="Remove this output from the drawer. The next node re-run will produce a fresh one (the version-archive keeps prior runs separately).">
                               <IconButton size="small"
-                                onClick={() => deleteOutput(o.nodeId, o.outputId)}
+                                onClick={(e) => { e.preventDefault(); e.stopPropagation(); deleteOutput(o.nodeId, o.outputId); }}
+                                onMouseDown={(e) => { e.stopPropagation(); }}
                                 sx={{ p: 0.25, color: "text.disabled", "&:hover": { color: "error.main" } }}>
                                 <DeleteOutlineIcon sx={{ fontSize: 14 }} />
                               </IconButton>
