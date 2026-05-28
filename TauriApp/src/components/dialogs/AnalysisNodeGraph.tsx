@@ -4905,19 +4905,30 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     if (node.data.interactive === "wb_bands") {
       const roiNow = node.data.roi as BandPickerConfig | undefined;
       const needBands = !roiNow || (roiNow.lanes?.length ?? 0) === 0;
-      const needGroups = !needBands && (roiNow!.groups?.length ?? 0) === 0;
+      // Require at least one group with at least one band assigned. An empty
+      // groups[] OR groups that exist but have no bands BOTH halt the run
+      // (the downstream R plot would otherwise show empty bars). The picker
+      // disables Save until this condition is met, so this gate mostly
+      // catches legacy configs.
+      const groupsHaveBands = !needBands
+        && (roiNow!.groups?.length ?? 0) > 0
+        && (roiNow!.groups || []).some((g) => (g.bands?.length ?? 0) > 0);
+      const needGroups = !needBands && !groupsHaveBands;
       if (needBands || needGroups) {
         const why = needBands
           ? "specify bands first — opening the picker (auto-detect / draw lanes, then Save bands)"
-          : "define at least one group before running — opening the picker so you can fill the Groups panel";
+          : "assign bands to at least one group before running — opening the picker so you can fill the Groups panel";
         consoleRef.current += `\n=== ${node.data.label}: ${why} ===\n`;
         setConsoleOut(consoleRef.current);
         setNodes((cur) => cur.map((n) => n.id === node.id ? { ...n, data: { ...n.data, status: "idle" } } : n));
         const picked = await openBandPickerAndWait(node.id);
-        if (!picked || (picked.lanes?.length ?? 0) === 0 || (picked.groups?.length ?? 0) === 0) {
+        const pickedHasGroupedBands = !!picked
+          && (picked.groups?.length ?? 0) > 0
+          && (picked.groups || []).some((g) => (g.bands?.length ?? 0) > 0);
+        if (!picked || (picked.lanes?.length ?? 0) === 0 || !pickedHasGroupedBands) {
           const stop = !picked || (picked.lanes?.length ?? 0) === 0
             ? "no bands specified"
-            : "no groups defined";
+            : "no group has any bands assigned";
           consoleRef.current += `=== ${node.data.label}: ${stop} — run stopped ===\n`;
           setConsoleOut(consoleRef.current);
           runAbortRef.current = true;   // stop a full "Run graph" here

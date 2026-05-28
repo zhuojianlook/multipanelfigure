@@ -1555,11 +1555,56 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
           </Typography>
         </Box>
       </DialogContent>
-      <DialogActions>
-        <Button onClick={onClose} sx={{ textTransform: "none" }}>Cancel</Button>
-        <Button variant="contained" onClick={() => onSave(cfg)} sx={{ textTransform: "none" }}>
-          Save bands
-        </Button>
+      <DialogActions sx={{ flexDirection: "column", alignItems: "stretch", gap: 0.75, px: 2, py: 1.25 }}>
+        {/* Save-blocker banner. The analysis runner aborts the workflow
+            with "no groups defined" when the saved config has bands but
+            zero groups — explain that here and disable Save until at
+            least one group has at least one band assigned, so the user
+            doesn't keep cycling Run graph → picker → save → halt. */}
+        {(() => {
+          const hasBands = cfg.lanes.length > 0;
+          const groupCount = (cfg.groups ?? []).length;
+          const groupsWithBands = (cfg.groups ?? []).filter((g) => (g.bands?.length ?? 0) > 0).length;
+          const canSave = !hasBands || (groupCount > 0 && groupsWithBands > 0);
+          let reason = "";
+          if (hasBands && groupCount === 0) {
+            reason = "⚠ No groups defined yet — the analysis runner halts on save. "
+              + "Click \"+ Group\" above and assign at least one band before saving.";
+          } else if (hasBands && groupsWithBands === 0) {
+            reason = "⚠ You have groups but no bands assigned to any of them — "
+              + "click the band-name chips (B1, B2, …) inside a group row to assign them, then save.";
+          }
+          return (
+            <>
+              {reason && (
+                <Box sx={{
+                  px: 1, py: 0.5, borderRadius: 0.5,
+                  bgcolor: "rgba(180,120,40,0.12)",
+                  border: "1px solid rgba(220,150,60,0.4)",
+                  color: "#e0a060",
+                  fontSize: "0.72rem",
+                  textAlign: "left",
+                }}>
+                  {reason}
+                </Box>
+              )}
+              <Box sx={{ display: "flex", justifyContent: "flex-end", gap: 1 }}>
+                <Button onClick={onClose} sx={{ textTransform: "none" }}>Cancel</Button>
+                <Tooltip title={canSave ? "" : (reason || "Save disabled")}
+                         disableHoverListener={canSave}
+                         disableFocusListener={canSave}>
+                  <span>
+                    <Button variant="contained" disabled={!canSave}
+                            onClick={() => onSave(cfg)}
+                            sx={{ textTransform: "none" }}>
+                      Save bands
+                    </Button>
+                  </span>
+                </Tooltip>
+              </Box>
+            </>
+          );
+        })()}
       </DialogActions>
     </Dialog>
   );
