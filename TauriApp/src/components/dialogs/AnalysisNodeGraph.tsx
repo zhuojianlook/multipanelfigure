@@ -89,6 +89,8 @@ import BandPickerDialog, {
 } from "./BandPickerDialog";
 import IntensityPickerDialog, {
   type FluorIntensityConfig,
+  type FluorPickerImage,
+  type FluorImageSource,
   generateFluorCode,
   emptyFluorConfig,
 } from "./IntensityPickerDialog";
@@ -2493,92 +2495,165 @@ function buildCornealHazeWorkflow(): SavedWorkflow {
 // "Configure intensity…" button on the node (and a "Run graph"
 // pauses there until the user clicks Save).
 
-const INTENSITY_PLOT_R = `# @name: Plot intensities (groups × channels)
+const INTENSITY_PLOT_R = `# @name: Plot intensities (groups × channels, control panel)
 # Per-channel comparison across user-defined groups (set in the
 # Intensity picker UI). Bars = group mean, error = SD, jittered raw
-# points overlaid, pairwise t-test brackets per channel.
+# points overlaid, ANOVA + Tukey HSD pairwise brackets per channel.
+# When the picker marks a channel as the control (is_control == TRUE),
+# its panel is rendered separately and visually flagged when the
+# control's between-group test is significant (suggests the groups
+# may not be biologically comparable).
 suppressWarnings(suppressMessages({ library(ggplot2); library(ggprism) }))
 
 data <- inputs[[1]]
 if (!"mean_intensity" %in% names(data)) data$mean_intensity <- 0
 if (!"channel" %in% names(data)) data$channel <- "Channel"
 if (!"group"   %in% names(data)) data$group   <- "all"
+if (!"is_control" %in% names(data)) data$is_control <- FALSE
 data$mean_intensity <- suppressWarnings(as.numeric(data$mean_intensity))
+data$is_control <- as.logical(data$is_control)
+data$is_control[is.na(data$is_control)] <- FALSE
 data <- data[is.finite(data$mean_intensity), , drop = FALSE]
 data$channel <- factor(data$channel, levels = unique(data$channel))
 data$group   <- factor(data$group,   levels = unique(data$group))
 
-if (nrow(data) == 0) {
+# Tukey HSD across groups within a single channel. Returns a data.frame
+# of pairwise comparisons (group1, group2, p.adj, label, sig) ready for
+# ggprism::add_pvalue. Empty df when fewer than 2 usable groups.
+.tukey_for <- function(sub) {
+  grps <- intersect(levels(data$group), unique(as.character(sub$group)))
+  usable <- grps[vapply(grps, function(gg) sum(sub$group == gg) >= 2, logical(1))]
+  if (length(usable) < 2) return(NULL)
+  sub2 <- sub[sub$group %in% usable, , drop = FALSE]
+  sub2$group <- factor(sub2$group, levels = usable)
+  aov_res <- tryCatch(aov(mean_intensity ~ group, data = sub2), error = function(e) NULL)
+  if (is.null(aov_res)) return(NULL)
+  tk <- tryCatch(TukeyHSD(aov_res), error = function(e) NULL)
+  if (is.null(tk)) return(NULL)
+  tk_mat <- tk[["group"]]
+  if (is.null(tk_mat) || nrow(tk_mat) == 0) return(NULL)
+  pairs <- strsplit(rownames(tk_mat), "-", fixed = TRUE)
+  data.frame(
+    group1   = vapply(pairs, function(p) p[2], character(1)),
+    group2   = vapply(pairs, function(p) p[1], character(1)),
+    p.adj    = tk_mat[, "p adj"],
+    stringsAsFactors = FALSE
+  )
+}
+
+# Build a brackets df for ggprism::add_pvalue: rows = {channel, group1,
+# group2, p.label, y.position}, with y.position stacked per channel.
+.brackets <- function(sub, ch_levels, summ) {
+  out <- list()
+  for (ch in ch_levels) {
+    s <- sub[sub$channel == ch, , drop = FALSE]
+    tk <- .tukey_for(s)
+    if (is.null(tk) || nrow(tk) == 0) next
+    tk <- tk[order(tk$p.adj), , drop = FALSE]
+    ymax <- max(summ$mean[summ$channel == ch] + summ$sd[summ$channel == ch], na.rm = TRUE)
+    if (!is.finite(ymax) || ymax <= 0) ymax <- max(s$mean_intensity, na.rm = TRUE)
+    step <- 0.13 * ymax
+    k <- 0
+    for (i in seq_len(nrow(tk))) {
+      pv <- tk$p.adj[i]
+      if (is.na(pv)) next
+      lab <- if (pv < 0.001) "***" else if (pv < 0.01) "**" else if (pv < 0.05) "*" else "ns"
+      k <- k + 1
+      out[[length(out) + 1]] <- data.frame(
+        channel = ch, group1 = tk$group1[i], group2 = tk$group2[i],
+        p.label = lab, y.position = ymax + step * k, stringsAsFactors = FALSE)
+    }
+  }
+  if (length(out) == 0) return(NULL)
+  do.call(rbind, out)
+}
+
+# Per-(group, channel) summary used by both panels (mean + SD + n).
+.summary <- function(d) {
+  if (nrow(d) == 0) return(data.frame(group = character(0), channel = character(0),
+                                       mean = numeric(0), sd = numeric(0), n = integer(0)))
+  agg <- aggregate(mean_intensity ~ group + channel, data = d,
+                   FUN = function(v) c(m = mean(v), s = sd(v), n = length(v)))
+  out <- data.frame(group = agg$group, channel = agg$channel,
+                    mean = agg$mean_intensity[, "m"],
+                    sd   = agg$mean_intensity[, "s"],
+                    n    = as.integer(agg$mean_intensity[, "n"]))
+  out$sd[is.na(out$sd)] <- 0
+  out
+}
+
+# Render a single ggplot for the given data subset. flag_warning=TRUE
+# draws a red ribbon at the top of the panel(s) — used on the control
+# panel when the between-group test rejects H0.
+.render_panel <- function(d, title, flag_warning) {
+  if (nrow(d) == 0) {
+    return(ggplot() + theme_void() +
+           annotate("text", x = 0.5, y = 0.5, label = paste0(title, ": no rows")))
+  }
+  s <- .summary(d)
+  br <- .brackets(d, levels(droplevels(d$channel)), s)
+  n_facets <- length(unique(d$channel))
+  p <- ggplot() +
+    geom_col(data = s, aes(x = group, y = mean, fill = group),
+             width = 0.7, color = "grey25", linewidth = 0.3) +
+    geom_errorbar(data = s, aes(x = group, ymin = pmax(0, mean - sd), ymax = mean + sd),
+                  width = 0.22, linewidth = 0.4) +
+    geom_jitter(data = d, aes(x = group, y = mean_intensity),
+                width = 0.13, height = 0, size = 1.1, alpha = 0.7,
+                color = "grey20", stroke = 0) +
+    facet_wrap(~ channel, scales = "free_y", nrow = 1) +
+    theme_prism(base_size = 11) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
+          plot.margin = margin(10, 10, 6, 10),
+          plot.title = element_text(size = 11, face = "bold",
+                                    color = if (flag_warning) "#b03030" else "grey25")) +
+    labs(x = NULL, y = "Mean intensity", title = title)
+  if (!is.null(br)) {
+    p <- tryCatch(
+      p + ggprism::add_pvalue(br, label = "p.label",
+                              xmin = "group1", xmax = "group2",
+                              y.position = "y.position",
+                              tip.length = 0.01, label.size = 3.0, bracket.size = 0.3),
+      error = function(e) { message("add_pvalue failed: ", conditionMessage(e)); p })
+  }
+  p
+}
+
+# ── Split control vs analysis channels and render each. ─────────────
+control_data  <- data[data$is_control == TRUE, , drop = FALSE]
+analysis_data <- data[data$is_control == FALSE, , drop = FALSE]
+
+if (nrow(analysis_data) == 0 && nrow(control_data) == 0) {
   mpfig_plot("channel_intensity.png", width = 1100, height = 800, res = 300)
   print(ggplot() + theme_void() + annotate("text", x = 0.5, y = 0.5,
         label = "No intensity rows — wire images upstream and Configure intensity."))
 } else {
-
-# Per-group, per-channel mean + SD. (For Cellpose mode each row is
-# already one cell, so SD reflects cell-to-cell variation; for
-# simple mode each row is one image, so SD reflects between-image
-# variation.)
-agg <- aggregate(mean_intensity ~ group + channel, data = data,
-                 FUN = function(v) c(m = mean(v), s = sd(v), n = length(v)))
-summ <- data.frame(group = agg$group, channel = agg$channel,
-                   mean = agg$mean_intensity[, "m"],
-                   sd   = agg$mean_intensity[, "s"],
-                   n    = agg$mean_intensity[, "n"])
-summ$sd[is.na(summ$sd)] <- 0
-
-# Pairwise t-tests between groups, within each channel (needs n>=2 each).
-stat_df <- NULL
-if (nlevels(data$group) >= 2) {
-  pieces <- list()
-  for (ch in levels(data$channel)) {
-    sub <- data[data$channel == ch, ]
-    grps <- intersect(levels(data$group), unique(as.character(sub$group)))
-    usable <- grps[vapply(grps, function(gg) sum(sub$group == gg) >= 2, logical(1))]
-    if (length(usable) < 2) next
-    ymax <- max(summ$mean[summ$channel == ch] + summ$sd[summ$channel == ch], na.rm = TRUE)
-    step <- 0.13 * ymax; k <- 0
-    combs <- combn(usable, 2)
-    for (j in seq_len(ncol(combs))) {
-      a <- combs[1, j]; b <- combs[2, j]
-      pv <- tryCatch(t.test(sub$mean_intensity[sub$group == a], sub$mean_intensity[sub$group == b])$p.value,
-                     error = function(e) NA_real_)
-      if (is.na(pv)) next
-      lab <- if (pv < 0.001) "***" else if (pv < 0.01) "**" else if (pv < 0.05) "*" else "ns"
-      k <- k + 1
-      pieces[[length(pieces) + 1]] <- data.frame(
-        channel = ch, group1 = a, group2 = b, p.label = lab, y.position = ymax + step * k)
-    }
+  # Render the analysis (non-control) panel first.
+  if (nrow(analysis_data) > 0) {
+    analysis_data$channel <- droplevels(analysis_data$channel)
+    n_facets <- length(unique(analysis_data$channel))
+    mpfig_plot("channel_intensity.png",
+               width = max(1100, 520 * min(n_facets, 4)), height = 1050, res = 300)
+    print(.render_panel(analysis_data, "Channel intensities", FALSE))
   }
-  if (length(pieces) > 0) stat_df <- do.call(rbind, pieces)
-}
-
-n_facets <- length(unique(data$channel))
-mpfig_plot("channel_intensity.png",
-           width = max(1100, 520 * min(n_facets, 4)), height = 1050, res = 300)
-p <- ggplot() +
-  geom_col(data = summ, aes(x = group, y = mean, fill = group),
-           width = 0.7, color = "grey25", linewidth = 0.3) +
-  geom_errorbar(data = summ, aes(x = group, ymin = pmax(0, mean - sd), ymax = mean + sd),
-                width = 0.22, linewidth = 0.4) +
-  geom_jitter(data = data, aes(x = group, y = mean_intensity),
-              width = 0.13, height = 0, size = 1.1, alpha = 0.7,
-              color = "grey20", stroke = 0) +
-  facet_wrap(~ channel, scales = "free_y", nrow = 1) +
-  theme_prism(base_size = 11) +
-  theme(legend.position = "none",
-        axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
-        plot.margin = margin(10, 10, 6, 10)) +
-  labs(x = NULL, y = "Mean intensity")
-
-if (!is.null(stat_df)) {
-  p <- tryCatch(
-    p + ggprism::add_pvalue(stat_df, label = "p.label",
-                            xmin = "group1", xmax = "group2",
-                            y.position = "y.position",
-                            tip.length = 0.01, label.size = 3.0, bracket.size = 0.3),
-    error = function(e) { message("add_pvalue failed: ", conditionMessage(e)); p })
-}
-print(p)
+  # Render the control sanity check separately if a control channel was
+  # set. If between-group p < 0.05, flag the panel so the user can tell
+  # at a glance that the control isn't comparable.
+  if (nrow(control_data) > 0) {
+    control_data$channel <- droplevels(control_data$channel)
+    # Determine if the control is significantly different between groups
+    # (any pairwise Tukey p.adj < 0.05 counts).
+    ctrl_summary <- .summary(control_data)
+    ctrl_brackets <- .brackets(control_data, levels(droplevels(control_data$channel)), ctrl_summary)
+    is_flagged <- !is.null(ctrl_brackets) && any(ctrl_brackets$p.label %in% c("*", "**", "***"))
+    title <- if (is_flagged)
+      "Control channel — DIFFERS between groups (groups may not be comparable)"
+    else
+      "Control channel — sanity check (NS expected)"
+    mpfig_plot("control_intensity.png", width = 1100, height = 900, res = 300)
+    print(.render_panel(control_data, title, is_flagged))
+  }
 }
 `;
 
@@ -3614,10 +3689,12 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // downstream Normalize/Plot with no bands.
   const runAbortRef = useRef(false);
   // Fluorescence intensity picker modal state — mirrors bandPicker.
-  // `images` is the upstream image labels resolved at open time so the
-  // group-assignment UI can show chips for the right files.
+  // `images` is the full upstream image input set (label + thumbnail b64 +
+  // optional source descriptor) resolved at open time so the dialog can
+  // cycle through, show live segmentation previews, and re-extract full
+  // resolution when needed.
   const [intensityPicker, setIntensityPicker] = useState<{
-    open: boolean; nodeId: string | null; images: string[]; cfg: FluorIntensityConfig | null;
+    open: boolean; nodeId: string | null; images: FluorPickerImage[]; cfg: FluorIntensityConfig | null;
   }>(() => ({ open: false, nodeId: null, images: [], cfg: null }));
   const intensityPickerResolveRef = useRef<((cfg: FluorIntensityConfig | null) => void) | null>(null);
   // Set of currently-selected node ids + edge ids — populated by
@@ -4746,22 +4823,53 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   }, [openBandPicker]);
 
   // ── Intensity picker (fluorescence channel intensity comparison) ──
+  // Resolve every upstream image input — label, thumbnail base64 PNG, and,
+  // for source-node-derived inputs, the source descriptor — so the dialog
+  // can: (a) cycle through images, (b) show a live segmentation overlay,
+  // (c) re-extract full-res when needed.
   const openIntensityPicker = useCallback((nodeId: string) => {
     const nm = new Map(nodes.map((n) => [n.id, n]));
     const ins = collectInputs(nodeId, nm);
-    // List of distinct upstream image labels so the picker can show them
-    // as chips for group assignment.
+    // Source-descriptor lookup keyed by inset_<i>_<src.key> so we can pair
+    // each thumbnail with its full-res re-extract handle (matches the key
+    // that `collectInputs` synthesises for source-node inputs).
+    const srcByKey = new Map<string, FluorImageSource>();
+    for (const e of edges) {
+      if (e.target !== nodeId) continue;
+      const upstream = nm.get(e.source);
+      if (!upstream || upstream.data.kind !== "source") continue;
+      if (!(e.sourceHandle || "").startsWith("out_image_")) continue;
+      const idx = parseInt((e.sourceHandle || "").replace("out_image_", ""), 10);
+      const src = (upstream.data.sources || [])[idx];
+      if (!src) continue;
+      // The descriptor mirrors the wb-preview / wb-detect-bands shape so
+      // the backend's _extract_source_image can re-extract full-res.
+      srcByKey.set(src.key, {
+        key: src.key,
+        row: (src as { row?: number }).row,
+        col: (src as { col?: number }).col,
+        inset_index: (src as { inset_index?: number }).inset_index,
+        name: src.label,
+      });
+    }
     const seen = new Set<string>();
-    const labels: string[] = [];
+    const pickerImages: FluorPickerImage[] = [];
     for (const x of ins) {
       if (x.kind !== "image") continue;
       const lbl = (x.label || "").split("/").pop() || x.label;
-      if (lbl && !seen.has(lbl)) { seen.add(lbl); labels.push(lbl); }
+      if (!lbl || seen.has(lbl)) continue;
+      seen.add(lbl);
+      // Source-node inputs key as inset_<i>_<src.key>; pull the descriptor.
+      // Upstream-node outputs have no source descriptor — the dialog falls
+      // back to the base64 thumbnail for preview.
+      const skey = x.key.startsWith("inset_") ? x.key.split("_").slice(2).join("_") : "";
+      const source = skey ? srcByKey.get(skey) : undefined;
+      pickerImages.push({ label: lbl, image_b64: x.image_b64 || "", source });
     }
     const node = nm.get(nodeId);
     const initialCfg = (node?.data.intensity as FluorIntensityConfig | undefined) || emptyFluorConfig();
-    setIntensityPicker({ open: true, nodeId, images: labels, cfg: initialCfg });
-  }, [nodes, collectInputs]);
+    setIntensityPicker({ open: true, nodeId, images: pickerImages, cfg: initialCfg });
+  }, [nodes, edges, collectInputs]);
 
   const saveIntensityPicker = useCallback((cfg: FluorIntensityConfig) => {
     setIntensityPicker((ip) => {
@@ -4777,7 +4885,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   }, [setNodes]);
 
   const closeIntensityPicker = useCallback(() => {
-    setIntensityPicker({ open: false, nodeId: null, images: [], cfg: null });
+    setIntensityPicker({ open: false, nodeId: null, images: [] as FluorPickerImage[], cfg: null });
     const r = intensityPickerResolveRef.current; intensityPickerResolveRef.current = null;
     if (r) r(null);
   }, []);
@@ -6583,10 +6691,11 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         onClose={closeBandPicker}
         onSave={saveBandPicker}
       />
-      {/* Fluorescence intensity picker — channel renames + group assignment. */}
+      {/* Fluorescence intensity picker — image cycler + live segmentation
+          preview + channel renames + group assignment. */}
       <IntensityPickerDialog
         open={intensityPicker.open}
-        imageLabels={intensityPicker.images}
+        images={intensityPicker.images}
         initial={intensityPicker.cfg}
         onClose={closeIntensityPicker}
         onSave={saveIntensityPicker}

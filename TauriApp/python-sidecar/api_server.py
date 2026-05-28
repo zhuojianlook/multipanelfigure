@@ -37,7 +37,7 @@ import uvicorn
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
@@ -6933,6 +6933,272 @@ def wb_detect_bands(body: WbBandDetectRequest):
         "used_source": bool(used_source),
         "raw_depth": bool(raw_depth),
         "preview_b64": preview_b64,
+    }
+
+
+# ── Fluorescence intensity picker live preview ───────────────────
+# Powers the IntensityPickerDialog's segmentation overlay. The user
+# tweaks per-channel threshold knobs OR Cellpose params and this
+# endpoint returns an overlay PNG of detected regions/cells so they
+# can see whether the parameters work before committing.
+class FluorChannelThreshold(BaseModel):
+    enabled: bool = True
+    threshold_method: str = "percentile"  # "percentile" | "otsu"
+    threshold_percentile: float = 95.0
+    min_area: int = 30
+
+
+class FluorCellposePreview(BaseModel):
+    model: str = "cpsam"
+    diameter: float = 0.0       # 0 = auto
+    seg_channel: str = "b"      # "r" | "g" | "b"
+    min_size: int = 30
+
+
+class FluorPreviewRequest(BaseModel):
+    # Same dual-input pattern as wb-preview: prefer `source` (re-extract
+    # full-res in-sidecar) and fall back to base64.
+    image_b64: str = ""
+    source: Optional[Dict[str, object]] = None
+    # "simple" → per-channel threshold; "cellpose" → call the Cellpose
+    # plugin for per-cell labels.
+    strategy: str = "simple"
+    # Simple-mode params, keyed by channel ("r" | "g" | "b"). Channels
+    # marked `enabled=False` are skipped (rendered without an overlay
+    # contour). All channels share the same rolling-ball BG radius.
+    channels: Dict[str, FluorChannelThreshold] = Field(default_factory=dict)
+    rolling_radius: int = 35
+    # Cellpose-mode params (ignored when strategy == "simple").
+    cellpose: Optional[FluorCellposePreview] = None
+    # Cap the longer edge of the preview to this many px to keep the
+    # round-trip snappy as the user drags sliders. 1024 ≈ <1 s for
+    # threshold; Cellpose is internally capped further (its host runs
+    # on CPU on most installs).
+    preview_max_w: int = 1024
+
+
+@app.post("/api/analysis/fluor-preview-segment")
+def fluor_preview_segment(body: FluorPreviewRequest):
+    """Render a live segmentation-overlay preview for the Intensity picker.
+
+    Simple strategy: each enabled channel is rolling-ball BG-subtracted
+    then thresholded (percentile or Otsu). The overlay draws each
+    channel's mask boundary in that channel's pure colour on top of a
+    contrast-stretched composite of the source — so the user sees what
+    pixels each threshold currently picks up.
+
+    Cellpose strategy: routes a single image through the existing
+    isolated-venv plugin (model/diameter/seg_channel from `cellpose`),
+    extracts the labels image, draws yellow object outlines + cell IDs
+    on top of the composite.
+
+    Output:
+      { success, overlay_b64, src_w, src_h, n_cells?, per_channel?: {r,g,b -> n_pixels}, error? }
+    """
+    import numpy as _np
+    import sys as __s
+    try:
+        import cv2 as _cv2
+        from scipy import ndimage as _ndi
+        _have_cv = True
+    except Exception as _e:
+        _have_cv = False
+        _cv_err = str(_e)
+
+    # 1) Decode the source image. Re-extract full-res from a source
+    #    descriptor when provided (lossless); otherwise decode base64.
+    rgb = None
+    if body.source:
+        try:
+            ex = _extract_source_image(body.source)
+            if ex is not None:
+                rgb = _np.asarray(ex.convert("RGB")).astype(_np.float32)
+        except Exception as _e:
+            print(f"[fluor-preview] source extract failed: {_e}", file=__s.stderr, flush=True)
+    if rgb is None:
+        try:
+            raw = base64.b64decode(str(body.image_b64 or "").split(",")[-1])
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            rgb = _np.asarray(img).astype(_np.float32)
+        except Exception as e:
+            return {"success": False, "overlay_b64": "", "error": f"decode failed: {e}"}
+    if rgb.ndim != 3 or rgb.shape[2] < 3 or rgb.shape[0] < 16 or rgb.shape[1] < 16:
+        return {"success": False, "overlay_b64": "", "error": "image too small"}
+    src_h0, src_w0 = rgb.shape[:2]
+
+    # 2) Downsample to the preview cap so slider-drags stay sub-second.
+    PW = max(64, int(body.preview_max_w or 1024))
+    if src_w0 > PW and _have_cv:
+        ph = max(1, int(round(src_h0 * PW / src_w0)))
+        rgb = _cv2.resize(rgb, (PW, ph), interpolation=_cv2.INTER_AREA)
+    h, w = rgb.shape[:2]
+
+    # 3) Helper: contrast-stretched composite for the overlay base.
+    def _composite_u8(arr):
+        comp = _np.zeros((arr.shape[0], arr.shape[1], 3), dtype=_np.float32)
+        for ci in range(min(3, arr.shape[2])):
+            ch = arr[..., ci].astype(_np.float32)
+            lo, hi = _np.percentile(ch, [1, 99.5])
+            if hi > lo:
+                comp[..., ci] = _np.clip((ch - lo) / (hi - lo), 0, 1)
+        return (comp * 255).astype(_np.uint8)
+
+    composite = _composite_u8(rgb)
+
+    # 4) Branch on strategy.
+    strategy = (body.strategy or "simple").lower()
+
+    if strategy == "cellpose":
+        # Single-image cellpose preview via the plugin venv. We delegate
+        # to the same code path as /api/analysis/run-cellpose by calling
+        # cellpose_plugin.run() directly with one image — no subprocess
+        # ping back to ourselves.
+        cp = body.cellpose or FluorCellposePreview()
+        seg_ch = {"r": 1, "g": 2, "b": 3}.get((cp.seg_channel or "b").lower(), 3)
+        cfg = {
+            "model": cp.model or "cpsam",
+            "diameter": float(cp.diameter or 0) or None,
+            "min_size": int(cp.min_size or 30),
+            "channels": [seg_ch, 0],
+        }
+        # The plugin expects uint8 arrays.
+        try:
+            arr_u8 = _np.clip(rgb, 0, 255).astype(_np.uint8)
+            res = cellpose_plugin.run([("preview", arr_u8)], cfg, 120)
+        except Exception as _e:
+            return {"success": False, "overlay_b64": "",
+                    "error": f"cellpose invocation failed: {_e}"}
+        if not res.get("success"):
+            return {"success": False, "overlay_b64": "",
+                    "error": (res.get("stderr") or "(no detail)").strip() or "cellpose failed"}
+        # Grab the labels image the plugin emits as <label>_labels.
+        lbl_b64 = next((im["image"] for im in (res.get("images") or [])
+                        if im.get("name") == "preview_labels"), None)
+        if not lbl_b64:
+            return {"success": False, "overlay_b64": "",
+                    "error": "cellpose returned no labels image"}
+        try:
+            labels = _np.asarray(
+                Image.open(io.BytesIO(base64.b64decode(lbl_b64))).convert("L")
+            ).astype(_np.int32)
+            if labels.shape[:2] != composite.shape[:2] and _have_cv:
+                labels = _cv2.resize(
+                    labels, (composite.shape[1], composite.shape[0]),
+                    interpolation=_cv2.INTER_NEAREST,
+                )
+        except Exception as _e:
+            return {"success": False, "overlay_b64": "",
+                    "error": f"labels decode failed: {_e}"}
+
+        # Draw yellow boundaries on the composite.
+        boundaries = _np.zeros(labels.shape, dtype=bool)
+        boundaries[:-1, :] |= labels[:-1, :] != labels[1:, :]
+        boundaries[:, :-1] |= labels[:, :-1] != labels[:, 1:]
+        boundaries &= labels > 0
+        composite[boundaries] = (255, 255, 0)
+        n_cells = int(len(_np.unique(labels[labels > 0])))
+        # Emit overlay PNG.
+        _buf = io.BytesIO()
+        Image.fromarray(_np.ascontiguousarray(composite)).save(_buf, format="PNG")
+        return {
+            "success": True,
+            "overlay_b64": base64.b64encode(_buf.getvalue()).decode(),
+            "src_w": int(src_w0), "src_h": int(src_h0),
+            "preview_w": int(w), "preview_h": int(h),
+            "n_cells": n_cells,
+        }
+
+    # ── Simple strategy: per-channel threshold. ──────────────────
+    if not _have_cv:
+        return {"success": False, "overlay_b64": "",
+                "error": f"scipy/cv2 unavailable in sidecar ({_cv_err})"}
+
+    def _rolling_bg(img, radius):
+        if radius <= 0:
+            return _np.zeros_like(img, dtype=_np.float64)
+        k = int(radius) * 2 + 1
+        kernel = _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (k, k))
+        return _cv2.morphologyEx(img.astype(_np.float32), _cv2.MORPH_OPEN, kernel).astype(_np.float64)
+
+    def _disk(r):
+        y, x = _np.ogrid[-r:r + 1, -r:r + 1]
+        return (x * x + y * y) <= r * r
+
+    def _threshold_mask(corr, method, pct):
+        if method == "otsu":
+            lo = _np.percentile(corr, 0.2)
+            hi = _np.percentile(corr, 99.8)
+            if hi > lo:
+                scaled = _np.clip((corr - lo) / (hi - lo), 0, 1)
+                u8 = (scaled * 255).astype(_np.uint8)
+                thr_u8, _ = _cv2.threshold(u8, 0, 255, _cv2.THRESH_BINARY + _cv2.THRESH_OTSU)
+                thr = float(lo + (thr_u8 / 255.0) * (hi - lo))
+            else:
+                thr = float(_np.percentile(corr, 99))
+        else:  # percentile
+            thr = float(_np.percentile(corr, float(pct)))
+        m = corr > thr
+        m = _ndi.binary_opening(m, structure=_disk(1))
+        m = _ndi.binary_closing(m, structure=_disk(2))
+        m = _ndi.binary_fill_holes(m)
+        return m.astype(bool)
+
+    per_channel: Dict[str, int] = {}
+    rolling_radius = int(body.rolling_radius or 0)
+    # Channel colour for the outline: pure R/G/B so the user can tell at
+    # a glance which contour belongs to which channel.
+    ch_colors = {"r": (255, 64, 64), "g": (96, 220, 96), "b": (96, 160, 255)}
+    out = composite.copy()
+    # Tally enabled channels for diagnostics.
+    enabled_count = 0
+    for ch_key, ch_idx in (("r", 0), ("g", 1), ("b", 2)):
+        spec = body.channels.get(ch_key)
+        if spec is None or not bool(getattr(spec, "enabled", True)):
+            per_channel[ch_key] = 0
+            continue
+        enabled_count += 1
+        ch_raw = rgb[..., ch_idx]
+        bg = _rolling_bg(ch_raw, rolling_radius)
+        corr = ch_raw.astype(_np.float64) - bg
+        corr[corr < 0] = 0
+        try:
+            mask = _threshold_mask(
+                corr,
+                str(getattr(spec, "threshold_method", "percentile")),
+                float(getattr(spec, "threshold_percentile", 95)),
+            )
+        except Exception as _e:
+            print(f"[fluor-preview] ch {ch_key}: threshold failed: {_e}",
+                  file=__s.stderr, flush=True)
+            per_channel[ch_key] = 0
+            continue
+        # Remove small components per channel.
+        min_area = int(getattr(spec, "min_area", 30) or 0)
+        if min_area > 0:
+            labels_c, _n = _ndi.label(mask)
+            sizes = _np.bincount(labels_c.ravel())
+            sizes[0] = 0
+            keep_ids = _np.where(sizes >= min_area)[0]
+            mask = _np.isin(labels_c, keep_ids)
+        per_channel[ch_key] = int(mask.sum())
+        # Draw a thicker boundary so it survives downscaling on the UI side.
+        boundary = _np.zeros(mask.shape, dtype=bool)
+        boundary[:-1, :] |= mask[:-1, :] != mask[1:, :]
+        boundary[:, :-1] |= mask[:, :-1] != mask[:, 1:]
+        # Dilate slightly so the line is readable in the preview.
+        boundary = _ndi.binary_dilation(boundary, iterations=1)
+        out[boundary] = ch_colors[ch_key]
+
+    # Emit overlay PNG.
+    _buf = io.BytesIO()
+    Image.fromarray(_np.ascontiguousarray(out)).save(_buf, format="PNG")
+    return {
+        "success": True,
+        "overlay_b64": base64.b64encode(_buf.getvalue()).decode(),
+        "src_w": int(src_w0), "src_h": int(src_h0),
+        "preview_w": int(w), "preview_h": int(h),
+        "per_channel": per_channel,
+        "enabled_count": enabled_count,
     }
 
 
