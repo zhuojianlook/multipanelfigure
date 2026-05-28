@@ -143,7 +143,11 @@ export function emptyFluorConfig(): FluorIntensityConfig {
       b: { enabled: true, thresholdMethod: "percentile", thresholdPercentile: 95, minArea: 30, enhanceEdges: false },
     },
     rollingRadius: 35,
-    cellpose: { model: "cpsam", diameter: 0, segChannel: "b", minSize: 80 },
+    // Default to cyto3 — much smaller (~25 MB vs ~100 MB for cpsam),
+    // ~3x faster inference, works great on most fluorescence cell
+    // types. Users can switch to cpsam in the dropdown when they need
+    // its higher-accuracy segmentation.
+    cellpose: { model: "cyto3", diameter: 0, segChannel: "b", minSize: 80 },
     controlChannel: null,
     groups: [],
   };
@@ -768,13 +772,17 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   const [repairing, setRepairing] = useState(false);
   const [repairLog, setRepairLog] = useState<string>("");
   // Show the repair affordance when the error looks like a plugin-env
-  // problem (the 'No module named …' / "Cellpose isn't installed" pattern).
-  const showRepair = !!previewError && (
-    /No module named/.test(previewError)
-    || /not installed/i.test(previewError)
-    || /Install Cellpose/i.test(previewError)
-    || /plugin (?:venv|environment)/i.test(previewError)
-  );
+  // problem (the 'No module named …' / "Cellpose isn't installed"
+  // pattern). Exclude timeouts — a slow inference doesn't mean the venv
+  // is broken; offering a 5-15 min reinstall on a timeout was bad UX.
+  const showRepair = !!previewError
+    && !/timed out|timeout/i.test(previewError)
+    && (
+      /No module named/.test(previewError)
+      || /not installed/i.test(previewError)
+      || /Install Cellpose/i.test(previewError)
+      || /plugin (?:venv|environment)/i.test(previewError)
+    );
   const runCellposeRepair = useCallback(async () => {
     if (repairing) return;
     setRepairing(true);
@@ -985,7 +993,11 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         // user-driven cancel (e.g. they clicked Run again to retry).
         if ((ac as unknown as { __timedOut?: boolean }).__timedOut) {
           setPreviewError(cfg.mode === "cellpose"
-            ? "Cellpose preview timed out (>10 min). The first run downloads the model (~100 MB) — check your internet, then try again, or verify the plugin venv with 'Repair plugin venv'."
+            ? `Cellpose timed out (>10 min). ${
+                cfg.cellpose.model === "cpsam"
+                  ? "cpsam is the slowest model — try 'cyto3' in the Model dropdown (~3x faster, ~25 MB vs ~100 MB) or"
+                  : "Check your internet (first run downloads the model), or"
+              } close the dialog and try again — the model is cached after a successful run.`
             : "Preview timed out (>60 s). The sidecar may be busy or still loading scientific libraries on a cold start — try again.");
         }
         return;
@@ -1701,8 +1713,8 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                     inputProps={{ style: { fontSize: "0.78rem" } }}
                     InputLabelProps={{ style: { fontSize: "0.78rem" } }}
                     SelectProps={SELECT_MENU_PROPS}>
-                    <MenuItem value="cpsam" sx={{ fontSize: "0.78rem" }}>cpsam</MenuItem>
-                    <MenuItem value="cyto3" sx={{ fontSize: "0.78rem" }}>cyto3</MenuItem>
+                    <MenuItem value="cyto3" sx={{ fontSize: "0.78rem" }}>cyto3 (fast, default)</MenuItem>
+                    <MenuItem value="cpsam" sx={{ fontSize: "0.78rem" }}>cpsam (slow, accurate)</MenuItem>
                     <MenuItem value="cyto2" sx={{ fontSize: "0.78rem" }}>cyto2</MenuItem>
                     <MenuItem value="nuclei" sx={{ fontSize: "0.78rem" }}>nuclei</MenuItem>
                   </TextField>
