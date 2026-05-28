@@ -1023,12 +1023,29 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
               // Simple strategy: prefer composite + per-channel overlays.
               // Fallback to fused overlaySrc if composite missing.
               if (ap && isSimple && (ap.compositeSrc || ap.overlaySrc)) {
+                // Layered preview: the wrapper sizes to the composite img
+                // (inline-block + lineHeight:0 to suppress baseline-descender
+                // space). Overlay imgs are absolutely positioned to the
+                // wrapper's full bounds with NO objectFit — the overlays
+                // are guaranteed by the backend to be the EXACT same pixel
+                // dimensions as the composite, so stretching to 100%/100%
+                // is a pixel-perfect match. Earlier objectFit:contain on
+                // each overlay introduced independent fit-rounding that
+                // could shift overlays 1-2 px off the underlying signal.
                 return (
-                  <Box sx={{ position: "relative", maxWidth: "100%", maxHeight: "100%", display: "inline-block" }}>
+                  <Box sx={{
+                    position: "relative", maxWidth: "100%", maxHeight: "100%",
+                    display: "inline-block", lineHeight: 0, fontSize: 0,
+                  }}>
                     <img
                       src={ap.compositeSrc || ap.overlaySrc}
                       alt="Composite"
-                      style={{ display: "block", maxWidth: "100%", maxHeight: "calc(100vh - 320px)", objectFit: "contain" }}
+                      style={{
+                        display: "block",
+                        maxWidth: "100%",
+                        maxHeight: "calc(100vh - 320px)",
+                        verticalAlign: "top",
+                      }}
                     />
                     {(["r", "g", "b"] as const).map((k) => {
                       const src = ap.channelOverlays?.[k];
@@ -1039,9 +1056,9 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                           src={src}
                           alt={`${cfg.channels[k]} mask`}
                           style={{
-                            position: "absolute", inset: 0,
+                            position: "absolute",
+                            top: 0, left: 0,
                             width: "100%", height: "100%",
-                            objectFit: "contain", objectPosition: "center",
                             display: maskVisible[k] ? "block" : "none",
                             pointerEvents: "none",
                           }}
