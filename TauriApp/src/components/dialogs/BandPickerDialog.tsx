@@ -224,6 +224,25 @@ else:
     plane = arr
 H, W = plane.shape[:2]
 
+# Orientation detection — chemiluminescent / film blots are DARK bands
+# on a LIGHT background, so a naive np.sum(roi) UNDER-reads the strong
+# (dark) bands (their pixel values are LOWER than the bg).  Invert the
+# plane so signal = sum(vmax - pixel) → "integrated density" with the
+# conventional Western-blot semantics (darker band → larger IOD →
+# target/LC > 1 when LC is faint and target is strong).
+# Fluorescent / dark-background blots (LI-COR, etc.) skip the inversion
+# automatically because their median sits near 0.
+vmax = 65535.0 if float(plane.max()) > 255.0 else 255.0
+median_v = float(np.median(plane))
+dark_on_light = median_v > vmax * 0.5
+if dark_on_light:
+    plane = vmax - plane
+    print(f"detected DARK-on-LIGHT blot (median={median_v:.1f} of {vmax:.0f}) "
+          f"— inverted plane so signal = integrated density (higher = more protein)")
+else:
+    print(f"detected LIGHT-on-DARK blot (median={median_v:.1f} of {vmax:.0f}) "
+          f"— summing raw pixels directly")
+
 def _px(rect):
     x0 = int(round(rect["x"] * W)); x1 = int(round((rect["x"] + rect["w"]) * W))
     y0 = int(round(rect["y"] * H)); y1 = int(round((rect["y"] + rect["h"]) * H))

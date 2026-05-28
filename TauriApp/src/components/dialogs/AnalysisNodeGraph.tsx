@@ -2996,12 +2996,21 @@ plot_per_group <- "plot_per_group" %in% names(df) &&
 #     range, so labels stay readable.
 #   • Smaller-but-still-legible facet titles + 10-pt body so 3-up
 #     panels don't squish the y-axis ticks into noise.
-render_one <- function(d_sub, s_sub, facet_var, w, h, fname) {
+render_one <- function(d_sub, s_sub, facet_var, w, h, fname, group_title = NULL) {
   # Pick a y-tick formatter based on the magnitude of values.
   ymax_v <- if (nrow(s_sub) > 0) max(s_sub$mean + s_sub$sd, na.rm = TRUE) else 1
   y_fmt <- if (val_col == "normalized") scales::label_number(accuracy = 0.1)
            else if (is.finite(ymax_v) && ymax_v >= 1e5) scales::label_scientific(digits = 2)
            else scales::label_number(big.mark = ",", accuracy = 1)
+  # Plot title — when a single group is being rendered we show its
+  # name prominently so a saved per-group PNG is self-describing
+  # (was "wb_Treatment.png" with no on-figure label — easy to mix
+  # up once the figure left the analysis pane).  Combined / faceted
+  # plots get a generic title since the facet strips already carry
+  # the group names.
+  ptitle <- if (!is.null(group_title) && nzchar(as.character(group_title)))
+              paste0("Group: ", as.character(group_title))
+            else "Band quantification"
   p <- ggplot() +
     geom_col(data = s_sub, aes(x = band, y = mean, fill = band),
              width = 0.75, color = "grey25", linewidth = 0.3) +
@@ -3014,6 +3023,8 @@ render_one <- function(d_sub, s_sub, facet_var, w, h, fname) {
                        labels = y_fmt) +
     theme_prism(base_size = 12) +
     theme(legend.position = "none",
+          plot.title    = element_text(face = "bold", size = 13,
+                                       margin = margin(b = 2)),
           axis.title.y = element_text(margin = margin(r = 8)),
           axis.text.x  = element_text(angle = 30, hjust = 1, vjust = 1, size = 9),
           axis.text.y  = element_text(size = 9),
@@ -3021,7 +3032,7 @@ render_one <- function(d_sub, s_sub, facet_var, w, h, fname) {
           plot.subtitle = element_text(size = 9, color = "grey35",
                                        margin = margin(b = 6)),
           plot.margin = margin(t = 18, r = 18, b = 22, l = 22)) +
-    labs(x = NULL, y = y_lab, subtitle = plot_subtitle)
+    labs(x = NULL, y = y_lab, title = ptitle, subtitle = plot_subtitle)
   if (!is.null(facet_var)) p <- p + facet_wrap(as.formula(paste("~", facet_var)),
                                                 scales = "free_y",
                                                 ncol = min(3, n_facets))
@@ -3045,7 +3056,8 @@ if (plot_per_group) {
     safe_name <- gsub("[^A-Za-z0-9_-]", "_", g)
     render_one(d_sub, s_sub, NULL,
                w = max(900, 120 * n_bands + 480),
-               h = 1000, fname = paste0("wb_", safe_name, ".png"))
+               h = 1000, fname = paste0("wb_", safe_name, ".png"),
+               group_title = g)
   }
 } else {
   # Combined facets — width scales with facet count, height with the

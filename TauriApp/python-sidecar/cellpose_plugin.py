@@ -300,6 +300,71 @@ def main():
             except Exception as _ce:
                 log.append("[%d/%d] %r: cellprob unavailable (%s)" % (i, len(inputs), label, _ce))
 
+        # show_segmentation-style overview: a single PNG with four
+        # PIL panels side-by-side — original | flows RGB | coloured
+        # masks | outlines.  Mirrors cellpose.plot.show_segmentation
+        # so users get the same at-a-glance QC view they'd get
+        # running cellpose from the CLI.  PIL-only (no matplotlib
+        # dep) so it works on every venv we install into.
+        try:
+            from PIL import ImageDraw as _ID, ImageFont as _IF
+            panels = [("original", img if img.ndim == 3 else np.stack([img]*3, axis=-1))]
+            # Flows panel only when flows actually arrived (skipped on
+            # edited masks; we show a uniform grey filler so the four
+            # panels stay aligned).
+            if flows is not None:
+                try:
+                    fr = np.asarray(flows[0])
+                    if fr.ndim == 3 and fr.shape[2] >= 3:
+                        panels.append(("flows", fr[..., :3].astype(np.uint8)))
+                    else:
+                        raise ValueError("flows[0] wrong shape")
+                except Exception:
+                    panels.append(("flows (n/a)", np.full((img.shape[0], img.shape[1], 3), 60, dtype=np.uint8)))
+            else:
+                panels.append(("flows (skipped on edit)",
+                               np.full((img.shape[0], img.shape[1], 3), 60, dtype=np.uint8)))
+            panels.append(("masks (N=%d)" % n_cells, mask_rgb))
+            panels.append(("outlines", outline_img))
+            # Resize each panel to a common height so they line up
+            # cleanly; max 380 px tall keeps the overview file modest
+            # while staying readable at typical preview zoom.
+            target_h = min(380, img.shape[0])
+            scale = target_h / float(img.shape[0])
+            target_w = max(1, int(round(img.shape[1] * scale)))
+            from PIL import Image as _PI
+            tiles = []
+            for name, arr_p in panels:
+                tile = _PI.fromarray(arr_p).convert("RGB").resize((target_w, target_h), _PI.LANCZOS)
+                # Stamp the panel name in the top-left corner.
+                d = _ID.Draw(tile)
+                try: font = _IF.load_default()
+                except Exception: font = None
+                d.rectangle([(0, 0), (max(110, len(name) * 7), 16)], fill=(0, 0, 0))
+                d.text((4, 1), name, fill=(255, 255, 255), font=font)
+                tiles.append(tile)
+            # Glue them with a 2-px white separator.
+            gap = 2
+            stitched_w = target_w * len(tiles) + gap * (len(tiles) - 1)
+            stitched = _PI.new("RGB", (stitched_w, target_h), color=(255, 255, 255))
+            for k, t in enumerate(tiles):
+                stitched.paste(t, (k * (target_w + gap), 0))
+            # Title bar across the top with the source label.
+            title_h = 22
+            full = _PI.new("RGB", (stitched_w, target_h + title_h), color=(28, 28, 28))
+            d2 = _ID.Draw(full)
+            try: tf = _IF.load_default()
+            except Exception: tf = None
+            d2.text((6, 4), "%s — show_segmentation%s" % (label, " (edited)" if used_edits else ""),
+                    fill=(255, 255, 255), font=tf)
+            full.paste(stitched, (0, title_h))
+            _save(out_dir, "%s_show_segmentation.png" % label, np.array(full))
+            result["images"].append({"name": "%s_show_segmentation" % label,
+                                     "file": "%s_show_segmentation.png" % label})
+        except Exception as _se:
+            log.append("[%d/%d] %r: show_segmentation render failed: %s"
+                       % (i, len(inputs), label, _se))
+
         sizes = np.bincount(masks.ravel())[1:] if n_cells > 0 else np.array([0])
         result["rows"].append({
             "source": label, "n_cells": n_cells,

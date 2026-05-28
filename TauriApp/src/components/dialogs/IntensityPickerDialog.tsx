@@ -1028,6 +1028,16 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // visibility above): cells = yellow outline, nuclei = cyan. Both
   // default ON so the user immediately sees what cellpose found.
   const [cpMaskVisible, setCpMaskVisible] = useState<{ cells: boolean; nuclei: boolean }>({ cells: true, nuclei: true });
+  // ── Tier 2: view mode (base layer) ────────────────────────────
+  // "composite" = full contrast-stretched RGB; "r"/"g"/"b" isolate
+  // one channel as a grayscale view; "flows" / "cellprob" swap the
+  // base for cellpose's intermediate visualisations (Tier 2).  All
+  // tools and toggles still work on top of any view.
+  type ViewMode = "composite" | "r" | "g" | "b" | "flows" | "cellprob";
+  const [viewMode, setViewMode] = useState<ViewMode>("composite");
+  // Show a translucent reference circle at the cellpose `diameter` so
+  // the user can sanity-check whether their cells look about that big.
+  const [scaleDiskOn, setScaleDiskOn] = useState(false);
   // ── Interactive mask editor (cellpose mode only) ───────────────
   // The active tool: "pan" is the default and matches the existing
   // click-drag-to-pan behaviour; "paint" draws a new cell with a
@@ -1165,6 +1175,8 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       setEditHistory({});
       setMergeFirstId(null);
       setHoverInfo(null);
+      setViewMode("composite");
+      setScaleDiskOn(false);
     }
   }, [open, initial]);
 
@@ -1435,6 +1447,11 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // composite is a synchronous drawImage on every visibility toggle.
   const [cellImgEl, setCellImgEl] = useState<HTMLImageElement | null>(null);
   const [nucImgEl, setNucImgEl] = useState<HTMLImageElement | null>(null);
+  // Tier-2 view layers — cellpose's flow direction RGB + cell-probability
+  // heatmap.  Loaded only on demand (when the corresponding view mode is
+  // chosen) but cached so toggling between views is instant.
+  const [flowsImgEl, setFlowsImgEl] = useState<HTMLImageElement | null>(null);
+  const [cellprobImgEl, setCellprobImgEl] = useState<HTMLImageElement | null>(null);
   // View state for the preview canvas: zoom + pan. zoom = 1 → fit to
   // the preview pane. Wheel zooms around the cursor (Photoshop-style);
   // drag pans; double-click resets.
@@ -1765,6 +1782,15 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       else if (k === "d") { setEditTool("delete"); setMergeFirstId(null); }
       else if (k === "m") { setEditTool("merge"); setMergeFirstId(null); }
       else if (k === "escape") { setMergeFirstId(null); }
+      // Tier-2 view-mode hotkeys (cellpose only).  We deliberately
+      // SKIP R/G/B isolate keys — "B" is paint and "G" is too easy
+      // to fat-finger; users pick those channels via the chip row
+      // below the toolbar.  Available: W=composite, F=flows,
+      // P=cell probability, S=scale disk.
+      else if (k === "w") { setViewMode("composite"); }
+      else if (k === "f") { setViewMode((v) => v === "flows" ? "composite" : "flows"); }
+      else if (k === "p") { setViewMode((v) => v === "cellprob" ? "composite" : "cellprob"); }
+      else if (k === "s") { setScaleDiskOn((p) => !p); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -1795,6 +1821,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     if (!activePreview) {
       setCompImgEl(null); setChImgEls({});
       setCellImgEl(null); setNucImgEl(null);
+      setFlowsImgEl(null); setCellprobImgEl(null);
       return;
     }
     let cancelled = false;
@@ -1811,6 +1838,8 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     setChImgEls({});
     setCellImgEl(null);
     setNucImgEl(null);
+    setFlowsImgEl(null);
+    setCellprobImgEl(null);
     if (cfg.mode === "simple") {
       for (const k of ["r", "g", "b"] as const) {
         const src = activePreview.channelOverlays?.[k];
@@ -1831,9 +1860,46 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         im.onload = () => { if (!cancelled) setNucImgEl(im); };
         im.src = activePreview.nucleusOverlaySrc;
       }
+      if (activePreview.flowsRgbSrc) {
+        const im = new window.Image();
+        im.onload = () => { if (!cancelled) setFlowsImgEl(im); };
+        im.src = activePreview.flowsRgbSrc;
+      }
+      if (activePreview.cellprobSrc) {
+        const im = new window.Image();
+        im.onload = () => { if (!cancelled) setCellprobImgEl(im); };
+        im.src = activePreview.cellprobSrc;
+      }
     }
     return () => { cancelled = true; };
   }, [activePreview, cfg.mode]);
+
+  // Channel-isolation cache: when viewMode is "r" / "g" / "b" we
+  // render compImgEl as a single-channel grayscale canvas.  Built
+  // lazily and only when the user actually picks the isolated view.
+  const channelGrayCache = useRef<Partial<Record<"r" | "g" | "b", HTMLCanvasElement>>>({});
+  useEffect(() => { channelGrayCache.current = {}; }, [compImgEl]);
+  const getChannelGray = useCallback((k: "r" | "g" | "b"): HTMLCanvasElement | null => {
+    if (!compImgEl) return null;
+    const hit = channelGrayCache.current[k];
+    if (hit) return hit;
+    const w = compImgEl.naturalWidth, h = compImgEl.naturalHeight;
+    const cnv = document.createElement("canvas");
+    cnv.width = w; cnv.height = h;
+    const ctx = cnv.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(compImgEl, 0, 0);
+    const id = ctx.getImageData(0, 0, w, h);
+    const d = id.data;
+    const ofs = k === "r" ? 0 : k === "g" ? 1 : 2;
+    for (let i = 0; i < d.length; i += 4) {
+      const v = d[i + ofs];
+      d[i] = v; d[i + 1] = v; d[i + 2] = v; d[i + 3] = 255;
+    }
+    ctx.putImageData(id, 0, 0);
+    channelGrayCache.current[k] = cnv;
+    return cnv;
+  }, [compImgEl]);
 
   // ── Editor: derived boundary canvases (cellpose mode) ─────────
   // When the active preview carries an Int32Array of cell labels (i.e.
@@ -1891,7 +1957,28 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.clearRect(0, 0, w, h);
-    ctx.drawImage(compImgEl, 0, 0);
+    // Base layer — Tier 2 view modes swap what gets drawn.  Channel
+    // isolation re-uses the composite via getChannelGray; flows /
+    // cellprob use their dedicated HTMLImageElement.  Cellpose-only
+    // modes fall back to the composite when the matching layer
+    // hasn't arrived (e.g. flows is skipped on user-edited masks).
+    if (cfg.mode === "cellpose" && (viewMode === "flows" || viewMode === "cellprob")) {
+      const im = viewMode === "flows" ? flowsImgEl : cellprobImgEl;
+      if (im) {
+        // The flows / cellprob layers can be at a different intrinsic
+        // resolution than the composite (cellpose caps its inference
+        // res).  Stretch to fit the canvas so they overlay 1:1.
+        ctx.drawImage(im, 0, 0, w, h);
+      } else {
+        ctx.drawImage(compImgEl, 0, 0);
+      }
+    } else if (viewMode === "r" || viewMode === "g" || viewMode === "b") {
+      const cnv = getChannelGray(viewMode);
+      if (cnv) ctx.drawImage(cnv, 0, 0);
+      else ctx.drawImage(compImgEl, 0, 0);
+    } else {
+      ctx.drawImage(compImgEl, 0, 0);
+    }
     if (cfg.mode === "simple") {
       for (const k of ["r", "g", "b"] as const) {
         if (!maskVisible[k]) continue;
@@ -1932,6 +2019,26 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         }
         ctx.putImageData(id, 0, 0);
       }
+      // Scale disk — translucent circle of `diameter` px in the
+      // bottom-right corner, so the user can sanity-check whether
+      // their cells look about the diameter they've entered.
+      if (scaleDiskOn && cfg.cellpose.diameter > 0) {
+        const r = Math.max(2, cfg.cellpose.diameter / 2);
+        const cx = w - r - 24, cy = h - r - 24;
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.strokeStyle = "rgba(255,180,80,0.85)";
+        ctx.lineWidth = 2;
+        ctx.fillStyle = "rgba(255,180,80,0.18)";
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = "rgba(255,180,80,0.95)";
+        ctx.font = "bold 12px system-ui, sans-serif";
+        ctx.textAlign = "right";
+        ctx.fillText(`Ø ${Math.round(cfg.cellpose.diameter)} px`, cx + r, cy - r - 4);
+        ctx.restore();
+      }
       // Brush cursor — only when in an editing tool with hover info.
       if (hoverInfo && editTool !== "pan") {
         const cx = hoverInfo.x, cy = hoverInfo.y;
@@ -1959,7 +2066,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [compImgEl, chImgEls, maskVisible, cellImgEl, nucImgEl, cpMaskVisible, cfg.mode,
       cellBoundaryCnv, nucleusBoundaryCnv, hoverInfo, editTool, brushPx, mergeFirstId,
-      strokeTick]);
+      strokeTick, viewMode, flowsImgEl, cellprobImgEl, scaleDiskOn, cfg.cellpose.diameter]);
 
   const setChannel = useCallback((k: keyof FluorChannels, v: string) => {
     setCfg((c) => ({ ...c, channels: { ...c.channels, [k]: v } }));
@@ -2377,6 +2484,88 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                 fontSize: "0.62rem", overflow: "auto", whiteSpace: "pre-wrap",
               }}>
                 {repairLog || "starting…"}
+              </Box>
+            )}
+            {/* ── Tier-2 view-mode chips (cellpose only) ──
+                Sits at the bottom-left, above the stats footer, so it
+                doesn't fight the edit toolbar or zoom HUD.  Lets the
+                user swap between composite / R / G / B isolation,
+                cellpose's flow direction RGB, the cell-probability
+                heatmap, and a scale-disk overlay calibrated to the
+                configured diameter.  Hotkeys: W (composite), F
+                (flows), P (probability), S (scale disk). */}
+            {cfg.mode === "cellpose" && activePreview && (
+              <Box sx={{
+                position: "absolute", bottom: 32, left: 4, zIndex: 5,
+                display: "flex", alignItems: "center", gap: 0.3, flexWrap: "wrap",
+                bgcolor: "rgba(0,0,0,0.5)", color: "common.white",
+                px: 0.5, py: 0.25, borderRadius: 0.5,
+                fontSize: "0.62rem",
+              }}>
+                {([
+                  { mode: "composite" as const, label: "Composite",  hk: "W", color: "rgba(255,255,255,0.7)" },
+                  { mode: "r" as const,        label: "R",           hk: "",  color: "#d35454" },
+                  { mode: "g" as const,        label: "G",           hk: "",  color: "#5fa566" },
+                  { mode: "b" as const,        label: "B",           hk: "",  color: "#5d80c0" },
+                  { mode: "flows" as const,    label: "Flows",       hk: "F", color: "#c489ff" },
+                  { mode: "cellprob" as const, label: "Cell prob.",  hk: "P", color: "#7fdc89" },
+                ] as const).map(({ mode, label, hk, color }) => {
+                  const active = viewMode === mode;
+                  const disabled =
+                    (mode === "flows" && !flowsImgEl)
+                    || (mode === "cellprob" && !cellprobImgEl);
+                  return (
+                    <Tooltip key={mode} title={
+                      disabled
+                        ? `${label} not available (run cellpose first; edited masks skip flows/probability)`
+                        : `Show ${label}${hk ? ` (${hk})` : ""}`}>
+                      <Box
+                        onClick={() => { if (!disabled) setViewMode(mode); }}
+                        sx={{
+                          cursor: disabled ? "not-allowed" : "pointer",
+                          opacity: disabled ? 0.35 : 1,
+                          userSelect: "none",
+                          px: 0.55, py: 0.1, borderRadius: 0.3,
+                          bgcolor: active ? color : "transparent",
+                          color: active ? "common.white" : "rgba(255,255,255,0.85)",
+                          border: "1px solid",
+                          borderColor: active ? color : "rgba(255,255,255,0.25)",
+                          fontWeight: active ? 700 : 500,
+                          display: "inline-flex", alignItems: "center", gap: 0.2,
+                        }}>
+                        <span>{label}</span>
+                      </Box>
+                    </Tooltip>
+                  );
+                })}
+                {/* Scale disk + fit-to-view + reset cluster */}
+                <Box sx={{ width: 1, alignSelf: "stretch", bgcolor: "rgba(255,255,255,0.2)", mx: 0.3 }} />
+                <Tooltip title="Show a calibration disk at the configured cellpose diameter (S)">
+                  <Box
+                    onClick={() => setScaleDiskOn((p) => !p)}
+                    sx={{
+                      cursor: "pointer", userSelect: "none",
+                      px: 0.55, py: 0.1, borderRadius: 0.3,
+                      bgcolor: scaleDiskOn ? "rgba(255,180,80,0.85)" : "transparent",
+                      color: scaleDiskOn ? "common.white" : "rgba(255,255,255,0.85)",
+                      border: "1px solid",
+                      borderColor: scaleDiskOn ? "rgba(255,180,80,0.85)" : "rgba(255,255,255,0.25)",
+                      fontWeight: scaleDiskOn ? 700 : 500,
+                    }}>
+                    ⊙ disk
+                  </Box>
+                </Tooltip>
+                <Tooltip title="Fit image to view (also: double-click the image)">
+                  <Box
+                    onClick={resetView}
+                    sx={{
+                      cursor: "pointer", userSelect: "none",
+                      px: 0.55, py: 0.1, borderRadius: 0.3,
+                      border: "1px solid rgba(255,255,255,0.25)",
+                    }}>
+                    ⤢ fit
+                  </Box>
+                </Tooltip>
               </Box>
             )}
             {/* Stats footer (cell count or per-channel pixel tallies). */}
