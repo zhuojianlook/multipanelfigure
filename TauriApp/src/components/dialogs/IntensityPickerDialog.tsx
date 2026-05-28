@@ -564,6 +564,21 @@ const CHANNEL_SUGGESTIONS = [
   "Anti-VegF", "Anti-CD31", "Anti-Ki67", "α-SMA",
 ];
 
+/** Compact MenuProps for all the Select dropdowns in this dialog.
+ *  MUI's default popup uses the theme's normal body font (~14-16 px),
+ *  which towers over the dialog's 0.78 rem fields and feels off-key
+ *  ("cpsam (default)" looked huge). This shrinks the popup paper +
+ *  every MenuItem to match the surrounding fields. */
+const SELECT_MENU_PROPS = {
+  MenuProps: {
+    PaperProps: {
+      sx: {
+        "& .MuiMenuItem-root": { fontSize: "0.78rem", py: 0.4, minHeight: 28 },
+      },
+    },
+  },
+} as const;
+
 /** A computed preview for one image: the base composite + a per-channel
  *  boundary overlay (each on transparent background, so the dialog can
  *  layer + toggle visibility live without re-running). For Cellpose
@@ -750,8 +765,10 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       }
       // Hard client-side timeout so the spinner can't get stuck forever
       // when the sidecar is offline or the strategy is mis-configured.
-      // Cellpose is allowed longer because it loads the model on first run.
-      const timeoutMs = cfg.mode === "cellpose" ? 180000 : 30000;
+      // Cellpose: 10 min (matches the backend's plugin call), so the
+      // first run can finish downloading the ~100 MB model. Threshold
+      // is fast — 30 s is plenty.
+      const timeoutMs = cfg.mode === "cellpose" ? 600000 : 30000;
       const timeoutId = setTimeout(() => {
         // Tag the controller so the catch block can distinguish a
         // timeout-driven abort from a user-driven one (e.g. re-clicking
@@ -802,7 +819,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         // user-driven cancel (e.g. they clicked Run again to retry).
         if ((ac as unknown as { __timedOut?: boolean }).__timedOut) {
           setPreviewError(cfg.mode === "cellpose"
-            ? "Cellpose preview timed out (>3 min). The first run loads the model from disk — try again, or verify the plugin venv is installed."
+            ? "Cellpose preview timed out (>10 min). The first run downloads the model (~100 MB) — check your internet, then try again, or verify the plugin venv with 'Repair plugin venv'."
             : "Preview timed out (>30 s). The sidecar may be busy or unreachable.");
         }
         return;
@@ -1187,7 +1204,8 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                 value={cfg.controlChannel ?? ""}
                 onChange={(e) => setCfg((c) => ({ ...c, controlChannel: (e.target.value || null) as ("r" | "g" | "b" | null) }))}
                 inputProps={{ style: { fontSize: "0.75rem", padding: "4px 6px" } }}
-                sx={{ minWidth: 140 }}>
+                sx={{ minWidth: 140 }}
+                SelectProps={SELECT_MENU_PROPS}>
                 <MenuItem value="" sx={{ fontSize: "0.78rem" }}>— none —</MenuItem>
                 <MenuItem value="r" sx={{ fontSize: "0.78rem" }}>{cfg.channels.r}</MenuItem>
                 <MenuItem value="g" sx={{ fontSize: "0.78rem" }}>{cfg.channels.g}</MenuItem>
@@ -1328,25 +1346,29 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
               <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 1 }}>
                 <TextField select size="small" label="Model" value={cfg.cellpose.model}
                   onChange={(e) => setCellpose({ model: e.target.value })}
-                  inputProps={{ style: { fontSize: "0.78rem" } }}>
-                  <MenuItem value="cpsam">cpsam (default)</MenuItem>
-                  <MenuItem value="cyto3">cyto3</MenuItem>
-                  <MenuItem value="cyto2">cyto2</MenuItem>
-                  <MenuItem value="nuclei">nuclei</MenuItem>
+                  inputProps={{ style: { fontSize: "0.78rem" } }}
+                  SelectProps={SELECT_MENU_PROPS}>
+                  <MenuItem value="cpsam" sx={{ fontSize: "0.78rem" }}>cpsam (default)</MenuItem>
+                  <MenuItem value="cyto3" sx={{ fontSize: "0.78rem" }}>cyto3</MenuItem>
+                  <MenuItem value="cyto2" sx={{ fontSize: "0.78rem" }}>cyto2</MenuItem>
+                  <MenuItem value="nuclei" sx={{ fontSize: "0.78rem" }}>nuclei</MenuItem>
                 </TextField>
                 <TextField select size="small" label="Segment on" value={cfg.cellpose.segChannel}
                   onChange={(e) => setCellpose({ segChannel: e.target.value as "r" | "g" | "b" })}
-                  inputProps={{ style: { fontSize: "0.78rem" } }}>
-                  <MenuItem value="r">{cfg.channels.r}</MenuItem>
-                  <MenuItem value="g">{cfg.channels.g}</MenuItem>
-                  <MenuItem value="b">{cfg.channels.b}</MenuItem>
+                  inputProps={{ style: { fontSize: "0.78rem" } }}
+                  SelectProps={SELECT_MENU_PROPS}>
+                  <MenuItem value="r" sx={{ fontSize: "0.78rem" }}>{cfg.channels.r}</MenuItem>
+                  <MenuItem value="g" sx={{ fontSize: "0.78rem" }}>{cfg.channels.g}</MenuItem>
+                  <MenuItem value="b" sx={{ fontSize: "0.78rem" }}>{cfg.channels.b}</MenuItem>
                 </TextField>
                 <TextField size="small" label="Diameter (px, 0=auto)" type="number" value={cfg.cellpose.diameter}
                   onChange={(e) => setCellpose({ diameter: Math.max(0, Number(e.target.value) || 0) })}
-                  inputProps={{ min: 0, max: 400, step: 5, style: { fontSize: "0.78rem" } }} />
+                  inputProps={{ min: 0, max: 400, step: 5, style: { fontSize: "0.78rem" } }}
+                  InputLabelProps={{ style: { fontSize: "0.78rem" } }} />
                 <TextField size="small" label="Min size (px²)" type="number" value={cfg.cellpose.minSize}
                   onChange={(e) => setCellpose({ minSize: Math.max(0, Number(e.target.value) || 0) })}
-                  inputProps={{ min: 0, max: 10000, step: 5, style: { fontSize: "0.78rem" } }} />
+                  inputProps={{ min: 0, max: 10000, step: 5, style: { fontSize: "0.78rem" } }}
+                  InputLabelProps={{ style: { fontSize: "0.78rem" } }} />
               </Box>
             )}
           </Box>

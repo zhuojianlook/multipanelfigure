@@ -7061,10 +7061,13 @@ def fluor_preview_segment(body: FluorPreviewRequest):
             "min_size": int(cp.min_size or 30),
             "channels": [seg_ch, 0],
         }
-        # The plugin expects uint8 arrays.
+        # The plugin expects uint8 arrays. 600 s = 10 min — generous so
+        # the FIRST cellpose run can download the model weights (~100 MB
+        # for cpsam) without timing out. Subsequent runs are fast (sub-
+        # second on small previews); the longer ceiling is harmless.
         try:
             arr_u8 = _np.clip(rgb, 0, 255).astype(_np.uint8)
-            res = cellpose_plugin.run([("preview", arr_u8)], cfg, 120)
+            res = cellpose_plugin.run([("preview", arr_u8)], cfg, 600)
         except Exception as _e:
             return {"success": False, "overlay_b64": "",
                     "error": f"cellpose invocation failed: {_e}"}
