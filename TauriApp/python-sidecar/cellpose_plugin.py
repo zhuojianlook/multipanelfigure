@@ -160,6 +160,30 @@ def main():
         result["stdout"] = "\n".join(log)
         _write(out_dir, result); return
 
+    # Optional pre-supplied label rasters keyed by image label.  When
+    # the user has interactively painted/deleted cells in the dialog,
+    # we round-trip the corrected mask back here as a 16-bit-packed
+    # RGBA PNG (R = low byte, G = high byte) on disk; the runner reads
+    # it INSTEAD of running model.eval on that image.  Lets the final
+    # quantification reflect the user's edits exactly.
+    edited_label_paths = cfg.get("edited_label_paths") or {}
+
+    def _decode_labels_rgba(path, target_shape=None):
+        # PIL keeps the four channels intact.  Returns int32 HxW.
+        # Optionally NN-resizes to target_shape (h, w) — needed when
+        # the dialog painted at PREVIEW resolution (~1024 px) but the
+        # cellpose input arrived at a different size.
+        try:
+            im = Image.open(path).convert("RGBA")
+            if target_shape is not None:
+                th, tw = int(target_shape[0]), int(target_shape[1])
+                if (im.size[1], im.size[0]) != (th, tw):
+                    im = im.resize((tw, th), resample=Image.NEAREST)
+            arr = np.asarray(im)
+            return arr[..., 0].astype(np.int32) | (arr[..., 1].astype(np.int32) << 8)
+        except Exception:
+            return None
+
     t0 = time.monotonic()
     for i, item in enumerate(inputs, start=1):
         label = str(item.get("label") or ("src_%d" % i))
@@ -169,14 +193,42 @@ def main():
         except Exception as e:
             log.append("[%d/%d] %r: failed to read input (%s)" % (i, len(inputs), label, e))
             continue
-        log.append("[%d/%d] segmenting %r shape=%s" % (i, len(inputs), label, img.shape))
-        ek = dict(diameter=diameter, flow_threshold=flow_threshold,
-                  cellprob_threshold=cellprob_threshold, min_size=min_size)
-        try:
-            res = model.eval(img, channels=channels, **ek)
-        except TypeError:
-            res = model.eval(img, **ek)
-        masks = res[0]
+        masks = None
+        flows = None
+        used_edits = False
+        edit_path = edited_label_paths.get(label) if isinstance(edited_label_paths, dict) else None
+        if edit_path and os.path.isfile(edit_path):
+            # Pass the image dims so the runner NN-upscales preview-res
+            # edits (the dialog paints at ~1024 px) to the cellpose
+            # input size (downsized to ~1500 px max edge by the
+            # generator).  Result: an edited mask painted in the dialog
+            # is faithfully applied to whatever size cellpose sees.
+            ed = _decode_labels_rgba(edit_path, target_shape=img.shape[:2])
+            if ed is not None and ed.shape[:2] == img.shape[:2]:
+                masks = ed
+                used_edits = True
+                log.append("[%d/%d] %r: USING user-edited mask (%d cell(s))"
+                           % (i, len(inputs), label, int(ed.max())))
+            else:
+                log.append("[%d/%d] %r: edited mask shape mismatch / decode failed — re-running cellpose"
+                           % (i, len(inputs), label))
+
+        if masks is None:
+            log.append("[%d/%d] segmenting %r shape=%s" % (i, len(inputs), label, img.shape))
+            ek = dict(diameter=diameter, flow_threshold=flow_threshold,
+                      cellprob_threshold=cellprob_threshold, min_size=min_size)
+            try:
+                res = model.eval(img, channels=channels, **ek)
+            except TypeError:
+                res = model.eval(img, **ek)
+            masks = res[0]
+            # flows is a list — flows[0] = HxWx3 RGB direction visualisation,
+            # flows[2] = HxW cellprob (float).  Shape varies slightly across
+            # cellpose versions; guard each access.
+            try:
+                flows = res[1]
+            except Exception:
+                flows = None
         n_cells = int(masks.max())
 
         # coloured mask png
@@ -189,13 +241,26 @@ def main():
         _save(out_dir, "%s_mask.png" % label, mask_rgb)
         result["images"].append({"name": "%s_mask" % label, "file": "%s_mask.png" % label})
 
-        # 8-bit label image
+        # 8-bit label image (legacy — kept for backwards compat with
+        # downstream code paths that read <label>_labels by name).
         labels8 = masks.astype(np.int64)
         if n_cells > 255:
             labels8 = ((labels8 - 1) % 255 + 1) * (labels8 > 0)
             log.append("WARNING: %r has %d cells (>255) — packed cyclically." % (label, n_cells))
         _save(out_dir, "%s_labels.png" % label, labels8.astype(np.uint8), mode="L")
         result["images"].append({"name": "%s_labels" % label, "file": "%s_labels.png" % label})
+
+        # 16-bit label image as RGBA-packed PNG so the dialog can round-
+        # trip masks through the browser canvas without losing IDs >255.
+        # R = low byte, G = high byte, B = 0, A = 255.
+        m_lo = (masks & 0xFF).astype(np.uint8)
+        m_hi = ((masks >> 8) & 0xFF).astype(np.uint8)
+        rgba = np.zeros((masks.shape[0], masks.shape[1], 4), dtype=np.uint8)
+        rgba[..., 0] = m_lo
+        rgba[..., 1] = m_hi
+        rgba[..., 3] = 255
+        _save(out_dir, "%s_labels16.png" % label, rgba)
+        result["images"].append({"name": "%s_labels16" % label, "file": "%s_labels16.png" % label})
 
         # outlines overlay
         outline_img = img.copy()
@@ -211,14 +276,40 @@ def main():
         _save(out_dir, "%s_outlines.png" % label, outline_img)
         result["images"].append({"name": "%s_outlines" % label, "file": "%s_outlines.png" % label})
 
+        # Flows (only available when model.eval just ran — skipped when
+        # the user supplied an edited mask).  flows[0] is HxWx3 uint8
+        # already; flows[2] is HxW float cellprob.
+        if flows is not None:
+            try:
+                flow_rgb = np.asarray(flows[0])
+                if flow_rgb.ndim == 3 and flow_rgb.shape[2] >= 3:
+                    flow_rgb_u8 = np.ascontiguousarray(flow_rgb[..., :3].astype(np.uint8))
+                    _save(out_dir, "%s_flows_rgb.png" % label, flow_rgb_u8)
+                    result["images"].append({"name": "%s_flows_rgb" % label, "file": "%s_flows_rgb.png" % label})
+            except Exception as _fe:
+                log.append("[%d/%d] %r: flows RGB unavailable (%s)" % (i, len(inputs), label, _fe))
+            try:
+                cprob = np.asarray(flows[2]).astype(np.float32)
+                cp_lo = float(cprob.min()); cp_hi = float(cprob.max())
+                if cp_hi - cp_lo > 1e-6:
+                    cp_u8 = ((cprob - cp_lo) / (cp_hi - cp_lo) * 255.0).astype(np.uint8)
+                else:
+                    cp_u8 = np.zeros_like(cprob, dtype=np.uint8)
+                _save(out_dir, "%s_cellprob.png" % label, cp_u8, mode="L")
+                result["images"].append({"name": "%s_cellprob" % label, "file": "%s_cellprob.png" % label})
+            except Exception as _ce:
+                log.append("[%d/%d] %r: cellprob unavailable (%s)" % (i, len(inputs), label, _ce))
+
         sizes = np.bincount(masks.ravel())[1:] if n_cells > 0 else np.array([0])
         result["rows"].append({
             "source": label, "n_cells": n_cells,
             "mean_area_px": float(sizes.mean()) if n_cells > 0 else 0.0,
             "median_area_px": float(np.median(sizes)) if n_cells > 0 else 0.0,
             "model": model_name,
+            "edited": bool(used_edits),
         })
-        log.append("[%d/%d] %r: %d cell(s)" % (i, len(inputs), label, n_cells))
+        log.append("[%d/%d] %r: %d cell(s)%s" % (i, len(inputs), label, n_cells,
+                                                  " (edited)" if used_edits else ""))
 
     log.append("total: %d image(s) in %.1fs" % (len(inputs), time.monotonic() - t0))
     result["success"] = True
@@ -375,6 +466,29 @@ def run(images_in: List[Tuple[str, "object"]], cfg_dict: dict, timeout_sec: int 
             p = os.path.join(workdir, "in_%d.png" % i)
             Image.fromarray(arr).convert("RGB").save(p, format="PNG")
             inputs.append({"label": str(label), "path": p})
+
+        # User-edited masks (from the interactive Intensity dialog):
+        # base64-encoded 16-bit-packed RGBA PNGs keyed by image label.
+        # Dump each to disk and pass the paths through cfg_dict so the
+        # runner sub-process can read them WITHOUT re-encoding (and so
+        # the JSON job stays small).
+        edited_masks = cfg_dict.pop("edited_masks", None) if isinstance(cfg_dict, dict) else None
+        edited_paths: Dict[str, str] = {}
+        if isinstance(edited_masks, dict):
+            for j, (lbl, b64s) in enumerate(edited_masks.items()):
+                if not (isinstance(lbl, str) and isinstance(b64s, str) and b64s):
+                    continue
+                try:
+                    raw = base64.b64decode(b64s.split(",")[-1])
+                    ep = os.path.join(workdir, "edit_%d.png" % j)
+                    with open(ep, "wb") as fh:
+                        fh.write(raw)
+                    edited_paths[lbl] = ep
+                except Exception:
+                    continue
+        if edited_paths:
+            cfg_dict = {**cfg_dict, "edited_label_paths": edited_paths}
+
         job = {"config": cfg_dict, "inputs": inputs, "out_dir": workdir}
         job_path = os.path.join(workdir, "job.json")
         with open(job_path, "w") as f:

@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.318"
+SIDECAR_BUILD = "0.1.319"
 
 
 @app.get("/api/version")
@@ -7152,16 +7152,27 @@ def fluor_preview_segment(body: FluorPreviewRequest):
         if not res.get("success"):
             return {"success": False, "overlay_b64": "",
                     "error": (res.get("stderr") or "(no detail)").strip() or "cellpose failed"}
-        # Grab the labels image the plugin emits as <label>_labels.
+        # Grab the labels image.  Prefer the 16-bit RGBA-packed labels
+        # (R = low byte, G = high byte) so cell IDs >255 don't get
+        # truncated; fall back to the 8-bit version for older runners.
+        lbl16_b64 = next((im["image"] for im in (res.get("images") or [])
+                          if im.get("name") == "preview_labels16"), None)
         lbl_b64 = next((im["image"] for im in (res.get("images") or [])
                         if im.get("name") == "preview_labels"), None)
-        if not lbl_b64:
+        if not (lbl16_b64 or lbl_b64):
             return {"success": False, "overlay_b64": "",
                     "error": "cellpose returned no labels image"}
         try:
-            labels = _np.asarray(
-                Image.open(io.BytesIO(base64.b64decode(lbl_b64))).convert("L")
-            ).astype(_np.int32)
+            if lbl16_b64:
+                rgba_lbl = _np.asarray(
+                    Image.open(io.BytesIO(base64.b64decode(lbl16_b64))).convert("RGBA")
+                )
+                labels = (rgba_lbl[..., 0].astype(_np.int32)
+                          | (rgba_lbl[..., 1].astype(_np.int32) << 8))
+            else:
+                labels = _np.asarray(
+                    Image.open(io.BytesIO(base64.b64decode(lbl_b64))).convert("L")
+                ).astype(_np.int32)
             if labels.shape[:2] != composite.shape[:2] and _have_cv:
                 labels = _cv2.resize(
                     labels, (composite.shape[1], composite.shape[0]),
@@ -7170,6 +7181,12 @@ def fluor_preview_segment(body: FluorPreviewRequest):
         except Exception as _e:
             return {"success": False, "overlay_b64": "",
                     "error": f"labels decode failed: {_e}"}
+        # Also pull flows RGB + cellprob — used by the dialog's "flows"
+        # and "cell probability" view modes (Tier 2 in the plan).
+        flows_rgb_b64 = next((im["image"] for im in (res.get("images") or [])
+                              if im.get("name") == "preview_flows_rgb"), None)
+        cellprob_b64 = next((im["image"] for im in (res.get("images") or [])
+                             if im.get("name") == "preview_cellprob"), None)
 
         # Optional second pass: nuclei model on the nuclei channel.
         # Only when the user enabled "measure compartments" AND set a
@@ -7185,12 +7202,21 @@ def fluor_preview_segment(body: FluorPreviewRequest):
                 print(f"[fluor-preview] cellpose nuclei-pass finished in {_tm.monotonic() - _t1:.1f}s",
                       file=__s.stderr, flush=True)
                 if nres.get("success"):
+                    nlbl16_b64 = next((im["image"] for im in (nres.get("images") or [])
+                                       if im.get("name") == "preview_nuc_labels16"), None)
                     nlbl_b64 = next((im["image"] for im in (nres.get("images") or [])
                                      if im.get("name") == "preview_nuc_labels"), None)
-                    if nlbl_b64:
+                    if nlbl16_b64:
+                        rgba_n = _np.asarray(
+                            Image.open(io.BytesIO(base64.b64decode(nlbl16_b64))).convert("RGBA")
+                        )
+                        nucleus_labels = (rgba_n[..., 0].astype(_np.int32)
+                                          | (rgba_n[..., 1].astype(_np.int32) << 8))
+                    elif nlbl_b64:
                         nucleus_labels = _np.asarray(
                             Image.open(io.BytesIO(base64.b64decode(nlbl_b64))).convert("L")
                         ).astype(_np.int32)
+                    if nucleus_labels is not None:
                         if nucleus_labels.shape[:2] != labels.shape[:2] and _have_cv:
                             nucleus_labels = _cv2.resize(
                                 nucleus_labels, (labels.shape[1], labels.shape[0]),
@@ -7230,6 +7256,25 @@ def fluor_preview_segment(body: FluorPreviewRequest):
             nuc_boundary = _symmetric_boundary(nucleus_labels)
             nucleus_overlay_b64 = _mask_overlay_png(nuc_boundary, (96, 220, 255))
 
+        # Pack labels at PREVIEW resolution as RGBA PNG (R = low byte,
+        # G = high byte) so the frontend can decode them via canvas
+        # without losing IDs >255.  We re-pack here (rather than reuse
+        # the runner's labels16) because labels were resized to the
+        # composite resolution above and we want the round-trip to
+        # match what the user sees.
+        def _pack_labels_rgba_b64(lbl):
+            rgba = _np.zeros((lbl.shape[0], lbl.shape[1], 4), dtype=_np.uint8)
+            rgba[..., 0] = (lbl & 0xFF).astype(_np.uint8)
+            rgba[..., 1] = ((lbl >> 8) & 0xFF).astype(_np.uint8)
+            rgba[..., 3] = 255
+            _b = io.BytesIO()
+            Image.fromarray(_np.ascontiguousarray(rgba)).save(_b, format="PNG")
+            return base64.b64encode(_b.getvalue()).decode()
+
+        cell_labels_b64 = _pack_labels_rgba_b64(labels)
+        nucleus_labels_packed_b64 = (_pack_labels_rgba_b64(nucleus_labels)
+                                     if nucleus_labels is not None else None)
+
         # Composite PNG (no outlines) — the BASE layer the frontend draws
         # the overlays on top of. We keep the legacy fused overlay_b64
         # (with outlines stamped on) for back-compat with older clients,
@@ -7253,6 +7298,14 @@ def fluor_preview_segment(body: FluorPreviewRequest):
             "composite_b64": composite_b64,
             "cell_overlay_b64": cell_overlay_b64,
             "nucleus_overlay_b64": nucleus_overlay_b64,
+            # Raw editable labels (Tier 1 interactive editing).  RGBA-
+            # packed PNG: R = label low byte, G = label high byte.
+            "cell_labels_b64": cell_labels_b64,
+            "nucleus_labels_b64": nucleus_labels_packed_b64,
+            # Cellpose intermediates for Tier 2 view modes.  Both at
+            # preview resolution.
+            "flows_rgb_b64": flows_rgb_b64,
+            "cellprob_b64": cellprob_b64,
             "src_w": int(src_w0), "src_h": int(src_h0),
             "preview_w": int(w), "preview_h": int(h),
             "n_cells": n_cells,
@@ -7395,6 +7448,73 @@ def fluor_preview_segment(body: FluorPreviewRequest):
         "preview_w": int(w), "preview_h": int(h),
         "per_channel": per_channel,
         "enabled_count": enabled_count,
+    }
+
+
+class RefineMaskRequest(BaseModel):
+    """Re-derive boundary overlays from a user-edited label image.
+
+    The Intensity dialog calls this after every paint / delete / merge
+    so it can show the yellow cell outline + cyan nucleus outline
+    without having to re-run cellpose.  NumPy is ~50× faster at
+    boundary derivation than the same code in JS — keeping it
+    server-side keeps the dialog snappy even on dense fields of cells.
+    """
+    cell_labels_b64: str            # RGBA-packed PNG, R = lo, G = hi
+    nucleus_labels_b64: Optional[str] = None
+
+
+@app.post("/api/analysis/refine-mask")
+def refine_mask(body: RefineMaskRequest):
+    import numpy as _np
+    try:
+        rgba = _np.asarray(Image.open(
+            io.BytesIO(base64.b64decode((body.cell_labels_b64 or "").split(",")[-1]))
+        ).convert("RGBA"))
+        cell_lbl = (rgba[..., 0].astype(_np.int32)
+                    | (rgba[..., 1].astype(_np.int32) << 8))
+    except Exception as e:
+        return {"success": False, "error": f"cell_labels decode failed: {e}"}
+
+    nuc_lbl = None
+    if body.nucleus_labels_b64:
+        try:
+            nrgba = _np.asarray(Image.open(
+                io.BytesIO(base64.b64decode(body.nucleus_labels_b64.split(",")[-1]))
+            ).convert("RGBA"))
+            nuc_lbl = (nrgba[..., 0].astype(_np.int32)
+                       | (nrgba[..., 1].astype(_np.int32) << 8))
+        except Exception:
+            nuc_lbl = None
+
+    def _sym_boundary(lbl):
+        b_up    = _np.zeros(lbl.shape, dtype=bool)
+        b_down  = _np.zeros(lbl.shape, dtype=bool)
+        b_left  = _np.zeros(lbl.shape, dtype=bool)
+        b_right = _np.zeros(lbl.shape, dtype=bool)
+        b_up[1:, :]    = lbl[1:, :]    != lbl[:-1, :]
+        b_down[:-1, :] = lbl[:-1, :]   != lbl[1:, :]
+        b_left[:, 1:]  = lbl[:, 1:]    != lbl[:, :-1]
+        b_right[:, :-1]= lbl[:, :-1]   != lbl[:, 1:]
+        return (b_up | b_down | b_left | b_right) & (lbl > 0)
+
+    def _overlay_png(boundary, rgb):
+        rgba = _np.zeros((boundary.shape[0], boundary.shape[1], 4), dtype=_np.uint8)
+        rgba[boundary] = (rgb[0], rgb[1], rgb[2], 255)
+        b = io.BytesIO()
+        Image.fromarray(_np.ascontiguousarray(rgba)).save(b, format="PNG")
+        return base64.b64encode(b.getvalue()).decode()
+
+    cell_b = _sym_boundary(cell_lbl)
+    nuc_b = _sym_boundary(nuc_lbl) if nuc_lbl is not None else None
+    return {
+        "success": True,
+        "cell_overlay_b64": _overlay_png(cell_b, (255, 255, 0)),
+        "nucleus_overlay_b64": (_overlay_png(nuc_b, (96, 220, 255))
+                                if nuc_b is not None else None),
+        "n_cells": int(len(_np.unique(cell_lbl[cell_lbl > 0]))),
+        "n_nuclei": (int(len(_np.unique(nuc_lbl[nuc_lbl > 0])))
+                     if nuc_lbl is not None else 0),
     }
 
 
@@ -7912,6 +8032,14 @@ class CellposeAnalysisRequest(BaseModel):
     # isn't enough. Subsequent runs are sub-second on small previews,
     # so a generous ceiling is harmless.
     timeout_sec: int = 600
+    # Optional user-edited masks keyed by image label.  Each value is
+    # a base64-encoded RGBA-packed PNG (R = label low byte, G = label
+    # high byte) the dialog generated from its interactive editor.
+    # When supplied, the matching image SKIPS model.eval and runs
+    # quantification against the user's mask instead.  Masks must
+    # match the native image dimensions (we NN-upscale preview-res
+    # masks frontend-side before submitting).
+    edited_masks: Optional[Dict[str, str]] = None
 
 
 @app.post("/api/analysis/run-cellpose")
@@ -7975,6 +8103,10 @@ def run_cellpose_pipeline(body: CellposeAnalysisRequest):
 
     # 4) Run cellpose in the isolated plugin venv (real Python, separate
     #    process) — the frozen sidecar can't import cellpose/torch itself.
+    #    If the user has edited masks in the Intensity dialog, forward
+    #    them via cfg_dict so the runner can substitute them per-image.
+    if body.edited_masks:
+        cfg_dict = {**cfg_dict, "edited_masks": dict(body.edited_masks)}
     return cellpose_plugin.run(images_in, cfg_dict, body.timeout_sec)
 
 

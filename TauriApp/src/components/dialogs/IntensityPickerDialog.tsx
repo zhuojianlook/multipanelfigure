@@ -38,6 +38,13 @@ import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import ChevronLeftIcon from "@mui/icons-material/ChevronLeft";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import RefreshIcon from "@mui/icons-material/Refresh";
+import PanToolAltIcon from "@mui/icons-material/PanToolAlt";
+import BrushIcon from "@mui/icons-material/Brush";
+import HighlightOffIcon from "@mui/icons-material/HighlightOff";
+import CallMergeIcon from "@mui/icons-material/CallMerge";
+import UndoIcon from "@mui/icons-material/Undo";
+import RedoIcon from "@mui/icons-material/Redo";
+import LayersClearIcon from "@mui/icons-material/LayersClear";
 
 // ── Types (exported so the host can persist the config on the node) ──
 export interface FluorChannels {
@@ -143,6 +150,13 @@ export interface FluorIntensityConfig {
    *  biologically comparable). null = no control panel. */
   controlChannel: "r" | "g" | "b" | null;
   groups: FluorGroup[];
+  /** Optional user-painted cellpose masks keyed by image label.  Each
+   *  value is the RGBA-packed PNG data URL the dialog produced from
+   *  its interactive editor (R = label low byte, G = label high
+   *  byte).  When non-empty, the generated Python forwards these to
+   *  /api/analysis/run-cellpose so the FINAL quantification uses the
+   *  user's edits instead of a fresh cellpose run for those images. */
+  editedMasks?: Record<string, string>;
 }
 
 export function emptyFluorConfig(): FluorIntensityConfig {
@@ -386,7 +400,19 @@ def _cellpose_labels_batch(items, model, channels):
             "kind": "image", "key": label, "label": label,
             "image_b64": _b64.b64encode(_png_bytes(a8_small)).decode(),
         })
-    payload = json.dumps({
+    # Forward user-edited masks (Intensity dialog Tier-1 editing).
+    # Only relevant for the WHOLE-CELL pass; the nuclei pass uses a
+    # different model and edits aren't tracked separately for nuclei.
+    _edited = {}
+    if model != "nuclei":
+        _edited_cfg = CFG.get("editedMasks") or {}
+        if isinstance(_edited_cfg, dict):
+            for _lbl in [label for label, _ in items]:
+                v = _edited_cfg.get(_lbl)
+                if isinstance(v, str) and v:
+                    # Strip the "data:image/png;base64," prefix if present.
+                    _edited[_lbl] = v.split(",", 1)[-1] if v.startswith("data:") else v
+    payload_obj = {
         "config": json.dumps({
             "model": model,
             "diameter": float(cp_cfg.get("diameter") or 0) or None,
@@ -398,7 +424,12 @@ def _cellpose_labels_batch(items, model, channels):
         }),
         "extra_inputs": sent,
         "sources": [], "timeout_sec": 600,
-    })
+    }
+    if _edited:
+        payload_obj["edited_masks"] = _edited
+        print(f"[intensity] cellpose: applying {len(_edited)} user-edited mask(s) "
+              f"({', '.join(sorted(_edited.keys()))})")
+    payload = json.dumps(payload_obj)
     print(f"[intensity] cellpose ({model}, channels={channels}): batching {len(sent)} image(s) into one model load "
           f"(cap {CELLPOSE_MAX_EDGE}px per edge)")
     try:
@@ -414,17 +445,24 @@ def _cellpose_labels_batch(items, model, channels):
     if not cp_out.get("success"):
         msg = (cp_out.get("stderr") or "(no detail)").strip()
         return {}, {label: msg for label, _ in items}
-    # Index returned images by name (each image emits <label>_labels).
+    # Index returned images by name.  Prefer <label>_labels16 (RGBA-
+    # packed, no >255 truncation) and fall back to the legacy 8-bit
+    # <label>_labels for older sidecar builds.
     by_name = {im.get("name"): im.get("image") for im in (cp_out.get("images") or [])}
     labels_by_label = {}
     errors = {}
     for label, _ in items:
+        lbl16_b64 = by_name.get(f"{label}_labels16")
         lbl_b64 = by_name.get(f"{label}_labels")
-        if not lbl_b64:
+        if not (lbl16_b64 or lbl_b64):
             errors[label] = "no labels image returned"
             continue
         try:
-            arr = np.asarray(_Im.open(_io.BytesIO(_b64.b64decode(lbl_b64))).convert("L")).astype(np.int32)
+            if lbl16_b64:
+                rgba = np.asarray(_Im.open(_io.BytesIO(_b64.b64decode(lbl16_b64))).convert("RGBA"))
+                arr = (rgba[..., 0].astype(np.int32) | (rgba[..., 1].astype(np.int32) << 8))
+            else:
+                arr = np.asarray(_Im.open(_io.BytesIO(_b64.b64decode(lbl_b64))).convert("L")).astype(np.int32)
             # Restore to native resolution for stat measurement.
             h_n, w_n = sizes_native[label]
             arr = _upsize_labels(arr, h_n, w_n)
@@ -841,10 +879,123 @@ type PreviewLayers = {
   /** Cellpose nucleus-mask outline (cyan, transparent bg) — only
    *  present when "Measure compartments" was on. */
   nucleusOverlaySrc?: string;
+  /** Editable cell-label raster at PREVIEW resolution.  Decoded from
+   *  the backend's RGBA-packed PNG (R = lo, G = hi).  Each pixel's
+   *  Int32Array value is the cell ID (0 = background). */
+  cellLabels?: Int32Array;
+  nucleusLabels?: Int32Array;
+  labelW?: number;
+  labelH?: number;
+  /** Cellpose intermediate visualisations.  Tier 2 view modes. */
+  flowsRgbSrc?: string;
+  cellprobSrc?: string;
+  /** True once the user has interactively painted/deleted/merged. */
+  edited?: boolean;
   n_cells?: number;
   n_nuclei?: number;
   per_channel?: Record<string, number>;
 };
+
+/** Decode the backend's RGBA-packed labels PNG into an Int32Array.
+ *  Uses a hidden canvas (browser-native PNG decode), then reads
+ *  R = low byte + G = high byte for every pixel.  Returns null on
+ *  any decode failure. */
+async function decodeRgbaLabels(b64: string): Promise<{ labels: Int32Array; w: number; h: number } | null> {
+  return new Promise((resolve) => {
+    const img = new window.Image();
+    img.onload = () => {
+      const cnv = document.createElement("canvas");
+      cnv.width = img.naturalWidth;
+      cnv.height = img.naturalHeight;
+      const ctx = cnv.getContext("2d");
+      if (!ctx) { resolve(null); return; }
+      ctx.drawImage(img, 0, 0);
+      const data = ctx.getImageData(0, 0, cnv.width, cnv.height).data;
+      const n = cnv.width * cnv.height;
+      const labels = new Int32Array(n);
+      for (let i = 0; i < n; i++) {
+        labels[i] = data[i * 4] | (data[i * 4 + 1] << 8);
+      }
+      resolve({ labels, w: cnv.width, h: cnv.height });
+    };
+    img.onerror = () => resolve(null);
+    img.src = `data:image/png;base64,${b64}`;
+  });
+}
+
+/** Encode an Int32Array label image back to an RGBA-packed PNG data
+ *  URL for round-tripping to the backend (R = lo, G = hi). */
+function encodeRgbaLabels(labels: Int32Array, w: number, h: number): string {
+  const cnv = document.createElement("canvas");
+  cnv.width = w; cnv.height = h;
+  const ctx = cnv.getContext("2d");
+  if (!ctx) return "";
+  const imageData = ctx.createImageData(w, h);
+  const d = imageData.data;
+  for (let i = 0; i < labels.length; i++) {
+    const v = labels[i] | 0;
+    d[i * 4] = v & 0xFF;
+    d[i * 4 + 1] = (v >>> 8) & 0xFF;
+    d[i * 4 + 2] = 0;
+    d[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(imageData, 0, 0);
+  return cnv.toDataURL("image/png");
+}
+
+/** Derive a 4-neighbour boundary mask from an Int32Array label image. */
+function deriveBoundary(labels: Int32Array, w: number, h: number): Uint8Array {
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const v = labels[i];
+      if (v === 0) continue;
+      // Compare against 4-neighbours.  At the edge, "no neighbour"
+      // is treated as a different label so the cell's silhouette is
+      // closed against the image border.
+      const up = y > 0 ? labels[i - w] : -1;
+      const dn = y < h - 1 ? labels[i + w] : -1;
+      const lf = x > 0 ? labels[i - 1] : -1;
+      const rt = x < w - 1 ? labels[i + 1] : -1;
+      if (v !== up || v !== dn || v !== lf || v !== rt) out[i] = 1;
+    }
+  }
+  return out;
+}
+
+/** Count the number of distinct non-zero IDs in a label image.
+ *  Used for the live cell-count display next to the eye chip. */
+function countNonZeroIds(labels: Int32Array): number {
+  const seen = new Set<number>();
+  for (let i = 0; i < labels.length; i++) {
+    const v = labels[i];
+    if (v > 0) seen.add(v);
+  }
+  return seen.size;
+}
+
+/** Render a boundary mask onto a transparent canvas in the given
+ *  colour.  Returns the canvas so the compositor can drawImage it. */
+function renderBoundaryCanvas(
+  boundary: Uint8Array, w: number, h: number, rgb: [number, number, number],
+): HTMLCanvasElement {
+  const cnv = document.createElement("canvas");
+  cnv.width = w; cnv.height = h;
+  const ctx = cnv.getContext("2d");
+  if (!ctx) return cnv;
+  const imageData = ctx.createImageData(w, h);
+  const d = imageData.data;
+  for (let i = 0; i < boundary.length; i++) {
+    if (!boundary[i]) continue;
+    d[i * 4] = rgb[0];
+    d[i * 4 + 1] = rgb[1];
+    d[i * 4 + 2] = rgb[2];
+    d[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(imageData, 0, 0);
+  return cnv;
+}
 
 export default function IntensityPickerDialog(props: IntensityPickerDialogProps) {
   const { open, images, initial, onClose, onSave } = props;
@@ -877,6 +1028,35 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // visibility above): cells = yellow outline, nuclei = cyan. Both
   // default ON so the user immediately sees what cellpose found.
   const [cpMaskVisible, setCpMaskVisible] = useState<{ cells: boolean; nuclei: boolean }>({ cells: true, nuclei: true });
+  // ── Interactive mask editor (cellpose mode only) ───────────────
+  // The active tool: "pan" is the default and matches the existing
+  // click-drag-to-pan behaviour; "paint" draws a new cell with a
+  // round brush stroke; "delete" zeroes whichever cell the user
+  // clicks; "merge" reassigns one cell's pixels to the ID of another.
+  type EditTool = "pan" | "paint" | "delete" | "merge";
+  const [editTool, setEditTool] = useState<EditTool>("pan");
+  // Brush radius (preview-pixel space).  Cellpose's GUI uses 3 / 5 / 7;
+  // 12 is a forgiving default for human pointing.  `[` / `]` adjusts.
+  const [brushPx, setBrushPx] = useState(12);
+  // Merge-tool state: the ID of the first cell clicked, awaiting the
+  // second click that completes the merge.  null = no pending merge.
+  const [mergeFirstId, setMergeFirstId] = useState<number | null>(null);
+  // Hover cursor position + the cell ID under it (for the tooltip).
+  const [hoverInfo, setHoverInfo] = useState<{
+    x: number; y: number; clientX: number; clientY: number; cellId: number;
+  } | null>(null);
+  // Undo / redo: per-image stacks of {cells, nuclei} label snapshots.
+  // We keep the active image's stack only; switching images flushes
+  // the other image's history to keep peak memory bounded.
+  type EditSnapshot = { cellLabels: Int32Array; nucleusLabels?: Int32Array };
+  const [editHistory, setEditHistory] = useState<Record<string, { past: EditSnapshot[]; future: EditSnapshot[] }>>({});
+  // Edited counts per image — surfaced in the stats footer so the
+  // user can see at a glance which images have been touched.
+  const editsMeta = useMemo(() => {
+    const out: Record<string, number> = {};
+    for (const [k, v] of Object.entries(editHistory)) out[k] = v.past.length;
+    return out;
+  }, [editHistory]);
   // Run-all progress: { current, total } while iterating images.
   // null when idle. cancelRef lets the user abort mid-batch (close
   // the dialog or click again).
@@ -981,6 +1161,10 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       setPreviewByImage({});
       setPreviewError(null);
       setMaskVisible({ r: true, g: true, b: true });
+      setEditTool("pan");
+      setEditHistory({});
+      setMergeFirstId(null);
+      setHoverInfo(null);
     }
   }, [open, initial]);
 
@@ -1124,14 +1308,32 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
             ? `data:image/png;base64,${data.cell_overlay_b64}` : undefined,
           nucleusOverlaySrc: data.nucleus_overlay_b64
             ? `data:image/png;base64,${data.nucleus_overlay_b64}` : undefined,
+          flowsRgbSrc: data.flows_rgb_b64
+            ? `data:image/png;base64,${data.flows_rgb_b64}` : undefined,
+          cellprobSrc: data.cellprob_b64
+            ? `data:image/png;base64,${data.cellprob_b64}` : undefined,
           n_cells: typeof data.n_cells === "number" ? data.n_cells : undefined,
           n_nuclei: typeof data.n_nuclei === "number" ? data.n_nuclei : undefined,
           per_channel: data.per_channel,
         };
+        // Decode editable label rasters (cellpose mode only).  These
+        // power the brush / delete / merge tools — the dialog stores
+        // them as Int32Arrays and re-derives the boundary canvas on
+        // each edit.  Async (PNG decode goes through a hidden canvas).
+        if (data.cell_labels_b64) {
+          const dec = await decodeRgbaLabels(data.cell_labels_b64);
+          if (dec) { layers.cellLabels = dec.labels; layers.labelW = dec.w; layers.labelH = dec.h; }
+        }
+        if (data.nucleus_labels_b64) {
+          const dec = await decodeRgbaLabels(data.nucleus_labels_b64);
+          if (dec) { layers.nucleusLabels = dec.labels; }
+        }
         // Cache by THIS image's label so Run-all stores results
         // against each image's own label, not the (stale) activeIdx.
         const key = img.label;
         setPreviewByImage((cur) => ({ ...cur, [key]: layers }));
+        // Fresh preview → clear the edit history for this image.
+        setEditHistory((cur) => { const c = { ...cur }; delete c[key]; return c; });
         setParamsDirty(false);
       } else {
         setPreviewError(data.error || "preview failed");
@@ -1197,9 +1399,14 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
 
   // Param changes invalidate the whole cache — every previously-rendered
   // image's overlay is now stale relative to the current settings.
+  // Also resets editor history; re-running cellpose with new params
+  // would produce a fresh label image that wouldn't share IDs with
+  // the user's prior edits.
   useEffect(() => {
     if (!open) return;
     setPreviewByImage({});
+    setEditHistory({});
+    setMergeFirstId(null);
     setParamsDirty(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cfg.mode, cfg.rollingRadius, cfg.thresholds, cfg.cellpose]);
@@ -1254,22 +1461,331 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       };
     });
   }, []);
-  // Left-drag pans. Track via window listeners so dragging off-canvas works.
+  // Convert a DOM mouse event into IMAGE-space pixel coordinates
+  // (the canvas's intrinsic resolution).  Returns null when the
+  // pointer is outside the canvas bounds — which means the user is
+  // hovering the dark padding area around the image.
+  const clientToImage = useCallback((clientX: number, clientY: number): { x: number; y: number } | null => {
+    const cnv = canvasRef.current;
+    if (!cnv) return null;
+    const rect = cnv.getBoundingClientRect();
+    if (clientX < rect.left || clientX > rect.right) return null;
+    if (clientY < rect.top || clientY > rect.bottom) return null;
+    const x = Math.round((clientX - rect.left) * (cnv.width / rect.width));
+    const y = Math.round((clientY - rect.top) * (cnv.height / rect.height));
+    return { x, y };
+  }, []);
+
+  // ── Editor: commits ─────────────────────────────────────────────
+  // Each commit pushes a snapshot of the current cellLabels (and
+  // nucleusLabels) onto the per-image undo stack, then mutates a
+  // CLONE of the labels and writes it back into previewByImage.
+  const pushHistorySnapshot = useCallback((label: string) => {
+    setEditHistory((cur) => {
+      const ap = previewByImage[label];
+      if (!ap || !ap.cellLabels) return cur;
+      const prev = cur[label] || { past: [], future: [] };
+      const snap: EditSnapshot = {
+        cellLabels: new Int32Array(ap.cellLabels),
+        nucleusLabels: ap.nucleusLabels ? new Int32Array(ap.nucleusLabels) : undefined,
+      };
+      // Cap the per-image history depth at 20 — each Int32 snapshot
+      // of a 1024×1024 mask is ~4 MB so unbounded growth would chew
+      // through memory fast.
+      const past = [...prev.past, snap].slice(-20);
+      return { ...cur, [label]: { past, future: [] } };
+    });
+  }, [previewByImage]);
+
+  const writeBackLabels = useCallback((label: string, next: Int32Array, nextNuc?: Int32Array | null) => {
+    setPreviewByImage((cur) => {
+      const ap = cur[label];
+      if (!ap) return cur;
+      return {
+        ...cur,
+        [label]: {
+          ...ap,
+          cellLabels: next,
+          nucleusLabels: nextNuc === null ? undefined : (nextNuc || ap.nucleusLabels),
+          edited: true,
+          n_cells: countNonZeroIds(next),
+        },
+      };
+    });
+  }, []);
+
+  // Paint a filled circle into the stroke mask at image-space (x, y).
+  const stampCircle = useCallback((cx: number, cy: number, r: number, w: number, h: number) => {
+    const mask = strokeMaskRef.current;
+    if (!mask) return;
+    const x0 = Math.max(0, Math.floor(cx - r));
+    const x1 = Math.min(w - 1, Math.ceil(cx + r));
+    const y0 = Math.max(0, Math.floor(cy - r));
+    const y1 = Math.min(h - 1, Math.ceil(cy + r));
+    const r2 = r * r;
+    for (let y = y0; y <= y1; y++) {
+      const dy = y - cy;
+      for (let x = x0; x <= x1; x++) {
+        const dx = x - cx;
+        if (dx * dx + dy * dy <= r2) mask[y * w + x] = 1;
+      }
+    }
+  }, []);
+
+  // Stamp circles along the segment between the previous and current
+  // pointer positions so a fast drag still produces a continuous
+  // stroke (Bresenham would do; circles every pixel is plenty).
+  const paintSegment = useCallback((x: number, y: number, w: number, h: number) => {
+    const r = brushPx;
+    const last = lastPaintXYRef.current;
+    if (!last) {
+      stampCircle(x, y, r, w, h);
+    } else {
+      const dx = x - last.x, dy = y - last.y;
+      const steps = Math.max(1, Math.ceil(Math.hypot(dx, dy)));
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        stampCircle(last.x + dx * t, last.y + dy * t, r, w, h);
+      }
+    }
+    lastPaintXYRef.current = { x, y };
+    setStrokeTick((t) => t + 1);
+  }, [brushPx, stampCircle]);
+
+  const commitPaintStroke = useCallback((label: string) => {
+    const mask = strokeMaskRef.current;
+    const ap = previewByImage[label];
+    if (!mask || !ap?.cellLabels || !ap.labelW || !ap.labelH) {
+      strokeMaskRef.current = null;
+      paintingRef.current = false;
+      lastPaintXYRef.current = null;
+      setStrokeTick((t) => t + 1);
+      return;
+    }
+    pushHistorySnapshot(label);
+    const next = new Int32Array(ap.cellLabels);
+    let nextId = 0;
+    for (let i = 0; i < next.length; i++) if (next[i] > nextId) nextId = next[i];
+    nextId += 1;
+    let touched = 0;
+    for (let i = 0; i < mask.length; i++) {
+      if (!mask[i]) continue;
+      next[i] = nextId; touched++;
+    }
+    if (touched > 0) writeBackLabels(label, next);
+    strokeMaskRef.current = null;
+    paintingRef.current = false;
+    lastPaintXYRef.current = null;
+    setStrokeTick((t) => t + 1);
+  }, [previewByImage, pushHistorySnapshot, writeBackLabels]);
+
+  const deleteCellAt = useCallback((label: string, x: number, y: number) => {
+    const ap = previewByImage[label];
+    if (!ap?.cellLabels || !ap.labelW || !ap.labelH) return;
+    const idx = y * ap.labelW + x;
+    const id = ap.cellLabels[idx];
+    if (!id) return;
+    pushHistorySnapshot(label);
+    const next = new Int32Array(ap.cellLabels);
+    for (let i = 0; i < next.length; i++) if (next[i] === id) next[i] = 0;
+    writeBackLabels(label, next);
+  }, [previewByImage, pushHistorySnapshot, writeBackLabels]);
+
+  const mergeCellInto = useCallback((label: string, srcId: number, dstId: number) => {
+    if (srcId === dstId || !srcId || !dstId) return;
+    const ap = previewByImage[label];
+    if (!ap?.cellLabels) return;
+    pushHistorySnapshot(label);
+    const next = new Int32Array(ap.cellLabels);
+    for (let i = 0; i < next.length; i++) if (next[i] === srcId) next[i] = dstId;
+    writeBackLabels(label, next);
+  }, [previewByImage, pushHistorySnapshot, writeBackLabels]);
+
+  const clearAllMasks = useCallback((label: string) => {
+    const ap = previewByImage[label];
+    if (!ap?.cellLabels) return;
+    pushHistorySnapshot(label);
+    writeBackLabels(label, new Int32Array(ap.cellLabels.length));
+  }, [previewByImage, pushHistorySnapshot, writeBackLabels]);
+
+  const doUndo = useCallback((label: string) => {
+    setEditHistory((cur) => {
+      const h = cur[label];
+      if (!h || h.past.length === 0) return cur;
+      const ap = previewByImage[label];
+      if (!ap?.cellLabels) return cur;
+      const snap = h.past[h.past.length - 1];
+      const present: EditSnapshot = {
+        cellLabels: new Int32Array(ap.cellLabels),
+        nucleusLabels: ap.nucleusLabels ? new Int32Array(ap.nucleusLabels) : undefined,
+      };
+      writeBackLabels(label, snap.cellLabels, snap.nucleusLabels ?? null);
+      return {
+        ...cur,
+        [label]: { past: h.past.slice(0, -1), future: [...h.future, present] },
+      };
+    });
+  }, [previewByImage, writeBackLabels]);
+
+  const doRedo = useCallback((label: string) => {
+    setEditHistory((cur) => {
+      const h = cur[label];
+      if (!h || h.future.length === 0) return cur;
+      const ap = previewByImage[label];
+      if (!ap?.cellLabels) return cur;
+      const snap = h.future[h.future.length - 1];
+      const present: EditSnapshot = {
+        cellLabels: new Int32Array(ap.cellLabels),
+        nucleusLabels: ap.nucleusLabels ? new Int32Array(ap.nucleusLabels) : undefined,
+      };
+      writeBackLabels(label, snap.cellLabels, snap.nucleusLabels ?? null);
+      return {
+        ...cur,
+        [label]: { past: [...h.past, present], future: h.future.slice(0, -1) },
+      };
+    });
+  }, [previewByImage, writeBackLabels]);
+
+  // ── Mouse dispatcher ─────────────────────────────────────────
+  // Drives pan in the default tool, paint / delete / merge otherwise.
+  // We don't disable wheel zoom or double-click reset — those stay
+  // available regardless of tool.
   const onPreviewMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
+    const label = activeImage?.label;
+    const ap = label ? previewByImage[label] : undefined;
+    const editable = cfg.mode === "cellpose" && !!ap?.cellLabels && !!ap.labelW && !!ap.labelH;
+    if (!editable || editTool === "pan") {
+      // Existing pan behaviour.
+      e.preventDefault();
+      const startX = e.clientX, startY = e.clientY;
+      const startPan = view;
+      const onMove = (ev: MouseEvent) => {
+        setView((v) => ({ ...v, panX: startPan.panX + (ev.clientX - startX), panY: startPan.panY + (ev.clientY - startY) }));
+      };
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+      };
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+      return;
+    }
     e.preventDefault();
-    const startX = e.clientX, startY = e.clientY;
-    const startPan = view;
-    const onMove = (ev: MouseEvent) => {
-      setView((v) => ({ ...v, panX: startPan.panX + (ev.clientX - startX), panY: startPan.panY + (ev.clientY - startY) }));
+    const pt = clientToImage(e.clientX, e.clientY);
+    if (!pt) return;
+    const w = ap!.labelW!, h = ap!.labelH!;
+    if (editTool === "paint") {
+      strokeMaskRef.current = new Uint8Array(w * h);
+      paintingRef.current = true;
+      lastPaintXYRef.current = null;
+      paintSegment(pt.x, pt.y, w, h);
+      const onMove = (ev: MouseEvent) => {
+        if (!paintingRef.current) return;
+        const p = clientToImage(ev.clientX, ev.clientY);
+        if (!p) return;
+        paintSegment(p.x, p.y, w, h);
+      };
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        if (label) commitPaintStroke(label);
+      };
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+      return;
+    }
+    if (editTool === "delete" && label) {
+      deleteCellAt(label, pt.x, pt.y);
+      return;
+    }
+    if (editTool === "merge" && label) {
+      const idx = pt.y * w + pt.x;
+      const id = ap!.cellLabels![idx];
+      if (!id) return;
+      if (mergeFirstId == null) {
+        setMergeFirstId(id);
+      } else {
+        mergeCellInto(label, id, mergeFirstId);
+        setMergeFirstId(null);
+      }
+      return;
+    }
+  }, [view, activeImage, previewByImage, cfg.mode, editTool, clientToImage,
+      paintSegment, commitPaintStroke, deleteCellAt, mergeCellInto, mergeFirstId]);
+
+  // Hover tracking — updates the brush cursor + cell-ID tooltip.
+  const onPreviewMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (cfg.mode !== "cellpose") return;
+    const label = activeImage?.label;
+    const ap = label ? previewByImage[label] : undefined;
+    if (!ap?.cellLabels || !ap.labelW || !ap.labelH) {
+      setHoverInfo(null);
+      return;
+    }
+    const pt = clientToImage(e.clientX, e.clientY);
+    if (!pt) { setHoverInfo(null); return; }
+    const cellId = ap.cellLabels[pt.y * ap.labelW + pt.x] | 0;
+    setHoverInfo({ x: pt.x, y: pt.y, clientX: e.clientX, clientY: e.clientY, cellId });
+  }, [cfg.mode, activeImage, previewByImage, clientToImage]);
+
+  const onPreviewMouseLeave = useCallback(() => {
+    setHoverInfo(null);
+  }, []);
+
+  // ── Hotkeys ──────────────────────────────────────────────────
+  // Roughly mirror cellpose's GUI shortcuts: V=pan, B=paint, D=delete,
+  // M=merge; [ / ] resize brush; Cmd+Z / Cmd+Shift+Z undo/redo;
+  // Cmd+0 clears every mask on the active image.  We deliberately
+  // SKIP hotkeys when focus is in a text input so typing channel
+  // names doesn't toggle tools.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      const tgt = e.target as HTMLElement | null;
+      if (tgt && (tgt.tagName === "INPUT" || tgt.tagName === "TEXTAREA" || tgt.isContentEditable)) return;
+      const cmd = e.metaKey || e.ctrlKey;
+      const label = activeImage?.label;
+      if (cfg.mode !== "cellpose") return;
+      if (cmd && (e.key === "z" || e.key === "Z")) {
+        e.preventDefault();
+        if (label) { if (e.shiftKey) doRedo(label); else doUndo(label); }
+        return;
+      }
+      if (cmd && e.key === "0") {
+        e.preventDefault();
+        if (label) clearAllMasks(label);
+        return;
+      }
+      if (e.key === "[") { e.preventDefault(); setBrushPx((p) => Math.max(2, p - 2)); return; }
+      if (e.key === "]") { e.preventDefault(); setBrushPx((p) => Math.min(80, p + 2)); return; }
+      const k = e.key.toLowerCase();
+      if (k === "v") { setEditTool("pan"); setMergeFirstId(null); }
+      else if (k === "b") { setEditTool("paint"); setMergeFirstId(null); }
+      else if (k === "d") { setEditTool("delete"); setMergeFirstId(null); }
+      else if (k === "m") { setEditTool("merge"); setMergeFirstId(null); }
+      else if (k === "escape") { setMergeFirstId(null); }
     };
-    const onUp = () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  }, [view]);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, cfg.mode, activeImage, doUndo, doRedo, clearAllMasks]);
+
+  // ── Save: pack edited masks into cfg ─────────────────────────
+  // The dialog only ships the edited mask for images that the user
+  // actually painted on (edit count > 0).  Encoded as RGBA-packed
+  // PNG data URLs so the generated Python forwards them straight to
+  // /api/analysis/run-cellpose's `edited_masks` field.
+  const handleSave = useCallback(() => {
+    const edited: Record<string, string> = {};
+    for (const [lbl, hist] of Object.entries(editHistory)) {
+      if (hist.past.length === 0) continue;
+      const ap = previewByImage[lbl];
+      if (!ap?.cellLabels || !ap.labelW || !ap.labelH) continue;
+      const url = encodeRgbaLabels(ap.cellLabels, ap.labelW, ap.labelH);
+      if (url) edited[lbl] = url;
+    }
+    onSave({ ...cfg, editedMasks: Object.keys(edited).length ? edited : undefined });
+  }, [cfg, editHistory, previewByImage, onSave]);
 
   // Load composite + overlay layers (per-channel for simple, cells +
   // nuclei for cellpose) as HTMLImageElement instances whenever the
@@ -1319,10 +1835,47 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     return () => { cancelled = true; };
   }, [activePreview, cfg.mode]);
 
-  // Redraw the canvas whenever the composite, any overlay, or the
-  // visibility map changes. The redraw runs at the PNG's native
-  // resolution — CSS scales the result for display, but the layers
-  // themselves are pixel-perfect aligned.
+  // ── Editor: derived boundary canvases (cellpose mode) ─────────
+  // When the active preview carries an Int32Array of cell labels (i.e.
+  // the new "editable" path), we re-derive the boundary client-side
+  // on every change.  This is what makes paint / delete / merge appear
+  // instantly — the server's overlay PNG is only used as the initial
+  // bootstrap and falls back when labels weren't returned.
+  const [cellBoundaryCnv, setCellBoundaryCnv] = useState<HTMLCanvasElement | null>(null);
+  const [nucleusBoundaryCnv, setNucleusBoundaryCnv] = useState<HTMLCanvasElement | null>(null);
+  useEffect(() => {
+    if (!activePreview || !activePreview.cellLabels || !activePreview.labelW || !activePreview.labelH) {
+      setCellBoundaryCnv(null);
+      setNucleusBoundaryCnv(null);
+      return;
+    }
+    const w = activePreview.labelW, h = activePreview.labelH;
+    const b = deriveBoundary(activePreview.cellLabels, w, h);
+    setCellBoundaryCnv(renderBoundaryCanvas(b, w, h, [255, 255, 0]));
+    if (activePreview.nucleusLabels) {
+      const nb = deriveBoundary(activePreview.nucleusLabels, w, h);
+      setNucleusBoundaryCnv(renderBoundaryCanvas(nb, w, h, [96, 220, 255]));
+    } else {
+      setNucleusBoundaryCnv(null);
+    }
+  }, [activePreview]);
+
+  // ── Editor: transient paint stroke + brush-cursor overlays ─────
+  // While the user holds left-mouse with the paint tool, every
+  // sampled pointer position is stamped into strokeMaskRef as a
+  // filled circle.  The compositor reads it as a semi-transparent
+  // top layer so the user sees what they're drawing IMMEDIATELY.
+  // On mouseup it's committed into cellLabels with a fresh ID.
+  const strokeMaskRef = useRef<Uint8Array | null>(null);
+  const paintingRef = useRef(false);
+  const lastPaintXYRef = useRef<{ x: number; y: number } | null>(null);
+  // Bumped on every paint stamp so the compositor re-runs.  Cheaper
+  // than copying the Int32Array on every move.
+  const [strokeTick, setStrokeTick] = useState(0);
+
+  // Redraw the canvas whenever the composite, any overlay, the
+  // visibility map, or any editor state changes.  Pixel-perfect:
+  // CSS scales the final canvas, but all layers share its grid.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -1346,10 +1899,67 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         if (im) ctx.drawImage(im, 0, 0);
       }
     } else {
-      if (cpMaskVisible.cells && cellImgEl) ctx.drawImage(cellImgEl, 0, 0);
-      if (cpMaskVisible.nuclei && nucImgEl) ctx.drawImage(nucImgEl, 0, 0);
+      // Prefer the locally-derived boundary (always current with
+      // edits); fall back to the server's overlay PNG when we
+      // haven't decoded labels for this image yet.
+      if (cpMaskVisible.cells) {
+        if (cellBoundaryCnv) ctx.drawImage(cellBoundaryCnv, 0, 0);
+        else if (cellImgEl) ctx.drawImage(cellImgEl, 0, 0);
+      }
+      if (cpMaskVisible.nuclei) {
+        if (nucleusBoundaryCnv) ctx.drawImage(nucleusBoundaryCnv, 0, 0);
+        else if (nucImgEl) ctx.drawImage(nucImgEl, 0, 0);
+      }
+      // Transient paint stroke (semi-transparent yellow fill).
+      const stroke = strokeMaskRef.current;
+      if (stroke && stroke.length === w * h) {
+        const id = ctx.createImageData(w, h);
+        const d = id.data;
+        for (let i = 0; i < stroke.length; i++) {
+          if (!stroke[i]) continue;
+          d[i * 4] = 255; d[i * 4 + 1] = 255; d[i * 4 + 2] = 80; d[i * 4 + 3] = 110;
+        }
+        ctx.putImageData(id, 0, 0);
+      }
+      // Highlight the cell that's mid-merge (waiting for second click).
+      if (mergeFirstId != null && activePreview?.cellLabels) {
+        const lbl = activePreview.cellLabels;
+        const id = ctx.createImageData(w, h);
+        const d = id.data;
+        for (let i = 0; i < lbl.length; i++) {
+          if (lbl[i] !== mergeFirstId) continue;
+          d[i * 4] = 255; d[i * 4 + 1] = 80; d[i * 4 + 2] = 255; d[i * 4 + 3] = 80;
+        }
+        ctx.putImageData(id, 0, 0);
+      }
+      // Brush cursor — only when in an editing tool with hover info.
+      if (hoverInfo && editTool !== "pan") {
+        const cx = hoverInfo.x, cy = hoverInfo.y;
+        ctx.save();
+        ctx.lineWidth = 1.5;
+        const col = editTool === "paint" ? "#fff58a"
+                  : editTool === "delete" ? "#ff7a7a"
+                  : editTool === "merge" ? "#ff8aff" : "#ffffff";
+        ctx.strokeStyle = col;
+        if (editTool === "paint") {
+          ctx.beginPath();
+          ctx.arc(cx, cy, brushPx, 0, Math.PI * 2);
+          ctx.stroke();
+        } else {
+          // Crosshair for click-tools so the user knows there's no
+          // brush radius to think about.
+          ctx.beginPath();
+          ctx.moveTo(cx - 8, cy); ctx.lineTo(cx + 8, cy);
+          ctx.moveTo(cx, cy - 8); ctx.lineTo(cx, cy + 8);
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
     }
-  }, [compImgEl, chImgEls, maskVisible, cellImgEl, nucImgEl, cpMaskVisible, cfg.mode]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [compImgEl, chImgEls, maskVisible, cellImgEl, nucImgEl, cpMaskVisible, cfg.mode,
+      cellBoundaryCnv, nucleusBoundaryCnv, hoverInfo, editTool, brushPx, mergeFirstId,
+      strokeTick]);
 
   const setChannel = useCallback((k: keyof FluorChannels, v: string) => {
     setCfg((c) => ({ ...c, channels: { ...c.channels, [k]: v } }));
@@ -1502,6 +2112,139 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
             display: "flex", alignItems: "center", justifyContent: "center",
             minHeight: 560,
           }}>
+            {/* ── Editor toolbar (cellpose mode, after a Run) ──
+                Mirrors cellpose-GUI: pan / paint / delete / merge +
+                undo / redo / clear, with a brush-size slider.  Sits
+                top-left so it doesn't clash with the zoom HUD on the
+                right or the stats footer at the bottom.
+                Hotkeys: V (pan), B (paint), D (delete), M (merge),
+                [/] (brush ±2 px), Cmd+Z / Cmd+Shift+Z, Cmd+0. */}
+            {cfg.mode === "cellpose" && activePreview?.cellLabels && (
+              <Box sx={{
+                position: "absolute", top: 4, left: 4, zIndex: 5,
+                display: "flex", alignItems: "center", gap: 0.4, flexWrap: "wrap",
+                bgcolor: "rgba(0,0,0,0.55)", color: "common.white",
+                px: 0.6, py: 0.35, borderRadius: 0.6,
+              }}>
+                {([
+                  { tool: "pan" as const,    icon: <PanToolAltIcon sx={{ fontSize: 16 }} />,    title: "Pan (V)" },
+                  { tool: "paint" as const,  icon: <BrushIcon sx={{ fontSize: 16 }} />,         title: "Paint new cell (B)" },
+                  { tool: "delete" as const, icon: <HighlightOffIcon sx={{ fontSize: 16 }} />,  title: "Delete cell under cursor (D)" },
+                  { tool: "merge" as const,  icon: <CallMergeIcon sx={{ fontSize: 16 }} />,     title: "Merge two cells (M) — click first cell, then the cell to merge it INTO" },
+                ] as const).map(({ tool, icon, title }) => (
+                  <Tooltip key={tool} title={title}>
+                    <Box
+                      onClick={() => { setEditTool(tool); setMergeFirstId(null); }}
+                      sx={{
+                        cursor: "pointer", userSelect: "none",
+                        px: 0.6, py: 0.2, borderRadius: 0.4,
+                        bgcolor: editTool === tool ? "primary.main" : "transparent",
+                        color: editTool === tool ? "common.white" : "rgba(255,255,255,0.85)",
+                        border: "1px solid",
+                        borderColor: editTool === tool ? "primary.main" : "rgba(255,255,255,0.25)",
+                        display: "inline-flex", alignItems: "center",
+                      }}>
+                      {icon}
+                    </Box>
+                  </Tooltip>
+                ))}
+                {/* Brush radius (paint tool only).  Shows the actual px
+                    radius so the user understands the units. */}
+                {editTool === "paint" && (
+                  <Box sx={{ display: "inline-flex", alignItems: "center", gap: 0.3, ml: 0.4 }}>
+                    <Typography variant="caption" sx={{ fontSize: "0.62rem", opacity: 0.85 }}>
+                      brush {brushPx}px
+                    </Typography>
+                    <Box onClick={() => setBrushPx((p) => Math.max(2, p - 2))}
+                      sx={{ cursor: "pointer", px: 0.5, py: 0.05, borderRadius: 0.3,
+                            border: "1px solid rgba(255,255,255,0.25)", fontSize: "0.7rem", lineHeight: 1 }}>−</Box>
+                    <Box onClick={() => setBrushPx((p) => Math.min(80, p + 2))}
+                      sx={{ cursor: "pointer", px: 0.5, py: 0.05, borderRadius: 0.3,
+                            border: "1px solid rgba(255,255,255,0.25)", fontSize: "0.7rem", lineHeight: 1 }}>+</Box>
+                  </Box>
+                )}
+                {/* Spacer */}
+                <Box sx={{ width: 1, alignSelf: "stretch", bgcolor: "rgba(255,255,255,0.2)", mx: 0.4 }} />
+                {/* Undo / Redo / Clear.  Disabled when there's nothing
+                    to act on — the chip styling reflects state. */}
+                {(() => {
+                  const lbl = activeImage?.label || "";
+                  const h = editHistory[lbl];
+                  const canUndo = !!h && h.past.length > 0;
+                  const canRedo = !!h && h.future.length > 0;
+                  return (
+                    <>
+                      <Tooltip title="Undo (Cmd/Ctrl+Z)">
+                        <Box onClick={() => { if (canUndo) doUndo(lbl); }}
+                          sx={{
+                            cursor: canUndo ? "pointer" : "not-allowed",
+                            opacity: canUndo ? 1 : 0.35,
+                            px: 0.6, py: 0.2, borderRadius: 0.4,
+                            border: "1px solid rgba(255,255,255,0.25)",
+                            display: "inline-flex", alignItems: "center",
+                          }}>
+                          <UndoIcon sx={{ fontSize: 16 }} />
+                        </Box>
+                      </Tooltip>
+                      <Tooltip title="Redo (Cmd/Ctrl+Shift+Z)">
+                        <Box onClick={() => { if (canRedo) doRedo(lbl); }}
+                          sx={{
+                            cursor: canRedo ? "pointer" : "not-allowed",
+                            opacity: canRedo ? 1 : 0.35,
+                            px: 0.6, py: 0.2, borderRadius: 0.4,
+                            border: "1px solid rgba(255,255,255,0.25)",
+                            display: "inline-flex", alignItems: "center",
+                          }}>
+                          <RedoIcon sx={{ fontSize: 16 }} />
+                        </Box>
+                      </Tooltip>
+                      <Tooltip title="Clear ALL masks on this image (Cmd/Ctrl+0)">
+                        <Box onClick={() => { if (lbl) clearAllMasks(lbl); }}
+                          sx={{
+                            cursor: lbl ? "pointer" : "not-allowed",
+                            px: 0.6, py: 0.2, borderRadius: 0.4,
+                            border: "1px solid rgba(255,255,255,0.25)",
+                            display: "inline-flex", alignItems: "center",
+                          }}>
+                          <LayersClearIcon sx={{ fontSize: 16 }} />
+                        </Box>
+                      </Tooltip>
+                    </>
+                  );
+                })()}
+                {/* "Edited" badge — surfaces the per-image edit count
+                    so the user knows their work is captured. */}
+                {(() => {
+                  const lbl = activeImage?.label || "";
+                  const n = editsMeta[lbl] || 0;
+                  if (!n) return null;
+                  return (
+                    <Typography variant="caption" sx={{
+                      ml: 0.6, fontSize: "0.62rem", color: "#ffd56a",
+                      fontWeight: 700,
+                    }}>
+                      edited ✱ ({n})
+                    </Typography>
+                  );
+                })()}
+                {/* Merge-tool hint */}
+                {editTool === "merge" && (
+                  <Typography variant="caption" sx={{
+                    ml: 0.6, fontSize: "0.62rem", color: "#ffb1ff", fontWeight: 600,
+                  }}>
+                    {mergeFirstId == null ? "click first cell…" : `merge → click target cell (Esc to cancel)`}
+                  </Typography>
+                )}
+                {/* Hover cell ID */}
+                {hoverInfo && hoverInfo.cellId > 0 && editTool !== "pan" && (
+                  <Typography variant="caption" sx={{
+                    ml: 0.6, fontSize: "0.62rem", opacity: 0.85,
+                  }}>
+                    cell #{hoverInfo.cellId}
+                  </Typography>
+                )}
+              </Box>
+            )}
             {/* Pan/zoom container — wraps the canvas (or fused-overlay
                 <img> for cellpose) and a fallback thumbnail. Mouse-wheel
                 zooms around the cursor, click-drag pans, double-click
@@ -1511,12 +2254,24 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
               ref={previewBoxRef}
               onWheel={onPreviewWheel}
               onMouseDown={onPreviewMouseDown}
+              onMouseMove={onPreviewMouseMove}
+              onMouseLeave={onPreviewMouseLeave}
               onDoubleClick={resetView}
               sx={{
                 position: "absolute", inset: 0,
                 display: "flex", alignItems: "center", justifyContent: "center",
-                cursor: previewLoading ? "wait" : "grab",
-                "&:active": { cursor: previewLoading ? "wait" : "grabbing" },
+                cursor: previewLoading
+                  ? "wait"
+                  : (cfg.mode === "cellpose" && editTool !== "pan" && activePreview?.cellLabels
+                      ? "crosshair"
+                      : "grab"),
+                "&:active": {
+                  cursor: previewLoading
+                    ? "wait"
+                    : (cfg.mode === "cellpose" && editTool !== "pan" && activePreview?.cellLabels
+                        ? "crosshair"
+                        : "grabbing"),
+                },
                 overflow: "hidden",
               }}
             >
@@ -2198,7 +2953,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                          disableFocusListener={canSave}>
                   <span>
                     <Button variant="contained" disabled={!canSave}
-                            onClick={() => onSave(cfg)}
+                            onClick={handleSave}
                             sx={{ textTransform: "none" }}>
                       Save configuration
                     </Button>
