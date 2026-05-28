@@ -3625,24 +3625,22 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // PNGs that would blow the 5 MB quota in a couple of runs). To make
   // outputs survive a tab switch (Analysis → Collage → Analysis), we
   // also mirror them into a module-level Map keyed by (tabId, nodeId).
-  // The cache ALWAYS reflects the current state (incl. emptied lists)
-  // so user deletions persist correctly across tab switches.
-  useEffect(() => {
-    for (const t of workflowTabs) {
-      for (const n of t.nodes) {
-        nodeOutputsCache.set(outputsCacheKey(t.id, n.id), n.data.outputs || []);
-      }
-    }
-  }, [workflowTabs]);
-  // One-time rehydration on mount: paint cached outputs back onto the
-  // freshly-restored (stripped) nodes. Only fills nodes that currently
-  // have no outputs (so we don't trample fresh runs) and only when the
-  // cache has SOMETHING for them (empty cache → leave as-is).
+  //
+  // Ordering matters: we MUST hydrate from the cache BEFORE we start
+  // mirroring workflowTabs into it. Otherwise the freshly-restored
+  // stripped tabs from localStorage (which have outputs=[]) would
+  // overwrite the cache's real outputs with empty arrays on the very
+  // first mirror pass — which is exactly why the previous version
+  // lost outputs on Analysis→Collage→Analysis. The hydration effect
+  // runs FIRST and flips outputsHydratedRef.current = true; the
+  // mirror effect bails out until then.
   const outputsHydratedRef = useRef(false);
+  // Hydration: one-time rehydration on mount — paint cached outputs
+  // back onto the freshly-restored (stripped) nodes. Declared first
+  // so it runs before the mirror effect below on the initial commit.
   useEffect(() => {
     if (outputsHydratedRef.current) return;
     if (workflowTabs.length === 0) return;
-    outputsHydratedRef.current = true;
     setWorkflowTabs((tabs) => tabs.map((t) => ({
       ...t,
       nodes: t.nodes.map((n) => {
@@ -3652,8 +3650,23 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         return { ...n, data: { ...n.data, outputs: cached } };
       }),
     })));
+    outputsHydratedRef.current = true;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // Mirror: keep the cache in sync with subsequent state changes. Gate
+  // on outputsHydratedRef so we don't trample the cache with the
+  // stripped tabs during initial mount. After hydration runs once,
+  // every subsequent workflowTabs change writes through to the cache,
+  // including emptied lists (so a user deletion persists across
+  // tab-switches just like it should).
+  useEffect(() => {
+    if (!outputsHydratedRef.current) return;
+    for (const t of workflowTabs) {
+      for (const n of t.nodes) {
+        nodeOutputsCache.set(outputsCacheKey(t.id, n.id), n.data.outputs || []);
+      }
+    }
+  }, [workflowTabs]);
 
   // Saved workflow library (localStorage).
   const [savedWorkflows, setSavedWorkflows] = useState<SavedWorkflow[]>(() => loadSavedWorkflows());
@@ -5129,8 +5142,13 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            // 300 s (5 min) — covers the band picker's full-resolution
+            // annotated-overlay render on large blots (3-4k px wide) and
+            // the fluor picker's per-cell stat loop. The earlier 60 s
+            // was too tight: the band picker would silently fail and
+            // the user wouldn't see the annotated_bands image.
             code: node.data.code || PY_DEFAULT,
-            sources, extra_inputs: extras, timeout_sec: 60,
+            sources, extra_inputs: extras, timeout_sec: 300,
             interpreter_path: enginePaths.python || undefined,
           }),
         });
