@@ -108,6 +108,20 @@ export interface BandPickerConfig {
    *  "separate" emits one PNG per group so each group can be moved into
    *  the figure timeline independently. */
   plotPerGroup?: boolean;
+  /** Image orientation for IOD math.  Drives whether the measurement
+   *  plane is inverted (vmax − pixel) before summing.
+   *    "dark_on_light" — chemiluminescent / film: dark bands on light
+   *      background.  Stronger band = darker pixels = LOWER raw sum.
+   *      We invert so signal = integrated density (higher = more).
+   *    "light_on_dark" — fluorescent (LI-COR / Odyssey, etc.): bright
+   *      bands on dark background.  Raw sum already IS the density,
+   *      no inversion needed.
+   *    "auto" (default) — pick based on the median of the measurement
+   *      plane.  Wrong only if your image was contrast-adjusted in a
+   *      way that fooled the heuristic (e.g. histogram-stretched
+   *      chemilum with a black background applied in software).
+   *  Saved per-blot; the generated Python honours whatever you pick. */
+  bandOrientation?: "auto" | "dark_on_light" | "light_on_dark";
 }
 
 export function emptyBandConfig(): BandPickerConfig {
@@ -118,6 +132,7 @@ export function emptyBandConfig(): BandPickerConfig {
     bgMode: "percentile", bgRoi: null, bgPercentile: 5,
     groups: [], laneBounds: [],
     plotPerGroup: false,
+    bandOrientation: "auto",
   };
 }
 
@@ -224,24 +239,36 @@ else:
     plane = arr
 H, W = plane.shape[:2]
 
-# Orientation detection — chemiluminescent / film blots are DARK bands
-# on a LIGHT background, so a naive np.sum(roi) UNDER-reads the strong
-# (dark) bands (their pixel values are LOWER than the bg).  Invert the
-# plane so signal = sum(vmax - pixel) → "integrated density" with the
-# conventional Western-blot semantics (darker band → larger IOD →
-# target/LC > 1 when LC is faint and target is strong).
-# Fluorescent / dark-background blots (LI-COR, etc.) skip the inversion
-# automatically because their median sits near 0.
+# Orientation handling — DARK-on-LIGHT blots (chemiluminescent / film:
+# dark bands on a light background) need the plane inverted before
+# summing, so that "stronger band = LARGER IOD" matches the conventional
+# Western-blot semantics.  LIGHT-on-DARK blots (fluorescent, LI-COR /
+# Odyssey: bright bands on dark background) already satisfy that and
+# need no inversion.
+#
+# CFG["bandOrientation"]:
+#   "dark_on_light" — force inversion
+#   "light_on_dark" — force no inversion (raw sum = density)
+#   "auto" / missing — pick by the median of the plane (median > vmax/2
+#     → mostly-light background → dark-on-light → invert).  Wrong only
+#     when the image was contrast-stretched in a way that confuses the
+#     heuristic; flip the picker's "Image orientation" radio to fix.
 vmax = 65535.0 if float(plane.max()) > 255.0 else 255.0
 median_v = float(np.median(plane))
-dark_on_light = median_v > vmax * 0.5
+_orient = str(CFG.get("bandOrientation") or "auto").lower()
+if _orient == "dark_on_light":
+    dark_on_light = True
+elif _orient == "light_on_dark":
+    dark_on_light = False
+else:
+    dark_on_light = median_v > vmax * 0.5
 if dark_on_light:
     plane = vmax - plane
-    print(f"detected DARK-on-LIGHT blot (median={median_v:.1f} of {vmax:.0f}) "
+    print(f"IOD orientation: DARK-on-LIGHT (median={median_v:.1f}/{vmax:.0f}, source={_orient}) "
           f"— inverted plane so signal = integrated density (higher = more protein)")
 else:
-    print(f"detected LIGHT-on-DARK blot (median={median_v:.1f} of {vmax:.0f}) "
-          f"— summing raw pixels directly")
+    print(f"IOD orientation: LIGHT-on-DARK (median={median_v:.1f}/{vmax:.0f}, source={_orient}) "
+          f"— summing raw pixels directly (bright bands → larger IOD)")
 
 def _px(rect):
     x0 = int(round(rect["x"] * W)); x1 = int(round((rect["x"] + rect["w"]) * W))
@@ -1392,6 +1419,51 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
                   />
                   <Typography variant="caption" sx={{ color: "text.secondary", ml: "auto", fontSize: "0.65rem" }}>
                     {cfg.plotPerGroup ? "one figure per group" : "combined (faceted)"}
+                  </Typography>
+                </Box>
+                {/* Image orientation — drives whether IOD is computed as
+                    sum(pixel) (light-on-dark; fluorescent) or
+                    sum(vmax - pixel) (dark-on-light; chemilum / film).
+                    Default "auto" picks by the median of the measurement
+                    plane.  Wrong only when the image was contrast-
+                    adjusted in a way that fooled the heuristic — in
+                    that case the user picks explicitly here. */}
+                <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5, pt: 0.5, borderTop: "1px dashed", borderColor: "divider", flexWrap: "wrap" }}>
+                  <Tooltip title="How are the bands rendered in this image? Bright (light-on-dark, fluorescent / LI-COR) → sum raw pixels = signal. Dark (dark-on-light, chemilum / film) → invert plane (vmax − pixel) so darker bands give larger IOD. Auto = pick by the median of the measurement plane (works for most blots).">
+                    <Typography variant="caption" sx={{ fontWeight: 700 }}>
+                      Image orientation
+                    </Typography>
+                  </Tooltip>
+                  {([
+                    { v: "auto",          label: "Auto",                hint: "Pick by median" },
+                    { v: "light_on_dark", label: "Bright bands",        hint: "Fluorescent / LI-COR — sum raw" },
+                    { v: "dark_on_light", label: "Dark bands",          hint: "Chemilum / film — invert" },
+                  ] as const).map(({ v, label, hint }) => {
+                    const active = (cfg.bandOrientation ?? "auto") === v;
+                    return (
+                      <Tooltip key={v} title={hint}>
+                        <Box
+                          onClick={() => setCfg((c) => ({ ...c, bandOrientation: v }))}
+                          sx={{
+                            cursor: "pointer", userSelect: "none",
+                            fontSize: "0.65rem", px: 0.7, py: 0.2, borderRadius: 0.5,
+                            border: "1px solid",
+                            borderColor: active ? "primary.main" : "divider",
+                            bgcolor: active ? "primary.main" : "transparent",
+                            color: active ? "primary.contrastText" : "text.secondary",
+                            fontWeight: active ? 700 : 500,
+                          }}>
+                          {label}
+                        </Box>
+                      </Tooltip>
+                    );
+                  })}
+                  <Typography variant="caption" sx={{ color: "text.secondary", ml: "auto", fontSize: "0.62rem" }}>
+                    {(cfg.bandOrientation ?? "auto") === "auto"
+                      ? "auto-detect from image"
+                      : ((cfg.bandOrientation === "light_on_dark")
+                          ? "sum raw pixels = density"
+                          : "invert plane (vmax − pixel)")}
                   </Typography>
                 </Box>
                 {lcEnabled && lanesPresent.length > 0 && (
