@@ -34,7 +34,7 @@ import SystemUpdateAltIcon from "@mui/icons-material/SystemUpdateAlt";
 import DownloadIcon from "@mui/icons-material/Download";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import LibraryAddIcon from "@mui/icons-material/LibraryAdd";
-import { useCollageStore, PT_TO_PX, DEFAULT_TEXT_PT, PANEL_LABEL_DEFAULT_PT, panelLabelTextMap, panelReadingOrder } from "../../store/collageStore";
+import { useCollageStore, PT_TO_PX, DEFAULT_TEXT_PT, PANEL_LABEL_DEFAULT_PT, panelLabelTextMap, computePageGeometry } from "../../store/collageStore";
 import type { CollageItem } from "../../store/collageStore";
 import { api } from "../../api/client";
 import { check } from "@tauri-apps/plugin-updater";
@@ -415,6 +415,7 @@ function SaveCollageButton() {
   const pages = useCollageStore((s) => s.pages);
   const activePageId = useCollageStore((s) => s.activePageId);
   const panelLabelNumberingMode = useCollageStore((s) => s.panelLabelNumberingMode);
+  const pageGutter = useCollageStore((s) => s.pageGutter);
   const pageSyncFlat = useCollageStore((s) => s.pageSyncFlat);
   const [exporting, setExporting] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
@@ -433,37 +434,68 @@ function SaveCollageButton() {
     pageSyncFlat();
     const freshPages = useCollageStore.getState().pages;
     const activePageIdx = freshPages.findIndex((p) => p.id === activePageId);
-    // Scope = "current" exports only the active page; "all" iterates every
-    // page in left-to-right order.
+    // Spread-model export. Items are global with spread-space x/y; to
+    // emit a page we clip the items list to those whose centre-x falls
+    // inside the page's spread region, then shift x by -offsetX so the
+    // page renders with its own (0..pageW) coordinate system.
+    const { geoms: pageGeoms } = computePageGeometry(freshPages, pageGutter);
+    const allItems = useCollageStore.getState().items;
+
+    // Pre-compute panel-label maps:
+    //   continuous → ONE map over the whole spread (matches what's on-screen)
+    //   per-page   → a separate map per page (each restarts at A)
+    const globalLabelMap = panelLabelTextMap(allItems, panelLabelUpper, panelLabelParen, 0);
+    const perPageLabelMaps: Record<string, Record<string, string>> = {};
+    if (panelLabelNumberingMode === "per-page") {
+      for (let i = 0; i < freshPages.length; i++) {
+        const g = pageGeoms[i];
+        const pageItems = allItems.filter((it) => {
+          const cx = (it.x ?? 0) + (it.w ?? 0) / 2;
+          return cx >= g.offsetX && cx < g.offsetX + g.width;
+        });
+        perPageLabelMaps[freshPages[i].id] = panelLabelTextMap(pageItems, panelLabelUpper, panelLabelParen, 0);
+      }
+    }
+
+    // Items per page (clipped + shifted), used to render each page in
+    // its own canvas coordinate system. Items in the gutter are dropped.
+    const itemsForPage = (pageIdx: number): CollageItem[] => {
+      const g = pageGeoms[pageIdx];
+      if (!g) return [];
+      return allItems
+        .filter((it) => {
+          const cx = (it.x ?? 0) + (it.w ?? 0) / 2;
+          return cx >= g.offsetX && cx < g.offsetX + g.width;
+        })
+        .map((it) => ({ ...it, x: (it.x ?? 0) - g.offsetX }));
+    };
+
     type ExportPage = {
       name: string; items: CollageItem[]; canvasW: number; canvasH: number;
-      background: string; labelStart: number;
+      background: string; pageId: string;
     };
     const exportPages: ExportPage[] = [];
     if (scope === "current") {
-      const p = freshPages[activePageIdx] ?? null;
-      const name = p?.name ?? "page";
-      // For continuous numbering, even the "current page only" export honours
-      // the offset so its letters match what's on-screen.
-      const labelStart = panelLabelNumberingMode === "continuous"
-        ? freshPages.slice(0, activePageIdx >= 0 ? activePageIdx : 0)
-            .reduce((acc, pp) => acc + panelReadingOrder(pp.snapshot.items).length, 0)
-        : 0;
-      exportPages.push({
-        name, items, canvasW, canvasH, background, labelStart,
+      const p = freshPages[activePageIdx];
+      if (p) exportPages.push({
+        name: p.name,
+        items: itemsForPage(activePageIdx),
+        canvasW: p.snapshot.canvasW,
+        canvasH: p.snapshot.canvasH,
+        background: p.snapshot.background,
+        pageId: p.id,
       });
     } else {
-      let offset = 0;
-      for (const p of freshPages) {
+      for (let i = 0; i < freshPages.length; i++) {
+        const p = freshPages[i];
         exportPages.push({
           name: p.name,
-          items: p.snapshot.items,
+          items: itemsForPage(i),
           canvasW: p.snapshot.canvasW,
           canvasH: p.snapshot.canvasH,
           background: p.snapshot.background,
-          labelStart: panelLabelNumberingMode === "continuous" ? offset : 0,
+          pageId: p.id,
         });
-        offset += panelReadingOrder(p.snapshot.items).length;
       }
     }
     // Drop pages that are completely empty when "all" is selected (no point
@@ -516,13 +548,20 @@ function SaveCollageButton() {
     try {
     for (const __pg of nonEmpty) {
     // Per-page aliases — shadow the outer closure-captured values so the
-    // existing rasterisation logic below can address them by their original
-    // names without any further renames.
+    // existing rasterisation logic below can address them by their
+    // original names without any further renames. Items here are ALREADY
+    // clipped to the page's spread region AND shifted by -offsetX, so
+    // they're in the page's local 0..pageW coordinate system.
     const items = __pg.items;
     const canvasW = __pg.canvasW;
     const canvasH = __pg.canvasH;
     const background = __pg.background;
-    const __labelStart = __pg.labelStart;
+    // Spread-model panel labels: continuous mode uses ONE global map
+    // computed earlier (so letters match on-screen across pages),
+    // per-page mode has its own map per page.
+    const __pageLabelMap = panelLabelNumberingMode === "per-page"
+      ? (perPageLabelMaps[__pg.pageId] || {})
+      : globalLabelMap;
     const sorted = [...items].sort((a, b) => a.z - b.z);
 
     // ── Pre-render figures + R plots at the export resolution ──
@@ -641,11 +680,10 @@ function SaveCollageButton() {
         }
       }
     };
-    // Precompute each labeled item's letter (reading order + global format).
-    // labelStart offsets the alphabet by the number of labelable items on
-    // all prior pages — so page 2's letters continue (continuous mode) or
-    // restart at A (per-page mode), matching the picker on-screen.
-    const labelTextById = panelLabelTextMap(sorted, panelLabelUpper, panelLabelParen, __labelStart);
+    // Spread-model label map — already includes the right letters for the
+    // current numbering mode (continuous → one map across pages with global
+    // reading order; per-page → each page restarts at A).
+    const labelTextById = __pageLabelMap;
     for (const it of sorted) {
       if (it.kind === "text") {
         withRotation(it, () => {

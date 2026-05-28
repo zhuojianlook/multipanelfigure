@@ -322,21 +322,32 @@ export type DocTab = {
   name: string;
 };
 
-/** A single collage page. Each page has its own items + canvas dims +
- *  background + guides. Pages are ordered left-to-right; the active page's
- *  per-canvas fields ALSO live on the top-level store (the active page's
- *  data and the top-level flat state are kept in sync by the page-switch
- *  actions and by an on-persist snapshot). This dual storage avoids
- *  rewriting every consumer that reads `items` / `canvasW` / etc.
- *  directly from the store — those keep working unchanged. */
+/** A single collage page — now a VISUAL REGION of a shared "spread"
+ *  canvas, not a separate canvas with its own items. All items live in
+ *  state.items with global (spread-space) x/y; the page just defines a
+ *  rectangle (width × height + background colour) tiled left-to-right
+ *  on the spread with `state.pageGutter` between adjacent pages. The
+ *  active page is the one the preset / background / guide settings on
+ *  the top-level state describe, and the one the page-tabs strip will
+ *  scroll the viewport to focus on.
+ *
+ *  Per-page items (the previous model) are migrated on load by
+ *  concatenating each page's items into the global list and shifting
+ *  their x by the page's cumulative offset on the spread. */
 export type CollagePageSnapshot = {
-  items: CollageItem[];
+  /** Page width in canvas pixels (NOT spread width). */
   canvasW: number;
+  /** Page height in canvas pixels. */
   canvasH: number;
+  /** Per-page background colour (RGB hex or "transparent"). */
   background: string;
+  /** Per-page guide overlay — same semantics as the legacy top-level
+   *  fields, but scoped per-page so each spread page can carry its own
+   *  column-guide preset. */
   guideColumns: number;
   guideGutter: number;
   guidesVisible: boolean;
+  /** Per-page panel-labels toggle. */
   panelLabelsOn: boolean;
 };
 
@@ -345,6 +356,44 @@ export type CollagePage = {
   name: string;
   snapshot: CollagePageSnapshot;
 };
+
+/** Geometry of every page on the spread — computed each render from the
+ *  pages array, the page gutter, and the chosen orientation (currently
+ *  horizontal only). The arrays are parallel to `pages`. */
+export type CollagePageGeom = {
+  /** spread-x of the page's top-left corner (px). */
+  offsetX: number;
+  /** spread-y of the page's top-left corner (px). */
+  offsetY: number;
+  /** page width (px) (= snapshot.canvasW). */
+  width: number;
+  /** page height (px) (= snapshot.canvasH). */
+  height: number;
+};
+
+/** Compute every page's spread-space rectangle. Horizontal layout: pages
+ *  are tiled left-to-right with `gutter` px between them; each page's
+ *  vertical alignment is top. Pure function (no React / store
+ *  dependencies) so it can be called from anywhere (render, save, etc.). */
+export function computePageGeometry(pages: CollagePage[], gutter: number): {
+  geoms: CollagePageGeom[]; spreadW: number; spreadH: number;
+} {
+  const g = Math.max(0, gutter);
+  const geoms: CollagePageGeom[] = [];
+  let x = 0;
+  let maxH = 0;
+  for (const p of pages) {
+    const w = Math.max(1, p.snapshot.canvasW);
+    const h = Math.max(1, p.snapshot.canvasH);
+    geoms.push({ offsetX: x, offsetY: 0, width: w, height: h });
+    x += w + g;
+    if (h > maxH) maxH = h;
+  }
+  // Strip the trailing gutter so the spread bounds the last page exactly.
+  const spreadW = pages.length > 0 ? x - g : 0;
+  const spreadH = maxH;
+  return { geoms, spreadW, spreadH };
+}
 
 /** Panel-label numbering modes across multi-page collages:
  *   - "continuous" → page 1 = A..F, page 2 = G..M, … (offset by previous-
@@ -424,16 +473,22 @@ export type CollageState = {
    *  pt regardless of how the user has scaled the figure. */
   globalHeaderPt: number | null;
 
-  /** Collage pages (multi-page collage). Always has length >= 1; the
-   *  "active page" is the one whose items + canvas dims + background
-   *  ALSO live on the top-level state (kept in sync by page-switch
-   *  actions). Persisted alongside the flat state. */
+  /** Collage pages (multi-page collage). Always has length >= 1.
+   *  Pages are REGIONS of one shared spread — all items live in
+   *  state.items with global (spread-space) x/y. The active page is
+   *  the one the preset / background / guide settings on the top-level
+   *  state describe (and the one the page-tabs strip will scroll the
+   *  viewport to focus on). */
   pages: CollagePage[];
   /** Id of the currently-active page (must be in `pages`). */
   activePageId: string;
   /** Whether panel-label letters (A,B,C,…) continue across pages or
    *  restart at A on every page. */
   panelLabelNumberingMode: PanelLabelNumberingMode;
+  /** Gutter (px) between adjacent pages on the spread. Default 60 —
+   *  big enough to read as separate pages, small enough not to dominate
+   *  the viewport. */
+  pageGutter: number;
 
   /** Open .mpf documents shown as tabs. Order is stable. Session-only
    *  (not persisted) — rebuilt on mount from the current builder doc +
@@ -568,17 +623,20 @@ export type CollageState = {
 
 const STORAGE_KEY = "mpfig_collage_v1";
 
-type Persisted = Pick<CollageState, "items" | "canvasW" | "canvasH" | "background" | "gridVisible" | "snapEnabled" | "gridStep" | "globalHeaderPt" | "guideColumns" | "guideGutter" | "guidesVisible" | "exportDpi" | "exportFormat" | "elemOverridesByItem" | "panelLabelUpper" | "panelLabelParen" | "panelLabelsOn" | "panelLabelsDefaultedOn" | "pages" | "activePageId" | "panelLabelNumberingMode">;
+type Persisted = Pick<CollageState, "items" | "canvasW" | "canvasH" | "background" | "gridVisible" | "snapEnabled" | "gridStep" | "globalHeaderPt" | "guideColumns" | "guideGutter" | "guidesVisible" | "exportDpi" | "exportFormat" | "elemOverridesByItem" | "panelLabelUpper" | "panelLabelParen" | "panelLabelsOn" | "panelLabelsDefaultedOn" | "pages" | "activePageId" | "panelLabelNumberingMode" | "pageGutter">;
 
 let _pageSeq = 1;
 const _newPageId = () => `page_${Date.now().toString(36)}_${_pageSeq++}`;
 
+/** Snapshot ONLY the per-page top-level fields (NOT items, which are
+ *  shared across pages in the spread model). Used by pageAdd / pageRemove /
+ *  pageSetActive to keep the page list synced with the active page's
+ *  current dims + background + guides. */
 function _snapshotFromFlat(s: {
-  items: CollageItem[]; canvasW: number; canvasH: number; background: string;
+  canvasW: number; canvasH: number; background: string;
   guideColumns: number; guideGutter: number; guidesVisible: boolean; panelLabelsOn: boolean;
 }): CollagePageSnapshot {
   return {
-    items: s.items,
     canvasW: s.canvasW,
     canvasH: s.canvasH,
     background: s.background,
@@ -629,29 +687,26 @@ function loadInitial(): Persisted {
           }
           return migrated;
         }) as CollageItem[];
-        // Flat per-canvas fields for the ACTIVE page. With multi-page,
-        // these mirror the active page's snapshot.
-        const flat = {
-          items,
-          canvasW: data.canvasW || DEFAULT_CANVAS_W,
-          canvasH: data.canvasH || DEFAULT_CANVAS_H,
-          background: data.background || "#FFFFFF",
-          guideColumns: typeof data.guideColumns === "number" ? data.guideColumns : 0,
-          guideGutter: typeof data.guideGutter === "number" ? data.guideGutter : 0,
-          guidesVisible: data.guidesVisible ?? true,
-          panelLabelsOn: data.panelLabelsDefaultedOn ? !!data.panelLabelsOn : true,
-        };
-        // Pages migration: older saves don't carry `pages`. Wrap the flat
-        // state into a single page so the multi-page UI shows "Page 1"
-        // and behaves identically to the pre-pages collage.
+        const pageGutter = typeof data.pageGutter === "number" && data.pageGutter >= 0 ? data.pageGutter : 60;
+        // Spread model: ALL items live in a single global list (state.items)
+        // with global x/y in spread coordinates. Pages are regions of the
+        // spread. Migrate two legacy schemas:
+        //   (a) Flat single-page (pre-pages): wrap `items` + top-level
+        //       canvasW/H/background into one CollagePage.
+        //   (b) Per-page items (the 0.1.287 → 0.1.289 schema): for each
+        //       page beyond the first, shift its items.x by the cumulative
+        //       (sum widths + gutters) offset on the spread, then concat
+        //       into the global items list. Page entries keep their dims +
+        //       background but lose `items`.
         let pages: CollagePage[] = [];
         let activePageId = "";
+        let mergedItems: CollageItem[] = items;
         if (Array.isArray(data.pages) && data.pages.length > 0) {
+          // Step 1: normalise page records to the new shape (drop items).
           pages = data.pages.map((p: any, i: number) => ({
             id: typeof p.id === "string" ? p.id : `page_${i}`,
             name: typeof p.name === "string" ? p.name : `Page ${i + 1}`,
             snapshot: {
-              items: Array.isArray(p?.snapshot?.items) ? p.snapshot.items : [],
               canvasW: p?.snapshot?.canvasW || DEFAULT_CANVAS_W,
               canvasH: p?.snapshot?.canvasH || DEFAULT_CANVAS_H,
               background: p?.snapshot?.background || "#FFFFFF",
@@ -663,15 +718,53 @@ function loadInitial(): Persisted {
           }));
           activePageId = typeof data.activePageId === "string"
             && pages.find((p) => p.id === data.activePageId) ? data.activePageId : pages[0].id;
-          // Restore the active page's snapshot into the flat fields so the
-          // UI displays the right page on reload.
-          const ap = pages.find((p) => p.id === activePageId);
-          if (ap) Object.assign(flat, ap.snapshot);
+          // Step 2: concatenate any per-page items into the global list with
+          // their offsetX shift applied. `data.items` (the top-level field)
+          // is from the OLD active page; everything else lives on
+          // data.pages[i].snapshot.items. Order pages left-to-right so the
+          // shifts line up with the new spread layout.
+          let runningX = 0;
+          const allItems: CollageItem[] = [];
+          for (let i = 0; i < pages.length; i++) {
+            const srcPage = data.pages[i];
+            const isActive = pages[i].id === activePageId;
+            const pageItems = isActive
+              ? items
+              : (Array.isArray(srcPage?.snapshot?.items) ? srcPage.snapshot.items : []);
+            for (const it of pageItems) {
+              const x = typeof it.x === "number" ? it.x : 0;
+              allItems.push({ ...it, x: x + runningX });
+            }
+            runningX += pages[i].snapshot.canvasW + pageGutter;
+          }
+          mergedItems = allItems;
         } else {
+          // Legacy single-page → one page, items untouched.
           const id = _newPageId();
-          pages = [{ id, name: "Page 1", snapshot: _snapshotFromFlat(flat) }];
+          pages = [{ id, name: "Page 1", snapshot: {
+            canvasW: data.canvasW || DEFAULT_CANVAS_W,
+            canvasH: data.canvasH || DEFAULT_CANVAS_H,
+            background: data.background || "#FFFFFF",
+            guideColumns: typeof data.guideColumns === "number" ? data.guideColumns : 0,
+            guideGutter: typeof data.guideGutter === "number" ? data.guideGutter : 0,
+            guidesVisible: data.guidesVisible ?? true,
+            panelLabelsOn: data.panelLabelsDefaultedOn ? !!data.panelLabelsOn : true,
+          } }];
           activePageId = id;
         }
+        // Top-level flat fields are the ACTIVE page's snapshot (so existing
+        // consumers reading canvasW/H/background see the active page's dims).
+        const activePage = pages.find((p) => p.id === activePageId) ?? pages[0];
+        const flat = {
+          items: mergedItems,
+          canvasW: activePage.snapshot.canvasW,
+          canvasH: activePage.snapshot.canvasH,
+          background: activePage.snapshot.background,
+          guideColumns: activePage.snapshot.guideColumns,
+          guideGutter: activePage.snapshot.guideGutter,
+          guidesVisible: activePage.snapshot.guidesVisible,
+          panelLabelsOn: activePage.snapshot.panelLabelsOn,
+        };
         return {
           ...flat,
           gridVisible: data.gridVisible ?? true,
@@ -688,6 +781,7 @@ function loadInitial(): Persisted {
           panelLabelsDefaultedOn: true,
           pages, activePageId,
           panelLabelNumberingMode: (data.panelLabelNumberingMode === "per-page" ? "per-page" : "continuous") as PanelLabelNumberingMode,
+          pageGutter,
         };
       }
     }
@@ -715,6 +809,7 @@ function loadInitial(): Persisted {
     pages: [{ id: initialId, name: "Page 1", snapshot: _snapshotFromFlat(initialFlat) }],
     activePageId: initialId,
     panelLabelNumberingMode: "continuous",
+    pageGutter: 60,
   };
 }
 
@@ -749,6 +844,7 @@ function persist(s: Persisted) {
       pages,
       activePageId: s.activePageId,
       panelLabelNumberingMode: s.panelLabelNumberingMode,
+      pageGutter: s.pageGutter,
     }));
   } catch {
     /* quota — ignore */
@@ -958,7 +1054,12 @@ export const useCollageStore = create<CollageState>()(
     setPanelLabelParen: (v) => { set((s) => { s.panelLabelParen = v; }); persist(get()); },
     setPanelLabelNumberingMode: (m) => { set((s) => { s.panelLabelNumberingMode = m; }); persist(get()); },
 
-    // ── Pages ─────────────────────────────────────────────────
+    // ── Pages (spread-model: items live globally, pages are regions) ──
+    /** Mirror the active page's snapshot from the flat fields. Items are
+     *  NOT in the snapshot — they live on state.items, shared across the
+     *  whole spread. Called by every mutator that changes a per-page
+     *  field (canvas dims, background, guides) so the persisted pages
+     *  array always reflects the live state. */
     pageSyncFlat: () => {
       set((s) => {
         const i = s.pages.findIndex((p) => p.id === s.activePageId);
@@ -971,8 +1072,7 @@ export const useCollageStore = create<CollageState>()(
     pageAdd: (name) => {
       const id = _newPageId();
       set((s) => {
-        // Snapshot the active page's current state into the pages array
-        // BEFORE adding the new one (so we don't lose unsaved edits).
+        // Sync the active page's snapshot first.
         const ai = s.pages.findIndex((p) => p.id === s.activePageId);
         if (ai >= 0) s.pages[ai].snapshot = _snapshotFromFlat(s);
         // Pick a name that doesn't collide ("Page 1" / "Page 2" / ...).
@@ -983,10 +1083,11 @@ export const useCollageStore = create<CollageState>()(
           while (usedNames.has(`Page ${n}`)) n++;
           auto = `Page ${n}`;
         }
-        // Blank snapshot — inherit the canvas dims/background of the
-        // outgoing page so the new page visually matches.
-        const blank: CollagePageSnapshot = {
-          items: [],
+        // New page inherits the outgoing page's dims + background so the
+        // spread looks visually uniform until the user picks a different
+        // preset. Items array is global → not duplicated; the new page
+        // just opens up an empty region to the right.
+        const fresh: CollagePageSnapshot = {
           canvasW: s.canvasW,
           canvasH: s.canvasH,
           background: s.background,
@@ -995,69 +1096,47 @@ export const useCollageStore = create<CollageState>()(
           guidesVisible: s.guidesVisible,
           panelLabelsOn: s.panelLabelsOn,
         };
-        // Insert to the RIGHT of the currently-active page (user's request).
+        // Insert to the RIGHT of the currently-active page.
         const insertAt = ai >= 0 ? ai + 1 : s.pages.length;
-        s.pages.splice(insertAt, 0, { id, name: auto, snapshot: blank });
-        // Activate the new page → load its (blank) snapshot into flat.
+        s.pages.splice(insertAt, 0, { id, name: auto, snapshot: fresh });
+        // Activate the new page (flat fields already match its snapshot
+        // because it inherited from the outgoing one — no swap needed).
         s.activePageId = id;
-        s.items = blank.items;
-        s.canvasW = blank.canvasW;
-        s.canvasH = blank.canvasH;
-        s.background = blank.background;
-        s.guideColumns = blank.guideColumns;
-        s.guideGutter = blank.guideGutter;
-        s.guidesVisible = blank.guidesVisible;
-        s.panelLabelsOn = blank.panelLabelsOn;
-        s.selectedId = null;
-        s.selectedIds = [];
       });
       persist(get());
       return id;
     },
 
     pageDuplicate: (id) => {
+      // In the spread model "duplicate" just makes another page region
+      // with the same dims + background (items can't be duplicated
+      // independently — they're global). For an actual content copy the
+      // user multi-selects items and pastes them into the new region.
       const newId = _newPageId();
       set((s) => {
         const ai = s.pages.findIndex((p) => p.id === s.activePageId);
         if (ai >= 0) s.pages[ai].snapshot = _snapshotFromFlat(s);
         const src = s.pages.find((p) => p.id === (id || s.activePageId));
         if (!src) return;
-        // Deep-clone items so the duplicate doesn't alias the original.
-        // structuredClone handles nested objects + arrays cleanly.
-        const cloned: CollagePageSnapshot = {
-          items: JSON.parse(JSON.stringify(src.snapshot.items)) as CollageItem[],
-          canvasW: src.snapshot.canvasW,
-          canvasH: src.snapshot.canvasH,
-          background: src.snapshot.background,
-          guideColumns: src.snapshot.guideColumns,
-          guideGutter: src.snapshot.guideGutter,
-          guidesVisible: src.snapshot.guidesVisible,
-          panelLabelsOn: src.snapshot.panelLabelsOn,
-        };
+        const cloned: CollagePageSnapshot = { ...src.snapshot };
         const srcIdx = s.pages.findIndex((p) => p.id === src.id);
         const usedNames = new Set(s.pages.map((p) => p.name));
         let copyName = `${src.name} copy`;
         let i = 2;
         while (usedNames.has(copyName)) { copyName = `${src.name} copy ${i++}`; }
         s.pages.splice(srcIdx + 1, 0, { id: newId, name: copyName, snapshot: cloned });
-        // Activate the copy.
         s.activePageId = newId;
-        s.items = cloned.items;
-        s.canvasW = cloned.canvasW;
-        s.canvasH = cloned.canvasH;
-        s.background = cloned.background;
-        s.guideColumns = cloned.guideColumns;
-        s.guideGutter = cloned.guideGutter;
-        s.guidesVisible = cloned.guidesVisible;
-        s.panelLabelsOn = cloned.panelLabelsOn;
-        s.selectedId = null;
-        s.selectedIds = [];
       });
       persist(get());
       return newId;
     },
 
     pageRemove: (id) => {
+      // Items inside the removed page's region remain in state.items —
+      // they may now overlap a neighbouring page or sit in the gutter.
+      // CollageView shows them at their original x/y; the user can
+      // move them. Confirmation when items overlap the removed region
+      // is handled by the page-tabs UI (it knows the page geometry).
       set((s) => {
         if (s.pages.length <= 1) return;  // never remove the last page
         const idx = s.pages.findIndex((p) => p.id === id);
@@ -1065,11 +1144,10 @@ export const useCollageStore = create<CollageState>()(
         const wasActive = s.activePageId === id;
         s.pages.splice(idx, 1);
         if (wasActive) {
-          // Activate the page that was to the LEFT of the removed one
-          // (or the new first page if the removed one was leftmost).
           const next = s.pages[Math.max(0, idx - 1)];
           s.activePageId = next.id;
-          s.items = next.snapshot.items;
+          // Re-load the new active page's snapshot into the flat fields
+          // so the preset / background controls reflect the new active.
           s.canvasW = next.snapshot.canvasW;
           s.canvasH = next.snapshot.canvasH;
           s.background = next.snapshot.background;
@@ -1077,24 +1155,24 @@ export const useCollageStore = create<CollageState>()(
           s.guideGutter = next.snapshot.guideGutter;
           s.guidesVisible = next.snapshot.guidesVisible;
           s.panelLabelsOn = next.snapshot.panelLabelsOn;
-          s.selectedId = null;
-          s.selectedIds = [];
         }
       });
       persist(get());
     },
 
     pageSetActive: (id) => {
+      // Spread-model semantics: switching the active page does NOT swap
+      // the items — they're shared. We just mirror the new active
+      // page's snapshot into the flat fields so the preset / background
+      // controls describe it. The viewport scroll-to-page is done by
+      // the page-tabs UI in CollageView (it has the spread geometry).
       set((s) => {
         if (id === s.activePageId) return;
         const target = s.pages.find((p) => p.id === id);
         if (!target) return;
-        // Snapshot the outgoing page so its unsaved edits aren't lost.
         const ai = s.pages.findIndex((p) => p.id === s.activePageId);
         if (ai >= 0) s.pages[ai].snapshot = _snapshotFromFlat(s);
-        // Load the target page into the flat fields.
         s.activePageId = id;
-        s.items = target.snapshot.items;
         s.canvasW = target.snapshot.canvasW;
         s.canvasH = target.snapshot.canvasH;
         s.background = target.snapshot.background;
@@ -1102,8 +1180,6 @@ export const useCollageStore = create<CollageState>()(
         s.guideGutter = target.snapshot.guideGutter;
         s.guidesVisible = target.snapshot.guidesVisible;
         s.panelLabelsOn = target.snapshot.panelLabelsOn;
-        s.selectedId = null;
-        s.selectedIds = [];
       });
       persist(get());
     },

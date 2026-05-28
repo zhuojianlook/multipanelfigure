@@ -50,6 +50,7 @@ import {
   isLabelable,
   panelLabelTextMap,
   panelReadingOrder,
+  computePageGeometry,
 } from "../../store/collageStore";
 import type { CollageItem, RTextSlot, RTextOverride } from "../../store/collageStore";
 import { useFigureStore } from "../../store/figureStore";
@@ -311,26 +312,43 @@ export function CollageView() {
   // Inline panel-label editing: id of the item whose (a,b,c…) label is being
   // edited. Maps each labeled item to its displayed letter in reading order.
   const [editingLabelId, setEditingLabelId] = useState<string | null>(null);
-  // Multi-page panel-label numbering: in "continuous" mode each page's
-  // letters pick up where the previous pages left off (page 1 A..F → page 2
-  // G..M), in "per-page" mode every page restarts at A. The offset for the
-  // active page is the sum of labelable items on all pages BEFORE it.
+  // Spread-model panel-label numbering. All items live globally; each one
+  // belongs to whichever page region contains its centre-x.
+  //   - "continuous" → one reading-order across the whole spread (a single
+  //     panelLabelTextMap call), so letters naturally flow A,B,C,… left
+  //     to right across pages.
+  //   - "per-page"   → each page's items get their own A..N independently.
   const pages = useCollageStore((s) => s.pages);
   const activePageId = useCollageStore((s) => s.activePageId);
+  const pageGutter = useCollageStore((s) => s.pageGutter);
   const panelLabelNumberingMode = useCollageStore((s) => s.panelLabelNumberingMode);
-  const labelStartIndex = useMemo(() => {
-    if (panelLabelNumberingMode !== "continuous") return 0;
-    let n = 0;
-    for (const p of pages) {
-      if (p.id === activePageId) break;
-      n += panelReadingOrder(p.snapshot.items).length;
-    }
-    return n;
-  }, [pages, activePageId, panelLabelNumberingMode]);
-  const labelTextMap = useMemo(
-    () => panelLabelTextMap(items, panelLabelUpper, panelLabelParen, labelStartIndex),
-    [items, panelLabelUpper, panelLabelParen, labelStartIndex],
+  // Spread geometry: each page's offset/dims on the shared spread canvas,
+  // plus the total spread bounds. Shared across the fit-scale calc, the
+  // viewport rendering, the labeller (per-page bucketing) and the
+  // scroll-to-page effect — all should agree on the same layout.
+  const spread = useMemo(
+    () => computePageGeometry(pages, pageGutter),
+    [pages, pageGutter],
   );
+  const spreadW = spread.spreadW;
+  const spreadH = spread.spreadH;
+  const labelTextMap = useMemo(() => {
+    if (panelLabelNumberingMode !== "per-page" || pages.length <= 1) {
+      return panelLabelTextMap(items, panelLabelUpper, panelLabelParen, 0);
+    }
+    const buckets: CollageItem[][] = pages.map(() => []);
+    for (const it of items) {
+      const cx = (it.x ?? 0) + (it.w ?? 0) / 2;
+      let idx = spread.geoms.findIndex((g) => cx >= g.offsetX && cx < g.offsetX + g.width);
+      if (idx < 0) idx = 0;     // gutter overflow → first page
+      buckets[idx].push(it);
+    }
+    const out: Record<string, string> = {};
+    for (const pageItems of buckets) {
+      Object.assign(out, panelLabelTextMap(pageItems, panelLabelUpper, panelLabelParen, 0));
+    }
+    return out;
+  }, [items, panelLabelUpper, panelLabelParen, panelLabelNumberingMode, pages, spread]);
   // Panel labels are ON by default — seed labels once for a collage that
   // predates the feature (or was just opened) so figures/images get a, b, c…
   // without a manual click. Newly added items are auto-labeled by addItem.
@@ -648,7 +666,10 @@ export function CollageView() {
     cancelCrop();
   };
 
-  /** Re-fit the page to the viewport — runs on mount + resize. */
+  /** Re-fit the WHOLE SPREAD (every page tiled side-by-side) to the
+   *  viewport — runs on mount + resize + whenever the spread bounds
+   *  change (page add/remove/resize). The viewport scrolls to centre
+   *  the active page on subsequent tab clicks (see effect below). */
   useEffect(() => {
     const compute = () => {
       const el = containerRef.current;
@@ -657,17 +678,43 @@ export function CollageView() {
       const availW = el.clientWidth - pad;
       const availH = el.clientHeight - pad;
       if (availW <= 0 || availH <= 0) return;
-      const sx = availW / canvasW;
-      const sy = availH / canvasH;
+      const sx = availW / Math.max(1, spreadW);
+      const sy = availH / Math.max(1, spreadH);
       setFitScale(Math.min(1, Math.min(sx, sy)));
     };
     compute();
     const ro = new ResizeObserver(compute);
     if (containerRef.current) ro.observe(containerRef.current);
     return () => ro.disconnect();
-  }, [canvasW, canvasH]);
+  }, [spreadW, spreadH]);
 
   const displayScale = fitScale * userZoom;
+
+  /** Scroll the viewport to centre the active page when the user clicks a
+   *  different page tab (or pageAdd/pageDuplicate switches active). Skip
+   *  the very first run so the initial mount keeps the auto-fit (top-left
+   *  aligned) view of the whole spread. */
+  const lastActiveRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (lastActiveRef.current === null) { lastActiveRef.current = activePageId; return; }
+    if (lastActiveRef.current === activePageId) return;
+    lastActiveRef.current = activePageId;
+    const el = containerRef.current;
+    if (!el) return;
+    const idx = pages.findIndex((p) => p.id === activePageId);
+    if (idx < 0) return;
+    const g = spread.geoms[idx];
+    if (!g) return;
+    const cx = g.offsetX + g.width / 2;
+    const cy = g.offsetY + g.height / 2;
+    setPan({
+      x: el.clientWidth / 2 - cx * displayScale,
+      y: el.clientHeight / 2 - cy * displayScale,
+    });
+    // displayScale intentionally read at click time only (no need to scroll
+    // on every zoom change — wheel zoom centres on the cursor itself).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePageId]);
 
   const sortedItems = useMemo(
     () => [...items].sort((a, b) => a.z - b.z),
@@ -1688,26 +1735,19 @@ export function CollageView() {
             transformOrigin: "top left",
           }}
         >
-          {/* The "page" — solid color or a checkerboard for transparent. */}
+          {/* The SPREAD — a transparent layout container at the union of
+              every page's rectangle (pages tiled left-to-right with
+              pageGutter between). Items live in global spread coordinates
+              and render here directly. Each page's BACKGROUND + grid +
+              guides is its own per-page Box drawn at the page's
+              offsetX/Y; those are pointer-events:none so marquee + drag
+              clicks pass through to this spread container. */}
           <Box
             ref={pageRef}
             sx={{
               position: "relative",
-              width: canvasW,
-              height: canvasH,
-              boxShadow: "0 0 0 1px rgba(255,255,255,0.15), 0 8px 24px rgba(0,0,0,0.4)",
-              ...(background === "transparent"
-                ? {
-                    backgroundColor: "#ffffff",
-                    backgroundImage:
-                      `linear-gradient(45deg, #cfcfcf 25%, transparent 25%),` +
-                      `linear-gradient(-45deg, #cfcfcf 25%, transparent 25%),` +
-                      `linear-gradient(45deg, transparent 75%, #cfcfcf 75%),` +
-                      `linear-gradient(-45deg, transparent 75%, #cfcfcf 75%)`,
-                    backgroundSize: "24px 24px",
-                    backgroundPosition: "0 0, 0 12px, 12px -12px, -12px 0",
-                  }
-                : { backgroundColor: background }),
+              width: spreadW,
+              height: spreadH,
             }}
             onMouseDown={(e) => {
               // Only start a marquee when the click lands on the empty page
@@ -1746,46 +1786,84 @@ export function CollageView() {
               window.addEventListener("mouseup", onUp);
             }}
           >
-            {/* Gridline overlay (kept separate from the page background so it
-                composes cleanly over a transparent checkerboard). */}
-            {gridVisible && (
-              <Box sx={{
-                position: "absolute", inset: 0, pointerEvents: "none",
-                backgroundImage:
-                  `linear-gradient(to right, rgba(0,0,0,0.10) 1px, transparent 1px),` +
-                  `linear-gradient(to bottom, rgba(0,0,0,0.10) 1px, transparent 1px)`,
-                backgroundSize: `${gridStep}px ${gridStep}px, ${gridStep}px ${gridStep}px`,
-              }} />
-            )}
-            {/* Journal column guides — vertical lines at each column edge with
-                shaded gutters, so figures can be aligned to journal columns. */}
-            {guidesVisible && guideColumns >= 2 && (() => {
-              const colW = (canvasW - guideGutter * (guideColumns - 1)) / guideColumns;
-              const nodes: React.ReactNode[] = [];
-              for (let i = 0; i < guideColumns; i++) {
-                const left = i * (colW + guideGutter);
-                // Shaded gutter to the right of every column except the last.
-                if (i < guideColumns - 1 && guideGutter > 0) {
-                  nodes.push(
-                    <Box key={`gut-${i}`} sx={{
-                      position: "absolute", top: 0, bottom: 0,
-                      left: left + colW, width: guideGutter,
-                      backgroundColor: "rgba(79,195,247,0.10)", pointerEvents: "none",
-                    }} />,
-                  );
-                }
-                // Column edges (left + right).
-                for (const x of [left, left + colW]) {
-                  nodes.push(
-                    <Box key={`g-${i}-${x}`} sx={{
-                      position: "absolute", top: 0, bottom: 0, left: x, width: 0,
-                      borderLeft: "1px dashed rgba(79,195,247,0.7)", pointerEvents: "none",
-                    }} />,
-                  );
-                }
-              }
-              return <>{nodes}</>;
-            })()}
+            {/* Per-page background rectangles. Each page is its own Box at
+                its spread offset, carrying that page's own background +
+                gridlines + guides. pointer-events: none so they don't
+                eat marquee/drag clicks intended for the spread. The
+                active page gets a brighter outline. Non-active pages
+                use the snapshot's stored bg/guides; the active page
+                uses the live flat fields (canvas controls). */}
+            {pages.map((p, pi) => {
+              const g = spread.geoms[pi];
+              if (!g) return null;
+              const isActive = p.id === activePageId;
+              const snap = p.snapshot;
+              const pgBg = isActive ? background : snap.background;
+              const pgGuideCols = isActive ? guideColumns : snap.guideColumns;
+              const pgGuideGut = isActive ? guideGutter : snap.guideGutter;
+              const pgGuidesVis = isActive ? guidesVisible : snap.guidesVisible;
+              return (
+                <Box
+                  key={`pg-${p.id}`}
+                  sx={{
+                    position: "absolute",
+                    left: g.offsetX, top: g.offsetY,
+                    width: g.width, height: g.height,
+                    pointerEvents: "none",
+                    boxShadow: isActive
+                      ? "0 0 0 2px rgba(79,195,247,0.7), 0 8px 24px rgba(0,0,0,0.4)"
+                      : "0 0 0 1px rgba(255,255,255,0.15), 0 8px 24px rgba(0,0,0,0.4)",
+                    ...(pgBg === "transparent"
+                      ? {
+                          backgroundColor: "#ffffff",
+                          backgroundImage:
+                            `linear-gradient(45deg, #cfcfcf 25%, transparent 25%),` +
+                            `linear-gradient(-45deg, #cfcfcf 25%, transparent 25%),` +
+                            `linear-gradient(45deg, transparent 75%, #cfcfcf 75%),` +
+                            `linear-gradient(-45deg, transparent 75%, #cfcfcf 75%)`,
+                          backgroundSize: "24px 24px",
+                          backgroundPosition: "0 0, 0 12px, 12px -12px, -12px 0",
+                        }
+                      : { backgroundColor: pgBg }),
+                  }}
+                >
+                  {gridVisible && (
+                    <Box sx={{
+                      position: "absolute", inset: 0,
+                      backgroundImage:
+                        `linear-gradient(to right, rgba(0,0,0,0.10) 1px, transparent 1px),` +
+                        `linear-gradient(to bottom, rgba(0,0,0,0.10) 1px, transparent 1px)`,
+                      backgroundSize: `${gridStep}px ${gridStep}px, ${gridStep}px ${gridStep}px`,
+                    }} />
+                  )}
+                  {pgGuidesVis && pgGuideCols >= 2 && (() => {
+                    const colW = (g.width - pgGuideGut * (pgGuideCols - 1)) / pgGuideCols;
+                    const nodes: React.ReactNode[] = [];
+                    for (let i = 0; i < pgGuideCols; i++) {
+                      const left = i * (colW + pgGuideGut);
+                      if (i < pgGuideCols - 1 && pgGuideGut > 0) {
+                        nodes.push(
+                          <Box key={`gut-${i}`} sx={{
+                            position: "absolute", top: 0, bottom: 0,
+                            left: left + colW, width: pgGuideGut,
+                            backgroundColor: "rgba(79,195,247,0.10)",
+                          }} />,
+                        );
+                      }
+                      for (const x of [left, left + colW]) {
+                        nodes.push(
+                          <Box key={`g-${i}-${x}`} sx={{
+                            position: "absolute", top: 0, bottom: 0, left: x, width: 0,
+                            borderLeft: "1px dashed rgba(79,195,247,0.7)",
+                          }} />,
+                        );
+                      }
+                    }
+                    return <>{nodes}</>;
+                  })()}
+                </Box>
+              );
+            })}
             {sortedItems.map((it) => {
               const isSelected = selectedIds.includes(it.id);
               return (
@@ -2169,21 +2247,40 @@ function PageTabsBar() {
     setEditingId(null); setEditingName("");
   };
 
+  // Count items whose centre-x falls within the page's region on the
+  // spread. Items in the gutter or outside any page count toward the
+  // FIRST page (matches the labeller's fallback in per-page mode).
+  const gutter = useCollageStore((s) => s.pageGutter);
+  const itemsInPageRegion = (pageId: string) => {
+    const idx = pages.findIndex((p) => p.id === pageId);
+    if (idx < 0) return 0;
+    const { geoms } = computePageGeometry(pages, gutter);
+    const g = geoms[idx];
+    const its = useCollageStore.getState().items;
+    let n = 0;
+    for (const it of its) {
+      const cx = (it.x ?? 0) + (it.w ?? 0) / 2;
+      const fallsHere = cx >= g.offsetX && cx < g.offsetX + g.width;
+      const fallsHereAsFallback = idx === 0 && !geoms.some((gg) => cx >= gg.offsetX && cx < gg.offsetX + gg.width);
+      if (fallsHere || fallsHereAsFallback) n++;
+    }
+    return n;
+  };
+
   const handleRemove = async (id: string) => {
     if (pages.length <= 1) return;     // never remove the last page
     const p = pages.find((x) => x.id === id);
     if (!p) return;
-    const liveItems = (id === activePageId)
-      ? useCollageStore.getState().items
-      : p.snapshot.items;
-    if (liveItems && liveItems.length > 0) {
-      // Confirm — warns user before discarding work. Uses the MUI-styled
-      // confirm dialog because window.confirm is disabled in the Tauri
-      // webview.
+    // In the spread model items are GLOBAL and survive a page removal —
+    // the page rectangle disappears but its items keep their absolute
+    // position. We still warn so the user knows items inside that region
+    // will overlap a neighbouring page (or sit in the gutter) afterwards.
+    const overlap = itemsInPageRegion(id);
+    if (overlap > 0) {
       const { confirm } = await import("../shared/ConfirmDialog");
       const ok = await confirm({
         title: `Delete "${p.name}"?`,
-        body: `This page has ${liveItems.length} item(s). They will be permanently removed.`,
+        body: `This page's region currently overlaps ${overlap} item(s). They will STAY on the spread (their positions are preserved) but will no longer have a page backing them. The pages to the right will shift left to fill the gap.`,
         confirmLabel: "Delete page",
         cancelLabel: "Cancel",
       });
@@ -2244,11 +2341,15 @@ function PageTabsBar() {
                 }}>
                   {p.name}
                 </Typography>
-                {p.snapshot.items.length > 0 && (
-                  <Typography component="span" sx={{ fontSize: "0.55rem", color: "text.disabled", ml: 0.25 }}>
-                    {p.snapshot.items.length}
-                  </Typography>
-                )}
+                {(() => {
+                  // Items inside this page's region of the spread.
+                  const n = itemsInPageRegion(p.id);
+                  return n > 0 ? (
+                    <Typography component="span" sx={{ fontSize: "0.55rem", color: "text.disabled", ml: 0.25 }}>
+                      {n}
+                    </Typography>
+                  ) : null;
+                })()}
                 {pages.length > 1 && (
                   <Box component="span"
                     onClick={(e) => { e.stopPropagation(); void handleRemove(p.id); }}
