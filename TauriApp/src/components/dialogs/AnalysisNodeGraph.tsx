@@ -4827,30 +4827,112 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // for source-node-derived inputs, the source descriptor — so the dialog
   // can: (a) cycle through images, (b) show a live segmentation overlay,
   // (c) re-extract full-res when needed.
+  //
+  // Auto-wire missing source insets so adding new images to a connected
+  // source automatically flows them through to this node. Without this,
+  // users add an inset to a Source already wired to fluor_intensity but
+  // see only the previously-wired one in the picker — the new inset has
+  // its own out_image_<i> handle but no edge until they manually draw one.
+  // Match the user's mental model ("adding an inset means include it").
   const openIntensityPicker = useCallback((nodeId: string) => {
-    const nm = new Map(nodes.map((n) => [n.id, n]));
-    const ins = collectInputs(nodeId, nm);
-    // Source-descriptor lookup keyed by inset_<i>_<src.key> so we can pair
-    // each thumbnail with its full-res re-extract handle (matches the key
-    // that `collectInputs` synthesises for source-node inputs).
-    const srcByKey = new Map<string, FluorImageSource>();
+    // 1) Find every source node already connected to this picker via ANY
+    //    out_image_* handle. Those are the sources the user has opted in.
+    const connectedSourceIds = new Set<string>();
+    const existingHandlesBySource = new Map<string, Set<string>>();
     for (const e of edges) {
       if (e.target !== nodeId) continue;
-      const upstream = nm.get(e.source);
-      if (!upstream || upstream.data.kind !== "source") continue;
-      if (!(e.sourceHandle || "").startsWith("out_image_")) continue;
-      const idx = parseInt((e.sourceHandle || "").replace("out_image_", ""), 10);
-      const src = (upstream.data.sources || [])[idx];
-      if (!src) continue;
-      // The descriptor mirrors the wb-preview / wb-detect-bands shape so
-      // the backend's _extract_source_image can re-extract full-res.
-      srcByKey.set(src.key, {
-        key: src.key,
-        row: (src as { row?: number }).row,
-        col: (src as { col?: number }).col,
-        inset_index: (src as { inset_index?: number }).inset_index,
-        name: src.label,
-      });
+      const handle = e.sourceHandle || "";
+      if (!handle.startsWith("out_image_")) continue;
+      connectedSourceIds.add(e.source);
+      if (!existingHandlesBySource.has(e.source)) existingHandlesBySource.set(e.source, new Set());
+      existingHandlesBySource.get(e.source)!.add(handle);
+    }
+    // 2) For each connected source, add edges for any insets that don't
+    //    yet have one. Keep handles + ids in shape ReactFlow expects.
+    const newEdges: Edge[] = [];
+    for (const srcId of connectedSourceIds) {
+      const src = nodes.find((n) => n.id === srcId);
+      if (!src || src.data.kind !== "source") continue;
+      const insets = src.data.sources || [];
+      const wired = existingHandlesBySource.get(srcId) || new Set<string>();
+      for (let i = 0; i < insets.length; i++) {
+        const handle = `out_image_${i}`;
+        if (wired.has(handle)) continue;
+        newEdges.push({
+          id: `e_${srcId}_${handle}__${nodeId}_in_image_${Date.now()}_${i}`,
+          source: srcId, sourceHandle: handle,
+          target: nodeId, targetHandle: "in_image",
+          type: "deletable", animated: false,
+          style: { stroke: PORT_COLOR.image, strokeWidth: 2 },
+        });
+      }
+    }
+    if (newEdges.length > 0) {
+      setEdges((cur) => [...cur, ...newEdges]);
+    }
+    // 3) Now resolve inputs with the (possibly augmented) edge set. Use
+    //    a synthetic edges array since setEdges hasn't propagated yet.
+    const effectiveEdges = newEdges.length > 0 ? [...edges, ...newEdges] : edges;
+    const nm = new Map(nodes.map((n) => [n.id, n]));
+    const ins = (() => {
+      // Local copy of collectInputs that reads from `effectiveEdges` instead
+      // of the closure's `edges` (which is stale until React re-renders).
+      const result: Array<{ key: string; kind: DataKind; label: string; image_b64?: string; csv?: string }> = [];
+      let imgCount = 0;
+      let tblCount = 0;
+      for (const e of effectiveEdges) {
+        if (e.target !== nodeId) continue;
+        const upstream = nm.get(e.source);
+        if (!upstream) continue;
+        const upstreamData = upstream.data;
+        if (upstreamData.kind === "source") {
+          if ((e.sourceHandle || "").startsWith("out_image_")) {
+            const idx = parseInt((e.sourceHandle || "").replace("out_image_", ""), 10);
+            const src = (upstreamData.sources || [])[idx];
+            if (!src) continue;
+            const key = `inset_${imgCount++}_${src.key}`;
+            result.push({ key, kind: "image", label: displayName(src, sourceNameOverrides), image_b64: src.thumbnail });
+          } else if (e.sourceHandle === "out_table_measurements") {
+            const key = `measurements`;
+            result.push({ key, kind: "table", label: "measurements", csv: measurementsCsv });
+          }
+          continue;
+        }
+        const outputs = upstreamData.outputs || [];
+        const outId = e.sourceHandle || "";
+        const kind: DataKind = outId.includes("image") ? "image" : outId.includes("table") ? "table" : "plot";
+        if (kind === "plot") continue;
+        for (const out of outputs) {
+          if (out.kind !== kind) continue;
+          const key = kind === "image" ? `up_image_${imgCount++}_${out.name}` : `up_table_${tblCount++}_${out.name}`;
+          if (kind === "image") {
+            result.push({ key, kind, label: `${upstream.data.label}/${out.name}`, image_b64: out.payload });
+          } else {
+            result.push({ key, kind, label: `${upstream.data.label}/${out.name}`, csv: out.payload });
+          }
+        }
+      }
+      return result;
+    })();
+    // Source-descriptor lookup keyed by src.key so we can pair each
+    // thumbnail with its full-res re-extract handle. Iterate the
+    // CONNECTED sources directly (not edges) so newly-auto-wired insets
+    // also resolve correctly even before React rerenders.
+    const srcByKey = new Map<string, FluorImageSource>();
+    for (const srcId of connectedSourceIds) {
+      const srcNode = nm.get(srcId);
+      if (!srcNode || srcNode.data.kind !== "source") continue;
+      for (const src of (srcNode.data.sources || [])) {
+        // The descriptor mirrors the wb-preview / wb-detect-bands shape so
+        // the backend's _extract_source_image can re-extract full-res.
+        srcByKey.set(src.key, {
+          key: src.key,
+          row: (src as { row?: number }).row,
+          col: (src as { col?: number }).col,
+          inset_index: (src as { inset_index?: number }).inset_index,
+          name: src.label,
+        });
+      }
     }
     // Preserve EVERY image input — earlier we deduped by label, which
     // silently dropped legitimate distinct images that happened to share a
