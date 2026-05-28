@@ -895,6 +895,81 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // Run yet, or the cache was invalidated by a param change).
   const activePreview = activeImage ? previewByImage[activeImage.label] : undefined;
 
+  // ── Canvas-composited preview ─────────────────────────────
+  // We composite the base composite + each visible channel boundary at
+  // the PNG's NATIVE resolution onto a single <canvas>. CSS only scales
+  // the final canvas (one element, one scale), so the per-channel
+  // contours can't drift relative to the underlying composite — they
+  // share the same scaling kernel because they're already burned into
+  // the same pixel grid before the browser sees them. Earlier two-
+  // <img> layout had subpixel drift between RGB (composite) and RGBA
+  // (overlay) imgs even with identical CSS — RGB and RGBA can use
+  // different interpolation kernels at scale.
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [compImgEl, setCompImgEl] = useState<HTMLImageElement | null>(null);
+  const [chImgEls, setChImgEls] = useState<Partial<Record<"r" | "g" | "b", HTMLImageElement>>>({});
+
+  // Load composite + channel overlays as HTMLImageElement instances
+  // whenever the active preview changes. We hold them in state so
+  // visibility toggles can re-composite without re-loading.
+  useEffect(() => {
+    if (!activePreview || cfg.mode !== "simple") {
+      setCompImgEl(null);
+      setChImgEls({});
+      return;
+    }
+    let cancelled = false;
+    const compSrc = activePreview.compositeSrc || activePreview.overlaySrc;
+    if (compSrc) {
+      const im = new window.Image();
+      im.onload = () => { if (!cancelled) setCompImgEl(im); };
+      im.src = compSrc;
+    } else {
+      setCompImgEl(null);
+    }
+    setChImgEls({});
+    for (const k of ["r", "g", "b"] as const) {
+      const src = activePreview.channelOverlays?.[k];
+      if (!src) continue;
+      const im = new window.Image();
+      im.onload = () => {
+        if (cancelled) return;
+        setChImgEls((cur) => ({ ...cur, [k]: im }));
+      };
+      im.src = src;
+    }
+    return () => { cancelled = true; };
+  }, [activePreview, cfg.mode]);
+
+  // Redraw the canvas whenever the composite, any overlay, or the
+  // visibility map changes. The redraw runs at the PNG's native
+  // resolution — CSS scales the result for display, but the layers
+  // themselves are pixel-perfect aligned.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    if (!compImgEl) {
+      // Reset to a tiny transparent canvas so the previous frame
+      // doesn't linger after switching images.
+      canvas.width = 1;
+      canvas.height = 1;
+      return;
+    }
+    const w = compImgEl.naturalWidth;
+    const h = compImgEl.naturalHeight;
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, w, h);
+    ctx.drawImage(compImgEl, 0, 0);
+    for (const k of ["r", "g", "b"] as const) {
+      if (!maskVisible[k]) continue;
+      const im = chImgEls[k];
+      if (im) ctx.drawImage(im, 0, 0);
+    }
+  }, [compImgEl, chImgEls, maskVisible]);
+
   const setChannel = useCallback((k: keyof FluorChannels, v: string) => {
     setCfg((c) => ({ ...c, channels: { ...c.channels, [k]: v } }));
   }, []);
@@ -1031,49 +1106,23 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
               // Simple strategy: prefer composite + per-channel overlays.
               // Fallback to fused overlaySrc if composite missing.
               if (ap && isSimple && (ap.compositeSrc || ap.overlaySrc)) {
-                // Layered preview: the wrapper sizes to the composite img
-                // (inline-block + lineHeight:0 to suppress baseline-descender
-                // space). Overlay imgs are absolutely positioned to the
-                // wrapper's full bounds with NO objectFit — the overlays
-                // are guaranteed by the backend to be the EXACT same pixel
-                // dimensions as the composite, so stretching to 100%/100%
-                // is a pixel-perfect match. Earlier objectFit:contain on
-                // each overlay introduced independent fit-rounding that
-                // could shift overlays 1-2 px off the underlying signal.
+                // Single-canvas composite: the base composite + every
+                // visible channel boundary are drawn onto one <canvas>
+                // at the PNG's NATIVE pixel grid by the effects above.
+                // CSS only scales the final canvas, so the layers can't
+                // drift sub-pixel relative to each other (the cause of
+                // the previous "borders displaced" issue with stacked
+                // <img>s and CSS scaling).
                 return (
-                  <Box sx={{
-                    position: "relative", maxWidth: "100%", maxHeight: "100%",
-                    display: "inline-block", lineHeight: 0, fontSize: 0,
-                  }}>
-                    <img
-                      src={ap.compositeSrc || ap.overlaySrc}
-                      alt="Composite"
-                      style={{
-                        display: "block",
-                        maxWidth: "100%",
-                        maxHeight: "calc(100vh - 320px)",
-                        verticalAlign: "top",
-                      }}
-                    />
-                    {(["r", "g", "b"] as const).map((k) => {
-                      const src = ap.channelOverlays?.[k];
-                      if (!src) return null;
-                      return (
-                        <img
-                          key={k}
-                          src={src}
-                          alt={`${cfg.channels[k]} mask`}
-                          style={{
-                            position: "absolute",
-                            top: 0, left: 0,
-                            width: "100%", height: "100%",
-                            display: maskVisible[k] ? "block" : "none",
-                            pointerEvents: "none",
-                          }}
-                        />
-                      );
-                    })}
-                  </Box>
+                  <canvas
+                    ref={canvasRef}
+                    style={{
+                      display: "block",
+                      maxWidth: "100%",
+                      maxHeight: "calc(100vh - 320px)",
+                      verticalAlign: "top",
+                    }}
+                  />
                 );
               }
               // Cellpose: single fused overlay.
