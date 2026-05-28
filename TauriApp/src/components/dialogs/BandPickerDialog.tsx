@@ -655,6 +655,35 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     }
   }, [open, initial]);
 
+  // High-resolution preview on open. The upstream Source node's image_b64 is
+  // a sub-512 px thumbnail (that's all collectInputs ships through the graph),
+  // so without this the band picker would open showing a soft, low-resolution
+  // membrane until the user runs Auto-detect. We hit the lightweight
+  // /api/analysis/wb-preview endpoint (no detection — just contrast-stretch
+  // + 3k px PNG) so the display upgrades to native-ish detail immediately.
+  useEffect(() => {
+    if (!open) return;
+    if (!source && !imageSrc) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const b64 = imageSrc ? (imageSrc.startsWith("data:") ? imageSrc.split(",")[1] : imageSrc) : "";
+        const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
+        const resp = await fetch(`${apiBase}/api/analysis/wb-preview`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ image_b64: b64, source: source ?? undefined }),
+        });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (cancelled) return;
+        if (data?.preview_b64) {
+          setPreviewSrc(`data:image/png;base64,${data.preview_b64}`);
+        }
+      } catch { /* backend unreachable → stay on the thumbnail, no harm */ }
+    })();
+    return () => { cancelled = true; };
+  }, [open, source, imageSrc]);
+
   const srcUrl = useMemo(() => {
     if (!imageSrc) return null;
     return imageSrc.startsWith("data:") ? imageSrc : `data:image/png;base64,${imageSrc}`;

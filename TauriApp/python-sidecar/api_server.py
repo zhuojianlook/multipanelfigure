@@ -6582,6 +6582,92 @@ def list_inset_sources_for(body: InsetSourcesForRequest):
     return {"sources": sources}
 
 
+class WbPreviewRequest(BaseModel):
+    """Build ONLY the contrast-stretched membrane preview — same gamma-sqrt
+    percentile stretch wb_detect.contrast_scale() applies inside the
+    detection pipeline, but without running detection. The band picker calls
+    this on dialog-open so the user sees a high-resolution membrane right
+    away (the inset thumbnail handed over by the source node is sub-512 px;
+    the on-screen picker uses 2400+ px so band edges read crisply at
+    arbitrary zoom)."""
+    image_b64: str = ""
+    source: Optional[Dict[str, object]] = None
+
+
+@app.post("/api/analysis/wb-preview")
+def wb_preview(body: WbPreviewRequest):
+    import numpy as _np
+    import cv2 as _cv2
+    import sys as __s
+    import wb_detect as _wb
+
+    rgb = None
+    used_source = False
+    raw_depth = False
+    if body.source:
+        try:
+            arr = _extract_source_raw(body.source)
+        except Exception:
+            arr = None
+        if arr is not None:
+            a = _np.asarray(arr).astype(_np.float32)
+            if a.ndim == 2: a = _np.stack([a, a, a], axis=-1)
+            elif a.ndim == 3 and a.shape[2] == 1: a = _np.repeat(a, 3, axis=2)
+            elif a.ndim == 3 and a.shape[2] >= 3: a = a[:, :, :3]
+            if a.ndim == 3 and a.shape[2] == 3:
+                rgb = a
+                used_source = True
+                raw_depth = bool(_np.asarray(arr).dtype != _np.uint8)
+        if rgb is None:
+            try:
+                ex = _extract_source_image(body.source)
+                if ex is not None:
+                    rgb = _np.asarray(ex.convert("RGB")).astype(_np.float32)
+                    used_source = True
+            except Exception:
+                rgb = None
+    if rgb is None:
+        try:
+            raw = base64.b64decode(str(body.image_b64 or "").split(",")[-1])
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            rgb = _np.asarray(img).astype(_np.float32)
+        except Exception as e:
+            return {"preview_b64": "", "error": f"decode failed: {e}"}
+    if rgb.ndim != 3 or rgb.shape[2] < 3 or rgb.shape[0] < 16 or rgb.shape[1] < 16:
+        return {"preview_b64": "", "error": "image too small"}
+
+    src_h, src_w = rgb.shape[:2]
+    # Safety cap (same as the detection endpoint) — pathologically huge
+    # scans get downscaled so the picker doesn't have to push 30+ MB of
+    # PNG over IPC; normal blots run at native res.
+    H0, W0 = rgb.shape[:2]
+    if W0 > 4000:
+        TH = max(16, int(round(H0 * 4000 / W0)))
+        rgb = _cv2.resize(rgb, (4000, TH), interpolation=_cv2.INTER_AREA)
+
+    _disp, _analysis = _wb.contrast_scale(rgb)
+    preview_b64 = ""
+    try:
+        ph, pw = _disp.shape[:2]
+        PW = 3000  # picker preview cap — bumped from 2400 so big blots look crisp at full zoom.
+        if pw > PW:
+            pth = max(1, int(round(ph * PW / pw)))
+            _disp = _cv2.resize(_disp, (PW, pth), interpolation=_cv2.INTER_AREA)
+        _pbuf = io.BytesIO()
+        Image.fromarray(_np.ascontiguousarray(_disp)).save(_pbuf, format="PNG")
+        preview_b64 = base64.b64encode(_pbuf.getvalue()).decode()
+    except Exception as _e:
+        print(f"[wb-preview] preview build failed: {_e}", file=__s.stderr, flush=True)
+
+    return {
+        "preview_b64": preview_b64,
+        "src_w": int(src_w),
+        "src_h": int(src_h),
+        "used_source": bool(used_source),
+        "raw_depth": bool(raw_depth),
+    }
+
+
 class WbBandDetectRequest(BaseModel):
     # base64-encoded image (data-URL prefix tolerated). Optional when `source`
     # is given (we then re-extract full-res in-app).
@@ -6804,15 +6890,13 @@ def wb_detect_bands(body: WbBandDetectRequest):
     # Contrast-stretched DISPLAY preview (the bright, gamma-corrected image the
     # detector effectively sees) so the band picker can show clearly-visible
     # bands instead of the dark raw thumbnail. ROIs are normalised 0..1 so any
-    # preview size maps correctly; cap width for a moderate transfer. Bumped
-    # from 1100 to 2400 px — at 1100 the picker preview looked low-resolution
-    # against full-res blots (1.5k+ px wide), and band edges became muddy when
-    # the user zoomed in.
+    # preview size maps correctly; cap width for a moderate transfer. Sized
+    # to keep band edges crisp even at full zoom on a typical 1.5–3k px blot.
     preview_b64 = ""
     try:
         disp8 = _disp  # uint8 HxWx3 from contrast_scale (gamma-sqrt, bright)
         ph, pw = disp8.shape[:2]
-        PW = 2400
+        PW = 3000
         if pw > PW:
             pth = max(1, int(round(ph * PW / pw)))
             disp8 = _cv2.resize(disp8, (PW, pth), interpolation=_cv2.INTER_AREA)
