@@ -350,7 +350,7 @@ def install_stream():
     yield 'data: {"done":true,"returncode":%d}\n\n' % proc.returncode
 
 
-def run(images_in: List[Tuple[str, "object"]], cfg_dict: dict, timeout_sec: int = 300) -> dict:
+def run(images_in: List[Tuple[str, "object"]], cfg_dict: dict, timeout_sec: int = 600) -> dict:
     """Run Cellpose on already-extracted (label, ndarray) images via the venv
     subprocess. Returns the same envelope shape the endpoint returned before:
     { success, stdout, stderr, plots, tables, images }."""

@@ -147,6 +147,18 @@ app.add_middleware(PrivateNetworkMiddleware)
 async def health():
     return {"status": "ok"}
 
+
+# Sidecar build identifier — bumped manually each push. Lets the UI verify
+# which sidecar binary is actually running (auto-updater bundles can drift
+# from the frontend if a CI build is partial / cached). Surfaced by the
+# Plugins dialog + the fluor picker's repair flow.
+SIDECAR_BUILD = "0.1.303"
+
+
+@app.get("/api/version")
+async def version():
+    return {"build": SIDECAR_BUILD}
+
 # Global state (single-user desktop app)
 cfg = FigureConfig()
 cfg.ensure_grid()
@@ -7743,7 +7755,11 @@ class CellposeAnalysisRequest(BaseModel):
     config: str
     sources: List[Dict[str, object]] = []
     extra_inputs: List[Dict[str, object]] = []
-    timeout_sec: int = 300
+    # 600 s = 10 min. The first cellpose run downloads the ~100 MB
+    # model from the cellpose CDN; on a slow connection 120-300 s
+    # isn't enough. Subsequent runs are sub-second on small previews,
+    # so a generous ceiling is harmless.
+    timeout_sec: int = 600
 
 
 @app.post("/api/analysis/run-cellpose")

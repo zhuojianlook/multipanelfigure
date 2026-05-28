@@ -623,6 +623,19 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // quantification) — this is purely a display toggle and never gates
   // the actual analysis. Defaults: all visible.
   const [maskVisible, setMaskVisible] = useState<Record<"r" | "g" | "b", boolean>>({ r: true, g: true, b: true });
+  // Sidecar build identifier — fetched once on dialog open so we can
+  // surface it next to the title. Lets the user (and bug reports) tell
+  // at a glance which python-sidecar binary is actually running.
+  const [sidecarBuild, setSidecarBuild] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    fetch("http://127.0.0.1:8765/api/version")
+      .then((r) => r.ok ? r.json() : null)
+      .then((d) => { if (!cancelled && d?.build) setSidecarBuild(String(d.build)); })
+      .catch(() => { /* not critical — leave null */ });
+    return () => { cancelled = true; };
+  }, [open]);
   // Repair flow for a broken Cellpose plugin venv (missing packaging,
   // missing setuptools, partial install, etc.). Streams the install log
   // into a textarea below the preview pane so the user can see progress.
@@ -914,6 +927,15 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         <Typography component="span" variant="caption" sx={{ ml: 1.5, color: "text.secondary" }}>
           Cycle inputs · choose strategy · tweak with live preview · then quantify
         </Typography>
+        {sidecarBuild && (
+          <Typography component="span" variant="caption"
+            sx={{
+              ml: 1, px: 0.6, py: 0.1, borderRadius: 0.5,
+              bgcolor: "action.hover", color: "text.disabled", fontSize: "0.6rem",
+            }}>
+            sidecar {sidecarBuild}
+          </Typography>
+        )}
       </DialogTitle>
       <DialogContent dividers sx={{ display: "flex", flexDirection: "row", gap: 1.5, py: 1.5, minHeight: 600 }}>
         {/* ── Left: image cycler + preview pane ─────────────────── */}

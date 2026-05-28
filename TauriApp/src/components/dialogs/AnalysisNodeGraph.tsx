@@ -5147,8 +5147,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
+              // 600 s — first-run model download (~100 MB) needs room.
               config: node.data.code || CELLPOSE_DEFAULT,
-              sources, extra_inputs: extras, timeout_sec: 300,
+              sources, extra_inputs: extras, timeout_sec: 600,
             }),
           });
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
