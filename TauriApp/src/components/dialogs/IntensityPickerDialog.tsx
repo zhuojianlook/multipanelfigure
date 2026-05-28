@@ -666,12 +666,28 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
           min_size: cfg.cellpose.minSize,
         };
       }
-      const resp = await fetch("http://127.0.0.1:8765/api/analysis/fluor-preview-segment", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: ac.signal,
-      });
+      // Hard client-side timeout so the spinner can't get stuck forever
+      // when the sidecar is offline or the strategy is mis-configured.
+      // Cellpose is allowed longer because it loads the model on first run.
+      const timeoutMs = cfg.mode === "cellpose" ? 180000 : 30000;
+      const timeoutId = setTimeout(() => {
+        // Tag the controller so the catch block can distinguish a
+        // timeout-driven abort from a user-driven one (e.g. re-clicking
+        // Run cancels the in-flight request via abortRef.current.abort()).
+        (ac as unknown as { __timedOut?: boolean }).__timedOut = true;
+        ac.abort();
+      }, timeoutMs);
+      let resp: Response;
+      try {
+        resp = await fetch("http://127.0.0.1:8765/api/analysis/fluor-preview-segment", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: ac.signal,
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
       const data = await resp.json();
       if (ac.signal.aborted) return;
       if (data.success && data.overlay_b64) {
@@ -686,7 +702,18 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         setPreviewSrc(null);
       }
     } catch (e: unknown) {
-      if ((e as { name?: string })?.name === "AbortError") return;
+      const isAbort = (e as { name?: string })?.name === "AbortError";
+      if (isAbort) {
+        // Distinguish a timeout (we tagged the controller) from a
+        // user-driven cancel (e.g. they clicked Run again to retry).
+        if ((ac as unknown as { __timedOut?: boolean }).__timedOut) {
+          setPreviewError(cfg.mode === "cellpose"
+            ? "Cellpose preview timed out (>3 min). The first run loads the model from disk — try again, or verify the plugin venv is installed."
+            : "Preview timed out (>30 s). The sidecar may be busy or unreachable.");
+          setPreviewSrc(null);
+        }
+        return;
+      }
       setPreviewError(String((e as { message?: string })?.message ?? e));
       setPreviewSrc(null);
     } finally {
@@ -694,25 +721,20 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     }
   }, [open, activeImage, cfg.mode, cfg.rollingRadius, cfg.thresholds, cfg.cellpose]);
 
-  // Auto-fetch ONLY on image cycle (a deliberate user action that wants
-  // a fresh overlay for the newly-shown image). Param changes leave the
-  // previous overlay in place and just mark the params dirty — the user
-  // clicks Run to commit.
+  // The preview NEVER fires automatically. Cycling images / changing
+  // strategy params just clears the stale overlay and marks the Run
+  // strategy button dirty — the user clicks it to commit. This is what
+  // the band picker does too, and it avoids accidentally queueing a
+  // heavy Cellpose run on every slider drag.
   useEffect(() => {
-    if (!open || !activeImage) return;
-    // Clear the previous image's stats so the footer doesn't lie about
-    // the new image while the next preview is being fetched.
+    if (!open) return;
+    setPreviewSrc(null);
     setPreviewStats(null);
-    setParamsDirty(false);
-    void fetchPreview();
-    // We intentionally depend ONLY on activeIdx + open, so changing
-    // strategy/thresholds doesn't trigger an auto-fetch.
+    setPreviewError(null);
+    setParamsDirty(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, activeIdx]);
+  }, [activeIdx]);
 
-  // Mark the preview as out-of-date whenever a preview-relevant param
-  // changes. Doesn't fire any fetch — just lights up the Run button so
-  // the user knows the current overlay isn't the latest.
   useEffect(() => {
     if (!open) return;
     setParamsDirty(true);
@@ -803,21 +825,28 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                 </IconButton>
               </span>
             </Tooltip>
-            <Tooltip title={paramsDirty
-              ? "Preview is out of date — click to re-run the segmentation with the current settings"
-              : "Re-run the segmentation preview"}>
-              <span>
-                <Button size="small" variant={paramsDirty ? "contained" : "outlined"}
-                  color={paramsDirty ? "primary" : "inherit"}
-                  startIcon={<RefreshIcon sx={{ fontSize: 16 }} />}
-                  onClick={() => void fetchPreview()}
-                  disabled={!activeImage || previewLoading}
-                  sx={{ textTransform: "none", fontSize: "0.72rem", py: 0.25, px: 1, minWidth: 0 }}>
-                  Run preview
-                </Button>
-              </span>
-            </Tooltip>
           </Box>
+          {/* The Run strategy button is the ONLY trigger for the
+              segmentation preview — by design (see the useEffects above).
+              It pulses (contained colour) whenever the current overlay
+              doesn't reflect the latest settings, so the user is never
+              left looking at a stale preview without knowing. */}
+          <Button
+            variant={paramsDirty ? "contained" : "outlined"}
+            color={paramsDirty ? "primary" : "inherit"}
+            startIcon={previewLoading
+              ? <CircularProgress size={14} color="inherit" />
+              : <RefreshIcon sx={{ fontSize: 18 }} />}
+            onClick={() => void fetchPreview()}
+            disabled={!activeImage || previewLoading}
+            sx={{ textTransform: "none", fontWeight: 700, py: 0.5 }}
+          >
+            {previewLoading
+              ? (cfg.mode === "cellpose" ? "Running Cellpose…" : "Running…")
+              : (paramsDirty
+                  ? `Run ${cfg.mode === "cellpose" ? "Cellpose" : "threshold"} preview`
+                  : "Re-run preview")}
+          </Button>
           {/* Preview canvas */}
           <Box sx={{
             position: "relative", flex: 1,
