@@ -7144,12 +7144,14 @@ def fluor_preview_segment(body: FluorPreviewRequest):
         return m.astype(bool)
 
     per_channel: Dict[str, int] = {}
+    channel_overlays: Dict[str, str] = {}
     rolling_radius = int(body.rolling_radius or 0)
     # Channel colour for the outline: pure R/G/B so the user can tell at
     # a glance which contour belongs to which channel.
     ch_colors = {"r": (255, 64, 64), "g": (96, 220, 96), "b": (96, 160, 255)}
+    # Combined overlay (legacy + still used as a fallback display): every
+    # enabled channel's boundary stamped onto the composite at once.
     out = composite.copy()
-    # Tally enabled channels for diagnostics.
     enabled_count = 0
     for ch_key, ch_idx in (("r", 0), ("g", 1), ("b", 2)):
         spec = body.channels.get(ch_key)
@@ -7181,20 +7183,37 @@ def fluor_preview_segment(body: FluorPreviewRequest):
             keep_ids = _np.where(sizes >= min_area)[0]
             mask = _np.isin(labels_c, keep_ids)
         per_channel[ch_key] = int(mask.sum())
-        # Draw a thicker boundary so it survives downscaling on the UI side.
+        # Dilate the boundary so the line is readable in the preview.
         boundary = _np.zeros(mask.shape, dtype=bool)
         boundary[:-1, :] |= mask[:-1, :] != mask[1:, :]
         boundary[:, :-1] |= mask[:, :-1] != mask[:, 1:]
-        # Dilate slightly so the line is readable in the preview.
         boundary = _ndi.binary_dilation(boundary, iterations=1)
+        # Stamp onto the combined overlay.
         out[boundary] = ch_colors[ch_key]
+        # ALSO emit a per-channel transparent PNG so the frontend can
+        # layer + toggle visibility live without re-running. RGBA: pure
+        # channel colour where boundary=True, alpha=0 elsewhere.
+        rgba = _np.zeros((boundary.shape[0], boundary.shape[1], 4), dtype=_np.uint8)
+        col = ch_colors[ch_key]
+        rgba[boundary] = (col[0], col[1], col[2], 255)
+        try:
+            _cbuf = io.BytesIO()
+            Image.fromarray(_np.ascontiguousarray(rgba)).save(_cbuf, format="PNG")
+            channel_overlays[ch_key] = base64.b64encode(_cbuf.getvalue()).decode()
+        except Exception as _e:
+            print(f"[fluor-preview] ch {ch_key}: overlay PNG failed: {_e}",
+                  file=__s.stderr, flush=True)
 
-    # Emit overlay PNG.
+    # Emit combined overlay (legacy) + base composite + per-channel overlays.
     _buf = io.BytesIO()
     Image.fromarray(_np.ascontiguousarray(out)).save(_buf, format="PNG")
+    _cbuf = io.BytesIO()
+    Image.fromarray(_np.ascontiguousarray(composite)).save(_cbuf, format="PNG")
     return {
         "success": True,
-        "overlay_b64": base64.b64encode(_buf.getvalue()).decode(),
+        "overlay_b64": base64.b64encode(_buf.getvalue()).decode(),  # legacy combined
+        "composite_b64": base64.b64encode(_cbuf.getvalue()).decode(),  # base layer
+        "channel_overlays": channel_overlays,                         # per-channel transparent
         "src_w": int(src_w0), "src_h": int(src_h0),
         "preview_w": int(w), "preview_h": int(h),
         "per_channel": per_channel,

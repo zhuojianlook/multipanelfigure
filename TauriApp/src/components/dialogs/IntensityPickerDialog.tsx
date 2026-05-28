@@ -564,15 +564,37 @@ const CHANNEL_SUGGESTIONS = [
   "Anti-VegF", "Anti-CD31", "Anti-Ki67", "α-SMA",
 ];
 
+/** A computed preview for one image: the base composite + a per-channel
+ *  boundary overlay (each on transparent background, so the dialog can
+ *  layer + toggle visibility live without re-running). For Cellpose
+ *  there's a single fused `overlaySrc` and no per-channel maps. */
+type PreviewLayers = {
+  /** Combined / fused overlay (legacy fallback; cellpose result). */
+  overlaySrc?: string;
+  /** Base layer — contrast-stretched composite (simple strategy only). */
+  compositeSrc?: string;
+  /** Per-channel boundary on transparent bg (simple strategy only). */
+  channelOverlays?: Partial<Record<"r" | "g" | "b", string>>;
+  n_cells?: number;
+  per_channel?: Record<string, number>;
+};
+
 export default function IntensityPickerDialog(props: IntensityPickerDialogProps) {
   const { open, images, initial, onClose, onSave } = props;
   const [cfg, setCfg] = useState<FluorIntensityConfig>(initial ? migrateConfig(initial) : emptyFluorConfig());
   const [activeIdx, setActiveIdx] = useState(0);
-  // Live preview state — overlay returned by /api/analysis/fluor-preview-segment.
-  const [previewSrc, setPreviewSrc] = useState<string | null>(null);
+  // Per-image preview cache: maps imageLabel → the rendered layers from
+  // the most recent successful Run. Switching back to a previously-
+  // previewed image restores its overlay INSTANTLY (no re-fetch); the
+  // cache is invalidated whenever a preview-relevant param changes.
+  const [previewByImage, setPreviewByImage] = useState<Record<string, PreviewLayers>>({});
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
-  const [previewStats, setPreviewStats] = useState<{ n_cells?: number; per_channel?: Record<string, number> } | null>(null);
+  // Per-channel mask visibility in the preview overlay. Independent of
+  // the per-channel "enabled" flag (which controls inclusion in
+  // quantification) — this is purely a display toggle and never gates
+  // the actual analysis. Defaults: all visible.
+  const [maskVisible, setMaskVisible] = useState<Record<"r" | "g" | "b", boolean>>({ r: true, g: true, b: true });
   // Repair flow for a broken Cellpose plugin venv (missing packaging,
   // missing setuptools, partial install, etc.). Streams the install log
   // into a textarea below the preview pane so the user can see progress.
@@ -633,14 +655,15 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     }
   }, [repairing]);
 
-  // Reset on (re-)open. Clear active idx + preview so we don't show stale.
+  // Reset on (re-)open. Clear active idx + preview cache so we don't
+  // show stale results from a previous open.
   useEffect(() => {
     if (open) {
       setCfg(initial ? migrateConfig(structuredClone(initial)) : emptyFluorConfig());
       setActiveIdx(0);
-      setPreviewSrc(null);
+      setPreviewByImage({});
       setPreviewError(null);
-      setPreviewStats(null);
+      setMaskVisible({ r: true, g: true, b: true });
     }
   }, [open, initial]);
 
@@ -749,16 +772,28 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       }
       const data = await resp.json();
       if (ac.signal.aborted) return;
-      if (data.success && data.overlay_b64) {
-        setPreviewSrc(`data:image/png;base64,${data.overlay_b64}`);
-        setPreviewStats({
+      if (data.success && (data.overlay_b64 || data.composite_b64)) {
+        const layers: PreviewLayers = {
+          overlaySrc: data.overlay_b64 ? `data:image/png;base64,${data.overlay_b64}` : undefined,
+          compositeSrc: data.composite_b64 ? `data:image/png;base64,${data.composite_b64}` : undefined,
+          channelOverlays: (() => {
+            const co = (data.channel_overlays || {}) as Record<string, string>;
+            const out: Partial<Record<"r" | "g" | "b", string>> = {};
+            for (const k of ["r", "g", "b"] as const) {
+              if (co[k]) out[k] = `data:image/png;base64,${co[k]}`;
+            }
+            return out;
+          })(),
           n_cells: typeof data.n_cells === "number" ? data.n_cells : undefined,
           per_channel: data.per_channel,
-        });
-        setParamsDirty(false);    // current overlay reflects current params
+        };
+        // Cache by the ACTIVE image's label so cycling through images
+        // restores their overlays instantly.
+        const key = activeImage.label;
+        setPreviewByImage((cur) => ({ ...cur, [key]: layers }));
+        setParamsDirty(false);
       } else {
         setPreviewError(data.error || "preview failed");
-        setPreviewSrc(null);
       }
     } catch (e: unknown) {
       const isAbort = (e as { name?: string })?.name === "AbortError";
@@ -769,36 +804,35 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
           setPreviewError(cfg.mode === "cellpose"
             ? "Cellpose preview timed out (>3 min). The first run loads the model from disk — try again, or verify the plugin venv is installed."
             : "Preview timed out (>30 s). The sidecar may be busy or unreachable.");
-          setPreviewSrc(null);
         }
         return;
       }
       setPreviewError(String((e as { message?: string })?.message ?? e));
-      setPreviewSrc(null);
     } finally {
       setPreviewLoading(false);
     }
   }, [open, activeImage, cfg.mode, cfg.rollingRadius, cfg.thresholds, cfg.cellpose]);
 
-  // The preview NEVER fires automatically. Cycling images / changing
-  // strategy params just clears the stale overlay and marks the Run
-  // strategy button dirty — the user clicks it to commit. This is what
-  // the band picker does too, and it avoids accidentally queueing a
-  // heavy Cellpose run on every slider drag.
+  // Cycling images: clear the inline error and dirty-state, but keep
+  // the cache so we can restore THIS image's previous overlay below.
   useEffect(() => {
     if (!open) return;
-    setPreviewSrc(null);
-    setPreviewStats(null);
     setPreviewError(null);
-    setParamsDirty(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeIdx]);
 
+  // Param changes invalidate the whole cache — every previously-rendered
+  // image's overlay is now stale relative to the current settings.
   useEffect(() => {
     if (!open) return;
+    setPreviewByImage({});
     setParamsDirty(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cfg.mode, cfg.rollingRadius, cfg.thresholds, cfg.cellpose]);
+
+  // The active image's cached preview (or undefined if it hasn't been
+  // Run yet, or the cache was invalidated by a param change).
+  const activePreview = activeImage ? previewByImage[activeImage.label] : undefined;
 
   const setChannel = useCallback((k: keyof FluorChannels, v: string) => {
     setCfg((c) => ({ ...c, channels: { ...c.channels, [k]: v } }));
@@ -906,7 +940,12 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                   ? `Run ${cfg.mode === "cellpose" ? "Cellpose" : "threshold"} preview`
                   : "Re-run preview")}
           </Button>
-          {/* Preview canvas */}
+          {/* Preview canvas. For simple strategy we LAYER the response:
+              the base composite goes at the bottom and each enabled
+              channel's transparent boundary PNG stacks on top with a
+              CSS visibility toggle — so the user can show/hide masks
+              instantly without re-running. For Cellpose we just show
+              the fused overlay PNG. */}
           <Box sx={{
             position: "relative", flex: 1,
             border: "1px solid", borderColor: "divider", borderRadius: 1,
@@ -915,23 +954,67 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
             display: "flex", alignItems: "center", justifyContent: "center",
             minHeight: 400,
           }}>
-            {previewSrc ? (
-              <img
-                src={previewSrc}
-                alt="Segmentation preview"
-                style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
-              />
-            ) : activeImage?.image_b64 ? (
-              <img
-                src={`data:image/png;base64,${activeImage.image_b64}`}
-                alt={activeImage.label}
-                style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", opacity: 0.65 }}
-              />
-            ) : (
-              <Typography variant="caption" sx={{ color: "text.disabled" }}>
-                {images.length === 0 ? "Wire upstream image sources first." : "(no preview)"}
-              </Typography>
-            )}
+            {(() => {
+              // 1) Best-available preview source for this image.
+              const ap = activePreview;
+              const isSimple = cfg.mode === "simple";
+              // Simple strategy: prefer composite + per-channel overlays.
+              // Fallback to fused overlaySrc if composite missing.
+              if (ap && isSimple && (ap.compositeSrc || ap.overlaySrc)) {
+                return (
+                  <Box sx={{ position: "relative", maxWidth: "100%", maxHeight: "100%", display: "inline-block" }}>
+                    <img
+                      src={ap.compositeSrc || ap.overlaySrc}
+                      alt="Composite"
+                      style={{ display: "block", maxWidth: "100%", maxHeight: "calc(100vh - 320px)", objectFit: "contain" }}
+                    />
+                    {(["r", "g", "b"] as const).map((k) => {
+                      const src = ap.channelOverlays?.[k];
+                      if (!src) return null;
+                      return (
+                        <img
+                          key={k}
+                          src={src}
+                          alt={`${cfg.channels[k]} mask`}
+                          style={{
+                            position: "absolute", inset: 0,
+                            width: "100%", height: "100%",
+                            objectFit: "contain", objectPosition: "center",
+                            display: maskVisible[k] ? "block" : "none",
+                            pointerEvents: "none",
+                          }}
+                        />
+                      );
+                    })}
+                  </Box>
+                );
+              }
+              // Cellpose: single fused overlay.
+              if (ap?.overlaySrc) {
+                return (
+                  <img
+                    src={ap.overlaySrc}
+                    alt="Segmentation preview"
+                    style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
+                  />
+                );
+              }
+              // No preview yet — fall back to the raw thumbnail (dimmed).
+              if (activeImage?.image_b64) {
+                return (
+                  <img
+                    src={`data:image/png;base64,${activeImage.image_b64}`}
+                    alt={activeImage.label}
+                    style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", opacity: 0.65 }}
+                  />
+                );
+              }
+              return (
+                <Typography variant="caption" sx={{ color: "text.disabled" }}>
+                  {images.length === 0 ? "Wire upstream image sources first." : "(no preview — click Run)"}
+                </Typography>
+              );
+            })()}
             {previewLoading && (
               <Box sx={{
                 position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
@@ -975,23 +1058,23 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                 {repairLog || "starting…"}
               </Box>
             )}
-            {/* Stats footer (cell count or per-channel pixel tallies) */}
-            {!previewError && previewStats && (
+            {/* Stats footer (cell count or per-channel pixel tallies). */}
+            {!previewError && activePreview && (
               <Box sx={{
                 position: "absolute", bottom: 4, left: 4, right: 4,
                 px: 0.8, py: 0.3, borderRadius: 0.5,
                 bgcolor: "rgba(0,0,0,0.55)", color: "common.white",
                 fontSize: "0.66rem", display: "flex", gap: 1, justifyContent: "center",
               }}>
-                {typeof previewStats.n_cells === "number" && (
-                  <span>cells: <b>{previewStats.n_cells}</b></span>
+                {typeof activePreview.n_cells === "number" && (
+                  <span>cells: <b>{activePreview.n_cells}</b></span>
                 )}
-                {previewStats.per_channel && (["r", "g", "b"] as const).map((k) => {
+                {activePreview.per_channel && (["r", "g", "b"] as const).map((k) => {
                   const sw = k === "r" ? "#ff8080" : k === "g" ? "#88e088" : "#88a8ff";
-                  const n = previewStats.per_channel?.[k] ?? 0;
+                  const n = activePreview.per_channel?.[k] ?? 0;
                   if (!cfg.thresholds[k].enabled) return null;
                   return (
-                    <span key={k} style={{ color: sw }}>
+                    <span key={k} style={{ color: sw, opacity: maskVisible[k] ? 1 : 0.4 }}>
                       {cfg.channels[k]}: <b>{n.toLocaleString()}px</b>
                     </span>
                   );
@@ -999,6 +1082,49 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
               </Box>
             )}
           </Box>
+          {/* Per-channel mask visibility — eye toggles for the live overlay.
+              Cellpose has no per-channel mask, so we only show this for
+              simple strategy AND when a preview has been computed. */}
+          {cfg.mode === "simple" && activePreview && (
+            <Box sx={{
+              display: "flex", alignItems: "center", gap: 0.75, flexWrap: "wrap",
+              px: 0.5, py: 0.4, borderRadius: 0.5,
+              bgcolor: "rgba(255,255,255,0.04)",
+            }}>
+              <Typography variant="caption" sx={{ color: "text.secondary", fontSize: "0.65rem", fontWeight: 600 }}>
+                Show masks:
+              </Typography>
+              {(["r", "g", "b"] as const).map((k) => {
+                const sw = k === "r" ? "#d35454" : k === "g" ? "#5fa566" : "#5d80c0";
+                const hasOverlay = !!activePreview.channelOverlays?.[k];
+                const enabled = cfg.thresholds[k].enabled;
+                const on = maskVisible[k];
+                return (
+                  <Box key={k}
+                    onClick={() => setMaskVisible((p) => ({ ...p, [k]: !p[k] }))}
+                    sx={{
+                      cursor: hasOverlay ? "pointer" : "not-allowed",
+                      fontSize: "0.66rem", px: 0.6, py: 0.15, borderRadius: 0.6,
+                      display: "inline-flex", alignItems: "center", gap: 0.3,
+                      userSelect: "none",
+                      opacity: !enabled ? 0.4 : (hasOverlay ? 1 : 0.55),
+                      bgcolor: on && hasOverlay ? sw : "transparent",
+                      color: on && hasOverlay ? "common.white" : "text.secondary",
+                      border: "1px solid", borderColor: sw,
+                      fontWeight: on ? 700 : 500,
+                    }}
+                    title={!enabled
+                      ? `${cfg.channels[k]} is not included in quantification (unchecked below)`
+                      : hasOverlay
+                        ? (on ? "Hide this channel's mask in the preview" : "Show this channel's mask in the preview")
+                        : "No mask for this channel — Run preview first"}>
+                    <span style={{ fontSize: "0.85rem", lineHeight: 1 }}>{on && hasOverlay ? "👁" : "·"}</span>
+                    <span>{cfg.channels[k]}</span>
+                  </Box>
+                );
+              })}
+            </Box>
+          )}
           {/* Image-list strip (quick jump) */}
           {images.length > 1 && (
             <Box sx={{ display: "flex", gap: 0.4, flexWrap: "wrap", maxHeight: 60, overflowY: "auto" }}>
@@ -1078,7 +1204,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                 onChange={(_, v) => { if (v) setCfg((c) => ({ ...c, mode: v })); }}
                 sx={{ ml: 1 }}>
                 <ToggleButton value="simple" sx={{ textTransform: "none", fontSize: "0.68rem", py: 0.15 }}>
-                  Simple (per-channel threshold)
+                  Simple (brightest pixels)
                 </ToggleButton>
                 <ToggleButton value="cellpose" sx={{ textTransform: "none", fontSize: "0.68rem", py: 0.15 }}>
                   Cellpose (per-cell)
@@ -1087,66 +1213,113 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
             </Box>
             <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mb: 0.75 }}>
               {cfg.mode === "simple"
-                ? "Each enabled channel gets a rolling-ball BG + threshold mask. Intensity sample = mean within that channel's mask. n = images per group."
-                : "Cellpose 3+ segments cells in the chosen channel. Per-cell mean intensity per channel. n = cells per group."}
+                ? "Detects the brightest pixels in each channel. Intensity sample = mean within that channel's detected pixels. n = images per group."
+                : "Cellpose 3+ segments individual cells in the chosen channel. Per-cell mean intensity per channel. n = cells per group."}
             </Typography>
 
             {cfg.mode === "simple" ? (
               <Box sx={{ display: "flex", flexDirection: "column", gap: 0.6 }}>
+                {/* Friendlier "Subtract background" — replaces the
+                    morphological-open-radius spinner. Default radius
+                    when ON is 35 px (the script's CLI default); OFF
+                    sends 0 to the backend. Power users who want a
+                    different radius can still edit the value via the
+                    saved JSON, but the picker UI is intentionally
+                    binary here. */}
                 <Box sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
-                  <Typography variant="caption" sx={{ fontWeight: 700, minWidth: 90 }}>Rolling BG (px)</Typography>
-                  <TextField size="small" type="number" value={cfg.rollingRadius}
-                    onChange={(e) => setCfg((c) => ({ ...c, rollingRadius: Math.max(0, Number(e.target.value) || 0) }))}
-                    inputProps={{ min: 0, max: 200, step: 1, style: { fontSize: "0.78rem", padding: "4px 6px" } }}
-                    sx={{ width: 110 }} />
-                  <Typography variant="caption" sx={{ color: "text.disabled", ml: 1 }}>
-                    Subtract a morphological-open background per channel (0 disables).
+                  <Box
+                    onClick={() => setCfg((c) => ({
+                      ...c,
+                      rollingRadius: c.rollingRadius > 0 ? 0 : 35,
+                    }))}
+                    sx={{
+                      width: 14, height: 14, borderRadius: 0.4, cursor: "pointer",
+                      bgcolor: cfg.rollingRadius > 0 ? "primary.main" : "transparent",
+                      border: "1px solid", borderColor: "primary.main",
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      color: "common.white", fontSize: "0.7rem", fontWeight: 700,
+                    }}>
+                    {cfg.rollingRadius > 0 ? "✓" : ""}
+                  </Box>
+                  <Tooltip title="Removes uneven illumination + autofluorescence by subtracting a smoothed-out version of each channel before thresholding. Recommended ON for most fluorescence images.">
+                    <Typography variant="caption" sx={{ fontWeight: 700 }}>
+                      Subtract background
+                    </Typography>
+                  </Tooltip>
+                  <Typography variant="caption" sx={{ color: "text.disabled", ml: 0.5 }}>
+                    (recommended for uneven illumination)
                   </Typography>
                 </Box>
-                {/* Per-channel threshold rows */}
+                {/* Per-channel STRICTNESS slider — replaces the method/
+                    percentile/min-area triple. Strictness 0 → percentile
+                    80 (loose, catches dim signal); 50 → 95 (default);
+                    100 → 99.7 (very strict, only the brightest pixels).
+                    The threshold method is always percentile here. */}
+                <Typography variant="caption" sx={{ color: "text.disabled", display: "block", mt: 0.4 }}>
+                  Drag each channel's slider to control how strict the detection is. Higher = fewer pixels (only the brightest); lower = more pixels (catches dimmer signal).
+                </Typography>
                 {(["r", "g", "b"] as const).map((k) => {
                   const sw = k === "r" ? "#d35454" : k === "g" ? "#5fa566" : "#5d80c0";
                   const t = cfg.thresholds[k];
+                  // Map stored percentile back to a 0..100 strictness for the
+                  // slider. percentile range we expose: 80..99.7 (~19.7 pts).
+                  const PCT_LO = 80, PCT_HI = 99.7;
+                  const pct = Math.max(PCT_LO, Math.min(PCT_HI, t.thresholdPercentile));
+                  const strictness = Math.round(((pct - PCT_LO) / (PCT_HI - PCT_LO)) * 100);
                   return (
                     <Box key={k} sx={{
                       display: "grid",
-                      gridTemplateColumns: "100px 90px 90px 90px 90px",
+                      gridTemplateColumns: "115px 1fr 100px",
                       gap: 0.6, alignItems: "center",
-                      px: 0.5, py: 0.4, borderRadius: 0.5,
+                      px: 0.5, py: 0.35, borderRadius: 0.5,
                       bgcolor: t.enabled ? "transparent" : "action.hover",
-                      opacity: t.enabled ? 1 : 0.7,
+                      opacity: t.enabled ? 1 : 0.5,
                     }}>
                       <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-                        <Box
-                          onClick={() => setThreshold(k, { enabled: !t.enabled })}
-                          sx={{
-                            width: 12, height: 12, borderRadius: 0.4,
-                            bgcolor: t.enabled ? sw : "transparent",
-                            border: "1px solid", borderColor: sw, cursor: "pointer",
-                          }} />
-                        <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.66rem",
+                        <Tooltip title={t.enabled
+                          ? "Click to skip this channel (not included in the analysis)"
+                          : "Click to include this channel"}>
+                          <Box
+                            onClick={() => setThreshold(k, { enabled: !t.enabled })}
+                            sx={{
+                              width: 14, height: 14, borderRadius: 0.4, cursor: "pointer",
+                              bgcolor: t.enabled ? sw : "transparent",
+                              border: "1px solid", borderColor: sw,
+                              display: "flex", alignItems: "center", justifyContent: "center",
+                              color: "common.white", fontSize: "0.7rem", fontWeight: 700,
+                            }}>
+                            {t.enabled ? "✓" : ""}
+                          </Box>
+                        </Tooltip>
+                        <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.7rem",
                                   overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           {cfg.channels[k]}
                         </Typography>
                       </Box>
-                      <TextField select size="small" value={t.thresholdMethod}
-                        onChange={(e) => setThreshold(k, { thresholdMethod: e.target.value as "percentile" | "otsu" })}
-                        disabled={!t.enabled}
-                        inputProps={{ style: { fontSize: "0.72rem", padding: "3px 5px" } }}>
-                        <MenuItem value="percentile" sx={{ fontSize: "0.78rem" }}>Percentile</MenuItem>
-                        <MenuItem value="otsu" sx={{ fontSize: "0.78rem" }}>Otsu</MenuItem>
-                      </TextField>
-                      <TextField size="small" type="number" label="%" value={t.thresholdPercentile}
-                        onChange={(e) => setThreshold(k, { thresholdPercentile: Math.max(0, Math.min(100, Number(e.target.value) || 0)) })}
-                        disabled={!t.enabled || t.thresholdMethod !== "percentile"}
-                        inputProps={{ min: 0, max: 100, step: 0.5, style: { fontSize: "0.72rem", padding: "3px 5px" } }} />
-                      <TextField size="small" type="number" label="Min area" value={t.minArea}
-                        onChange={(e) => setThreshold(k, { minArea: Math.max(0, Number(e.target.value) || 0) })}
-                        disabled={!t.enabled}
-                        inputProps={{ min: 0, max: 100000, step: 5, style: { fontSize: "0.72rem", padding: "3px 5px" } }} />
-                      <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.6rem", textAlign: "right" }}>
-                        {!t.enabled ? "skipped" : ""}
-                      </Typography>
+                      {/* Native range input — minimal MUI fuss, snappy. */}
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                        <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.disabled" }}>loose</Typography>
+                        <input
+                          type="range" min={0} max={100} step={1}
+                          value={strictness}
+                          disabled={!t.enabled}
+                          onChange={(e) => {
+                            const s = Math.max(0, Math.min(100, Number(e.target.value)));
+                            const newPct = PCT_LO + (s / 100) * (PCT_HI - PCT_LO);
+                            setThreshold(k, {
+                              thresholdMethod: "percentile",
+                              thresholdPercentile: Math.round(newPct * 10) / 10,
+                            });
+                          }}
+                          style={{ flex: 1, accentColor: sw }}
+                        />
+                        <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.disabled" }}>strict</Typography>
+                      </Box>
+                      <Tooltip title="Approximate fraction of the image's brightest pixels that survive the threshold.">
+                        <Typography variant="caption" sx={{ fontSize: "0.7rem", color: "text.secondary", textAlign: "right" }}>
+                          {t.enabled ? `top ${Math.max(0.3, Math.round((100 - pct) * 10) / 10)}%` : "skipped"}
+                        </Typography>
+                      </Tooltip>
                     </Box>
                   );
                 })}
