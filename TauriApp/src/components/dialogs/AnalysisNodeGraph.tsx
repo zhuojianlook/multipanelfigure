@@ -57,6 +57,7 @@ import {
   DialogTitle,
   DialogContent,
   Checkbox,
+  Divider,
 } from "@mui/material";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
@@ -6007,6 +6008,38 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
             onClose={() => setPluginsAnchor(null)}
             MenuListProps={{ dense: true }}
           >
+            {/* ── Pre-built analysis workflows. One-click templates that
+                drop a Source → Picker → Stats pipeline as a new tab.
+                Mirrors the "Load template…" dropdown but at one click
+                so users don't have to remember it lives there. ── */}
+            <Typography variant="caption"
+              sx={{ display: "block", px: 1.25, pt: 0.5, fontSize: "0.6rem",
+                    color: "text.disabled", fontWeight: 700, textTransform: "uppercase" }}>
+              Analysis workflows
+            </Typography>
+            <MenuItem
+              onClick={() => { loadSavedWorkflow("builtin:western_blot"); setPluginsAnchor(null); }}
+              sx={{ fontSize: "0.72rem" }}>
+              🟦 Detect bands (Western blot)
+              <Typography component="span" variant="caption" sx={{ ml: "auto", pl: 2, color: "text.secondary" }}>
+                new tab
+              </Typography>
+            </MenuItem>
+            <MenuItem
+              onClick={() => { loadSavedWorkflow("builtin:intensity_per_channel"); setPluginsAnchor(null); }}
+              sx={{ fontSize: "0.72rem" }}>
+              🌈 Channel intensities (fluorescence)
+              <Typography component="span" variant="caption" sx={{ ml: "auto", pl: 2, color: "text.secondary" }}>
+                new tab
+              </Typography>
+            </MenuItem>
+            <Divider sx={{ my: 0.25 }} />
+            {/* ── Engine plugins (Cellpose). ── */}
+            <Typography variant="caption"
+              sx={{ display: "block", px: 1.25, pt: 0.25, fontSize: "0.6rem",
+                    color: "text.disabled", fontWeight: 700, textTransform: "uppercase" }}>
+              Engines
+            </Typography>
             {cellposeKind ? (
               <MenuItem onClick={() => { addProcessNode("cellpose"); setPluginsAnchor(null); }} sx={{ fontSize: "0.72rem" }}>
                 🧬 Add Cellpose node
