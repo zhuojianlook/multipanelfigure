@@ -716,6 +716,17 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // cache is invalidated whenever a preview-relevant param changes.
   const [previewByImage, setPreviewByImage] = useState<Record<string, PreviewLayers>>({});
   const [previewLoading, setPreviewLoading] = useState(false);
+  // Elapsed seconds counter ticking while a preview is running. Drives
+  // the Run-button label and an HUD chip so the user gets continuous
+  // feedback (cellpose first-run can take 30-60 s on CPU before any
+  // visible signal of progress; without this it feels stuck).
+  const [elapsedSec, setElapsedSec] = useState(0);
+  useEffect(() => {
+    if (!previewLoading) { setElapsedSec(0); return; }
+    const t0 = Date.now();
+    const id = setInterval(() => setElapsedSec(Math.round((Date.now() - t0) / 1000)), 250);
+    return () => clearInterval(id);
+  }, [previewLoading]);
   const [previewError, setPreviewError] = useState<string | null>(null);
   // Per-channel mask visibility in the preview overlay. Independent of
   // the per-channel "enabled" flag (which controls inclusion in
@@ -726,6 +737,11 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // surface it next to the title. Lets the user (and bug reports) tell
   // at a glance which python-sidecar binary is actually running.
   const [sidecarBuild, setSidecarBuild] = useState<string | null>(null);
+  // Warmup PROMISE so the first Run preview can await it. The race
+  // between fire-and-forget warmup + first Run is what was producing
+  // the "load failed" error: fetch returning before cv2/scipy finished
+  // loading caused the socket to drop or the response to be malformed.
+  const warmupRef = useRef<Promise<void> | null>(null);
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
@@ -733,13 +749,14 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       .then((r) => r.ok ? r.json() : null)
       .then((d) => { if (!cancelled && d?.build) setSidecarBuild(String(d.build)); })
       .catch(() => { /* not critical — leave null */ });
-    // Fire-and-forget warmup — triggers cv2 / scipy / PIL imports in the
-    // frozen sidecar so the user's first Run preview click doesn't pay
-    // the cold-start cost (which would otherwise blow past the 30 s
-    // simple-mode timeout). Idempotent; subsequent dialog opens are
-    // ~instant because the modules stay cached for the process lifetime.
-    fetch("http://127.0.0.1:8765/api/analysis/warmup", { method: "POST" })
-      .catch(() => { /* warm-up is best-effort; the picker still works without it */ });
+    // Warmup — triggers cv2 / scipy / PIL imports in the frozen sidecar
+    // so the user's first Run preview click doesn't pay the cold-start
+    // cost (which would otherwise blow past the simple-mode timeout
+    // AND can manifest as "Failed to fetch" if the socket drops mid-
+    // import on macOS). We keep the promise so fetchPreview can await.
+    warmupRef.current = fetch("http://127.0.0.1:8765/api/analysis/warmup", { method: "POST" })
+      .then(() => undefined)
+      .catch(() => undefined);
     return () => { cancelled = true; };
   }, [open]);
   // Repair flow for a broken Cellpose plugin venv (missing packaging,
@@ -850,6 +867,13 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     abortRef.current = ac;
     setPreviewLoading(true);
     setPreviewError(null);
+    // Wait for the warmup ping to complete (or fail) before issuing
+    // the preview call. Fixes the "load failed" error on the FIRST
+    // Run when cv2/scipy were still loading in the sidecar.
+    if (warmupRef.current) {
+      try { await warmupRef.current; } catch { /* swallow */ }
+      if (ac.signal.aborted) return;
+    }
     try {
       const body: Record<string, unknown> = {
         image_b64: activeImage.image_b64 || "",
@@ -899,14 +923,30 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         (ac as unknown as { __timedOut?: boolean }).__timedOut = true;
         ac.abort();
       }, timeoutMs);
+      // Single retry on TypeError: Failed to fetch — that's macOS Safari /
+      // Chromium's generic name for a socket-level error, which can hit if
+      // the sidecar is doing a heavy import (cv2/scipy) right as we POST.
+      // The retry waits 600 ms and tries once more; if it still fails we
+      // surface the real error.
+      const doFetch = () => fetch("http://127.0.0.1:8765/api/analysis/fluor-preview-segment", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: ac.signal,
+      });
       let resp: Response;
       try {
-        resp = await fetch("http://127.0.0.1:8765/api/analysis/fluor-preview-segment", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-          signal: ac.signal,
-        });
+        try {
+          resp = await doFetch();
+        } catch (firstErr: unknown) {
+          const msg = String((firstErr as { message?: string })?.message ?? firstErr);
+          if (/Failed to fetch|Load failed|NetworkError/i.test(msg) && !ac.signal.aborted) {
+            await new Promise((r) => setTimeout(r, 600));
+            resp = await doFetch();
+          } else {
+            throw firstErr;
+          }
+        }
       } finally {
         clearTimeout(timeoutId);
       }
@@ -985,8 +1025,51 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // (overlay) imgs even with identical CSS — RGB and RGBA can use
   // different interpolation kernels at scale.
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const previewBoxRef = useRef<HTMLDivElement>(null);
   const [compImgEl, setCompImgEl] = useState<HTMLImageElement | null>(null);
   const [chImgEls, setChImgEls] = useState<Partial<Record<"r" | "g" | "b", HTMLImageElement>>>({});
+  // View state for the preview canvas: zoom + pan. zoom = 1 → fit to
+  // the preview pane. Wheel zooms around the cursor (Photoshop-style);
+  // drag pans; double-click resets.
+  const [view, setView] = useState<{ zoom: number; panX: number; panY: number }>({ zoom: 1, panX: 0, panY: 0 });
+  const resetView = useCallback(() => setView({ zoom: 1, panX: 0, panY: 0 }), []);
+  // Reset on image cycle so each new image opens at fit.
+  useEffect(() => { resetView(); }, [activeIdx, resetView]);
+  // Wheel = zoom around cursor; preventDefault so the page doesn't scroll.
+  const onPreviewWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const factor = e.deltaY > 0 ? 0.9 : 1.1;
+    setView((v) => {
+      const newZoom = Math.max(0.2, Math.min(20, v.zoom * factor));
+      // Zoom around the cursor: keep cursor's image-space point pinned.
+      const box = previewBoxRef.current?.getBoundingClientRect();
+      if (!box) return { ...v, zoom: newZoom };
+      const cx = e.clientX - box.left - box.width / 2;
+      const cy = e.clientY - box.top - box.height / 2;
+      const realFactor = newZoom / v.zoom;
+      return {
+        zoom: newZoom,
+        panX: cx - realFactor * (cx - v.panX),
+        panY: cy - realFactor * (cy - v.panY),
+      };
+    });
+  }, []);
+  // Left-drag pans. Track via window listeners so dragging off-canvas works.
+  const onPreviewMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const startX = e.clientX, startY = e.clientY;
+    const startPan = view;
+    const onMove = (ev: MouseEvent) => {
+      setView((v) => ({ ...v, panX: startPan.panX + (ev.clientX - startX), panY: startPan.panY + (ev.clientY - startY) }));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [view]);
 
   // Load composite + channel overlays as HTMLImageElement instances
   // whenever the active preview changes. We hold them in state so
@@ -1109,7 +1192,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
           </Typography>
         )}
       </DialogTitle>
-      <DialogContent dividers sx={{ display: "flex", flexDirection: "row", gap: 1.5, py: 1.5, minHeight: 600 }}>
+      <DialogContent dividers sx={{ display: "flex", flexDirection: "row", gap: 1.5, py: 1.5, minHeight: 720 }}>
         {/* ── Left: image cycler + preview pane ─────────────────── */}
         <Box sx={{ flex: 1.4, minWidth: 360, display: "flex", flexDirection: "column", gap: 1 }}>
           {/* Cycler header */}
@@ -1159,7 +1242,9 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
             sx={{ textTransform: "none", fontWeight: 700, py: 0.5 }}
           >
             {previewLoading
-              ? (cfg.mode === "cellpose" ? "Running Cellpose…" : "Running…")
+              ? (cfg.mode === "cellpose"
+                  ? `Running Cellpose… ${elapsedSec}s${elapsedSec < 10 ? " (loading model)" : elapsedSec < 30 ? " (inference)" : ""}`
+                  : `Running… ${elapsedSec}s`)
               : (paramsDirty
                   ? `Run ${cfg.mode === "cellpose" ? "Cellpose" : "threshold"} preview`
                   : "Re-run preview")}
@@ -1176,60 +1261,93 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
             bgcolor: "#0a0a0a",
             overflow: "hidden",
             display: "flex", alignItems: "center", justifyContent: "center",
-            minHeight: 400,
+            minHeight: 560,
           }}>
-            {(() => {
-              // 1) Best-available preview source for this image.
-              const ap = activePreview;
-              const isSimple = cfg.mode === "simple";
-              // Simple strategy: prefer composite + per-channel overlays.
-              // Fallback to fused overlaySrc if composite missing.
-              if (ap && isSimple && (ap.compositeSrc || ap.overlaySrc)) {
-                // Single-canvas composite: the base composite + every
-                // visible channel boundary are drawn onto one <canvas>
-                // at the PNG's NATIVE pixel grid by the effects above.
-                // CSS only scales the final canvas, so the layers can't
-                // drift sub-pixel relative to each other (the cause of
-                // the previous "borders displaced" issue with stacked
-                // <img>s and CSS scaling).
-                return (
-                  <canvas
-                    ref={canvasRef}
-                    style={{
-                      display: "block",
-                      maxWidth: "100%",
-                      maxHeight: "calc(100vh - 320px)",
-                      verticalAlign: "top",
-                    }}
-                  />
-                );
-              }
-              // Cellpose: single fused overlay.
-              if (ap?.overlaySrc) {
-                return (
-                  <img
-                    src={ap.overlaySrc}
-                    alt="Segmentation preview"
-                    style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
-                  />
-                );
-              }
-              // No preview yet — fall back to the raw thumbnail (dimmed).
-              if (activeImage?.image_b64) {
-                return (
-                  <img
-                    src={`data:image/png;base64,${activeImage.image_b64}`}
-                    alt={activeImage.label}
-                    style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain", opacity: 0.65 }}
-                  />
-                );
-              }
-              return (
-                <Typography variant="caption" sx={{ color: "text.disabled" }}>
-                  {images.length === 0 ? "Wire upstream image sources first." : "(no preview — click Run)"}
-                </Typography>
-              );
-            })()}
+            {/* Pan/zoom container — wraps the canvas (or fused-overlay
+                <img> for cellpose) and a fallback thumbnail. Mouse-wheel
+                zooms around the cursor, click-drag pans, double-click
+                resets. Children center in the box and are transformed
+                via CSS — the canvas itself keeps its native dimensions. */}
+            <Box
+              ref={previewBoxRef}
+              onWheel={onPreviewWheel}
+              onMouseDown={onPreviewMouseDown}
+              onDoubleClick={resetView}
+              sx={{
+                position: "absolute", inset: 0,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                cursor: previewLoading ? "wait" : "grab",
+                "&:active": { cursor: previewLoading ? "wait" : "grabbing" },
+                overflow: "hidden",
+              }}
+            >
+              <Box sx={{
+                transform: `translate(${view.panX}px, ${view.panY}px) scale(${view.zoom})`,
+                transformOrigin: "center center",
+                transition: "transform 50ms linear",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                maxWidth: "100%", maxHeight: "100%",
+              }}>
+                {(() => {
+                  const ap = activePreview;
+                  const isSimple = cfg.mode === "simple";
+                  if (ap && isSimple && (ap.compositeSrc || ap.overlaySrc)) {
+                    return (
+                      <canvas
+                        ref={canvasRef}
+                        style={{
+                          display: "block",
+                          maxWidth: "100%",
+                          maxHeight: "calc(100vh - 280px)",
+                          verticalAlign: "top",
+                          imageRendering: "auto",
+                        }}
+                      />
+                    );
+                  }
+                  if (ap?.overlaySrc) {
+                    return (
+                      <img
+                        src={ap.overlaySrc}
+                        alt="Segmentation preview"
+                        style={{ display: "block", maxWidth: "100%", maxHeight: "calc(100vh - 280px)", objectFit: "contain" }}
+                      />
+                    );
+                  }
+                  if (activeImage?.image_b64) {
+                    return (
+                      <img
+                        src={`data:image/png;base64,${activeImage.image_b64}`}
+                        alt={activeImage.label}
+                        style={{ display: "block", maxWidth: "100%", maxHeight: "calc(100vh - 280px)", objectFit: "contain", opacity: 0.65 }}
+                      />
+                    );
+                  }
+                  return (
+                    <Typography variant="caption" sx={{ color: "text.disabled" }}>
+                      {images.length === 0 ? "Wire upstream image sources first." : "(no preview — click Run)"}
+                    </Typography>
+                  );
+                })()}
+              </Box>
+            </Box>
+            {/* Pan/zoom HUD: reset button + zoom level. Floated to the
+                top-right so it doesn't fight the error banner at bottom. */}
+            <Box sx={{
+              position: "absolute", top: 4, right: 4,
+              display: "flex", alignItems: "center", gap: 0.5,
+              bgcolor: "rgba(0,0,0,0.45)", color: "common.white",
+              px: 0.6, py: 0.2, borderRadius: 0.5, fontSize: "0.66rem",
+              pointerEvents: "auto",
+            }}>
+              <Typography variant="caption" sx={{ fontSize: "0.65rem", opacity: 0.85 }}>
+                {Math.round(view.zoom * 100)}%
+              </Typography>
+              <Button size="small" onClick={resetView}
+                sx={{ textTransform: "none", fontSize: "0.62rem", color: "common.white", py: 0.05, px: 0.5, minWidth: 0 }}>
+                Reset
+              </Button>
+            </Box>
             {previewLoading && (
               <Box sx={{
                 position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
@@ -1567,32 +1685,56 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                 })}
               </Box>
             ) : (
-              <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 1 }}>
-                <TextField select size="small" label="Model" value={cfg.cellpose.model}
-                  onChange={(e) => setCellpose({ model: e.target.value })}
-                  inputProps={{ style: { fontSize: "0.78rem" } }}
-                  SelectProps={SELECT_MENU_PROPS}>
-                  <MenuItem value="cpsam" sx={{ fontSize: "0.78rem" }}>cpsam (default)</MenuItem>
-                  <MenuItem value="cyto3" sx={{ fontSize: "0.78rem" }}>cyto3</MenuItem>
-                  <MenuItem value="cyto2" sx={{ fontSize: "0.78rem" }}>cyto2</MenuItem>
-                  <MenuItem value="nuclei" sx={{ fontSize: "0.78rem" }}>nuclei</MenuItem>
-                </TextField>
-                <TextField select size="small" label="Segment on" value={cfg.cellpose.segChannel}
-                  onChange={(e) => setCellpose({ segChannel: e.target.value as "r" | "g" | "b" })}
-                  inputProps={{ style: { fontSize: "0.78rem" } }}
-                  SelectProps={SELECT_MENU_PROPS}>
-                  <MenuItem value="r" sx={{ fontSize: "0.78rem" }}>{cfg.channels.r}</MenuItem>
-                  <MenuItem value="g" sx={{ fontSize: "0.78rem" }}>{cfg.channels.g}</MenuItem>
-                  <MenuItem value="b" sx={{ fontSize: "0.78rem" }}>{cfg.channels.b}</MenuItem>
-                </TextField>
-                <TextField size="small" label="Diameter (px, 0=auto)" type="number" value={cfg.cellpose.diameter}
-                  onChange={(e) => setCellpose({ diameter: Math.max(0, Number(e.target.value) || 0) })}
-                  inputProps={{ min: 0, max: 400, step: 5, style: { fontSize: "0.78rem" } }}
-                  InputLabelProps={{ style: { fontSize: "0.78rem" } }} />
-                <TextField size="small" label="Min size (px²)" type="number" value={cfg.cellpose.minSize}
-                  onChange={(e) => setCellpose({ minSize: Math.max(0, Number(e.target.value) || 0) })}
-                  inputProps={{ min: 0, max: 10000, step: 5, style: { fontSize: "0.78rem" } }}
-                  InputLabelProps={{ style: { fontSize: "0.78rem" } }} />
+              // Cellpose params, compact. Diameter + min-size default
+                // to AUTO and are buried behind an Advanced disclosure —
+                // for typical fluorescence cell sizes the auto values are
+                // fine, and exposing them at top level just confuses
+                // users. Model + Segment-on stay top-level since they
+                // change frequently per experiment.
+              <Box sx={{ display: "flex", flexDirection: "column", gap: 0.75 }}>
+                <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1 }}>
+                  <TextField select size="small" label="Model" value={cfg.cellpose.model}
+                    onChange={(e) => setCellpose({ model: e.target.value })}
+                    inputProps={{ style: { fontSize: "0.78rem" } }}
+                    InputLabelProps={{ style: { fontSize: "0.78rem" } }}
+                    SelectProps={SELECT_MENU_PROPS}>
+                    <MenuItem value="cpsam" sx={{ fontSize: "0.78rem" }}>cpsam</MenuItem>
+                    <MenuItem value="cyto3" sx={{ fontSize: "0.78rem" }}>cyto3</MenuItem>
+                    <MenuItem value="cyto2" sx={{ fontSize: "0.78rem" }}>cyto2</MenuItem>
+                    <MenuItem value="nuclei" sx={{ fontSize: "0.78rem" }}>nuclei</MenuItem>
+                  </TextField>
+                  <TextField select size="small" label="Segment on" value={cfg.cellpose.segChannel}
+                    onChange={(e) => setCellpose({ segChannel: e.target.value as "r" | "g" | "b" })}
+                    inputProps={{ style: { fontSize: "0.78rem" } }}
+                    InputLabelProps={{ style: { fontSize: "0.78rem" } }}
+                    SelectProps={SELECT_MENU_PROPS}>
+                    <MenuItem value="r" sx={{ fontSize: "0.78rem" }}>{cfg.channels.r}</MenuItem>
+                    <MenuItem value="g" sx={{ fontSize: "0.78rem" }}>{cfg.channels.g}</MenuItem>
+                    <MenuItem value="b" sx={{ fontSize: "0.78rem" }}>{cfg.channels.b}</MenuItem>
+                  </TextField>
+                </Box>
+                {/* Auto-by-default + advanced disclosure. Setting
+                    diameter=0 in our config maps to None server-side,
+                    which makes cellpose auto-estimate the diameter from
+                    image content; min-size has a sane default (30 px²)
+                    that the user only needs to touch for unusually
+                    large/small cells. */}
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, flexWrap: "wrap" }}>
+                  <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.65rem" }}>
+                    Diameter + min-size are AUTO (recommended). Override:
+                  </Typography>
+                  <TextField size="small" label="Diameter (px)" type="number" value={cfg.cellpose.diameter || ""}
+                    onChange={(e) => setCellpose({ diameter: Math.max(0, Number(e.target.value) || 0) })}
+                    placeholder="auto"
+                    inputProps={{ min: 0, max: 400, step: 5, style: { fontSize: "0.7rem", padding: "3px 5px" } }}
+                    InputLabelProps={{ style: { fontSize: "0.7rem" } }}
+                    sx={{ width: 110 }} />
+                  <TextField size="small" label="Min size (px²)" type="number" value={cfg.cellpose.minSize}
+                    onChange={(e) => setCellpose({ minSize: Math.max(0, Number(e.target.value) || 0) })}
+                    inputProps={{ min: 0, max: 10000, step: 5, style: { fontSize: "0.7rem", padding: "3px 5px" } }}
+                    InputLabelProps={{ style: { fontSize: "0.7rem" } }}
+                    sx={{ width: 110 }} />
+                </Box>
               </Box>
             )}
           </Box>
