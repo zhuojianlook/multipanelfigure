@@ -314,9 +314,58 @@ def _composite_u8(arr):
         if hi > lo: comp[..., ci] = np.clip((ch - lo) / (hi - lo), 0, 1)
     return (comp * 255).astype(np.uint8)
 
-def _cellpose_labels_for_image(label, a8_rgb):
-    """Single-image cellpose call via the loopback API. Returns the
-    integer labels array (or None on failure)."""
+# Cellpose inference resolution cap — full-res images (4000+ px) on
+# CPU can take 5+ minutes per image. Cap to this max-edge for
+# segmentation, then upscale labels back to native size with nearest-
+# neighbour. Intensity measurements still use the native-res image,
+# so the only loss is sub-pixel cell boundary precision. Cellpose
+# itself recommends this for "very large images".
+CELLPOSE_MAX_EDGE = 1500
+
+def _downsize_for_cellpose(a8_rgb):
+    """Return (downsized_u8, scale_back_to_native) or (a8_rgb, 1.0)
+    when no downsizing was needed."""
+    h, w = a8_rgb.shape[:2]
+    long_edge = max(h, w)
+    if long_edge <= CELLPOSE_MAX_EDGE:
+        return a8_rgb, 1.0
+    if not _have_scipy:
+        return a8_rgb, 1.0
+    scale = CELLPOSE_MAX_EDGE / float(long_edge)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return _cv2.resize(a8_rgb, (new_w, new_h), interpolation=_cv2.INTER_AREA), scale
+
+def _upsize_labels(lbl_arr, target_h, target_w):
+    """Nearest-neighbour upscale of a label array (integer-valued)."""
+    if lbl_arr.shape[0] == target_h and lbl_arr.shape[1] == target_w:
+        return lbl_arr
+    if not _have_scipy:
+        return lbl_arr
+    return _cv2.resize(lbl_arr.astype(np.int32), (target_w, target_h),
+                       interpolation=_cv2.INTER_NEAREST).astype(np.int32)
+
+def _cellpose_labels_batch(items):
+    """BATCH cellpose over multiple images in ONE subprocess call so the
+    ~100-MB cpsam model loads only ONCE (vs once per image when calling
+    image-by-image — that was the dominant cost). "items" = list of
+    (label, a8_rgb_native) tuples. Returns {label: labels_array_native_res}
+    + per-image error map for the ones that failed.
+
+    Each image is downsized to CELLPOSE_MAX_EDGE for inference, then
+    its labels are NN-upscaled back to native resolution so stats are
+    measured on the original pixels."""
+    sent = []
+    scales = {}    # label → scale factor applied (1.0 = no resize)
+    sizes_native = {}  # label → (h, w) at native res
+    for label, a8 in items:
+        sizes_native[label] = a8.shape[:2]
+        a8_small, sc = _downsize_for_cellpose(a8)
+        scales[label] = sc
+        sent.append({
+            "kind": "image", "key": label, "label": label,
+            "image_b64": _b64.b64encode(_png_bytes(a8_small)).decode(),
+        })
     payload = json.dumps({
         "config": json.dumps({
             "model": cp_cfg.get("model") or "cpsam",
@@ -324,12 +373,11 @@ def _cellpose_labels_for_image(label, a8_rgb):
             "min_size": int(cp_cfg.get("minSize") or 30),
             "channels": [{"r": 1, "g": 2, "b": 3}.get(cp_cfg.get("segChannel") or "b", 3), 0],
         }),
-        "extra_inputs": [{
-            "kind": "image", "key": label, "label": label,
-            "image_b64": _b64.b64encode(_png_bytes(a8_rgb)).decode(),
-        }],
+        "extra_inputs": sent,
         "sources": [], "timeout_sec": 600,
     })
+    print(f"[intensity] cellpose: batching {len(sent)} image(s) into one model load "
+          f"(cap {CELLPOSE_MAX_EDGE}px per edge, model={cp_cfg.get('model') or 'cpsam'})")
     try:
         req = _ur.Request("http://127.0.0.1:8765/api/analysis/run-cellpose",
                           data=payload.encode("utf-8"),
@@ -337,17 +385,30 @@ def _cellpose_labels_for_image(label, a8_rgb):
         with _ur.urlopen(req, timeout=600) as resp:
             cp_out = json.loads(resp.read().decode("utf-8"))
     except Exception as _e:
-        return None, f"cellpose call failed: {_e}"
+        # If the WHOLE batch call failed, every image errors with the
+        # same message. The caller logs them per-image.
+        return {}, {label: f"cellpose call failed: {_e}" for label, _ in items}
     if not cp_out.get("success"):
-        return None, (cp_out.get("stderr") or "(no detail)").strip()
-    lbl_b64 = next((im["image"] for im in (cp_out.get("images") or [])
-                    if im.get("name") == f"{label}_labels"), None)
-    if not lbl_b64:
-        return None, "no labels image returned"
-    try:
-        return np.asarray(_Im.open(_io.BytesIO(_b64.b64decode(lbl_b64))).convert("L")).astype(np.int32), None
-    except Exception as _e:
-        return None, f"labels decode failed: {_e}"
+        msg = (cp_out.get("stderr") or "(no detail)").strip()
+        return {}, {label: msg for label, _ in items}
+    # Index returned images by name (each image emits <label>_labels).
+    by_name = {im.get("name"): im.get("image") for im in (cp_out.get("images") or [])}
+    labels_by_label = {}
+    errors = {}
+    for label, _ in items:
+        lbl_b64 = by_name.get(f"{label}_labels")
+        if not lbl_b64:
+            errors[label] = "no labels image returned"
+            continue
+        try:
+            arr = np.asarray(_Im.open(_io.BytesIO(_b64.b64decode(lbl_b64))).convert("L")).astype(np.int32)
+            # Restore to native resolution for stat measurement.
+            h_n, w_n = sizes_native[label]
+            arr = _upsize_labels(arr, h_n, w_n)
+            labels_by_label[label] = arr
+        except Exception as _e:
+            errors[label] = f"labels decode failed: {_e}"
+    return labels_by_label, errors
 
 def _png_bytes(arr_u8):
     buf = _io.BytesIO()
@@ -359,19 +420,24 @@ rows = []
 if mode == "cellpose":
     # ── Per-cell pipeline. ──
     # 1) Rolling-ball BG subtract every channel.
-    # 2) Get cell labels from Cellpose.
+    # 2) BATCH cellpose call for ALL grouped images at once — the model
+    #    only loads ONCE per run (vs once per image when we called
+    #    image-by-image, which was the dominant runtime cost when N>1).
     # 3) Per cell: per-channel mean (raw + bg-corrected) → one row per
-    #    (cell, channel). n = cells per group across all images in that
-    #    group.
+    #    (cell, channel).
     # 4) Save labeled-mask + outline-overlay PNG per source.
     n_images_with_cells = 0
+    # First pass: prepare every grouped image's corrected channels +
+    # the uint8 RGB Cellpose will see. Skipped (no group) images don't
+    # go to Cellpose.
+    prepared = []     # list of (key, src, label, grp, raw, corrected, a8)
     for key, src in imgs:
         label = _label_of(src, key)
         grp = img2group.get(label)
         if not grp:
             print(f"[intensity] {label}: not assigned to any group — skipping")
             continue
-        raw = _pixels(src)                                  # HxWx3 float32
+        raw = _pixels(src)
         corrected = np.zeros_like(raw, dtype=np.float64)
         for ci in range(3):
             bg = _rolling_bg(raw[..., ci], rolling_radius)
@@ -379,9 +445,22 @@ if mode == "cellpose":
             c[c < 0] = 0
             corrected[..., ci] = c
         a8 = np.clip(raw, 0, 255).astype(np.uint8)
-        lbl_arr, err = _cellpose_labels_for_image(label, a8)
-        if err or lbl_arr is None or lbl_arr.shape[:2] != raw.shape[:2]:
-            print(f"[intensity] {label}: cellpose unusable ({err or 'shape mismatch'}) — skipping")
+        prepared.append((key, src, label, grp, raw, corrected, a8))
+    if not prepared:
+        raise SystemExit("[intensity] no images are in any group — assign images to groups in the picker.")
+    # Second pass: ONE cellpose call for the whole batch.
+    print(f"[intensity] cellpose: starting batch run on {len(prepared)} image(s) — "
+          f"the model loads once (first run on a machine downloads ~100 MB)")
+    _cp_t0 = __import__("time").monotonic()
+    labels_by_label, cp_errors = _cellpose_labels_batch([(p[2], p[6]) for p in prepared])
+    print(f"[intensity] cellpose: batch finished in {__import__('time').monotonic() - _cp_t0:.1f}s "
+          f"({len(labels_by_label)} ok, {len(cp_errors)} failed)")
+    # Third pass: per-image stats from the batched labels.
+    for (_key, _src, label, grp, raw, corrected, _a8) in prepared:
+        lbl_arr = labels_by_label.get(label)
+        if lbl_arr is None or lbl_arr.shape[:2] != raw.shape[:2]:
+            err = cp_errors.get(label) or "shape mismatch"
+            print(f"[intensity] {label}: cellpose unusable ({err}) — skipping")
             continue
         # Drop tiny components.
         min_area = int(cp_cfg.get("minSize") or 30)

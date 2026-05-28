@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.308"
+SIDECAR_BUILD = "0.1.309"
 
 
 @app.get("/api/version")
@@ -7116,9 +7116,18 @@ def fluor_preview_segment(body: FluorPreviewRequest):
         # the FIRST cellpose run can download the model weights (~100 MB
         # for cpsam) without timing out. Subsequent runs are fast (sub-
         # second on small previews); the longer ceiling is harmless.
+        # Note: rgb has already been downsized to preview_max_w (default
+        # 1024px) at the top of this endpoint, so cellpose only sees a
+        # small image even when the source is 4000+ px wide.
         try:
             arr_u8 = _np.clip(rgb, 0, 255).astype(_np.uint8)
+            print(f"[fluor-preview] cellpose: starting model load + inference on {arr_u8.shape[1]}x{arr_u8.shape[0]} (model={cfg.get('model')}) — first run downloads ~100 MB",
+                  file=__s.stderr, flush=True)
+            import time as _tm
+            _t0 = _tm.monotonic()
             res = cellpose_plugin.run([("preview", arr_u8)], cfg, 600)
+            print(f"[fluor-preview] cellpose: finished in {_tm.monotonic() - _t0:.1f}s",
+                  file=__s.stderr, flush=True)
         except Exception as _e:
             return {"success": False, "overlay_b64": "",
                     "error": f"cellpose invocation failed: {_e}"}

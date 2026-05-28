@@ -1,6 +1,6 @@
 {
   "name": "tauriapp",
-  "version": "0.1.308",
+  "version": "0.1.309",
   "type": "module",
   "scripts": {
     "dev": "vite",
