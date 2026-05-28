@@ -379,7 +379,7 @@ def _upsize_labels(lbl_arr, target_h, target_w):
     return _cv2.resize(lbl_arr.astype(np.int32), (target_w, target_h),
                        interpolation=_cv2.INTER_NEAREST).astype(np.int32)
 
-def _cellpose_labels_batch(items, model, channels):
+def _cellpose_labels_batch(items, model, channels, isolate_channel=0, diameter_override=None):
     """BATCH cellpose over multiple images in ONE subprocess call so the
     ~100-MB cpsam model loads only ONCE (vs once per image when calling
     image-by-image — that was the dominant cost). "items" = list of
@@ -388,13 +388,33 @@ def _cellpose_labels_batch(items, model, channels):
 
     "model" and "channels" are passed through so the SAME function can
     run the cell-body pass (cyto3 with [cyto, nuclei]) AND the nucleus
-    pass (nuclei with [nuc, 0]) for compartment measurement."""
+    pass (nuclei with [nuc, 0]) for compartment measurement.
+
+    isolate_channel — when > 0 (1=R, 2=G, 3=B), strips the image to a
+    single channel before encoding.  Required for the NUCLEI pass on
+    cellpose 4: cpsam (v4's only model) has no separate nuclei head, so
+    given the full RGB it returns cell-shaped masks even when the user
+    asked for nuclei.  Isolating the DAPI channel makes the nuclei the
+    only thing visible, so cpsam (and v3's nuclei model) segment them
+    as the requested nuclei.
+
+    diameter_override — when set, overrides cp_cfg["diameter"] for this
+    pass.  Used by the nuclei pass to default to ~60% of the cell
+    diameter (nuclei are systematically smaller than whole cells)."""
     sent = []
     scales = {}    # label → scale factor applied (1.0 = no resize)
     sizes_native = {}  # label → (h, w) at native res
     for label, a8 in items:
         sizes_native[label] = a8.shape[:2]
-        a8_small, sc = _downsize_for_cellpose(a8)
+        # Channel isolation (nuclei-pass on cellpose 4).  Done BEFORE
+        # downsize so the resize works on the isolated 2D plane.
+        if isolate_channel and a8.ndim == 3 and a8.shape[2] >= isolate_channel:
+            ch_zero = isolate_channel - 1   # 1..3 → 0..2 RGB index
+            iso = a8[..., ch_zero]
+            a8_iso = np.stack([iso, iso, iso], axis=-1)
+        else:
+            a8_iso = a8
+        a8_small, sc = _downsize_for_cellpose(a8_iso)
         scales[label] = sc
         sent.append({
             "kind": "image", "key": label, "label": label,
@@ -412,10 +432,11 @@ def _cellpose_labels_batch(items, model, channels):
                 if isinstance(v, str) and v:
                     # Strip the "data:image/png;base64," prefix if present.
                     _edited[_lbl] = v.split(",", 1)[-1] if v.startswith("data:") else v
+    _diam = float(diameter_override) if diameter_override else float(cp_cfg.get("diameter") or 0)
     payload_obj = {
         "config": json.dumps({
             "model": model,
-            "diameter": float(cp_cfg.get("diameter") or 0) or None,
+            "diameter": _diam or None,
             "min_size": int(cp_cfg.get("minSize") or 30),
             "channels": channels,
             # Use GPU when available (CUDA / Apple Silicon MPS). Falls
@@ -532,12 +553,26 @@ if mode == "cellpose":
     # channel. Returns per-image nucleus_labels at native resolution.
     nuclei_by_label = {}
     if measure_compartments:
-        print(f"[intensity] cellpose: starting nuclei-pass on {len(prepared)} image(s) (model=nuclei)")
+        # Nuclei-pass: cellpose 4 only ships cpsam (no separate nuclei
+        # head), so giving it the full RGB makes it return CELL-shaped
+        # masks even when the user asked for nuclei.  Isolating the DAPI
+        # channel makes the nuclei the only thing visible, so cpsam (and
+        # v3's nuclei model) segment them as the requested nuclei.
+        # Diameter defaults to ~60% of the cell diameter (nuclei are
+        # systematically smaller — reusing the cell diameter merges
+        # adjacent nuclei).  When the user picked auto-diameter (0) we
+        # let cellpose estimate for the nuclei pass too.
+        _cell_diam = float(cp_cfg.get("diameter") or 0)
+        _nuc_diam = _cell_diam * 0.6 if _cell_diam > 0 else 0
+        print(f"[intensity] cellpose: starting nuclei-pass on {len(prepared)} image(s) "
+              f"(model=nuclei, isolated channel={nuc_idx}, diameter={_nuc_diam or 'auto'})")
         _np_t0 = __import__("time").monotonic()
         nuclei_by_label, _ne = _cellpose_labels_batch(
             [(p[2], p[6]) for p in prepared],
             "nuclei",
-            [nuc_idx, 0],
+            [0, 0],                       # grayscale segmentation
+            isolate_channel=nuc_idx,      # strip to nuclei-only signal
+            diameter_override=_nuc_diam,  # shrink for nuclei-sized blobs
         )
         print(f"[intensity] cellpose nuclei-pass: {__import__('time').monotonic() - _np_t0:.1f}s "
               f"({len(nuclei_by_label)} ok, {len(_ne)} failed)")

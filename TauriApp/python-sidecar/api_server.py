@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.322"
+SIDECAR_BUILD = "0.1.323"
 
 
 @app.get("/api/version")
@@ -7188,17 +7188,38 @@ def fluor_preview_segment(body: FluorPreviewRequest):
         cellprob_b64 = next((im["image"] for im in (res.get("images") or [])
                              if im.get("name") == "preview_cellprob"), None)
 
-        # Optional second pass: nuclei model on the nuclei channel.
+        # Optional second pass: nuclei segmentation on the nuclei channel.
         # Only when the user enabled "measure compartments" AND set a
         # nuclei channel. Lets the preview show both cell + nucleus
         # outlines so the user can verify both segmentations.
+        #
+        # Critical: we ISOLATE the nuclei channel as a grayscale image
+        # before handing it to cellpose, instead of sending the full RGB
+        # with channels=[nuc, 0].  Reason: cellpose 4 only ships cpsam,
+        # and the plugin transparently maps any "nuclei" request onto
+        # cpsam.  cpsam doesn't have a separate nuclei head — it does
+        # general cell segmentation on whatever it sees.  Given the
+        # full RGB, it returns CELL-shaped masks even though the user
+        # asked for nuclei → the symptom is "whole cells detected as
+        # nuclei".  Stripping the image down to a single channel makes
+        # the DAPI blobs the only thing visible, so cpsam (and v3's
+        # nuclei model) segment them as the requested nuclei.
+        # We also default the nuclei diameter to ~60% of the cell
+        # diameter — nuclei are systematically smaller than whole
+        # cells, so reusing the cell-pass diameter over-estimates and
+        # merges adjacent nuclei.
         nucleus_labels = None
         n_nuclei = 0
         if bool(cp.measure_compartments) and nuc_ch > 0:
             try:
-                ncfg = {**cfg, "model": "nuclei", "channels": [nuc_ch, 0]}
+                ch_zero_idx = max(0, nuc_ch - 1)  # 1..3 (R/G/B) → 0..2
+                nuc_only_2d = arr_u8[..., ch_zero_idx]
+                nuc_only_rgb = _np.stack([nuc_only_2d, nuc_only_2d, nuc_only_2d], axis=-1)
+                _nuc_diam = float(cp.diameter or 0) * 0.6 if (cp.diameter or 0) > 0 else 0.0
+                ncfg = {**cfg, "model": "nuclei", "channels": [0, 0],
+                        "diameter": _nuc_diam or None}
                 _t1 = _tm.monotonic()
-                nres = cellpose_plugin.run([("preview_nuc", arr_u8)], ncfg, 600)
+                nres = cellpose_plugin.run([("preview_nuc", nuc_only_rgb)], ncfg, 600)
                 print(f"[fluor-preview] cellpose nuclei-pass finished in {_tm.monotonic() - _t1:.1f}s",
                       file=__s.stderr, flush=True)
                 if nres.get("success"):
