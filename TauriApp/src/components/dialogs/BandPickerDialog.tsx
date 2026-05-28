@@ -378,78 +378,108 @@ else:
 mpfig_data(rows, name="band_iod")
 
 # ── Annotated preview output ──────────────────────────────────
-# Render every band box (and the LC marker, if enabled) on top of the
-# contrast-stretched membrane and emit it as an image output. This
-# means the band picker node ALWAYS produces a visual record of the
-# detection alongside the IOD table — the user can drop it into the
-# figure timeline or collage without re-opening the dialog.
+# Always emit an annotated_bands image so the downstream collage /
+# timeline has something to show. We build it in stages, each wrapped
+# defensively: as long as the basic contrast-stretch succeeds we emit
+# SOMETHING (raw membrane). Failing to draw the band-name labels (e.g.,
+# missing DejaVuSans font in the frozen sidecar) no longer wipes out
+# the entire image.
+import sys as _sys
+annot = None
 try:
     from PIL import Image as _PIL_I, ImageDraw as _PIL_D, ImageFont as _PIL_F
-    # Bright (gamma-sqrt) display plane — matches the picker preview.
+    # Stage 1: contrast-stretched display plane. Always runs.
     if arr.ndim == 3 and arr.shape[2] >= 3:
         rgb_disp = arr[..., :3].astype(np.float32)
-    else:
-        g = arr if arr.ndim == 2 else arr[..., 0]
+    elif arr.ndim == 3:
+        g = arr[..., 0]
         rgb_disp = np.stack([g, g, g], axis=-1).astype(np.float32)
+    else:
+        rgb_disp = np.stack([arr, arr, arr], axis=-1).astype(np.float32)
     _lo, _hi = np.percentile(rgb_disp, [0.5, 99.95])
     _scaled = np.clip((rgb_disp - _lo) / max(_hi - _lo, 1), 0, 1)
     _disp_u8 = np.clip(_scaled ** 0.5 * 255.0, 0, 255).astype(np.uint8)
     annot = _PIL_I.fromarray(_disp_u8).convert("RGB")
-    draw = _PIL_D.Draw(annot)
-    # Stable per-level colour palette so same-level bands share a colour
-    # (echoes the picker's on-canvas styling).
-    PALETTE = ["#1976d2", "#43a047", "#e65100", "#8e24aa", "#00838f",
-               "#c62828", "#5d4037", "#558b2f", "#6a1b9a", "#00695c"]
-    level_to_color = {}
-    for r in rows:
-        lv = str(r.get("level") or "Target")
-        if lv not in level_to_color:
-            level_to_color[lv] = PALETTE[len(level_to_color) % len(PALETTE)]
-    try:
-        font = _PIL_F.truetype("DejaVuSans.ttf", max(10, int(min(H, W) * 0.012)))
-    except Exception:
-        font = _PIL_F.load_default()
-    for band in (CFG.get("lanes", []) or []):
-        x0, y0, x1, y1 = _px(band)
-        if x1 <= x0 or y1 <= y0: continue
-        lv = (band.get("level") or "Target").strip() or "Target"
-        col = level_to_color.get(lv, PALETTE[0])
-        nm = (band.get("name") or "").strip()
-        # Stroke 2 px scaled by H/600 so it reads on big membranes too.
-        sw = max(1, int(round(min(H, W) / 600)))
-        # Loading-control bands get a dashed-look (stack two rectangles
-        # offset 2 px so it pops without needing native dash support).
-        is_lc_band = lc_enabled and lc_by_lane.get(str(band.get("label") or ""), "") == nm
-        draw.rectangle([x0, y0, x1 - 1, y1 - 1], outline=col, width=sw)
-        if is_lc_band:
-            draw.rectangle([x0 + sw, y0 + sw, x1 - sw - 1, y1 - sw - 1], outline=col, width=max(1, sw // 2))
-        # Band name label above the box (or below near the top edge).
-        label_y = max(0, y0 - int(font.size * 1.1) - 2)
-        draw.text((x0 + 2, label_y), nm or "?", fill=col, font=font)
-    # Optional lane guide-strip overlay when LC is on — faint blue.
-    if lc_enabled:
-        # Picker passes laneBounds in the config so we can echo them here.
-        for lb in (CFG.get("laneBounds", []) or []):
-            try:
-                lx0 = int(round(float(lb.get("x1", 0)) * W))
-                lx1 = int(round(float(lb.get("x2", 0)) * W))
-                ly0 = int(round(float(lb.get("y1", 0)) * H))
-                ly1 = int(round(float(lb.get("y2", 0)) * H))
-                if lx1 > lx0 and ly1 > ly0:
-                    draw.rectangle([lx0, ly0, lx1 - 1, ly1 - 1], outline="#2196f3", width=1)
-            except Exception: pass
-    # Cap the saved PNG at a sensible width (the timeline doesn't need
-    # multi-MP) but keep it WELL above the picker preview so the boxes
-    # don't look pixelated when the user drops it into a figure.
-    SAVE_MAX_W = 3000
-    if annot.width > SAVE_MAX_W:
-        ratio = SAVE_MAX_W / annot.width
-        annot = annot.resize((SAVE_MAX_W, max(1, int(round(annot.height * ratio)))), _PIL_I.LANCZOS)
-    mpfig_image(annot, name="annotated_bands")
-    print(f"emitted annotated_bands ({annot.width}x{annot.height})")
 except Exception as _e:
-    import sys as _sys
-    print(f"[band-picker] annotated preview failed: {_e}", file=_sys.stderr)
+    print(f"[band-picker] contrast-stretch failed: {_e}", file=_sys.stderr)
+    # Final fallback: emit the raw bytes as a uint8 PNG so the user still
+    # sees the membrane (no detection overlay, but no missing-output).
+    try:
+        from PIL import Image as _PIL_I2
+        a8 = np.clip(np.asarray(arr).astype(np.float32), 0, 255).astype(np.uint8)
+        if a8.ndim == 2:
+            annot = _PIL_I2.fromarray(a8).convert("RGB")
+        else:
+            annot = _PIL_I2.fromarray(a8[..., :3]).convert("RGB")
+    except Exception as _e2:
+        print(f"[band-picker] raw fallback also failed: {_e2}", file=_sys.stderr)
+
+# Stage 2: draw the band rectangles. Done in its own try block so a
+# font / draw failure doesn't drop the image we already built.
+if annot is not None:
+    try:
+        draw = _PIL_D.Draw(annot)
+        PALETTE = ["#1976d2", "#43a047", "#e65100", "#8e24aa", "#00838f",
+                   "#c62828", "#5d4037", "#558b2f", "#6a1b9a", "#00695c"]
+        level_to_color = {}
+        for r in rows:
+            lv = str(r.get("level") or "Target")
+            if lv not in level_to_color:
+                level_to_color[lv] = PALETTE[len(level_to_color) % len(PALETTE)]
+        # Try to load DejaVuSans (bundled in the sidecar); fall back to the
+        # PIL default font. font.size is unreliable across Pillow versions
+        # for the default font, so we cache a fallback size separately.
+        try:
+            target_font_size = max(10, int(min(H, W) * 0.012))
+            font = _PIL_F.truetype("DejaVuSans.ttf", target_font_size)
+        except Exception:
+            font = _PIL_F.load_default()
+            target_font_size = 14
+        # Use getattr — Pillow's bitmap default doesn't have .size on
+        # every version, but FreeTypeFont does. Either way we fall back.
+        font_size = int(getattr(font, "size", None) or target_font_size)
+        for band in (CFG.get("lanes", []) or []):
+            try:
+                x0, y0, x1, y1 = _px(band)
+                if x1 <= x0 or y1 <= y0: continue
+                lv = (band.get("level") or "Target").strip() or "Target"
+                col = level_to_color.get(lv, PALETTE[0])
+                nm = (band.get("name") or "").strip()
+                sw = max(1, int(round(min(H, W) / 600)))
+                is_lc_band = lc_enabled and lc_by_lane.get(str(band.get("label") or ""), "") == nm
+                draw.rectangle([x0, y0, x1 - 1, y1 - 1], outline=col, width=sw)
+                if is_lc_band:
+                    draw.rectangle([x0 + sw, y0 + sw, x1 - sw - 1, y1 - sw - 1], outline=col, width=max(1, sw // 2))
+                label_y = max(0, y0 - int(font_size * 1.1) - 2)
+                draw.text((x0 + 2, label_y), nm or "?", fill=col, font=font)
+            except Exception as _be:
+                print(f"[band-picker] band draw skipped ({band.get('name', '?')}): {_be}", file=_sys.stderr)
+        if lc_enabled:
+            for lb in (CFG.get("laneBounds", []) or []):
+                try:
+                    lx0 = int(round(float(lb.get("x1", 0)) * W))
+                    lx1 = int(round(float(lb.get("x2", 0)) * W))
+                    ly0 = int(round(float(lb.get("y1", 0)) * H))
+                    ly1 = int(round(float(lb.get("y2", 0)) * H))
+                    if lx1 > lx0 and ly1 > ly0:
+                        draw.rectangle([lx0, ly0, lx1 - 1, ly1 - 1], outline="#2196f3", width=1)
+                except Exception: pass
+    except Exception as _de:
+        print(f"[band-picker] band-overlay draw failed: {_de}", file=_sys.stderr)
+
+# Stage 3: cap + emit. ALWAYS runs if we have any annot image at all.
+if annot is not None:
+    try:
+        SAVE_MAX_W = 3000
+        if annot.width > SAVE_MAX_W:
+            ratio = SAVE_MAX_W / annot.width
+            annot = annot.resize((SAVE_MAX_W, max(1, int(round(annot.height * ratio)))), _PIL_I.LANCZOS)
+        mpfig_image(annot, name="annotated_bands")
+        print(f"emitted annotated_bands ({annot.width}x{annot.height})")
+    except Exception as _ee:
+        print(f"[band-picker] mpfig_image emit failed: {_ee}", file=_sys.stderr)
+else:
+    print("[band-picker] no annotated image could be built — see errors above", file=_sys.stderr)
 `;
 }
 
