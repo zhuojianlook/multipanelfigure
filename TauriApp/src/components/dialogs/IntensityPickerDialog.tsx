@@ -601,11 +601,18 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     return m;
   }, [cfg.groups]);
 
-  // ── Live preview fetcher ──
-  // Debounce param changes so the user can drag a slider without firing
-  // a flurry of overlapping requests. AbortController cancels in-flight
-  // calls when params change again so we always show the LATEST result.
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // ── Preview fetcher ──
+  // The preview ONLY runs when the user explicitly clicks "Run preview"
+  // (or when they cycle to a new image — a deliberate user action that
+  // does want a fresh overlay). Auto-refresh on every slider drag is
+  // disabled: Cellpose is heavy enough that an accidental flurry of
+  // requests stalls the sidecar, and even threshold tweaks deserve a
+  // chance to settle before the user commits to a re-fetch.
+  //
+  // `paramsDirty` tracks whether any preview-relevant param has changed
+  // since the last successful preview, so the Run button can pulse to
+  // tell the user "your tweaks aren't reflected in the overlay yet".
+  const [paramsDirty, setParamsDirty] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const fetchPreview = useCallback(async () => {
     if (!open || !activeImage) return;
@@ -673,6 +680,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
           n_cells: typeof data.n_cells === "number" ? data.n_cells : undefined,
           per_channel: data.per_channel,
         });
+        setParamsDirty(false);    // current overlay reflects current params
       } else {
         setPreviewError(data.error || "preview failed");
         setPreviewSrc(null);
@@ -686,15 +694,30 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     }
   }, [open, activeImage, cfg.mode, cfg.rollingRadius, cfg.thresholds, cfg.cellpose]);
 
-  // Debounced auto-fetch: any param / image change → preview after 250ms idle.
-  // Cellpose is heavier, so use a longer debounce there.
+  // Auto-fetch ONLY on image cycle (a deliberate user action that wants
+  // a fresh overlay for the newly-shown image). Param changes leave the
+  // previous overlay in place and just mark the params dirty — the user
+  // clicks Run to commit.
+  useEffect(() => {
+    if (!open || !activeImage) return;
+    // Clear the previous image's stats so the footer doesn't lie about
+    // the new image while the next preview is being fetched.
+    setPreviewStats(null);
+    setParamsDirty(false);
+    void fetchPreview();
+    // We intentionally depend ONLY on activeIdx + open, so changing
+    // strategy/thresholds doesn't trigger an auto-fetch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, activeIdx]);
+
+  // Mark the preview as out-of-date whenever a preview-relevant param
+  // changes. Doesn't fire any fetch — just lights up the Run button so
+  // the user knows the current overlay isn't the latest.
   useEffect(() => {
     if (!open) return;
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    const wait = cfg.mode === "cellpose" ? 600 : 250;
-    debounceRef.current = setTimeout(() => { void fetchPreview(); }, wait);
-    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
-  }, [open, fetchPreview, cfg.mode]);
+    setParamsDirty(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cfg.mode, cfg.rollingRadius, cfg.thresholds, cfg.cellpose]);
 
   const setChannel = useCallback((k: keyof FluorChannels, v: string) => {
     setCfg((c) => ({ ...c, channels: { ...c.channels, [k]: v } }));
@@ -780,11 +803,18 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                 </IconButton>
               </span>
             </Tooltip>
-            <Tooltip title="Refresh preview">
+            <Tooltip title={paramsDirty
+              ? "Preview is out of date — click to re-run the segmentation with the current settings"
+              : "Re-run the segmentation preview"}>
               <span>
-                <IconButton size="small" onClick={() => void fetchPreview()} disabled={!activeImage}>
-                  <RefreshIcon sx={{ fontSize: 18 }} />
-                </IconButton>
+                <Button size="small" variant={paramsDirty ? "contained" : "outlined"}
+                  color={paramsDirty ? "primary" : "inherit"}
+                  startIcon={<RefreshIcon sx={{ fontSize: 16 }} />}
+                  onClick={() => void fetchPreview()}
+                  disabled={!activeImage || previewLoading}
+                  sx={{ textTransform: "none", fontSize: "0.72rem", py: 0.25, px: 1, minWidth: 0 }}>
+                  Run preview
+                </Button>
               </span>
             </Tooltip>
           </Box>

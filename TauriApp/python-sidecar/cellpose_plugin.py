@@ -304,10 +304,29 @@ def install_stream():
         # Ensure pip exists (CLT pythons sometimes ship without it in the venv).
         subprocess.run([vpy, "-m", "ensurepip", "--upgrade"], capture_output=True, text=True, timeout=180)
 
-    # 2) Install/upgrade cellpose + its I/O deps, streaming pip output.
+    # 2) Bootstrap the venv's packaging toolchain. Some user-supplied
+    #    Pythons (and some venv creations) end up without the `packaging`
+    #    module wired in, which makes `from cellpose import models` fail
+    #    with "No module named 'packaging'" even after cellpose itself
+    #    installs cleanly. Upgrading pip + (re)installing setuptools /
+    #    wheel / packaging FIRST fixes that — and an existing user can
+    #    re-run "Install Cellpose 3" to repair an env that hit this trap.
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
     env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    yield emit("bootstrap: upgrading pip + setuptools + wheel + packaging")
+    boot = subprocess.run(
+        [vpy, "-u", "-m", "pip", "install", "--upgrade", "--no-input",
+         "pip", "setuptools", "wheel", "packaging"],
+        capture_output=True, text=True, timeout=600, env=env,
+    )
+    for line in (boot.stdout or "").splitlines() + (boot.stderr or "").splitlines():
+        if line.strip():
+            yield emit(line.rstrip())
+    if boot.returncode != 0:
+        yield emit("warning: bootstrap returned %d (continuing — pip may still work)" % boot.returncode)
+
+    # 3) Install/upgrade cellpose + its I/O deps, streaming pip output.
     cmd = [vpy, "-u", "-m", "pip", "install", "--upgrade", "--no-input",
            "--progress-bar", "on", "cellpose", "numpy", "pillow"]
     yield emit("pip install --upgrade cellpose numpy pillow (may take 5–15 min, ~500 MB)")

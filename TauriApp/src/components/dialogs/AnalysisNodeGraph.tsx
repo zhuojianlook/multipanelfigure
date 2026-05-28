@@ -4852,19 +4852,36 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         name: src.label,
       });
     }
-    const seen = new Set<string>();
+    // Preserve EVERY image input — earlier we deduped by label, which
+    // silently dropped legitimate distinct images that happened to share a
+    // display name (e.g., two insets named "image1" from different docs).
+    // If two inputs share a label, the cycler suffixes them as "label #1",
+    // "label #2", … so the user can still tell them apart AND so the
+    // group-assignment chips don't collide.
+    const labelCounts = new Map<string, number>();
     const pickerImages: FluorPickerImage[] = [];
     for (const x of ins) {
       if (x.kind !== "image") continue;
-      const lbl = (x.label || "").split("/").pop() || x.label;
-      if (!lbl || seen.has(lbl)) continue;
-      seen.add(lbl);
+      const baseLbl = (x.label || "").split("/").pop() || x.label || "image";
+      const seen = labelCounts.get(baseLbl) || 0;
+      labelCounts.set(baseLbl, seen + 1);
       // Source-node inputs key as inset_<i>_<src.key>; pull the descriptor.
       // Upstream-node outputs have no source descriptor — the dialog falls
       // back to the base64 thumbnail for preview.
       const skey = x.key.startsWith("inset_") ? x.key.split("_").slice(2).join("_") : "";
       const source = skey ? srcByKey.get(skey) : undefined;
-      pickerImages.push({ label: lbl, image_b64: x.image_b64 || "", source });
+      pickerImages.push({ label: baseLbl, image_b64: x.image_b64 || "", source });
+    }
+    // Second pass: when a label is shared by 2+ entries, suffix every
+    // occurrence with " #N" so each tile in the cycler has a unique name.
+    // Unique-label entries are left as-is.
+    const counters = new Map<string, number>();
+    for (const im of pickerImages) {
+      if ((labelCounts.get(im.label) || 0) > 1) {
+        const n = (counters.get(im.label) || 0) + 1;
+        counters.set(im.label, n);
+        im.label = `${im.label} #${n}`;
+      }
     }
     const node = nm.get(nodeId);
     const initialCfg = (node?.data.intensity as FluorIntensityConfig | undefined) || emptyFluorConfig();
