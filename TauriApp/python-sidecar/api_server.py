@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.314"
+SIDECAR_BUILD = "0.1.315"
 
 
 @app.get("/api/version")
@@ -7000,10 +7000,16 @@ class FluorChannelThreshold(BaseModel):
 
 
 class FluorCellposePreview(BaseModel):
-    model: str = "cpsam"
+    model: str = "cyto3"
     diameter: float = 0.0       # 0 = auto
-    seg_channel: str = "b"      # "r" | "g" | "b"
+    seg_channel: str = "b"      # "r" | "g" | "b" — cytoplasm / cell-body channel
+    nuclei_channel: Optional[str] = None    # "r" | "g" | "b" | None — DAPI for cyto3
     min_size: int = 30
+    # When True AND nuclei_channel is set, the PREVIEW additionally runs
+    # cellpose's `nuclei` model on the nuclei channel so the user can
+    # see both cell + nucleus outlines on the composite. Doesn't change
+    # the rest of the response shape.
+    measure_compartments: bool = False
 
 
 class FluorPreviewRequest(BaseModel):
@@ -7106,11 +7112,15 @@ def fluor_preview_segment(body: FluorPreviewRequest):
         # ping back to ourselves.
         cp = body.cellpose or FluorCellposePreview()
         seg_ch = {"r": 1, "g": 2, "b": 3}.get((cp.seg_channel or "b").lower(), 3)
+        # Nuclei channel for cyto3. 0 = no nuclei input (single-channel
+        # form). When set, cyto3 produces noticeably better whole-cell
+        # boundaries (it was trained on both inputs).
+        nuc_ch = {"r": 1, "g": 2, "b": 3}.get((cp.nuclei_channel or "").lower(), 0)
         cfg = {
-            "model": cp.model or "cpsam",
+            "model": cp.model or "cyto3",
             "diameter": float(cp.diameter or 0) or None,
             "min_size": int(cp.min_size or 30),
-            "channels": [seg_ch, 0],
+            "channels": [seg_ch, nuc_ch],
             # Try GPU acceleration. cellpose-pytorch picks the best backend
             # available — CUDA on Nvidia, MPS (Metal Performance Shaders)
             # on Apple Silicon, falls back to CPU when neither works. Net
@@ -7161,19 +7171,54 @@ def fluor_preview_segment(body: FluorPreviewRequest):
             return {"success": False, "overlay_b64": "",
                     "error": f"labels decode failed: {_e}"}
 
-        # Draw yellow boundaries on the composite. Use SYMMETRIC 4-neighbour
-        # transitions (above/below AND left/right) so the boundary line
-        # sits on top of the actual cell edge, not 1 pixel above it.
-        b_up    = _np.zeros(labels.shape, dtype=bool)
-        b_down  = _np.zeros(labels.shape, dtype=bool)
-        b_left  = _np.zeros(labels.shape, dtype=bool)
-        b_right = _np.zeros(labels.shape, dtype=bool)
-        b_up[1:, :]    = labels[1:, :]    != labels[:-1, :]
-        b_down[:-1, :] = labels[:-1, :]   != labels[1:, :]
-        b_left[:, 1:]  = labels[:, 1:]    != labels[:, :-1]
-        b_right[:, :-1]= labels[:, :-1]   != labels[:, 1:]
-        boundaries = (b_up | b_down | b_left | b_right) & (labels > 0)
-        composite[boundaries] = (255, 255, 0)
+        # Optional second pass: nuclei model on the nuclei channel.
+        # Only when the user enabled "measure compartments" AND set a
+        # nuclei channel. Lets the preview show both cell + nucleus
+        # outlines so the user can verify both segmentations.
+        nucleus_labels = None
+        n_nuclei = 0
+        if bool(cp.measure_compartments) and nuc_ch > 0:
+            try:
+                ncfg = {**cfg, "model": "nuclei", "channels": [nuc_ch, 0]}
+                _t1 = _tm.monotonic()
+                nres = cellpose_plugin.run([("preview_nuc", arr_u8)], ncfg, 600)
+                print(f"[fluor-preview] cellpose nuclei-pass finished in {_tm.monotonic() - _t1:.1f}s",
+                      file=__s.stderr, flush=True)
+                if nres.get("success"):
+                    nlbl_b64 = next((im["image"] for im in (nres.get("images") or [])
+                                     if im.get("name") == "preview_nuc_labels"), None)
+                    if nlbl_b64:
+                        nucleus_labels = _np.asarray(
+                            Image.open(io.BytesIO(base64.b64decode(nlbl_b64))).convert("L")
+                        ).astype(_np.int32)
+                        if nucleus_labels.shape[:2] != labels.shape[:2] and _have_cv:
+                            nucleus_labels = _cv2.resize(
+                                nucleus_labels, (labels.shape[1], labels.shape[0]),
+                                interpolation=_cv2.INTER_NEAREST,
+                            )
+                        n_nuclei = int(len(_np.unique(nucleus_labels[nucleus_labels > 0])))
+            except Exception as _ne:
+                print(f"[fluor-preview] nuclei-pass failed (continuing without): {_ne}",
+                      file=__s.stderr, flush=True)
+
+        # Helper: symmetric 4-neighbour boundary on a label image.
+        def _symmetric_boundary(lbl):
+            b_up    = _np.zeros(lbl.shape, dtype=bool)
+            b_down  = _np.zeros(lbl.shape, dtype=bool)
+            b_left  = _np.zeros(lbl.shape, dtype=bool)
+            b_right = _np.zeros(lbl.shape, dtype=bool)
+            b_up[1:, :]    = lbl[1:, :]    != lbl[:-1, :]
+            b_down[:-1, :] = lbl[:-1, :]   != lbl[1:, :]
+            b_left[:, 1:]  = lbl[:, 1:]    != lbl[:, :-1]
+            b_right[:, :-1]= lbl[:, :-1]   != lbl[:, 1:]
+            return (b_up | b_down | b_left | b_right) & (lbl > 0)
+
+        # Yellow cell outlines.
+        composite[_symmetric_boundary(labels)] = (255, 255, 0)
+        # Cyan nuclei outlines on top (when present), so they're
+        # distinguishable from the cell boundaries.
+        if nucleus_labels is not None:
+            composite[_symmetric_boundary(nucleus_labels)] = (96, 220, 255)
         n_cells = int(len(_np.unique(labels[labels > 0])))
         # Emit overlay PNG.
         _buf = io.BytesIO()
@@ -7184,6 +7229,7 @@ def fluor_preview_segment(body: FluorPreviewRequest):
             "src_w": int(src_w0), "src_h": int(src_h0),
             "preview_w": int(w), "preview_h": int(h),
             "n_cells": n_cells,
+            "n_nuclei": n_nuclei,
         }
 
     # ── Simple strategy: per-channel threshold. ──────────────────

@@ -52,14 +52,27 @@ export interface FluorGroup {
   images: string[];
 }
 export interface FluorCellpose {
-  /** Cellpose 4 model name. "cpsam" = the SAM-based default. */
+  /** Cellpose 4 model name. "cyto3" = the recommended cell-body model
+   *  (default; ~25 MB, ~3x faster than cpsam). */
   model: string;
   /** Object diameter prior in px. 0 = auto-estimate. */
   diameter: number;
-  /** Which channel to segment ON (cells / nuclei). */
+  /** Which channel carries the cell-body / cytoplasm signal for the
+   *  cyto3/cpsam segmentation. Cellpose's "channels[0]". */
   segChannel: "r" | "g" | "b";
+  /** Optional NUCLEI channel — DAPI / Hoechst. When set, cyto3 uses it
+   *  as its nuclei input (channels[1]), which the model was trained on
+   *  and produces noticeably better whole-cell boundaries than the
+   *  single-channel form. ALSO required for "measureCompartments". */
+  nucleiChannel?: "r" | "g" | "b" | null;
   /** Min object size in px² — filters out spurious tiny masks. */
   minSize: number;
+  /** When true AND nucleiChannel is set, run a SECOND cellpose pass
+   *  with the `nuclei` model on the nuclei channel, then emit per-cell
+   *  measurements separately for WHOLE-CELL / NUCLEUS / CYTOPLASM
+   *  compartments. Doubles cellpose cost but lets you compare e.g.
+   *  nuclear-vs-cytoplasmic localisation of a target. */
+  measureCompartments?: boolean;
 }
 
 /** Per-channel threshold knobs for the SIMPLE strategy. Each channel
@@ -147,7 +160,10 @@ export function emptyFluorConfig(): FluorIntensityConfig {
     // ~3x faster inference, works great on most fluorescence cell
     // types. Users can switch to cpsam in the dropdown when they need
     // its higher-accuracy segmentation.
-    cellpose: { model: "cyto3", diameter: 0, segChannel: "b", minSize: 80 },
+    cellpose: {
+      model: "cyto3", diameter: 0, segChannel: "b",
+      nucleiChannel: null, measureCompartments: false, minSize: 80,
+    },
     controlChannel: null,
     groups: [],
   };
@@ -349,16 +365,16 @@ def _upsize_labels(lbl_arr, target_h, target_w):
     return _cv2.resize(lbl_arr.astype(np.int32), (target_w, target_h),
                        interpolation=_cv2.INTER_NEAREST).astype(np.int32)
 
-def _cellpose_labels_batch(items):
+def _cellpose_labels_batch(items, model, channels):
     """BATCH cellpose over multiple images in ONE subprocess call so the
     ~100-MB cpsam model loads only ONCE (vs once per image when calling
     image-by-image — that was the dominant cost). "items" = list of
     (label, a8_rgb_native) tuples. Returns {label: labels_array_native_res}
     + per-image error map for the ones that failed.
 
-    Each image is downsized to CELLPOSE_MAX_EDGE for inference, then
-    its labels are NN-upscaled back to native resolution so stats are
-    measured on the original pixels."""
+    "model" and "channels" are passed through so the SAME function can
+    run the cell-body pass (cyto3 with [cyto, nuclei]) AND the nucleus
+    pass (nuclei with [nuc, 0]) for compartment measurement."""
     sent = []
     scales = {}    # label → scale factor applied (1.0 = no resize)
     sizes_native = {}  # label → (h, w) at native res
@@ -372,10 +388,10 @@ def _cellpose_labels_batch(items):
         })
     payload = json.dumps({
         "config": json.dumps({
-            "model": cp_cfg.get("model") or "cpsam",
+            "model": model,
             "diameter": float(cp_cfg.get("diameter") or 0) or None,
             "min_size": int(cp_cfg.get("minSize") or 30),
-            "channels": [{"r": 1, "g": 2, "b": 3}.get(cp_cfg.get("segChannel") or "b", 3), 0],
+            "channels": channels,
             # Use GPU when available (CUDA / Apple Silicon MPS). Falls
             # back to CPU automatically if neither is compiled in.
             "use_gpu": True,
@@ -383,8 +399,8 @@ def _cellpose_labels_batch(items):
         "extra_inputs": sent,
         "sources": [], "timeout_sec": 600,
     })
-    print(f"[intensity] cellpose: batching {len(sent)} image(s) into one model load "
-          f"(cap {CELLPOSE_MAX_EDGE}px per edge, model={cp_cfg.get('model') or 'cpsam'})")
+    print(f"[intensity] cellpose ({model}, channels={channels}): batching {len(sent)} image(s) into one model load "
+          f"(cap {CELLPOSE_MAX_EDGE}px per edge)")
     try:
         req = _ur.Request("http://127.0.0.1:8765/api/analysis/run-cellpose",
                           data=payload.encode("utf-8"),
@@ -455,13 +471,41 @@ if mode == "cellpose":
         prepared.append((key, src, label, grp, raw, corrected, a8))
     if not prepared:
         raise SystemExit("[intensity] no images are in any group — assign images to groups in the picker.")
-    # Second pass: ONE cellpose call for the whole batch.
+    # Second pass: ONE cellpose call for the whole batch — for WHOLE-CELL
+    # segmentation. cyto3 (the default) uses both the cytoplasm channel
+    # AND the nuclei channel (when set) for noticeably better cell
+    # boundaries; that's "channels: [seg_ch, nuc_ch]".
+    seg_idx = {"r": 1, "g": 2, "b": 3}.get(cp_cfg.get("segChannel") or "b", 3)
+    nuc_key = (cp_cfg.get("nucleiChannel") or "").lower()
+    nuc_idx = {"r": 1, "g": 2, "b": 3}.get(nuc_key, 0)
+    measure_compartments = bool(cp_cfg.get("measureCompartments")) and nuc_idx > 0
     print(f"[intensity] cellpose: starting batch run on {len(prepared)} image(s) — "
-          f"the model loads once (first run on a machine downloads ~100 MB)")
+          f"the model loads once (first run on a machine downloads weights)")
     _cp_t0 = __import__("time").monotonic()
-    labels_by_label, cp_errors = _cellpose_labels_batch([(p[2], p[6]) for p in prepared])
-    print(f"[intensity] cellpose: batch finished in {__import__('time').monotonic() - _cp_t0:.1f}s "
+    labels_by_label, cp_errors = _cellpose_labels_batch(
+        [(p[2], p[6]) for p in prepared],
+        cp_cfg.get("model") or "cyto3",
+        [seg_idx, nuc_idx],
+    )
+    print(f"[intensity] cellpose cell-pass: {__import__('time').monotonic() - _cp_t0:.1f}s "
           f"({len(labels_by_label)} ok, {len(cp_errors)} failed)")
+    # Optional second cellpose pass: nuclei model on the nuclei channel.
+    # Only when the user enabled "measure compartments" AND set a nuclei
+    # channel. Returns per-image nucleus_labels at native resolution.
+    nuclei_by_label = {}
+    if measure_compartments:
+        print(f"[intensity] cellpose: starting nuclei-pass on {len(prepared)} image(s) (model=nuclei)")
+        _np_t0 = __import__("time").monotonic()
+        nuclei_by_label, _ne = _cellpose_labels_batch(
+            [(p[2], p[6]) for p in prepared],
+            "nuclei",
+            [nuc_idx, 0],
+        )
+        print(f"[intensity] cellpose nuclei-pass: {__import__('time').monotonic() - _np_t0:.1f}s "
+              f"({len(nuclei_by_label)} ok, {len(_ne)} failed)")
+    # Per-image control mean (for Gap 3 normalization). Computed after
+    # the per-cell loop — initialize empty here.
+    image_ctrl_mean = {}
     # Third pass: per-image stats from the batched labels.
     for (_key, _src, label, grp, raw, corrected, _a8) in prepared:
         lbl_arr = labels_by_label.get(label)
@@ -488,29 +532,69 @@ if mode == "cellpose":
             print(f"[intensity] {label}: 0 cells above area {min_area} — skipped")
             continue
         n_images_with_cells += 1
+        # Optional nucleus labels for this image — used to derive the
+        # per-cell nuclear ROI when measure_compartments is on. We use
+        # cell ∩ nuclei to keep each cell's nucleus paired to ITS cell.
+        nuc_lbl = nuclei_by_label.get(label) if measure_compartments else None
+        if nuc_lbl is not None and nuc_lbl.shape[:2] != raw.shape[:2]:
+            print(f"[intensity] {label}: nucleus labels shape mismatch — ignoring nuclei", file=_sys.stderr)
+            nuc_lbl = None
+        # Collect control-channel BG-corrected means PER CELL so we can
+        # compute the per-image mean control signal (used for Gap 3
+        # normalization: mean_intensity_norm = mean_intensity / img_ctrl).
+        ctrl_per_cell = []
+        ctrl_ci = {"R": 0, "G": 1, "B": 2}.get(str(control_key).upper(), -1) if control_key else -1
         for cid in cell_ids:
-            m = labels == cid
-            area = int(m.sum())
-            ys, xs = np.where(m)
-            for ci, ck in enumerate(("R", "G", "B")):
-                rv = raw[..., ci][m].astype(np.float64)
-                cv = corrected[..., ci][m]
-                rows.append({
-                    "source": label,
-                    "group": grp,
-                    "channel": ch_name[ck],
-                    "is_control": (control_name is not None and ch_name[ck] == control_name),
-                    "object_id": int(cid),
-                    "area_px": area,
-                    "centroid_x": float(np.mean(xs)) if xs.size else 0.0,
-                    "centroid_y": float(np.mean(ys)) if ys.size else 0.0,
-                    "raw_mean": float(np.mean(rv)),
-                    "raw_integrated_density": float(np.sum(rv)),
-                    "background_corrected_mean": float(np.mean(cv)),
-                    "background_corrected_integrated_density": float(np.sum(cv)),
-                    "mean_intensity": float(np.mean(cv)),
-                    "max_intensity": float(np.max(rv)),
-                })
+            cell_mask = labels == cid
+            cell_area = int(cell_mask.sum())
+            ys, xs = np.where(cell_mask)
+            # Compartments:
+            #  - "whole" — full cellpose cyto3 mask (cell body)
+            #  - "nucleus" — cell ∩ any nucleus label
+            #  - "cytoplasm" — cell − nucleus
+            compartments = [("whole_cell", cell_mask)]
+            if nuc_lbl is not None:
+                nuc_in_cell = cell_mask & (nuc_lbl > 0)
+                cyto_in_cell = cell_mask & ~nuc_in_cell
+                if int(nuc_in_cell.sum()) > 0:
+                    compartments.append(("nucleus", nuc_in_cell))
+                if int(cyto_in_cell.sum()) > 0:
+                    compartments.append(("cytoplasm", cyto_in_cell))
+            # Track control-channel mean over the WHOLE cell for the
+            # per-image normalization step (one per cell, averaged across
+            # cells per image later).
+            if ctrl_ci >= 0:
+                ctrl_vals = corrected[..., ctrl_ci][cell_mask]
+                if ctrl_vals.size > 0:
+                    ctrl_per_cell.append(float(np.mean(ctrl_vals)))
+            for compartment, m in compartments:
+                if int(m.sum()) == 0: continue
+                m_area = int(m.sum())
+                for ci, ck in enumerate(("R", "G", "B")):
+                    rv = raw[..., ci][m].astype(np.float64)
+                    cv = corrected[..., ci][m]
+                    rows.append({
+                        "source": label,
+                        "group": grp,
+                        "channel": ch_name[ck],
+                        "compartment": compartment,
+                        "is_control": (control_name is not None and ch_name[ck] == control_name),
+                        "object_id": int(cid),
+                        "area_px": m_area,
+                        "cell_area_px": cell_area,
+                        "centroid_x": float(np.mean(xs)) if xs.size else 0.0,
+                        "centroid_y": float(np.mean(ys)) if ys.size else 0.0,
+                        "raw_mean": float(np.mean(rv)),
+                        "raw_integrated_density": float(np.sum(rv)),
+                        "background_corrected_mean": float(np.mean(cv)),
+                        "background_corrected_integrated_density": float(np.sum(cv)),
+                        "mean_intensity": float(np.mean(cv)),
+                        "max_intensity": float(np.max(rv)),
+                    })
+        # Per-image control mean (for normalization step below). Skipped
+        # when there's no control channel or no cells with control signal.
+        if ctrl_per_cell:
+            image_ctrl_mean[label] = float(np.mean(ctrl_per_cell))
         # ── Per-image outputs: labeled-mask PNG + outline-overlay PNG. ──
         try:
             # 1) Labeled mask (raw labels as 16-bit greyscale → palette-mapped
@@ -548,7 +632,24 @@ if mode == "cellpose":
     if not rows:
         raise SystemExit("[intensity] cellpose produced no measurable cells across the inputs — "
                          "check the picker preview, then re-run.")
-    print(f"computed per-cell intensities across {n_images_with_cells} image(s)")
+    # Gap 3: per-image control normalization. For each row, divide its
+    # mean_intensity by the image's mean control-channel intensity (over
+    # the WHOLE-cell compartment). Cancels exposure differences between
+    # images. Only computed when control_name is set AND we measured
+    # control intensity on enough cells.
+    if control_name and image_ctrl_mean:
+        for r in rows:
+            ctrl = image_ctrl_mean.get(r["source"])
+            if ctrl and ctrl > 0:
+                r["per_image_control_mean"] = ctrl
+                r["mean_intensity_norm"] = float(r["mean_intensity"] / ctrl)
+            else:
+                r["per_image_control_mean"] = None
+                r["mean_intensity_norm"] = None
+    n_compart = len({r.get("compartment", "whole_cell") for r in rows})
+    print(f"computed per-cell intensities across {n_images_with_cells} image(s); "
+          f"compartments={n_compart}; "
+          f"normalization={'on' if (control_name and image_ctrl_mean) else 'off'}")
     mpfig_data(rows, name="fluor_intensities")
     raise SystemExit(0)
 
@@ -658,9 +759,31 @@ for key, src in imgs:
 if not rows:
     raise SystemExit("[intensity] no channels above threshold across the inputs — "
                      "tweak the picker thresholds and re-run.")
+# Gap 3 (simple mode): per-image control normalization. Group rows by
+# source, find the control-channel row, divide every channel's mean
+# intensity by it. Cancels exposure differences between images.
+if control_name:
+    from collections import defaultdict as _dd
+    ctrl_per_source = {}
+    for r in rows:
+        if r.get("is_control") and r.get("source") and r.get("mean_intensity") is not None:
+            ctrl_per_source[r["source"]] = float(r["mean_intensity"])
+    for r in rows:
+        ctrl = ctrl_per_source.get(r.get("source"))
+        if ctrl and ctrl > 0:
+            r["per_image_control_mean"] = ctrl
+            r["mean_intensity_norm"] = float(r["mean_intensity"] / ctrl)
+        else:
+            r["per_image_control_mean"] = None
+            r["mean_intensity_norm"] = None
+# Simple mode rows don't have a compartment — tag them as whole_cell
+# so the downstream R plot can use the same column.
+for r in rows:
+    r.setdefault("compartment", "whole_cell")
 print(f"computed channel intensities for {len(imgs)} image(s); "
       f"groups = {sorted({r['group'] for r in rows})}; "
-      f"control = {control_name or '<none>'}")
+      f"control = {control_name or '<none>'}; "
+      f"normalization={'on' if control_name else 'off'}")
 mpfig_data(rows, name="fluor_intensities")
 `;
 }
@@ -915,7 +1038,9 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
           model: cfg.cellpose.model,
           diameter: cfg.cellpose.diameter,
           seg_channel: cfg.cellpose.segChannel,
+          nuclei_channel: cfg.cellpose.nucleiChannel || null,
           min_size: cfg.cellpose.minSize,
+          measure_compartments: !!cfg.cellpose.measureCompartments,
         };
       }
       // Hard client-side timeout so the spinner can't get stuck forever
@@ -1700,13 +1825,8 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                 })}
               </Box>
             ) : (
-              // Cellpose params, compact. Diameter + min-size default
-                // to AUTO and are buried behind an Advanced disclosure —
-                // for typical fluorescence cell sizes the auto values are
-                // fine, and exposing them at top level just confuses
-                // users. Model + Segment-on stay top-level since they
-                // change frequently per experiment.
               <Box sx={{ display: "flex", flexDirection: "column", gap: 0.75 }}>
+                {/* Row 1 — model + segment-on channel. */}
                 <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1 }}>
                   <TextField select size="small" label="Model" value={cfg.cellpose.model}
                     onChange={(e) => setCellpose({ model: e.target.value })}
@@ -1718,22 +1838,73 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                     <MenuItem value="cyto2" sx={{ fontSize: "0.78rem" }}>cyto2</MenuItem>
                     <MenuItem value="nuclei" sx={{ fontSize: "0.78rem" }}>nuclei</MenuItem>
                   </TextField>
-                  <TextField select size="small" label="Segment on" value={cfg.cellpose.segChannel}
-                    onChange={(e) => setCellpose({ segChannel: e.target.value as "r" | "g" | "b" })}
-                    inputProps={{ style: { fontSize: "0.78rem" } }}
-                    InputLabelProps={{ style: { fontSize: "0.78rem" } }}
-                    SelectProps={SELECT_MENU_PROPS}>
-                    <MenuItem value="r" sx={{ fontSize: "0.78rem" }}>{cfg.channels.r}</MenuItem>
-                    <MenuItem value="g" sx={{ fontSize: "0.78rem" }}>{cfg.channels.g}</MenuItem>
-                    <MenuItem value="b" sx={{ fontSize: "0.78rem" }}>{cfg.channels.b}</MenuItem>
-                  </TextField>
+                  <Tooltip title="Channel cellpose uses as the cell-body / cytoplasm signal. cyto3 uses this PLUS the nuclei channel below to find whole-cell boundaries.">
+                    <TextField select size="small" label="Cell channel" value={cfg.cellpose.segChannel}
+                      onChange={(e) => setCellpose({ segChannel: e.target.value as "r" | "g" | "b" })}
+                      inputProps={{ style: { fontSize: "0.78rem" } }}
+                      InputLabelProps={{ style: { fontSize: "0.78rem" } }}
+                      SelectProps={SELECT_MENU_PROPS}>
+                      <MenuItem value="r" sx={{ fontSize: "0.78rem" }}>{cfg.channels.r}</MenuItem>
+                      <MenuItem value="g" sx={{ fontSize: "0.78rem" }}>{cfg.channels.g}</MenuItem>
+                      <MenuItem value="b" sx={{ fontSize: "0.78rem" }}>{cfg.channels.b}</MenuItem>
+                    </TextField>
+                  </Tooltip>
                 </Box>
-                {/* Auto-by-default + advanced disclosure. Setting
-                    diameter=0 in our config maps to None server-side,
-                    which makes cellpose auto-estimate the diameter from
-                    image content; min-size has a sane default (30 px²)
-                    that the user only needs to touch for unusually
-                    large/small cells. */}
+                {/* Row 2 — nuclei channel (DAPI) + compartment toggle. */}
+                <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1, alignItems: "center" }}>
+                  <Tooltip title="DAPI / Hoechst channel. Passing this to cyto3 gives noticeably better whole-cell boundaries (the model was trained on both inputs). ALSO required for 'Measure compartments' below.">
+                    <TextField select size="small" label="Nuclei channel" value={cfg.cellpose.nucleiChannel ?? ""}
+                      onChange={(e) => setCellpose({ nucleiChannel: (e.target.value || null) as "r" | "g" | "b" | null })}
+                      inputProps={{ style: { fontSize: "0.78rem" } }}
+                      InputLabelProps={{ style: { fontSize: "0.78rem" } }}
+                      SelectProps={SELECT_MENU_PROPS}>
+                      <MenuItem value="" sx={{ fontSize: "0.78rem" }}>— none —</MenuItem>
+                      <MenuItem value="r" sx={{ fontSize: "0.78rem" }}>{cfg.channels.r}</MenuItem>
+                      <MenuItem value="g" sx={{ fontSize: "0.78rem" }}>{cfg.channels.g}</MenuItem>
+                      <MenuItem value="b" sx={{ fontSize: "0.78rem" }}>{cfg.channels.b}</MenuItem>
+                    </TextField>
+                  </Tooltip>
+                  <Tooltip title={cfg.cellpose.nucleiChannel
+                    ? "When ON: also run cellpose's 'nuclei' model on the nuclei channel, then for each cell emit THREE rows (whole_cell / nucleus / cytoplasm). Lets you compare nuclear vs cytoplasmic localisation directly. Roughly doubles cellpose time."
+                    : "Pick a Nuclei channel first to enable compartment measurement."}>
+                    <Box
+                      onClick={() => {
+                        if (!cfg.cellpose.nucleiChannel) return;
+                        setCellpose({ measureCompartments: !cfg.cellpose.measureCompartments });
+                      }}
+                      sx={{
+                        cursor: cfg.cellpose.nucleiChannel ? "pointer" : "not-allowed",
+                        display: "flex", alignItems: "center", gap: 0.6,
+                        px: 0.75, py: 0.4, borderRadius: 0.5,
+                        border: "1px solid", borderColor: "divider",
+                        opacity: cfg.cellpose.nucleiChannel ? 1 : 0.5,
+                        userSelect: "none",
+                        bgcolor: cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel
+                          ? "primary.main" : "transparent",
+                        color: cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel
+                          ? "primary.contrastText" : "text.primary",
+                      }}>
+                      <Box sx={{
+                        width: 14, height: 14, borderRadius: 0.4,
+                        bgcolor: cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel
+                          ? "common.white" : "transparent",
+                        border: "1px solid",
+                        borderColor: cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel
+                          ? "common.white" : "text.secondary",
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        color: cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel
+                          ? "primary.main" : "transparent",
+                        fontSize: "0.78rem", fontWeight: 700,
+                      }}>
+                        {cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel ? "✓" : ""}
+                      </Box>
+                      <Typography variant="caption" sx={{ fontSize: "0.72rem", fontWeight: 600 }}>
+                        Measure compartments
+                      </Typography>
+                    </Box>
+                  </Tooltip>
+                </Box>
+                {/* Auto-by-default + advanced disclosure. */}
                 <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, flexWrap: "wrap" }}>
                   <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.65rem" }}>
                     Diameter + min-size are AUTO (recommended). Override:

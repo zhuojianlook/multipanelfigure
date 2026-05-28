@@ -2496,14 +2496,23 @@ function buildCornealHazeWorkflow(): SavedWorkflow {
 // "Configure intensity…" button on the node (and a "Run graph"
 // pauses there until the user clicks Save).
 
-const INTENSITY_PLOT_R = `# @name: Plot intensities (groups × channels, control panel)
+const INTENSITY_PLOT_R = `# @name: Plot intensities (groups × channels × compartments)
 # Per-channel comparison across user-defined groups (set in the
 # Intensity picker UI). Bars = group mean, error = SD, jittered raw
 # points overlaid, ANOVA + Tukey HSD pairwise brackets per channel.
-# When the picker marks a channel as the control (is_control == TRUE),
-# its panel is rendered separately and visually flagged when the
-# control's between-group test is significant (suggests the groups
-# may not be biologically comparable).
+#
+# Three Python-side enhancements this plot now consumes:
+#   - "compartment" column: when the picker's "Measure compartments"
+#     is ON, each cell emits THREE rows (whole_cell / nucleus /
+#     cytoplasm). The plot facets channel × compartment so each
+#     localisation gets its own panel.
+#   - "mean_intensity_norm": when a control channel is set, each
+#     row's mean intensity is also divided by the per-image control
+#     mean. A SECOND output (channel_intensity_norm.png) renders
+#     the same comparison on the normalised scale — cancels
+#     exposure / staining-intensity differences between images.
+#   - Control sanity panel as before — flagged red if between-
+#     group test rejects H0 (groups may not be comparable).
 suppressWarnings(suppressMessages({ library(ggplot2); library(ggprism) }))
 
 data <- inputs[[1]]
@@ -2511,23 +2520,33 @@ if (!"mean_intensity" %in% names(data)) data$mean_intensity <- 0
 if (!"channel" %in% names(data)) data$channel <- "Channel"
 if (!"group"   %in% names(data)) data$group   <- "all"
 if (!"is_control" %in% names(data)) data$is_control <- FALSE
+if (!"compartment" %in% names(data)) data$compartment <- "whole_cell"
 data$mean_intensity <- suppressWarnings(as.numeric(data$mean_intensity))
 data$is_control <- as.logical(data$is_control)
 data$is_control[is.na(data$is_control)] <- FALSE
 data <- data[is.finite(data$mean_intensity), , drop = FALSE]
 data$channel <- factor(data$channel, levels = unique(data$channel))
 data$group   <- factor(data$group,   levels = unique(data$group))
+data$compartment <- factor(data$compartment, levels = c("whole_cell", "nucleus", "cytoplasm"))
+# Drop empty compartment levels so we don't render empty facet rows.
+data$compartment <- droplevels(data$compartment)
+has_compartments <- nlevels(data$compartment) > 1
+has_norm <- ("mean_intensity_norm" %in% names(data)) &&
+            any(is.finite(suppressWarnings(as.numeric(data$mean_intensity_norm))))
+if (has_norm) data$mean_intensity_norm <- suppressWarnings(as.numeric(data$mean_intensity_norm))
 
-# Tukey HSD across groups within a single channel. Returns a data.frame
-# of pairwise comparisons (group1, group2, p.adj, label, sig) ready for
-# ggprism::add_pvalue. Empty df when fewer than 2 usable groups.
-.tukey_for <- function(sub) {
+# Tukey HSD across groups within a (channel, compartment) subset.
+# Returns a data.frame of pairwise comparisons (group1, group2, p.adj)
+# ready for ggprism::add_pvalue. y_col selects which column to test
+# ("mean_intensity" raw vs "mean_intensity_norm" normalised).
+.tukey_for <- function(sub, y_col) {
   grps <- intersect(levels(data$group), unique(as.character(sub$group)))
   usable <- grps[vapply(grps, function(gg) sum(sub$group == gg) >= 2, logical(1))]
   if (length(usable) < 2) return(NULL)
   sub2 <- sub[sub$group %in% usable, , drop = FALSE]
   sub2$group <- factor(sub2$group, levels = usable)
-  aov_res <- tryCatch(aov(mean_intensity ~ group, data = sub2), error = function(e) NULL)
+  fml <- as.formula(paste(y_col, "~ group"))
+  aov_res <- tryCatch(aov(fml, data = sub2), error = function(e) NULL)
   if (is.null(aov_res)) return(NULL)
   tk <- tryCatch(TukeyHSD(aov_res), error = function(e) NULL)
   if (is.null(tk)) return(NULL)
@@ -2535,81 +2554,106 @@ data$group   <- factor(data$group,   levels = unique(data$group))
   if (is.null(tk_mat) || nrow(tk_mat) == 0) return(NULL)
   pairs <- strsplit(rownames(tk_mat), "-", fixed = TRUE)
   data.frame(
-    group1   = vapply(pairs, function(p) p[2], character(1)),
-    group2   = vapply(pairs, function(p) p[1], character(1)),
-    p.adj    = tk_mat[, "p adj"],
+    group1 = vapply(pairs, function(p) p[2], character(1)),
+    group2 = vapply(pairs, function(p) p[1], character(1)),
+    p.adj  = tk_mat[, "p adj"],
     stringsAsFactors = FALSE
   )
 }
 
-# Build a brackets df for ggprism::add_pvalue: rows = {channel, group1,
-# group2, p.label, y.position}, with y.position stacked per channel.
-.brackets <- function(sub, ch_levels, summ) {
+# Build a brackets df for ggprism::add_pvalue across (channel × compartment)
+# facets so the stat lines stack per facet, not across them.
+.brackets <- function(sub, summ, y_col) {
   out <- list()
-  for (ch in ch_levels) {
-    s <- sub[sub$channel == ch, , drop = FALSE]
-    tk <- .tukey_for(s)
-    if (is.null(tk) || nrow(tk) == 0) next
-    tk <- tk[order(tk$p.adj), , drop = FALSE]
-    ymax <- max(summ$mean[summ$channel == ch] + summ$sd[summ$channel == ch], na.rm = TRUE)
-    if (!is.finite(ymax) || ymax <= 0) ymax <- max(s$mean_intensity, na.rm = TRUE)
-    step <- 0.13 * ymax
-    k <- 0
-    for (i in seq_len(nrow(tk))) {
-      pv <- tk$p.adj[i]
-      if (is.na(pv)) next
-      lab <- if (pv < 0.001) "***" else if (pv < 0.01) "**" else if (pv < 0.05) "*" else "ns"
-      k <- k + 1
-      out[[length(out) + 1]] <- data.frame(
-        channel = ch, group1 = tk$group1[i], group2 = tk$group2[i],
-        p.label = lab, y.position = ymax + step * k, stringsAsFactors = FALSE)
+  for (ch in levels(droplevels(sub$channel))) {
+    for (co in levels(droplevels(sub$compartment))) {
+      s <- sub[sub$channel == ch & sub$compartment == co, , drop = FALSE]
+      if (nrow(s) == 0) next
+      tk <- .tukey_for(s, y_col)
+      if (is.null(tk) || nrow(tk) == 0) next
+      tk <- tk[order(tk$p.adj), , drop = FALSE]
+      # ymax for THIS facet only.
+      sf <- summ[summ$channel == ch & summ$compartment == co, ]
+      ymax <- max(sf$mean + sf$sd, na.rm = TRUE)
+      if (!is.finite(ymax) || ymax <= 0) ymax <- max(s[[y_col]], na.rm = TRUE)
+      step <- 0.13 * ymax
+      k <- 0
+      for (i in seq_len(nrow(tk))) {
+        pv <- tk$p.adj[i]
+        if (is.na(pv)) next
+        lab <- if (pv < 0.001) "***" else if (pv < 0.01) "**" else if (pv < 0.05) "*" else "ns"
+        k <- k + 1
+        out[[length(out) + 1]] <- data.frame(
+          channel = ch, compartment = co,
+          group1 = tk$group1[i], group2 = tk$group2[i],
+          p.label = lab, y.position = ymax + step * k, stringsAsFactors = FALSE)
+      }
     }
   }
   if (length(out) == 0) return(NULL)
   do.call(rbind, out)
 }
 
-# Per-(group, channel) summary used by both panels (mean + SD + n).
-.summary <- function(d) {
+# Per-(group, channel, compartment) summary used by both panels.
+.summary <- function(d, y_col) {
   if (nrow(d) == 0) return(data.frame(group = character(0), channel = character(0),
+                                       compartment = character(0),
                                        mean = numeric(0), sd = numeric(0), n = integer(0)))
-  agg <- aggregate(mean_intensity ~ group + channel, data = d,
-                   FUN = function(v) c(m = mean(v), s = sd(v), n = length(v)))
+  fml <- as.formula(paste(y_col, "~ group + channel + compartment"))
+  agg <- aggregate(fml, data = d,
+                   FUN = function(v) c(m = mean(v, na.rm = TRUE),
+                                       s = sd(v, na.rm = TRUE),
+                                       n = length(v)))
   out <- data.frame(group = agg$group, channel = agg$channel,
-                    mean = agg$mean_intensity[, "m"],
-                    sd   = agg$mean_intensity[, "s"],
-                    n    = as.integer(agg$mean_intensity[, "n"]))
+                    compartment = agg$compartment,
+                    mean = agg[[y_col]][, "m"],
+                    sd   = agg[[y_col]][, "s"],
+                    n    = as.integer(agg[[y_col]][, "n"]))
   out$sd[is.na(out$sd)] <- 0
   out
 }
 
-# Render a single ggplot for the given data subset. flag_warning=TRUE
-# draws a red ribbon at the top of the panel(s) — used on the control
-# panel when the between-group test rejects H0.
-.render_panel <- function(d, title, flag_warning) {
+# Render a ggplot for the given data subset. When the data has multiple
+# compartment levels, facet as channel ROWS x compartment COLUMNS so
+# each (channel, compartment) combination gets its own panel — that's
+# the natural way to compare e.g. nuclear vs cytoplasmic Anti-VegF.
+.render_panel <- function(d, title, flag_warning, y_col, y_label) {
   if (nrow(d) == 0) {
     return(ggplot() + theme_void() +
            annotate("text", x = 0.5, y = 0.5, label = paste0(title, ": no rows")))
   }
-  s <- .summary(d)
-  br <- .brackets(d, levels(droplevels(d$channel)), s)
-  n_facets <- length(unique(d$channel))
+  d$compartment <- droplevels(d$compartment)
+  d$channel <- droplevels(d$channel)
+  # Drop rows without a usable y-column value (matters mostly for the
+  # normalised plot when control was missing on some images).
+  d <- d[is.finite(d[[y_col]]), , drop = FALSE]
+  if (nrow(d) == 0) {
+    return(ggplot() + theme_void() +
+           annotate("text", x = 0.5, y = 0.5, label = paste0(title, ": no rows with ", y_col)))
+  }
+  s <- .summary(d, y_col)
+  br <- .brackets(d, s, y_col)
+  multi_compart <- nlevels(d$compartment) > 1
   p <- ggplot() +
     geom_col(data = s, aes(x = group, y = mean, fill = group),
              width = 0.7, color = "grey25", linewidth = 0.3) +
     geom_errorbar(data = s, aes(x = group, ymin = pmax(0, mean - sd), ymax = mean + sd),
                   width = 0.22, linewidth = 0.4) +
-    geom_jitter(data = d, aes(x = group, y = mean_intensity),
-                width = 0.13, height = 0, size = 1.1, alpha = 0.7,
+    geom_jitter(data = d, aes(x = group, y = !!sym(y_col)),
+                width = 0.13, height = 0, size = 1.0, alpha = 0.7,
                 color = "grey20", stroke = 0) +
-    facet_wrap(~ channel, scales = "free_y", nrow = 1) +
     theme_prism(base_size = 11) +
     theme(legend.position = "none",
           axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
           plot.margin = margin(10, 10, 6, 10),
           plot.title = element_text(size = 11, face = "bold",
                                     color = if (flag_warning) "#b03030" else "grey25")) +
-    labs(x = NULL, y = "Mean intensity", title = title)
+    labs(x = NULL, y = y_label, title = title)
+  if (multi_compart) {
+    p <- p + facet_grid(compartment ~ channel, scales = "free_y", switch = "y")
+  } else {
+    p <- p + facet_wrap(~ channel, scales = "free_y", nrow = 1)
+  }
   if (!is.null(br)) {
     p <- tryCatch(
       p + ggprism::add_pvalue(br, label = "p.label",
@@ -2621,39 +2665,56 @@ data$group   <- factor(data$group,   levels = unique(data$group))
   p
 }
 
+# rlang::sym is in the standard ggplot2 import; provide a tiny shim
+# in case the host R lacks it (very old ggplot2).
+if (!exists("sym")) sym <- function(x) rlang::sym(x)
+
 # ── Split control vs analysis channels and render each. ─────────────
 control_data  <- data[data$is_control == TRUE, , drop = FALSE]
 analysis_data <- data[data$is_control == FALSE, , drop = FALSE]
+
+# Plot dimension helper — wider when we have multiple channels and
+# taller when we have multiple compartments.
+.dims_for <- function(d) {
+  nch <- length(unique(d$channel))
+  nco <- length(unique(d$compartment))
+  list(w = max(1100, 520 * min(nch, 4)),
+       h = if (nco > 1) (550 * nco + 100) else 1050)
+}
 
 if (nrow(analysis_data) == 0 && nrow(control_data) == 0) {
   mpfig_plot("channel_intensity.png", width = 1100, height = 800, res = 300)
   print(ggplot() + theme_void() + annotate("text", x = 0.5, y = 0.5,
         label = "No intensity rows — wire images upstream and Configure intensity."))
 } else {
-  # Render the analysis (non-control) panel first.
+  # Render the RAW analysis (non-control) panel.
   if (nrow(analysis_data) > 0) {
-    analysis_data$channel <- droplevels(analysis_data$channel)
-    n_facets <- length(unique(analysis_data$channel))
-    mpfig_plot("channel_intensity.png",
-               width = max(1100, 520 * min(n_facets, 4)), height = 1050, res = 300)
-    print(.render_panel(analysis_data, "Channel intensities", FALSE))
+    dms <- .dims_for(analysis_data)
+    mpfig_plot("channel_intensity.png", width = dms$w, height = dms$h, res = 300)
+    print(.render_panel(analysis_data,
+                        if (has_compartments) "Channel intensities (channel × compartment)" else "Channel intensities",
+                        FALSE, "mean_intensity", "Mean intensity (BG-corrected)"))
   }
-  # Render the control sanity check separately if a control channel was
-  # set. If between-group p < 0.05, flag the panel so the user can tell
-  # at a glance that the control isn't comparable.
+  # Render the NORMALISED variant when the picker emitted the column.
+  if (nrow(analysis_data) > 0 && has_norm) {
+    dms <- .dims_for(analysis_data)
+    mpfig_plot("channel_intensity_norm.png", width = dms$w, height = dms$h, res = 300)
+    print(.render_panel(analysis_data,
+                        "Channel intensities — NORMALISED per image to control channel",
+                        FALSE, "mean_intensity_norm", "Mean intensity / per-image control"))
+  }
+  # Control sanity check — flag red if between-group test rejects H0.
   if (nrow(control_data) > 0) {
-    control_data$channel <- droplevels(control_data$channel)
-    # Determine if the control is significantly different between groups
-    # (any pairwise Tukey p.adj < 0.05 counts).
-    ctrl_summary <- .summary(control_data)
-    ctrl_brackets <- .brackets(control_data, levels(droplevels(control_data$channel)), ctrl_summary)
+    ctrl_summary <- .summary(control_data, "mean_intensity")
+    ctrl_brackets <- .brackets(control_data, ctrl_summary, "mean_intensity")
     is_flagged <- !is.null(ctrl_brackets) && any(ctrl_brackets$p.label %in% c("*", "**", "***"))
     title <- if (is_flagged)
       "Control channel — DIFFERS between groups (groups may not be comparable)"
     else
       "Control channel — sanity check (NS expected)"
-    mpfig_plot("control_intensity.png", width = 1100, height = 900, res = 300)
-    print(.render_panel(control_data, title, is_flagged))
+    dms <- .dims_for(control_data)
+    mpfig_plot("control_intensity.png", width = 1100, height = max(900, dms$h), res = 300)
+    print(.render_panel(control_data, title, is_flagged, "mean_intensity", "Mean intensity (BG-corrected)"))
   }
 }
 `;
