@@ -975,23 +975,49 @@ export const useCollageStore = create<CollageState>()(
       s.selectedId = s.selectedIds[s.selectedIds.length - 1] ?? null;
     }),
 
+    // All per-page setters below MIRROR the new flat-field value onto
+    // the active page's snapshot in the same set() call. Without that
+    // mirror, the in-memory pages array stays stale until the next
+    // persist() (which writes to localStorage but doesn't refresh
+    // state), so `computePageGeometry(pages, ...)` keeps returning
+    // the OLD spread bounds — meaning preset / background / guide
+    // changes don't reflow the viewport until the user does
+    // something else that triggers a re-render. Mirroring in-place
+    // fixes that.
     setCanvasSize: (w, h) => {
-      set((s) => { s.canvasW = w; s.canvasH = h; });
+      set((s) => {
+        s.canvasW = w; s.canvasH = h;
+        const i = s.pages.findIndex((p) => p.id === s.activePageId);
+        if (i >= 0) s.pages[i].snapshot = _snapshotFromFlat(s);
+      });
       persist(get());
     },
 
     setBackground: (bg) => {
-      set((s) => { s.background = bg; });
+      set((s) => {
+        s.background = bg;
+        const i = s.pages.findIndex((p) => p.id === s.activePageId);
+        if (i >= 0) s.pages[i].snapshot = _snapshotFromFlat(s);
+      });
       persist(get());
     },
 
     setColumnGuides: (columns, gutter) => {
-      set((s) => { s.guideColumns = Math.max(0, Math.round(columns)); s.guideGutter = Math.max(0, Math.round(gutter)); });
+      set((s) => {
+        s.guideColumns = Math.max(0, Math.round(columns));
+        s.guideGutter = Math.max(0, Math.round(gutter));
+        const i = s.pages.findIndex((p) => p.id === s.activePageId);
+        if (i >= 0) s.pages[i].snapshot = _snapshotFromFlat(s);
+      });
       persist(get());
     },
 
     setGuidesVisible: (v) => {
-      set((s) => { s.guidesVisible = v; });
+      set((s) => {
+        s.guidesVisible = v;
+        const i = s.pages.findIndex((p) => p.id === s.activePageId);
+        if (i >= 0) s.pages[i].snapshot = _snapshotFromFlat(s);
+      });
       persist(get());
     },
 

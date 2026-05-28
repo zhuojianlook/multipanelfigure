@@ -280,6 +280,10 @@ export function CollageView() {
   const [fitScale, setFitScale] = useState(1);
   const [userZoom, setUserZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
+  // Is the user actively dragging the viewport to pan? Drives the
+  // cursor swap (grab → grabbing) so the pointer feedback matches the
+  // current action. Reset on mouseup. Doesn't gate any logic, purely UX.
+  const [panning, setPanning] = useState(false);
 
   // Free-text drafts for the canvas W/H fields so the user can type
   // intermediate values (e.g. clearing to type a new number) without the
@@ -668,15 +672,24 @@ export function CollageView() {
 
   /** Re-fit the WHOLE SPREAD (every page tiled side-by-side) to the
    *  viewport — runs on mount + resize + whenever the spread bounds
-   *  change (page add/remove/resize). The viewport scrolls to centre
-   *  the active page on subsequent tab clicks (see effect below). */
+   *  change (page add/remove/resize/preset). The viewport scrolls to
+   *  centre the active page on subsequent tab clicks (see effect
+   *  below). pad is intentionally generous (≈12% of available area on
+   *  each side) so the user ALWAYS sees a clear margin around the
+   *  canvas — that empty band is where the grab-to-pan cursor lives,
+   *  so leaving room for it doubles as discoverability for the pan
+   *  affordance. */
   useEffect(() => {
     const compute = () => {
       const el = containerRef.current;
       if (!el) return;
-      const pad = 32;
-      const availW = el.clientWidth - pad;
-      const availH = el.clientHeight - pad;
+      // 12% of the smaller dimension on EACH side. Caps to 32-160 px so
+      // we don't burn too much canvas area on huge windows but also
+      // don't crowd the spread on small viewports.
+      const minDim = Math.min(el.clientWidth, el.clientHeight);
+      const pad = Math.max(32, Math.min(160, Math.round(minDim * 0.12)));
+      const availW = el.clientWidth - pad * 2;
+      const availH = el.clientHeight - pad * 2;
       if (availW <= 0 || availH <= 0) return;
       const sx = availW / Math.max(1, spreadW);
       const sy = availH / Math.max(1, spreadH);
@@ -787,6 +800,7 @@ export function CollageView() {
     }
     if (middle) e.preventDefault();   // suppress auto-scroll cursor on middle-click
     setSelectedId(null);
+    setPanning(true);
     const startX = e.clientX;
     const startY = e.clientY;
     const startPan = { ...pan };
@@ -796,6 +810,7 @@ export function CollageView() {
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      setPanning(false);
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -1742,6 +1757,11 @@ export function CollageView() {
             "linear-gradient(45deg, rgba(255,255,255,0.04) 25%, transparent 25%, transparent 75%, rgba(255,255,255,0.04) 75%)",
           backgroundSize: "20px 20px",
           backgroundPosition: "0 0, 10px 10px",
+          // grab → grabbing on the empty margin around the spread so
+          // the user discovers they can pan the view. The pageRef below
+          // overrides to "default" for clicks on the canvas itself
+          // (marquee-select is the action there).
+          cursor: panning ? "grabbing" : "grab",
         }}
       >
         {/* Pan/zoom wrapper. Positioned absolute at (pan.x, pan.y) and
@@ -1769,6 +1789,13 @@ export function CollageView() {
               position: "relative",
               width: spreadW,
               height: spreadH,
+              // Override the viewport's "grab" cursor when the pointer
+              // is over the canvas itself — the action here is marquee
+              // selection (or item click), not pan. While the user is
+              // actively panning the WHOLE view (middle-drag from inside
+              // the spread, for example) we stay on "grabbing" so the
+              // cursor matches the action.
+              cursor: panning ? "grabbing" : "default",
             }}
             onMouseDown={(e) => {
               // Only start a marquee when the click lands on the empty page
