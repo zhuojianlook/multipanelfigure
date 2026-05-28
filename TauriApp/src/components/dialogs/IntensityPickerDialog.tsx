@@ -825,18 +825,24 @@ const SELECT_MENU_PROPS = {
   },
 } as const;
 
-/** A computed preview for one image: the base composite + a per-channel
- *  boundary overlay (each on transparent background, so the dialog can
- *  layer + toggle visibility live without re-running). For Cellpose
- *  there's a single fused `overlaySrc` and no per-channel maps. */
+/** A computed preview for one image: a base composite + transparent
+ *  boundary overlays (per-channel for simple strategy, or cells +
+ *  nuclei for cellpose). The dialog layers them onto a canvas so
+ *  visibility toggles are instant and pixel-perfect. */
 type PreviewLayers = {
   /** Combined / fused overlay (legacy fallback; cellpose result). */
   overlaySrc?: string;
-  /** Base layer — contrast-stretched composite (simple strategy only). */
+  /** Base layer — contrast-stretched composite (no outlines). */
   compositeSrc?: string;
-  /** Per-channel boundary on transparent bg (simple strategy only). */
+  /** Per-channel boundary on transparent bg (simple strategy). */
   channelOverlays?: Partial<Record<"r" | "g" | "b", string>>;
+  /** Cellpose cell-mask outline (yellow, transparent bg). */
+  cellOverlaySrc?: string;
+  /** Cellpose nucleus-mask outline (cyan, transparent bg) — only
+   *  present when "Measure compartments" was on. */
+  nucleusOverlaySrc?: string;
   n_cells?: number;
+  n_nuclei?: number;
   per_channel?: Record<string, number>;
 };
 
@@ -867,6 +873,15 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // quantification) — this is purely a display toggle and never gates
   // the actual analysis. Defaults: all visible.
   const [maskVisible, setMaskVisible] = useState<Record<"r" | "g" | "b", boolean>>({ r: true, g: true, b: true });
+  // Cellpose mask visibility (separate from simple-mode channel
+  // visibility above): cells = yellow outline, nuclei = cyan. Both
+  // default ON so the user immediately sees what cellpose found.
+  const [cpMaskVisible, setCpMaskVisible] = useState<{ cells: boolean; nuclei: boolean }>({ cells: true, nuclei: true });
+  // Run-all progress: { current, total } while iterating images.
+  // null when idle. cancelRef lets the user abort mid-batch (close
+  // the dialog or click again).
+  const [runAllProgress, setRunAllProgress] = useState<{ current: number; total: number } | null>(null);
+  const runAllCancelRef = useRef(false);
   // Sidecar build identifier — fetched once on dialog open so we can
   // surface it next to the title. Lets the user (and bug reports) tell
   // at a glance which python-sidecar binary is actually running.
@@ -998,8 +1013,9 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // tell the user "your tweaks aren't reflected in the overlay yet".
   const [paramsDirty, setParamsDirty] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
-  const fetchPreview = useCallback(async () => {
-    if (!open || !activeImage) return;
+  const fetchPreview = useCallback(async (forImage?: FluorPickerImage) => {
+    const img = forImage || activeImage;
+    if (!open || !img) return;
     if (abortRef.current) abortRef.current.abort();
     const ac = new AbortController();
     abortRef.current = ac;
@@ -1014,14 +1030,14 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     }
     try {
       const body: Record<string, unknown> = {
-        image_b64: activeImage.image_b64 || "",
-        source: activeImage.source
+        image_b64: img.image_b64 || "",
+        source: img.source
           ? {
-              key: activeImage.source.key,
-              row: activeImage.source.row,
-              col: activeImage.source.col,
-              inset_index: activeImage.source.inset_index,
-              name: activeImage.source.name,
+              key: img.source.key,
+              row: img.source.row,
+              col: img.source.col,
+              inset_index: img.source.inset_index,
+              name: img.source.name,
             }
           : undefined,
         strategy: cfg.mode,
@@ -1104,12 +1120,17 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
             }
             return out;
           })(),
+          cellOverlaySrc: data.cell_overlay_b64
+            ? `data:image/png;base64,${data.cell_overlay_b64}` : undefined,
+          nucleusOverlaySrc: data.nucleus_overlay_b64
+            ? `data:image/png;base64,${data.nucleus_overlay_b64}` : undefined,
           n_cells: typeof data.n_cells === "number" ? data.n_cells : undefined,
+          n_nuclei: typeof data.n_nuclei === "number" ? data.n_nuclei : undefined,
           per_channel: data.per_channel,
         };
-        // Cache by the ACTIVE image's label so cycling through images
-        // restores their overlays instantly.
-        const key = activeImage.label;
+        // Cache by THIS image's label so Run-all stores results
+        // against each image's own label, not the (stale) activeIdx.
+        const key = img.label;
         setPreviewByImage((cur) => ({ ...cur, [key]: layers }));
         setParamsDirty(false);
       } else {
@@ -1136,6 +1157,35 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       setPreviewLoading(false);
     }
   }, [open, activeImage, cfg.mode, cfg.rollingRadius, cfg.thresholds, cfg.cellpose]);
+
+  // Run preview SEQUENTIALLY across every image. The cellpose model
+  // loads only once for the batch (Python is single-threaded server-
+  // side; we just queue requests here from JS) so this is ~as cheap
+  // as running each manually but without the user having to cycle +
+  // click N times. cancelRef + the run state let the user abort
+  // mid-batch by clicking Stop (or closing the dialog).
+  const runAll = useCallback(async () => {
+    if (!open || images.length === 0) return;
+    if (runAllProgress) {
+      // Already running — second click = cancel.
+      runAllCancelRef.current = true;
+      return;
+    }
+    runAllCancelRef.current = false;
+    setRunAllProgress({ current: 0, total: images.length });
+    for (let i = 0; i < images.length; i++) {
+      if (runAllCancelRef.current) break;
+      setRunAllProgress({ current: i + 1, total: images.length });
+      // Surface the in-flight image in the cycler so the user can
+      // watch progress (also primes activePreview for that image).
+      setActiveIdx(i);
+      await fetchPreview(images[i]);
+      // Brief breather to keep the UI responsive between calls.
+      if (i < images.length - 1) await new Promise((r) => setTimeout(r, 60));
+    }
+    setRunAllProgress(null);
+    runAllCancelRef.current = false;
+  }, [open, images, runAllProgress, fetchPreview]);
 
   // Cycling images: clear the inline error and dirty-state, but keep
   // the cache so we can restore THIS image's previous overlay below.
@@ -1172,6 +1222,12 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   const previewBoxRef = useRef<HTMLDivElement>(null);
   const [compImgEl, setCompImgEl] = useState<HTMLImageElement | null>(null);
   const [chImgEls, setChImgEls] = useState<Partial<Record<"r" | "g" | "b", HTMLImageElement>>>({});
+  // Cellpose mode mask layers — separate <Image> handles for the cell
+  // outline (yellow) and nucleus outline (cyan, when measure
+  // compartments was on). Loaded into HTMLImageElements so the canvas
+  // composite is a synchronous drawImage on every visibility toggle.
+  const [cellImgEl, setCellImgEl] = useState<HTMLImageElement | null>(null);
+  const [nucImgEl, setNucImgEl] = useState<HTMLImageElement | null>(null);
   // View state for the preview canvas: zoom + pan. zoom = 1 → fit to
   // the preview pane. Wheel zooms around the cursor (Photoshop-style);
   // drag pans; double-click resets.
@@ -1215,16 +1271,19 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     window.addEventListener("mouseup", onUp);
   }, [view]);
 
-  // Load composite + channel overlays as HTMLImageElement instances
-  // whenever the active preview changes. We hold them in state so
-  // visibility toggles can re-composite without re-loading.
+  // Load composite + overlay layers (per-channel for simple, cells +
+  // nuclei for cellpose) as HTMLImageElement instances whenever the
+  // active preview changes. We hold them in state so visibility
+  // toggles can re-composite without re-loading.
   useEffect(() => {
-    if (!activePreview || cfg.mode !== "simple") {
-      setCompImgEl(null);
-      setChImgEls({});
+    if (!activePreview) {
+      setCompImgEl(null); setChImgEls({});
+      setCellImgEl(null); setNucImgEl(null);
       return;
     }
     let cancelled = false;
+    // Base composite (no outlines) when available; fall back to the
+    // legacy fused overlay for very old responses.
     const compSrc = activePreview.compositeSrc || activePreview.overlaySrc;
     if (compSrc) {
       const im = new window.Image();
@@ -1234,15 +1293,28 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       setCompImgEl(null);
     }
     setChImgEls({});
-    for (const k of ["r", "g", "b"] as const) {
-      const src = activePreview.channelOverlays?.[k];
-      if (!src) continue;
-      const im = new window.Image();
-      im.onload = () => {
-        if (cancelled) return;
-        setChImgEls((cur) => ({ ...cur, [k]: im }));
-      };
-      im.src = src;
+    setCellImgEl(null);
+    setNucImgEl(null);
+    if (cfg.mode === "simple") {
+      for (const k of ["r", "g", "b"] as const) {
+        const src = activePreview.channelOverlays?.[k];
+        if (!src) continue;
+        const im = new window.Image();
+        im.onload = () => { if (!cancelled) setChImgEls((cur) => ({ ...cur, [k]: im })); };
+        im.src = src;
+      }
+    } else {
+      // cellpose: cell outline + (optional) nucleus outline
+      if (activePreview.cellOverlaySrc) {
+        const im = new window.Image();
+        im.onload = () => { if (!cancelled) setCellImgEl(im); };
+        im.src = activePreview.cellOverlaySrc;
+      }
+      if (activePreview.nucleusOverlaySrc) {
+        const im = new window.Image();
+        im.onload = () => { if (!cancelled) setNucImgEl(im); };
+        im.src = activePreview.nucleusOverlaySrc;
+      }
     }
     return () => { cancelled = true; };
   }, [activePreview, cfg.mode]);
@@ -1255,8 +1327,6 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     const canvas = canvasRef.current;
     if (!canvas) return;
     if (!compImgEl) {
-      // Reset to a tiny transparent canvas so the previous frame
-      // doesn't linger after switching images.
       canvas.width = 1;
       canvas.height = 1;
       return;
@@ -1269,12 +1339,17 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     if (!ctx) return;
     ctx.clearRect(0, 0, w, h);
     ctx.drawImage(compImgEl, 0, 0);
-    for (const k of ["r", "g", "b"] as const) {
-      if (!maskVisible[k]) continue;
-      const im = chImgEls[k];
-      if (im) ctx.drawImage(im, 0, 0);
+    if (cfg.mode === "simple") {
+      for (const k of ["r", "g", "b"] as const) {
+        if (!maskVisible[k]) continue;
+        const im = chImgEls[k];
+        if (im) ctx.drawImage(im, 0, 0);
+      }
+    } else {
+      if (cpMaskVisible.cells && cellImgEl) ctx.drawImage(cellImgEl, 0, 0);
+      if (cpMaskVisible.nuclei && nucImgEl) ctx.drawImage(nucImgEl, 0, 0);
     }
-  }, [compImgEl, chImgEls, maskVisible]);
+  }, [compImgEl, chImgEls, maskVisible, cellImgEl, nucImgEl, cpMaskVisible, cfg.mode]);
 
   const setChannel = useCallback((k: keyof FluorChannels, v: string) => {
     setCfg((c) => ({ ...c, channels: { ...c.channels, [k]: v } }));
@@ -1375,24 +1450,44 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
               It pulses (contained colour) whenever the current overlay
               doesn't reflect the latest settings, so the user is never
               left looking at a stale preview without knowing. */}
-          <Button
-            variant={paramsDirty ? "contained" : "outlined"}
-            color={paramsDirty ? "primary" : "inherit"}
-            startIcon={previewLoading
-              ? <CircularProgress size={14} color="inherit" />
-              : <RefreshIcon sx={{ fontSize: 18 }} />}
-            onClick={() => void fetchPreview()}
-            disabled={!activeImage || previewLoading}
-            sx={{ textTransform: "none", fontWeight: 700, py: 0.5 }}
-          >
-            {previewLoading
-              ? (cfg.mode === "cellpose"
-                  ? `Running Cellpose… ${elapsedSec}s${elapsedSec < 10 ? " (loading model)" : elapsedSec < 30 ? " (inference)" : ""}`
-                  : `Running… ${elapsedSec}s`)
-              : (paramsDirty
-                  ? `Run ${cfg.mode === "cellpose" ? "Cellpose" : "threshold"} preview`
-                  : "Re-run preview")}
-          </Button>
+          <Box sx={{ display: "flex", gap: 0.75 }}>
+            <Button
+              variant={paramsDirty ? "contained" : "outlined"}
+              color={paramsDirty ? "primary" : "inherit"}
+              startIcon={previewLoading && !runAllProgress
+                ? <CircularProgress size={14} color="inherit" />
+                : <RefreshIcon sx={{ fontSize: 18 }} />}
+              onClick={() => void fetchPreview()}
+              disabled={!activeImage || previewLoading || !!runAllProgress}
+              sx={{ textTransform: "none", fontWeight: 700, py: 0.5, flex: 1 }}
+            >
+              {previewLoading && !runAllProgress
+                ? (cfg.mode === "cellpose"
+                    ? `Running Cellpose… ${elapsedSec}s${elapsedSec < 10 ? " (loading model)" : elapsedSec < 30 ? " (inference)" : ""}`
+                    : `Running… ${elapsedSec}s`)
+                : (paramsDirty
+                    ? `Run on this image`
+                    : "Re-run on this image")}
+            </Button>
+            {/* Run-all: iterates every wired image through fetchPreview.
+                For cellpose this is dramatically faster than the user
+                clicking through each image one at a time — the model
+                doesn't reload between images (Python subprocess in the
+                sidecar caches it). Second click while running cancels. */}
+            {images.length > 1 && (
+              <Button
+                variant={runAllProgress ? "contained" : "outlined"}
+                color={runAllProgress ? "warning" : "inherit"}
+                onClick={() => void runAll()}
+                disabled={!activeImage}
+                sx={{ textTransform: "none", fontWeight: 700, py: 0.5, minWidth: 140 }}
+              >
+                {runAllProgress
+                  ? `Stop (${runAllProgress.current}/${runAllProgress.total})`
+                  : `Run on all (${images.length})`}
+              </Button>
+            )}
+          </Box>
           {/* Preview canvas. For simple strategy we LAYER the response:
               the base composite goes at the bottom and each enabled
               channel's transparent boundary PNG stacks on top with a
@@ -1434,8 +1529,11 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
               }}>
                 {(() => {
                   const ap = activePreview;
-                  const isSimple = cfg.mode === "simple";
-                  if (ap && isSimple && (ap.compositeSrc || ap.overlaySrc)) {
+                  // Canvas-composited preview for BOTH modes when we
+                  // have a composite layer + at least one overlay
+                  // type. The compositor effect routes channelOverlays
+                  // OR cell/nucleus overlays based on cfg.mode.
+                  if (ap && (ap.compositeSrc || ap.overlaySrc)) {
                     return (
                       <canvas
                         ref={canvasRef}
@@ -1446,15 +1544,6 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                           verticalAlign: "top",
                           imageRendering: "auto",
                         }}
-                      />
-                    );
-                  }
-                  if (ap?.overlaySrc) {
-                    return (
-                      <img
-                        src={ap.overlaySrc}
-                        alt="Segmentation preview"
-                        style={{ display: "block", maxWidth: "100%", maxHeight: "calc(100vh - 280px)", objectFit: "contain" }}
                       />
                     );
                   }
@@ -1600,6 +1689,52 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                   </Box>
                 );
               })}
+            </Box>
+          )}
+          {/* Cellpose-mode mask visibility row — analogue of the simple-
+              mode toggles above. Cells (yellow) is always togglable when
+              a preview exists; Nuclei (cyan) only appears when the user
+              ran with "Measure compartments" on and the nuclei-pass
+              actually produced labels. */}
+          {cfg.mode === "cellpose" && activePreview && (activePreview.cellOverlaySrc || activePreview.nucleusOverlaySrc) && (
+            <Box sx={{
+              display: "flex", alignItems: "center", gap: 0.75, flexWrap: "wrap",
+              px: 0.5, py: 0.4, borderRadius: 0.5,
+              bgcolor: "rgba(255,255,255,0.04)",
+            }}>
+              <Typography variant="caption" sx={{ color: "text.secondary", fontSize: "0.65rem", fontWeight: 600 }}>
+                Show masks:
+              </Typography>
+              {activePreview.cellOverlaySrc && (
+                <Box
+                  onClick={() => setCpMaskVisible((p) => ({ ...p, cells: !p.cells }))}
+                  sx={{
+                    cursor: "pointer", fontSize: "0.66rem", px: 0.6, py: 0.15, borderRadius: 0.6,
+                    display: "inline-flex", alignItems: "center", gap: 0.3, userSelect: "none",
+                    bgcolor: cpMaskVisible.cells ? "#cdb336" : "transparent",
+                    color: cpMaskVisible.cells ? "common.white" : "text.secondary",
+                    border: "1px solid", borderColor: "#cdb336",
+                    fontWeight: cpMaskVisible.cells ? 700 : 500,
+                  }}>
+                  <span style={{ fontSize: "0.85rem", lineHeight: 1 }}>{cpMaskVisible.cells ? "👁" : "·"}</span>
+                  <span>Cells{typeof activePreview.n_cells === "number" ? ` (${activePreview.n_cells})` : ""}</span>
+                </Box>
+              )}
+              {activePreview.nucleusOverlaySrc && (
+                <Box
+                  onClick={() => setCpMaskVisible((p) => ({ ...p, nuclei: !p.nuclei }))}
+                  sx={{
+                    cursor: "pointer", fontSize: "0.66rem", px: 0.6, py: 0.15, borderRadius: 0.6,
+                    display: "inline-flex", alignItems: "center", gap: 0.3, userSelect: "none",
+                    bgcolor: cpMaskVisible.nuclei ? "#5fbcdc" : "transparent",
+                    color: cpMaskVisible.nuclei ? "common.white" : "text.secondary",
+                    border: "1px solid", borderColor: "#5fbcdc",
+                    fontWeight: cpMaskVisible.nuclei ? 700 : 500,
+                  }}>
+                  <span style={{ fontSize: "0.85rem", lineHeight: 1 }}>{cpMaskVisible.nuclei ? "👁" : "·"}</span>
+                  <span>Nuclei{typeof activePreview.n_nuclei === "number" ? ` (${activePreview.n_nuclei})` : ""}</span>
+                </Box>
+              )}
             </Box>
           )}
           {/* Image-list strip (quick jump) */}
@@ -1829,8 +1964,12 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                 })}
               </Box>
             ) : (
+              // Cellpose params. Each dropdown's explanation lives in a
+              // small "ⓘ" icon-tooltip beside the label — wrapping the
+              // whole TextField in a Tooltip used to capture hover and
+              // block the click on the dropdown trigger itself.
               <Box sx={{ display: "flex", flexDirection: "column", gap: 0.75 }}>
-                {/* Row 1 — model + segment-on channel. */}
+                {/* Row 1 — model + cell-body channel. */}
                 <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1 }}>
                   <TextField select size="small" label="Model" value={cfg.cellpose.model}
                     onChange={(e) => setCellpose({ model: e.target.value })}
@@ -1842,75 +1981,96 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                     <MenuItem value="cyto2" sx={{ fontSize: "0.78rem" }}>cyto2</MenuItem>
                     <MenuItem value="nuclei" sx={{ fontSize: "0.78rem" }}>nuclei</MenuItem>
                   </TextField>
-                  <Tooltip title="Channel cellpose uses as the cell-body / cytoplasm signal. cyto3 uses this PLUS the nuclei channel below to find whole-cell boundaries.">
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.4 }}>
                     <TextField select size="small" label="Cell channel" value={cfg.cellpose.segChannel}
                       onChange={(e) => setCellpose({ segChannel: e.target.value as "r" | "g" | "b" })}
                       inputProps={{ style: { fontSize: "0.78rem" } }}
                       InputLabelProps={{ style: { fontSize: "0.78rem" } }}
-                      SelectProps={SELECT_MENU_PROPS}>
+                      SelectProps={SELECT_MENU_PROPS}
+                      sx={{ flex: 1 }}>
                       <MenuItem value="r" sx={{ fontSize: "0.78rem" }}>{cfg.channels.r}</MenuItem>
                       <MenuItem value="g" sx={{ fontSize: "0.78rem" }}>{cfg.channels.g}</MenuItem>
                       <MenuItem value="b" sx={{ fontSize: "0.78rem" }}>{cfg.channels.b}</MenuItem>
                     </TextField>
-                  </Tooltip>
+                    <Tooltip title="Channel cellpose uses as the cell-body / cytoplasm signal. cyto3 uses this PLUS the nuclei channel to find whole-cell boundaries. Intensity is measured in EVERY channel inside each detected cell — you don't need to pick this as the channel of interest, only the one whose signal best outlines cell bodies."
+                      placement="top" enterDelay={200}>
+                      <Box sx={{
+                        width: 16, height: 16, borderRadius: "50%",
+                        bgcolor: "action.hover", color: "text.secondary",
+                        fontSize: "0.7rem", display: "flex", alignItems: "center",
+                        justifyContent: "center", cursor: "help", flexShrink: 0,
+                      }}>ⓘ</Box>
+                    </Tooltip>
+                  </Box>
                 </Box>
-                {/* Row 2 — nuclei channel (DAPI) + compartment toggle. */}
+                {/* Row 2 — nuclei channel + compartment toggle. */}
                 <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1, alignItems: "center" }}>
-                  <Tooltip title="DAPI / Hoechst channel. Passing this to cyto3 gives noticeably better whole-cell boundaries (the model was trained on both inputs). ALSO required for 'Measure compartments' below.">
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.4 }}>
                     <TextField select size="small" label="Nuclei channel" value={cfg.cellpose.nucleiChannel ?? ""}
                       onChange={(e) => setCellpose({ nucleiChannel: (e.target.value || null) as "r" | "g" | "b" | null })}
                       inputProps={{ style: { fontSize: "0.78rem" } }}
                       InputLabelProps={{ style: { fontSize: "0.78rem" } }}
-                      SelectProps={SELECT_MENU_PROPS}>
+                      SelectProps={SELECT_MENU_PROPS}
+                      sx={{ flex: 1 }}>
                       <MenuItem value="" sx={{ fontSize: "0.78rem" }}>— none —</MenuItem>
                       <MenuItem value="r" sx={{ fontSize: "0.78rem" }}>{cfg.channels.r}</MenuItem>
                       <MenuItem value="g" sx={{ fontSize: "0.78rem" }}>{cfg.channels.g}</MenuItem>
                       <MenuItem value="b" sx={{ fontSize: "0.78rem" }}>{cfg.channels.b}</MenuItem>
                     </TextField>
-                  </Tooltip>
-                  <Tooltip title={cfg.cellpose.nucleiChannel
-                    ? "When ON: also run cellpose's 'nuclei' model on the nuclei channel, then for each cell emit THREE rows (whole_cell / nucleus / cytoplasm). Lets you compare nuclear vs cytoplasmic localisation directly. Roughly doubles cellpose time."
-                    : "Pick a Nuclei channel first to enable compartment measurement."}>
-                    <Box
-                      onClick={() => {
-                        if (!cfg.cellpose.nucleiChannel) return;
-                        setCellpose({ measureCompartments: !cfg.cellpose.measureCompartments });
-                      }}
-                      sx={{
-                        cursor: cfg.cellpose.nucleiChannel ? "pointer" : "not-allowed",
-                        display: "flex", alignItems: "center", gap: 0.6,
-                        px: 0.75, py: 0.4, borderRadius: 0.5,
-                        border: "1px solid", borderColor: "divider",
-                        opacity: cfg.cellpose.nucleiChannel ? 1 : 0.5,
-                        userSelect: "none",
-                        bgcolor: cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel
-                          ? "primary.main" : "transparent",
-                        color: cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel
-                          ? "primary.contrastText" : "text.primary",
-                      }}>
+                    <Tooltip title="DAPI / Hoechst channel. Feeding cyto3 a nuclei channel as well gives noticeably better whole-cell boundaries (the model was trained on both inputs). Also REQUIRED for 'Measure compartments'."
+                      placement="top" enterDelay={200}>
                       <Box sx={{
-                        width: 14, height: 14, borderRadius: 0.4,
-                        bgcolor: cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel
-                          ? "common.white" : "transparent",
-                        border: "1px solid",
-                        borderColor: cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel
-                          ? "common.white" : "text.secondary",
-                        display: "flex", alignItems: "center", justifyContent: "center",
-                        color: cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel
-                          ? "primary.main" : "transparent",
-                        fontSize: "0.78rem", fontWeight: 700,
-                      }}>
-                        {cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel ? "✓" : ""}
-                      </Box>
-                      <Typography variant="caption" sx={{ fontSize: "0.72rem", fontWeight: 600 }}>
-                        Measure compartments
-                      </Typography>
+                        width: 16, height: 16, borderRadius: "50%",
+                        bgcolor: "action.hover", color: "text.secondary",
+                        fontSize: "0.7rem", display: "flex", alignItems: "center",
+                        justifyContent: "center", cursor: "help", flexShrink: 0,
+                      }}>ⓘ</Box>
+                    </Tooltip>
+                  </Box>
+                  <Box
+                    onClick={() => {
+                      if (!cfg.cellpose.nucleiChannel) return;
+                      setCellpose({ measureCompartments: !cfg.cellpose.measureCompartments });
+                    }}
+                    title={cfg.cellpose.nucleiChannel
+                      ? "When ON: also run cellpose's nuclei model on the nuclei channel, then for each cell emit THREE rows (whole_cell / nucleus / cytoplasm). Lets you compare nuclear vs cytoplasmic localisation. Roughly doubles cellpose time."
+                      : "Pick a Nuclei channel first."}
+                    sx={{
+                      cursor: cfg.cellpose.nucleiChannel ? "pointer" : "not-allowed",
+                      display: "flex", alignItems: "center", gap: 0.6,
+                      px: 0.75, py: 0.55, borderRadius: 0.5,
+                      border: "1px solid", borderColor: "divider",
+                      opacity: cfg.cellpose.nucleiChannel ? 1 : 0.5,
+                      userSelect: "none",
+                      bgcolor: cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel
+                        ? "primary.main" : "transparent",
+                      color: cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel
+                        ? "primary.contrastText" : "text.primary",
+                    }}>
+                    <Box sx={{
+                      width: 14, height: 14, borderRadius: 0.4,
+                      bgcolor: cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel
+                        ? "common.white" : "transparent",
+                      border: "1px solid",
+                      borderColor: cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel
+                        ? "common.white" : "text.secondary",
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      color: cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel
+                        ? "primary.main" : "transparent",
+                      fontSize: "0.78rem", fontWeight: 700,
+                    }}>
+                      {cfg.cellpose.measureCompartments && cfg.cellpose.nucleiChannel ? "✓" : ""}
                     </Box>
-                  </Tooltip>
+                    <Typography variant="caption" sx={{ fontSize: "0.72rem", fontWeight: 600 }}>
+                      Measure compartments
+                    </Typography>
+                  </Box>
                 </Box>
-                {/* Auto-by-default + advanced disclosure. */}
+                {/* Auto-by-default override row. alignItems: "center" so
+                    the "Diameter + min-size are AUTO..." caption and
+                    the two number fields share a baseline. */}
                 <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, flexWrap: "wrap" }}>
-                  <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.65rem" }}>
+                  <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.65rem", alignSelf: "center" }}>
                     Diameter + min-size are AUTO (recommended). Override:
                   </Typography>
                   <TextField size="small" label="Diameter (px)" type="number" value={cfg.cellpose.diameter || ""}
@@ -1925,6 +2085,15 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                     InputLabelProps={{ style: { fontSize: "0.7rem" } }}
                     sx={{ width: 110 }} />
                 </Box>
+                {/* Quick clarifier line: cellpose segments ONCE using the
+                    chosen channels — the OTHER channels are not
+                    re-segmented but ARE measured inside each detected
+                    cell. This is the standard IF workflow and prevents
+                    the common "why isn't my third channel being
+                    segmented" confusion. */}
+                <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.65rem", display: "block", mt: 0.2 }}>
+                  Cellpose produces ONE cell mask per image (using the channels above). Intensities are then measured inside that mask in EVERY channel — not just the one used for segmentation.
+                </Typography>
               </Box>
             )}
           </Box>

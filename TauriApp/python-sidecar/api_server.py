@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.317"
+SIDECAR_BUILD = "0.1.318"
 
 
 @app.get("/api/version")
@@ -7213,19 +7213,46 @@ def fluor_preview_segment(body: FluorPreviewRequest):
             b_right[:, :-1]= lbl[:, :-1]   != lbl[:, 1:]
             return (b_up | b_down | b_left | b_right) & (lbl > 0)
 
-        # Yellow cell outlines.
-        composite[_symmetric_boundary(labels)] = (255, 255, 0)
-        # Cyan nuclei outlines on top (when present), so they're
-        # distinguishable from the cell boundaries.
+        # Build each mask as a SEPARATE RGBA overlay (transparent bg) so
+        # the frontend can layer them onto the composite and toggle each
+        # independently. Cells = yellow, Nuclei = cyan.
+        def _mask_overlay_png(boundary_mask, rgb_color):
+            rgba = _np.zeros((boundary_mask.shape[0], boundary_mask.shape[1], 4), dtype=_np.uint8)
+            rgba[boundary_mask] = (rgb_color[0], rgb_color[1], rgb_color[2], 255)
+            _b = io.BytesIO()
+            Image.fromarray(_np.ascontiguousarray(rgba)).save(_b, format="PNG")
+            return base64.b64encode(_b.getvalue()).decode()
+
+        cell_boundary = _symmetric_boundary(labels)
+        cell_overlay_b64 = _mask_overlay_png(cell_boundary, (255, 255, 0))
+        nucleus_overlay_b64 = None
         if nucleus_labels is not None:
-            composite[_symmetric_boundary(nucleus_labels)] = (96, 220, 255)
+            nuc_boundary = _symmetric_boundary(nucleus_labels)
+            nucleus_overlay_b64 = _mask_overlay_png(nuc_boundary, (96, 220, 255))
+
+        # Composite PNG (no outlines) — the BASE layer the frontend draws
+        # the overlays on top of. We keep the legacy fused overlay_b64
+        # (with outlines stamped on) for back-compat with older clients,
+        # but new builds prefer composite_b64 + the mask overlays.
+        _bbuf = io.BytesIO()
+        Image.fromarray(_np.ascontiguousarray(composite)).save(_bbuf, format="PNG")
+        composite_b64 = base64.b64encode(_bbuf.getvalue()).decode()
+
+        # Legacy fused overlay: stamp both outlines onto the composite.
+        fused = composite.copy()
+        fused[cell_boundary] = (255, 255, 0)
+        if nucleus_labels is not None:
+            fused[_symmetric_boundary(nucleus_labels)] = (96, 220, 255)
+        _fbuf = io.BytesIO()
+        Image.fromarray(_np.ascontiguousarray(fused)).save(_fbuf, format="PNG")
+
         n_cells = int(len(_np.unique(labels[labels > 0])))
-        # Emit overlay PNG.
-        _buf = io.BytesIO()
-        Image.fromarray(_np.ascontiguousarray(composite)).save(_buf, format="PNG")
         return {
             "success": True,
-            "overlay_b64": base64.b64encode(_buf.getvalue()).decode(),
+            "overlay_b64": base64.b64encode(_fbuf.getvalue()).decode(),  # legacy fused
+            "composite_b64": composite_b64,
+            "cell_overlay_b64": cell_overlay_b64,
+            "nucleus_overlay_b64": nucleus_overlay_b64,
             "src_w": int(src_w0), "src_h": int(src_h0),
             "preview_w": int(w), "preview_h": int(h),
             "n_cells": n_cells,
