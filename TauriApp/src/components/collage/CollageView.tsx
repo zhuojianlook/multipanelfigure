@@ -762,9 +762,30 @@ export function CollageView() {
     setUserZoom(newUserZoom);
   };
 
-  /** Pan with left-drag on empty canvas (or middle-drag anywhere). */
+  /** Pan with left-drag on empty viewport (anywhere outside the spread).
+   *  Middle-button drag panning works anywhere — including across the
+   *  spread — so the user can reposition without having to find a free
+   *  margin. Right-button (button === 2) is ignored to let the OS
+   *  context menu through (if/when we add one).
+   *
+   *  The earlier `e.target === e.currentTarget` check broke after the
+   *  0.1.291 spread-model rework: with the wrapper's CSS box now sized
+   *  to spreadW × spreadH (which can dwarf the viewport), some clicks
+   *  in the "empty" viewport area fall on the wrapper's untransformed
+   *  CSS box even when the visible spread is much smaller. We now
+   *  pan whenever the click is OUTSIDE the spread's DOM subtree — DOM
+   *  containment is the only reliable signal here. */
   const handleViewportMouseDown = (e: React.MouseEvent) => {
-    if (e.target !== e.currentTarget) return;
+    if (e.button === 2) return;       // right-click — let context menu through
+    const middle = e.button === 1;
+    // Skip pan when the click is on (or inside) the spread, EXCEPT for
+    // the middle button, which always pans (so a power user can pan even
+    // across the spread without having to reach an empty margin).
+    if (!middle) {
+      const pg = pageRef.current;
+      if (pg && pg.contains(e.target as Node)) return;
+    }
+    if (middle) e.preventDefault();   // suppress auto-scroll cursor on middle-click
     setSelectedId(null);
     const startX = e.clientX;
     const startY = e.clientY;
