@@ -2520,14 +2520,21 @@ if (!"mean_intensity" %in% names(data)) data$mean_intensity <- 0
 if (!"channel" %in% names(data)) data$channel <- "Channel"
 if (!"group"   %in% names(data)) data$group   <- "all"
 if (!"is_control" %in% names(data)) data$is_control <- FALSE
-if (!"compartment" %in% names(data)) data$compartment <- "whole_cell"
+if (!"compartment" %in% names(data)) data$compartment <- "whole_image"
 data$mean_intensity <- suppressWarnings(as.numeric(data$mean_intensity))
 data$is_control <- as.logical(data$is_control)
 data$is_control[is.na(data$is_control)] <- FALSE
 data <- data[is.finite(data$mean_intensity), , drop = FALSE]
 data$channel <- factor(data$channel, levels = unique(data$channel))
 data$group   <- factor(data$group,   levels = unique(data$group))
-data$compartment <- factor(data$compartment, levels = c("whole_cell", "nucleus", "cytoplasm"))
+# Compartment values used by the picker:
+#   whole_image  → simple-strategy: no segmentation, one mean per image
+#                  inside the channel's threshold mask
+#   whole_cell   → cellpose: full cyto3 mask
+#   nucleus      → cellpose: cell ∩ nuclei mask
+#   cytoplasm    → cellpose: cell − nucleus
+# Listed in a sensible reading order; droplevels() drops empty ones.
+data$compartment <- factor(data$compartment, levels = c("whole_image", "whole_cell", "nucleus", "cytoplasm"))
 # Drop empty compartment levels so we don't render empty facet rows.
 data$compartment <- droplevels(data$compartment)
 has_compartments <- nlevels(data$compartment) > 1
@@ -2669,6 +2676,35 @@ if (has_norm) data$mean_intensity_norm <- suppressWarnings(as.numeric(data$mean_
 # in case the host R lacks it (very old ggplot2).
 if (!exists("sym")) sym <- function(x) rlang::sym(x)
 
+# Per-image aggregation: average per-cell measurements within each
+# (image × group × channel × compartment) into ONE row. Used for the
+# Gap-4 publication-grade plot where the unit of analysis is the
+# image (n = number of images per group), not the cell. Cellpose's
+# per-cell rows alone would treat cells as independent observations,
+# but cells share staining batch / exposure / focus within an image
+# — pseudo-replication inflates n and produces overconfident
+# p-values. Per-image means side-steps the issue entirely.
+.per_image_aggregate <- function(d, y_col) {
+  if (nrow(d) == 0) return(d)
+  if (!(y_col %in% names(d))) return(d[0, , drop = FALSE])
+  dd <- d[is.finite(d[[y_col]]), , drop = FALSE]
+  if (nrow(dd) == 0) return(dd)
+  fml <- as.formula(paste(y_col, "~ source + group + channel + compartment"))
+  agg <- aggregate(fml, data = dd, FUN = mean, na.rm = TRUE)
+  # Preserve is_control + factor levels (aggregate() drops factor
+  # ordering — we restore it so downstream colour/order matches).
+  agg$is_control <- FALSE
+  agg$group <- factor(agg$group, levels = levels(d$group))
+  agg$channel <- factor(agg$channel, levels = levels(d$channel))
+  agg$compartment <- factor(agg$compartment, levels = levels(d$compartment))
+  agg
+}
+
+# Detect cellpose mode by presence of cellpose-only compartments. In
+# simple mode every row is compartment == "whole_image"; in cellpose
+# mode at least some rows are "whole_cell"/"nucleus"/"cytoplasm".
+is_cellpose <- any(as.character(data$compartment) %in% c("whole_cell", "nucleus", "cytoplasm"))
+
 # ── Split control vs analysis channels and render each. ─────────────
 control_data  <- data[data$is_control == TRUE, , drop = FALSE]
 analysis_data <- data[data$is_control == FALSE, , drop = FALSE]
@@ -2687,23 +2723,61 @@ if (nrow(analysis_data) == 0 && nrow(control_data) == 0) {
   print(ggplot() + theme_void() + annotate("text", x = 0.5, y = 0.5,
         label = "No intensity rows — wire images upstream and Configure intensity."))
 } else {
-  # Render the RAW analysis (non-control) panel.
+  # ── PER-CELL panel (cellpose) OR per-image panel (simple). ──────
+  # The data unit depends on mode: in simple mode each row IS already
+  # per-image (one threshold-mask mean per image), so this plot's
+  # statistics are already at the right level. In cellpose mode each
+  # row is a CELL; the brackets here therefore use n=cells, which
+  # over-states n (pseudo-replication). The per-image aggregate
+  # plot below is the publication-grade counterpart.
+  cell_n_label <- if (is_cellpose) " — per-CELL (n = cells; descriptive)" else ""
   if (nrow(analysis_data) > 0) {
     dms <- .dims_for(analysis_data)
     mpfig_plot("channel_intensity.png", width = dms$w, height = dms$h, res = 300)
     print(.render_panel(analysis_data,
-                        if (has_compartments) "Channel intensities (channel × compartment)" else "Channel intensities",
+                        paste0(if (has_compartments) "Channel intensities (channel × compartment)" else "Channel intensities",
+                               cell_n_label),
                         FALSE, "mean_intensity", "Mean intensity (BG-corrected)"))
   }
-  # Render the NORMALISED variant when the picker emitted the column.
   if (nrow(analysis_data) > 0 && has_norm) {
     dms <- .dims_for(analysis_data)
     mpfig_plot("channel_intensity_norm.png", width = dms$w, height = dms$h, res = 300)
     print(.render_panel(analysis_data,
-                        "Channel intensities — NORMALISED per image to control channel",
+                        paste0("Channel intensities — NORMALISED per image to control channel", cell_n_label),
                         FALSE, "mean_intensity_norm", "Mean intensity / per-image control"))
   }
-  # Control sanity check — flag red if between-group test rejects H0.
+
+  # ── Gap 4: PER-IMAGE AGGREGATE plot. Only meaningful in cellpose
+  #    mode (in simple mode each row is already per-image, so this
+  #    would just duplicate the previous plot). Aggregates the
+  #    per-cell rows by image first, then runs ANOVA + Tukey on
+  #    those image means. n drops from cells → images, removing
+  #    the within-image pseudo-replication bias.
+  if (is_cellpose && nrow(analysis_data) > 0) {
+    agg_raw <- .per_image_aggregate(analysis_data, "mean_intensity")
+    if (nrow(agg_raw) > 0) {
+      dms <- .dims_for(agg_raw)
+      mpfig_plot("channel_intensity_per_image.png", width = dms$w, height = dms$h, res = 300)
+      print(.render_panel(agg_raw,
+                          paste0(if (has_compartments) "Channel intensities (channel × compartment)" else "Channel intensities",
+                                 " — PER-IMAGE means (n = images; publication-grade)"),
+                          FALSE, "mean_intensity", "Per-image mean intensity"))
+    }
+    if (has_norm) {
+      agg_norm <- .per_image_aggregate(analysis_data, "mean_intensity_norm")
+      if (nrow(agg_norm) > 0) {
+        dms <- .dims_for(agg_norm)
+        mpfig_plot("channel_intensity_norm_per_image.png", width = dms$w, height = dms$h, res = 300)
+        print(.render_panel(agg_norm,
+                            paste0("Channel intensities — NORMALISED, PER-IMAGE means (n = images; publication-grade)"),
+                            FALSE, "mean_intensity_norm", "Per-image normalised intensity"))
+      }
+    }
+  }
+
+  # ── Control sanity check — unchanged. Stays per-cell (or per-image
+  #    in simple mode) because it's a yes/no flag for group comparability,
+  #    not a quantitative comparison the reader's going to put in a paper.
   if (nrow(control_data) > 0) {
     ctrl_summary <- .summary(control_data, "mean_intensity")
     ctrl_brackets <- .brackets(control_data, ctrl_summary, "mean_intensity")

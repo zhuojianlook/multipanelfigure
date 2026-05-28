@@ -776,10 +776,14 @@ if control_name:
         else:
             r["per_image_control_mean"] = None
             r["mean_intensity_norm"] = None
-# Simple mode rows don't have a compartment — tag them as whole_cell
-# so the downstream R plot can use the same column.
+# Simple mode rows are NOT per-cell — there's no segmentation in this
+# mode. They're a single mean per (image, channel) inside the channel's
+# threshold mask, which covers wherever the channel happens to be
+# bright in the whole image. Tag them as "whole_image" so the R plot
+# can show that label honestly and the cellpose compartments
+# (whole_cell / nucleus / cytoplasm) stay distinct.
 for r in rows:
-    r.setdefault("compartment", "whole_cell")
+    r.setdefault("compartment", "whole_image")
 print(f"computed channel intensities for {len(imgs)} image(s); "
       f"groups = {sorted({r['group'] for r in rows})}; "
       f"control = {control_name or '<none>'}; "
