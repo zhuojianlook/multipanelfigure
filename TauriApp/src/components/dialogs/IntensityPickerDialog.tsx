@@ -573,6 +573,65 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewStats, setPreviewStats] = useState<{ n_cells?: number; per_channel?: Record<string, number> } | null>(null);
+  // Repair flow for a broken Cellpose plugin venv (missing packaging,
+  // missing setuptools, partial install, etc.). Streams the install log
+  // into a textarea below the preview pane so the user can see progress.
+  const [repairing, setRepairing] = useState(false);
+  const [repairLog, setRepairLog] = useState<string>("");
+  // Show the repair affordance when the error looks like a plugin-env
+  // problem (the 'No module named …' / "Cellpose isn't installed" pattern).
+  const showRepair = !!previewError && (
+    /No module named/.test(previewError)
+    || /not installed/i.test(previewError)
+    || /Install Cellpose/i.test(previewError)
+    || /plugin (?:venv|environment)/i.test(previewError)
+  );
+  const runCellposeRepair = useCallback(async () => {
+    if (repairing) return;
+    setRepairing(true);
+    setRepairLog("");
+    try {
+      const resp = await fetch("http://127.0.0.1:8765/api/analysis/install-cellpose-stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      if (!resp.ok || !resp.body) {
+        setRepairLog(`HTTP ${resp.status}: failed to start install`);
+        return;
+      }
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        // SSE frames: split on double newline, parse `data:` lines.
+        let nl;
+        while ((nl = buf.indexOf("\n\n")) >= 0) {
+          const frame = buf.slice(0, nl);
+          buf = buf.slice(nl + 2);
+          for (const line of frame.split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            const payload = line.slice(5).trim();
+            try {
+              const evt = JSON.parse(payload) as { message?: string; done?: boolean; returncode?: number };
+              if (evt.message) setRepairLog((p) => p + evt.message + "\n");
+              if (evt.done) {
+                setRepairLog((p) => p + `\n${evt.returncode === 0 ? "✔ install finished" : `✘ install exited with ${evt.returncode}`}\n`);
+              }
+            } catch {
+              setRepairLog((p) => p + payload + "\n");
+            }
+          }
+        }
+      }
+    } catch (e: unknown) {
+      setRepairLog((p) => p + `\nerror: ${String((e as { message?: string })?.message ?? e)}\n`);
+    } finally {
+      setRepairing(false);
+    }
+  }, [repairing]);
 
   // Reset on (re-)open. Clear active idx + preview so we don't show stale.
   useEffect(() => {
@@ -884,11 +943,36 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
             {previewError && (
               <Box sx={{
                 position: "absolute", bottom: 4, left: 4, right: 4,
-                px: 0.8, py: 0.3, borderRadius: 0.5,
-                bgcolor: "rgba(180,40,40,0.85)", color: "common.white",
-                fontSize: "0.66rem",
+                px: 0.8, py: 0.5, borderRadius: 0.5,
+                bgcolor: "rgba(180,40,40,0.92)", color: "common.white",
+                fontSize: "0.7rem", display: "flex", flexDirection: "column", gap: 0.5,
               }}>
-                ⚠ {previewError}
+                <Box>⚠ {previewError}</Box>
+                {showRepair && (
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 1, flexWrap: "wrap" }}>
+                    <Typography variant="caption" sx={{ color: "common.white", opacity: 0.85, fontSize: "0.66rem" }}>
+                      The plugin venv looks broken. Click to repair (pip install — 5-15 min, ~500 MB).
+                    </Typography>
+                    <Button size="small" variant="contained" color="warning"
+                      onClick={() => void runCellposeRepair()}
+                      disabled={repairing}
+                      sx={{ textTransform: "none", fontWeight: 700, fontSize: "0.7rem", py: 0.2, px: 1, ml: "auto" }}>
+                      {repairing ? "Repairing…" : "Repair plugin venv"}
+                    </Button>
+                  </Box>
+                )}
+              </Box>
+            )}
+            {/* Live install log when repair is running. Anchored at the
+                top so it doesn't fight the error banner at the bottom. */}
+            {(repairing || repairLog) && (
+              <Box sx={{
+                position: "absolute", top: 4, left: 4, right: 4, maxHeight: "55%",
+                px: 0.8, py: 0.4, borderRadius: 0.5,
+                bgcolor: "rgba(0,0,0,0.85)", color: "#cfe", fontFamily: "monospace",
+                fontSize: "0.62rem", overflow: "auto", whiteSpace: "pre-wrap",
+              }}>
+                {repairLog || "starting…"}
               </Box>
             )}
             {/* Stats footer (cell count or per-channel pixel tallies) */}
