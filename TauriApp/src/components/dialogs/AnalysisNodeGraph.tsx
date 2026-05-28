@@ -4893,8 +4893,23 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         }
         continue;
       }
-      // Upstream process node: pull from its cached outputs.
-      const outputs = upstreamData.outputs || [];
+      // Upstream process node: pull from its cached outputs.  Tables AND
+      // images are now versioned (v1, v2, …); the runner consumes them
+      // by iteration order so we MUST pass only the latest version per
+      // (kind, name) tuple — otherwise stale runs would clobber the
+      // fresh data downstream.
+      const allOutputs = upstreamData.outputs || [];
+      const verOf = (o: NodeOutput): number => {
+        const m = (o.versionLabel || "").match(/^v(\d+)$/);
+        return m ? Number(m[1]) : 0;
+      };
+      const latestByName = new Map<string, NodeOutput>();
+      for (const o of allOutputs) {
+        const k = `${o.kind}/${o.name}`;
+        const cur = latestByName.get(k);
+        if (!cur || verOf(o) > verOf(cur)) latestByName.set(k, o);
+      }
+      const outputs = Array.from(latestByName.values());
       const outId = e.sourceHandle || "";
       // Match by handle id — but process nodes only have generic
       // `out_image` / `out_table` / `out_plot` handles, so we pull
@@ -5059,7 +5074,20 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           }
           continue;
         }
-        const outputs = upstreamData.outputs || [];
+        // Latest-version filter — mirrors the main collectInputs path
+        // so a versioned table/image only emits the newest run downstream.
+        const allOutputs = upstreamData.outputs || [];
+        const verOf = (o: NodeOutput): number => {
+          const m = (o.versionLabel || "").match(/^v(\d+)$/);
+          return m ? Number(m[1]) : 0;
+        };
+        const latestByName = new Map<string, NodeOutput>();
+        for (const o of allOutputs) {
+          const k = `${o.kind}/${o.name}`;
+          const cur = latestByName.get(k);
+          if (!cur || verOf(o) > verOf(cur)) latestByName.set(k, o);
+        }
+        const outputs = Array.from(latestByName.values());
         const outId = e.sourceHandle || "";
         const kind: DataKind = outId.includes("image") ? "image" : outId.includes("table") ? "table" : "plot";
         if (kind === "plot") continue;
@@ -5421,12 +5449,13 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       setConsoleOut(consoleRef.current);
       setNodes((cur) => cur.map((n) => {
         if (n.id !== node.id) return n;
-        // Versioning model: every image/plot output gets a monotonically
-        // increasing version label — the FIRST run produces v1, the next
-        // v2, and so on. Older versions are kept (capped at the 3 most
-        // recent runs) so the user can compare old vs new in the drawer.
-        // Tables are NOT versioned (CSVs replace fresh — they're cheap
-        // and rarely compared visually).
+        // Versioning model: every output gets a monotonically increasing
+        // version label — the FIRST run produces v1, the next v2, and so
+        // on.  Plots / images / tables all keep up to 3 most recent runs
+        // so the user can compare old vs new in the drawer.  Downstream
+        // consumers (collectInputs) filter to the LATEST version per
+        // (kind, name) tuple, so versioning tables doesn't break the
+        // chain even though the runner just picks the first table input.
         const prev = n.data.outputs || [];
         const versionOf = (o: NodeOutput): number => {
           const m = (o.versionLabel || "").match(/^v(\d+)$/);
@@ -5434,17 +5463,13 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         };
         const maxV = prev.reduce((acc, o) => Math.max(acc, versionOf(o)), 0);
         const newV = maxV + 1;
-        const tagged: NodeOutput[] = newOutputs.map((o) => (
-          o.kind === "table" ? o : {
-            ...o, id: `${o.id}__v${newV}`, versionLabel: `v${newV}`,
-          }
-        ));
-        // Keep the previous 2 versions of image/plot outputs (current = v(newV)
-        // → keep v(newV-1), v(newV-2); drop anything older). Tables: always
-        // replace with the fresh ones from this run.
+        const tagged: NodeOutput[] = newOutputs.map((o) => ({
+          ...o, id: `${o.id}__v${newV}`, versionLabel: `v${newV}`,
+        }));
+        // Keep previous 2 versions of EVERY output kind (current = v(newV)
+        // → keep v(newV-1), v(newV-2); drop anything older).
         const kept: NodeOutput[] = [];
         for (const o of prev) {
-          if (o.kind === "table") continue;
           const v = versionOf(o);
           if (v > 0 && v >= newV - 2) kept.push(o);
         }

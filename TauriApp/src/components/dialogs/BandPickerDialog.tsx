@@ -462,6 +462,8 @@ except Exception as _e:
 
 # Stage 2: draw the band rectangles. Done in its own try block so a
 # font / draw failure doesn't drop the image we already built.
+bands_drawn = 0
+bands_skipped = 0
 if annot is not None:
     try:
         draw = _PIL_D.Draw(annot)
@@ -492,13 +494,20 @@ if annot is not None:
                 col = level_to_color.get(lv, PALETTE[0])
                 nm = (band.get("name") or "").strip()
                 sw = max(1, int(round(min(H, W) / 600)))
-                is_lc_band = lc_enabled and lc_by_lane.get(str(band.get("label") or ""), "") == nm
-                draw.rectangle([x0, y0, x1 - 1, y1 - 1], outline=col, width=sw)
+                # NB: variable is lc_pick_for_lane (the per-lane LC band pick
+                # from the picker UI); an earlier draft used "lc_by_lane"
+                # here and every band's draw silently NameError'd under the
+                # per-band try/except, leaving only the lane outlines visible
+                # in the annotated_bands output.
+                is_lc_band = lc_enabled and lc_pick_for_lane.get(str(band.get("label") or ""), "") == nm
+                draw.rectangle([x0, y0, x1 - 1, y1 - 1], outline=col, width=max(2, sw))
                 if is_lc_band:
                     draw.rectangle([x0 + sw, y0 + sw, x1 - sw - 1, y1 - sw - 1], outline=col, width=max(1, sw // 2))
                 label_y = max(0, y0 - int(font_size * 1.1) - 2)
                 draw.text((x0 + 2, label_y), nm or "?", fill=col, font=font)
+                bands_drawn += 1
             except Exception as _be:
+                bands_skipped += 1
                 print(f"[band-picker] band draw skipped ({band.get('name', '?')}): {_be}", file=_sys.stderr)
         if lc_enabled:
             for lb in (CFG.get("laneBounds", []) or []):
@@ -521,7 +530,8 @@ if annot is not None:
             ratio = SAVE_MAX_W / annot.width
             annot = annot.resize((SAVE_MAX_W, max(1, int(round(annot.height * ratio)))), _PIL_I.LANCZOS)
         mpfig_image(annot, name="annotated_bands")
-        print(f"emitted annotated_bands ({annot.width}x{annot.height})")
+        print(f"emitted annotated_bands ({annot.width}x{annot.height}): "
+              f"{bands_drawn} band(s) drawn, {bands_skipped} skipped")
     except Exception as _ee:
         print(f"[band-picker] mpfig_image emit failed: {_ee}", file=_sys.stderr)
 else:
