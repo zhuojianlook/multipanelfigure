@@ -634,6 +634,13 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       .then((r) => r.ok ? r.json() : null)
       .then((d) => { if (!cancelled && d?.build) setSidecarBuild(String(d.build)); })
       .catch(() => { /* not critical — leave null */ });
+    // Fire-and-forget warmup — triggers cv2 / scipy / PIL imports in the
+    // frozen sidecar so the user's first Run preview click doesn't pay
+    // the cold-start cost (which would otherwise blow past the 30 s
+    // simple-mode timeout). Idempotent; subsequent dialog opens are
+    // ~instant because the modules stay cached for the process lifetime.
+    fetch("http://127.0.0.1:8765/api/analysis/warmup", { method: "POST" })
+      .catch(() => { /* warm-up is best-effort; the picker still works without it */ });
     return () => { cancelled = true; };
   }, [open]);
   // Repair flow for a broken Cellpose plugin venv (missing packaging,
@@ -792,9 +799,12 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       // Hard client-side timeout so the spinner can't get stuck forever
       // when the sidecar is offline or the strategy is mis-configured.
       // Cellpose: 10 min (matches the backend's plugin call), so the
-      // first run can finish downloading the ~100 MB model. Threshold
-      // is fast — 30 s is plenty.
-      const timeoutMs = cfg.mode === "cellpose" ? 600000 : 30000;
+      // first run can finish downloading the ~100 MB model. Threshold:
+      // 60 s — the FIRST simple-strategy call lazy-loads cv2 + scipy +
+      // PIL in the frozen sidecar (can take 10-30 s on a cold start),
+      // and the dialog's warmup ping at mount time helps but isn't
+      // guaranteed to finish before the user clicks Run.
+      const timeoutMs = cfg.mode === "cellpose" ? 600000 : 60000;
       const timeoutId = setTimeout(() => {
         // Tag the controller so the catch block can distinguish a
         // timeout-driven abort from a user-driven one (e.g. re-clicking
@@ -846,7 +856,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         if ((ac as unknown as { __timedOut?: boolean }).__timedOut) {
           setPreviewError(cfg.mode === "cellpose"
             ? "Cellpose preview timed out (>10 min). The first run downloads the model (~100 MB) — check your internet, then try again, or verify the plugin venv with 'Repair plugin venv'."
-            : "Preview timed out (>30 s). The sidecar may be busy or unreachable.");
+            : "Preview timed out (>60 s). The sidecar may be busy or still loading scientific libraries on a cold start — try again.");
         }
         return;
       }

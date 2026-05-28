@@ -152,12 +152,44 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.304"
+SIDECAR_BUILD = "0.1.305"
 
 
 @app.get("/api/version")
 async def version():
     return {"build": SIDECAR_BUILD}
+
+
+@app.post("/api/analysis/warmup")
+def analysis_warmup():
+    """Force the heavy scientific-Python imports the frozen sidecar
+    lazy-loads. The fluor / wb endpoints all need cv2 + scipy + PIL,
+    and on a cold start each import can take 5-15 s in a PyInstaller
+    binary (the modules are bundled but get deserialised on first use).
+    Calling this endpoint when a dialog opens hides that cost behind
+    UI-open latency so the user's first Run click doesn't time out.
+
+    Idempotent: every subsequent call just returns immediately (Python
+    caches module imports per-process). Returns a small JSON envelope
+    so the caller can also use it as a sidecar-up health check."""
+    out: Dict[str, object] = {"imported": []}
+    try:
+        import cv2 as _cv2          # noqa: F401
+        out["imported"].append("cv2")
+    except Exception as _e:
+        out["cv2_error"] = str(_e)
+    try:
+        from scipy import ndimage as _ndi  # noqa: F401
+        out["imported"].append("scipy.ndimage")
+    except Exception as _e:
+        out["scipy_error"] = str(_e)
+    try:
+        from PIL import Image as _Im  # noqa: F401
+        out["imported"].append("PIL.Image")
+    except Exception as _e:
+        out["pil_error"] = str(_e)
+    out["build"] = SIDECAR_BUILD
+    return out
 
 # Global state (single-user desktop app)
 cfg = FigureConfig()
