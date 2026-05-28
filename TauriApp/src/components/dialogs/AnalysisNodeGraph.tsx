@@ -4956,21 +4956,33 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         node = { ...node, data: { ...node.data, roi: picked, code: generateBandPickerCode(picked) } };
       }
     }
-    // Interactive intensity-picker not yet configured (no groups defined) →
-    // pause and open the picker so the run has meaningful group labels.
-    if (node.data.interactive === "fluor_intensity"
-        && (!node.data.intensity || (node.data.intensity.groups?.length ?? 0) === 0)) {
-      consoleRef.current += `\n=== ${node.data.label}: configure intensity first — opening the picker (rename channels, assign groups, pick mode) ===\n`;
-      setConsoleOut(consoleRef.current);
-      setNodes((cur) => cur.map((n) => n.id === node.id ? { ...n, data: { ...n.data, status: "idle" } } : n));
-      const picked = await openIntensityPickerAndWait(node.id);
-      if (!picked || (picked.groups?.length ?? 0) === 0) {
-        consoleRef.current += `=== ${node.data.label}: no groups assigned — run stopped ===\n`;
+    // Interactive intensity-picker not yet configured → pause and open
+    // the picker. We require at least one group with at least one image
+    // assigned (an empty groups[] OR groups that exist but contain no
+    // images both halt the run — the downstream R plot would otherwise
+    // show empty bars). The picker disables Save until this is met, so
+    // this gate mostly catches first runs + legacy configs.
+    if (node.data.interactive === "fluor_intensity") {
+      const ic = node.data.intensity;
+      const icHasAssignedGroup = !!ic
+        && (ic.groups?.length ?? 0) > 0
+        && (ic.groups || []).some((g) => (g.images?.length ?? 0) > 0);
+      if (!ic || !icHasAssignedGroup) {
+        consoleRef.current += `\n=== ${node.data.label}: configure intensity first — opening the picker (rename channels, assign images to groups, pick strategy) ===\n`;
         setConsoleOut(consoleRef.current);
-        runAbortRef.current = true;
-        return;
+        setNodes((cur) => cur.map((n) => n.id === node.id ? { ...n, data: { ...n.data, status: "idle" } } : n));
+        const picked = await openIntensityPickerAndWait(node.id);
+        const pickedHasAssignedGroup = !!picked
+          && (picked.groups?.length ?? 0) > 0
+          && (picked.groups || []).some((g) => (g.images?.length ?? 0) > 0);
+        if (!picked || !pickedHasAssignedGroup) {
+          consoleRef.current += `=== ${node.data.label}: no group has any images assigned — run stopped ===\n`;
+          setConsoleOut(consoleRef.current);
+          runAbortRef.current = true;
+          return;
+        }
+        node = { ...node, data: { ...node.data, intensity: picked, code: generateFluorCode(picked) } };
       }
-      node = { ...node, data: { ...node.data, intensity: picked, code: generateFluorCode(picked) } };
     }
     // Parse a `# @name: <label>` / `// @name: <label>` marker from the
     // first 20 lines so users can name a node from within the code.
