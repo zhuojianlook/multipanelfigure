@@ -372,6 +372,9 @@ def _cellpose_labels_batch(items):
             "diameter": float(cp_cfg.get("diameter") or 0) or None,
             "min_size": int(cp_cfg.get("minSize") or 30),
             "channels": [{"r": 1, "g": 2, "b": 3}.get(cp_cfg.get("segChannel") or "b", 3), 0],
+            # Use GPU when available (CUDA / Apple Silicon MPS). Falls
+            # back to CPU automatically if neither is compiled in.
+            "use_gpu": True,
         }),
         "extra_inputs": sent,
         "sources": [], "timeout_sec": 600,
