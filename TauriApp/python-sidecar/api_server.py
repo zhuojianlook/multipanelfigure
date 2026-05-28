@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.306"
+SIDECAR_BUILD = "0.1.307"
 
 
 @app.get("/api/version")
@@ -6990,6 +6990,13 @@ class FluorChannelThreshold(BaseModel):
     threshold_method: str = "percentile"  # "percentile" | "otsu"
     threshold_percentile: float = 95.0
     min_area: int = 30
+    # When True, apply a Difference-of-Gaussians band-pass before
+    # thresholding this channel. Suppresses diffuse haze AND emphasises
+    # cell-sized structures, so it's the right pick for densely-packed
+    # cells or cells with soft edges. Stacks on top of the global
+    # rolling-ball bg subtraction when both are on (BG removed first,
+    # then DoG, then threshold).
+    enhance_edges: bool = False
 
 
 class FluorCellposePreview(BaseModel):
@@ -7178,6 +7185,22 @@ def fluor_preview_segment(body: FluorPreviewRequest):
         y, x = _np.ogrid[-r:r + 1, -r:r + 1]
         return (x * x + y * y) <= r * r
 
+    def _dog_edges(img):
+        """Difference-of-Gaussians band-pass for cell-sized structures.
+        sigma_small (1 px) suppresses single-pixel noise; sigma_large
+        suppresses structures larger than typical cells. The result is a
+        non-negative response peaked on cell-sized blobs, well-separated
+        from diffuse background — feeds straight into the threshold."""
+        sigma_small = 1.0
+        sigma_large = 20.0   # ~cell radius in px; safe default for typical microscopy
+        # GaussianBlur with ksize=(0,0) lets OpenCV compute the kernel
+        # from sigma (kernel ≈ 6*sigma + 1).
+        g_small = _cv2.GaussianBlur(img.astype(_np.float32), (0, 0), sigma_small)
+        g_large = _cv2.GaussianBlur(img.astype(_np.float32), (0, 0), sigma_large)
+        out_img = (g_small - g_large).astype(_np.float64)
+        out_img[out_img < 0] = 0
+        return out_img
+
     def _threshold_mask(corr, method, pct):
         if method == "otsu":
             lo = _np.percentile(corr, 0.2)
@@ -7217,6 +7240,13 @@ def fluor_preview_segment(body: FluorPreviewRequest):
         bg = _rolling_bg(ch_raw, rolling_radius)
         corr = ch_raw.astype(_np.float64) - bg
         corr[corr < 0] = 0
+        # Optional per-channel edge enhancement (Difference of Gaussians).
+        # Applied AFTER rolling-ball BG subtract so any leftover haze gets
+        # squashed by the band-pass too. The user sees the slider /
+        # threshold operate on the DoG response, which makes cell-soft-
+        # edge signals far easier to pick up.
+        if bool(getattr(spec, "enhance_edges", False)):
+            corr = _dog_edges(corr)
         try:
             mask = _threshold_mask(
                 corr,

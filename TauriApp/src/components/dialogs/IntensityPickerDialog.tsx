@@ -74,6 +74,12 @@ export interface FluorChannelThreshold {
   thresholdPercentile: number;
   /** Drop connected components smaller than this many px². */
   minArea: number;
+  /** When true, apply a Difference-of-Gaussians band-pass to this channel
+   *  BEFORE thresholding. Suppresses diffuse haze and emphasises cell-
+   *  sized structures, so it works well for densely-packed cells or
+   *  cells with soft edges. Stacks on top of the global rolling-ball
+   *  background subtraction when both are on. */
+  enhanceEdges?: boolean;
 }
 
 /** Per-image upstream input — what the dialog needs to cycle / preview. */
@@ -132,9 +138,9 @@ export function emptyFluorConfig(): FluorIntensityConfig {
     channels: { r: "Channel R", g: "Channel G", b: "Channel B" },
     mode: "simple",
     thresholds: {
-      r: { enabled: true, thresholdMethod: "percentile", thresholdPercentile: 95, minArea: 30 },
-      g: { enabled: true, thresholdMethod: "percentile", thresholdPercentile: 95, minArea: 30 },
-      b: { enabled: true, thresholdMethod: "percentile", thresholdPercentile: 95, minArea: 30 },
+      r: { enabled: true, thresholdMethod: "percentile", thresholdPercentile: 95, minArea: 30, enhanceEdges: false },
+      g: { enabled: true, thresholdMethod: "percentile", thresholdPercentile: 95, minArea: 30, enhanceEdges: false },
+      b: { enabled: true, thresholdMethod: "percentile", thresholdPercentile: 95, minArea: 30, enhanceEdges: false },
     },
     rollingRadius: 35,
     cellpose: { model: "cpsam", diameter: 0, segChannel: "b", minSize: 80 },
@@ -482,10 +488,24 @@ for key, src in imgs:
         bg = _rolling_bg(raw[..., ci], rolling_radius)
         corr = raw[..., ci].astype(np.float64) - bg
         corr[corr < 0] = 0
+        # IMPORTANT: corrected[..., ci] stores the BG-corrected intensity
+        # used for the per-mask MEAN measurement — NOT the DoG response.
+        # We want intensity stats to reflect actual fluorescence, not a
+        # band-pass artefact. So we keep "corrected" here and build a
+        # separate "thresh_in" for the threshold step below.
         corrected[..., ci] = corr
+        thresh_in = corr
+        # Optional Difference-of-Gaussians band-pass: better separation
+        # for densely-packed cells / soft-edged signal. The threshold is
+        # applied to the DoG response; intensities still come from "corr".
+        if bool(spec.get("enhanceEdges", False)) and _have_scipy:
+            g_small = _cv2.GaussianBlur(corr.astype(np.float32), (0, 0), 1.0)
+            g_large = _cv2.GaussianBlur(corr.astype(np.float32), (0, 0), 20.0)
+            thresh_in = (g_small - g_large).astype(np.float64)
+            thresh_in[thresh_in < 0] = 0
         try:
             mask = _threshold_mask(
-                corr,
+                thresh_in,
                 str(spec.get("thresholdMethod", "percentile")),
                 float(spec.get("thresholdPercentile", 95)),
             )
@@ -768,26 +788,14 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         preview_max_w: 1024,
       };
       if (cfg.mode === "simple") {
-        body.channels = {
-          r: {
-            enabled: cfg.thresholds.r.enabled,
-            threshold_method: cfg.thresholds.r.thresholdMethod,
-            threshold_percentile: cfg.thresholds.r.thresholdPercentile,
-            min_area: cfg.thresholds.r.minArea,
-          },
-          g: {
-            enabled: cfg.thresholds.g.enabled,
-            threshold_method: cfg.thresholds.g.thresholdMethod,
-            threshold_percentile: cfg.thresholds.g.thresholdPercentile,
-            min_area: cfg.thresholds.g.minArea,
-          },
-          b: {
-            enabled: cfg.thresholds.b.enabled,
-            threshold_method: cfg.thresholds.b.thresholdMethod,
-            threshold_percentile: cfg.thresholds.b.thresholdPercentile,
-            min_area: cfg.thresholds.b.minArea,
-          },
-        };
+        const chBody = (k: "r" | "g" | "b") => ({
+          enabled: cfg.thresholds[k].enabled,
+          threshold_method: cfg.thresholds[k].thresholdMethod,
+          threshold_percentile: cfg.thresholds[k].thresholdPercentile,
+          min_area: cfg.thresholds[k].minArea,
+          enhance_edges: !!cfg.thresholds[k].enhanceEdges,
+        });
+        body.channels = { r: chBody("r"), g: chBody("g"), b: chBody("b") };
       } else {
         body.cellpose = {
           model: cfg.cellpose.model,
@@ -1346,10 +1354,11 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                   const PCT_LO = 80, PCT_HI = 99.7;
                   const pct = Math.max(PCT_LO, Math.min(PCT_HI, t.thresholdPercentile));
                   const strictness = Math.round(((pct - PCT_LO) / (PCT_HI - PCT_LO)) * 100);
+                  const edgeOn = !!t.enhanceEdges;
                   return (
                     <Box key={k} sx={{
                       display: "grid",
-                      gridTemplateColumns: "115px 1fr 100px",
+                      gridTemplateColumns: "115px 1fr 56px 90px",
                       gap: 0.6, alignItems: "center",
                       px: 0.5, py: 0.35, borderRadius: 0.5,
                       bgcolor: t.enabled ? "transparent" : "action.hover",
@@ -1395,6 +1404,31 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                         />
                         <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.disabled" }}>strict</Typography>
                       </Box>
+                      {/* Per-channel edge-enhance chip (Difference of
+                          Gaussians band-pass). Helps with cells that have
+                          soft edges or are densely packed — recommend the
+                          user try it when the slider can't separate cell
+                          signal from haze. Stacks with "Subtract bg". */}
+                      <Tooltip title={edgeOn
+                        ? "Edge enhancement ON — Difference-of-Gaussians band-pass before threshold. Toggle off to disable."
+                        : "Toggle ON for densely-packed cells / soft edges. Applies a Difference-of-Gaussians band-pass to this channel before thresholding."}>
+                        <Box
+                          onClick={() => t.enabled && setThreshold(k, { enhanceEdges: !edgeOn })}
+                          sx={{
+                            cursor: t.enabled ? "pointer" : "not-allowed",
+                            fontSize: "0.62rem", px: 0.45, py: 0.1, borderRadius: 0.5,
+                            display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 0.25,
+                            bgcolor: edgeOn ? sw : "transparent",
+                            color: edgeOn ? "common.white" : "text.secondary",
+                            border: "1px solid", borderColor: sw,
+                            fontWeight: edgeOn ? 700 : 500,
+                            opacity: t.enabled ? 1 : 0.4,
+                            userSelect: "none",
+                          }}>
+                          <span style={{ fontSize: "0.7rem", lineHeight: 1 }}>✦</span>
+                          <span>Edges</span>
+                        </Box>
+                      </Tooltip>
                       <Tooltip title="Approximate fraction of the image's brightest pixels that survive the threshold.">
                         <Typography variant="caption" sx={{ fontSize: "0.7rem", color: "text.secondary", textAlign: "right" }}>
                           {t.enabled ? `top ${Math.max(0.3, Math.round((100 - pct) * 10) / 10)}%` : "skipped"}
