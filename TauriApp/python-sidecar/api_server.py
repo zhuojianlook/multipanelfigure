@@ -7093,11 +7093,18 @@ def fluor_preview_segment(body: FluorPreviewRequest):
             return {"success": False, "overlay_b64": "",
                     "error": f"labels decode failed: {_e}"}
 
-        # Draw yellow boundaries on the composite.
-        boundaries = _np.zeros(labels.shape, dtype=bool)
-        boundaries[:-1, :] |= labels[:-1, :] != labels[1:, :]
-        boundaries[:, :-1] |= labels[:, :-1] != labels[:, 1:]
-        boundaries &= labels > 0
+        # Draw yellow boundaries on the composite. Use SYMMETRIC 4-neighbour
+        # transitions (above/below AND left/right) so the boundary line
+        # sits on top of the actual cell edge, not 1 pixel above it.
+        b_up    = _np.zeros(labels.shape, dtype=bool)
+        b_down  = _np.zeros(labels.shape, dtype=bool)
+        b_left  = _np.zeros(labels.shape, dtype=bool)
+        b_right = _np.zeros(labels.shape, dtype=bool)
+        b_up[1:, :]    = labels[1:, :]    != labels[:-1, :]
+        b_down[:-1, :] = labels[:-1, :]   != labels[1:, :]
+        b_left[:, 1:]  = labels[:, 1:]    != labels[:, :-1]
+        b_right[:, :-1]= labels[:, :-1]   != labels[:, 1:]
+        boundaries = (b_up | b_down | b_left | b_right) & (labels > 0)
         composite[boundaries] = (255, 255, 0)
         n_cells = int(len(_np.unique(labels[labels > 0])))
         # Emit overlay PNG.
@@ -7186,11 +7193,14 @@ def fluor_preview_segment(body: FluorPreviewRequest):
             keep_ids = _np.where(sizes >= min_area)[0]
             mask = _np.isin(labels_c, keep_ids)
         per_channel[ch_key] = int(mask.sum())
-        # Dilate the boundary so the line is readable in the preview.
-        boundary = _np.zeros(mask.shape, dtype=bool)
-        boundary[:-1, :] |= mask[:-1, :] != mask[1:, :]
-        boundary[:, :-1] |= mask[:, :-1] != mask[:, 1:]
-        boundary = _ndi.binary_dilation(boundary, iterations=1)
+        # SYMMETRIC 2-px boundary, centered on the mask edge. The earlier
+        # `boundary[:-1,:] |= mask[:-1,:] != mask[1:,:]` form is biased:
+        # it marks the row JUST ABOVE every transition, so a downstream
+        # dilation extends 2 rows above the mask but only 1 row below —
+        # visually the mask outline ends up displaced upward by ~1 pixel.
+        # `dilation(mask) AND NOT erosion(mask)` is a symmetric ring of
+        # the mask's perimeter (1 px inside + 1 px outside), no bias.
+        boundary = _ndi.binary_dilation(mask, iterations=1) & ~_ndi.binary_erosion(mask, iterations=1)
         # Stamp onto the combined overlay.
         out[boundary] = ch_colors[ch_key]
         # ALSO emit a per-channel transparent PNG so the frontend can

@@ -430,11 +430,18 @@ if mode == "cellpose":
             paletted = palette[labels]
             mpfig_image(_Im.fromarray(paletted), name=f"{label}_mask")
             # 2) Outline overlay (yellow cell edges on the composite + ids).
+            #    Symmetric 4-neighbour transitions so the outline sits on
+            #    the cell edge, not 1 px above it.
             comp = _composite_u8(raw)
-            boundaries = np.zeros(labels.shape, dtype=bool)
-            boundaries[:-1, :] |= labels[:-1, :] != labels[1:, :]
-            boundaries[:, :-1] |= labels[:, :-1] != labels[:, 1:]
-            boundaries &= labels > 0
+            b_up    = np.zeros(labels.shape, dtype=bool)
+            b_down  = np.zeros(labels.shape, dtype=bool)
+            b_left  = np.zeros(labels.shape, dtype=bool)
+            b_right = np.zeros(labels.shape, dtype=bool)
+            b_up[1:, :]     = labels[1:, :]    != labels[:-1, :]
+            b_down[:-1, :]  = labels[:-1, :]   != labels[1:, :]
+            b_left[:, 1:]   = labels[:, 1:]    != labels[:, :-1]
+            b_right[:, :-1] = labels[:, :-1]   != labels[:, 1:]
+            boundaries = (b_up | b_down | b_left | b_right) & (labels > 0)
             comp[boundaries] = (255, 255, 0)
             overlay = _Im.fromarray(comp)
             d = _ImD.Draw(overlay)
@@ -523,12 +530,18 @@ for key, src in imgs:
             # Fill the mask (semi-transparent feel via 50% blend with composite).
             for ci, cv in enumerate(color):
                 mask_rgb[..., ci] = np.maximum(mask_rgb[..., ci], (m * cv).astype(np.uint8))
-            # Outline boundary on the overlay so the user can spot small dots.
-            boundary = np.zeros(m.shape, dtype=bool)
-            boundary[:-1, :] |= m[:-1, :] != m[1:, :]
-            boundary[:, :-1] |= m[:, :-1] != m[:, 1:]
+            # SYMMETRIC 2-px boundary: dilation(mask) AND NOT erosion(mask).
+            # The earlier slice-diff form biased the outline 1 px upward
+            # (and 1 px leftward), so the saved overlay didn't quite sit
+            # on the actual signal. This matches the picker preview now.
             if _have_scipy:
-                boundary = _ndi.binary_dilation(boundary, iterations=1)
+                boundary = _ndi.binary_dilation(m, iterations=1) & ~_ndi.binary_erosion(m, iterations=1)
+            else:
+                boundary = np.zeros(m.shape, dtype=bool)
+                boundary[:-1, :] |= m[:-1, :] != m[1:, :]
+                boundary[:, :-1] |= m[:, :-1] != m[:, 1:]
+                boundary[1:, :]  |= m[1:, :]  != m[:-1, :]
+                boundary[:, 1:]  |= m[:, 1:]  != m[:, :-1]
             out[boundary] = color
         mpfig_image(_Im.fromarray(mask_rgb), name=f"{label}_mask")
         mpfig_image(_Im.fromarray(out), name=f"{label}_overlay")
