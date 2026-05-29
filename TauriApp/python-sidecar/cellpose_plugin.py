@@ -35,7 +35,26 @@ def plugin_base_dir() -> str:
     return base
 
 
-def cellpose_venv_dir() -> str:
+def cellpose_venv_dir(version: str = "v4") -> str:
+    """Per-major-version venv path.  v3 and v4 coexist on disk so the
+    user can pick which API to run per node — v3 has the real
+    `cyto3` / `nuclei` model zoo, v4 ships only `cpsam` (a SAM-based
+    generalist).  Each lives in its own venv to avoid pip's "one
+    cellpose package per env" constraint.
+    """
+    norm = (version or "v4").lower()
+    if norm in ("v3", "3", "cellpose3", "cellpose-3"):
+        name = "cellpose-v3"
+    else:
+        name = "cellpose-v4"
+    return os.path.join(plugin_base_dir(), "venvs", name)
+
+
+def legacy_cellpose_venv_dir() -> str:
+    """Pre-multi-version venv (single "cellpose" dir).  Users who
+    installed before 0.1.324 land here.  We treat it as whichever
+    major it actually has installed so existing workflows don't
+    break — install_stream(version) builds the new versioned dirs."""
     return os.path.join(plugin_base_dir(), "venvs", "cellpose")
 
 
@@ -406,30 +425,80 @@ def write_runner() -> str:
 
 
 # ── Public API used by api_server endpoints ────────────────────────────────
-def check() -> dict:
-    """Whether Cellpose is importable in the plugin venv."""
-    vpy = venv_python(cellpose_venv_dir())
-    if os.path.isfile(vpy):
-        try:
-            r = subprocess.run(
-                [vpy, "-c",
-                 "import cellpose;print(getattr(cellpose,'version',None) or getattr(cellpose,'__version__','') or 'installed')"],
-                capture_output=True, text=True, timeout=120,
-            )
-            if r.returncode == 0:
-                ver = (r.stdout or "").strip().splitlines()[0] if r.stdout else ""
-                return {"installed": True, "kind": ("cellpose " + ver).strip(), "path": vpy}
-        except Exception:
-            pass
+def _probe_venv(venv_path: str) -> dict:
+    """Returns {installed, kind, path, major} for a single venv path."""
+    vpy = venv_python(venv_path)
+    if not os.path.isfile(vpy):
+        return {"installed": False, "path": vpy}
+    try:
+        r = subprocess.run(
+            [vpy, "-c",
+             "import cellpose;print(getattr(cellpose,'version',None) or getattr(cellpose,'__version__','') or 'installed')"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode == 0:
+            ver_str = ((r.stdout or "").strip().splitlines()[0] if r.stdout else "")
+            # Detect major from the version string (e.g. "3.1.2" → 3, "4.0.0" → 4).
+            major = 0
+            try:
+                first = ver_str.split(".")[0]
+                major = int("".join(ch for ch in first if ch.isdigit()))
+            except Exception:
+                major = 0
+            return {"installed": True, "kind": ("cellpose " + ver_str).strip(),
+                    "path": vpy, "major": major}
+    except Exception:
+        pass
     return {"installed": False, "path": vpy}
 
 
-def install_stream():
-    """Generator yielding SSE 'data:' lines while building the venv + installing
-    Cellpose into it. Final event carries the return code."""
+def check_all() -> dict:
+    """Probe BOTH versioned venvs + the legacy single-venv directory.
+    Returns a dict { v3: {...}, v4: {...}, legacy: {...} } that the
+    frontend uses to drive the dual install cards."""
+    v3 = _probe_venv(cellpose_venv_dir("v3"))
+    v4 = _probe_venv(cellpose_venv_dir("v4"))
+    legacy = _probe_venv(legacy_cellpose_venv_dir())
+    # When a versioned venv isn't installed but the legacy single-venv
+    # IS, surface the legacy install as the matching slot so existing
+    # users keep working without re-installing.
+    if not v4.get("installed") and legacy.get("installed") and int(legacy.get("major", 0)) >= 4:
+        v4 = {**legacy, "legacy": True}
+    if not v3.get("installed") and legacy.get("installed") and int(legacy.get("major", 0)) == 3:
+        v3 = {**legacy, "legacy": True}
+    return {"v3": v3, "v4": v4, "legacy": legacy}
+
+
+def check() -> dict:
+    """Legacy single-slot check.  Returns v4 status first (the modern
+    default); falls back to v3 or legacy.  Older callers (pre-0.1.324)
+    expect {installed, kind, path} so this keeps them working."""
+    all_ = check_all()
+    if all_["v4"].get("installed"):
+        return {k: v for k, v in all_["v4"].items() if k != "legacy"}
+    if all_["v3"].get("installed"):
+        return {k: v for k, v in all_["v3"].items() if k != "legacy"}
+    return {"installed": False, "path": all_["v4"].get("path", "")}
+
+
+def install_stream(version: str = "v4"):
+    """Generator yielding SSE 'data:' lines while building the venv +
+    installing the requested Cellpose major version into it.  Final
+    event carries the return code.
+
+    version — "v3" pins `pip install "cellpose<4"` so the v3 model zoo
+              (cyto, cyto2, cyto3, nuclei, …) is available.
+              "v4" pins `pip install "cellpose>=4"` (cpsam-only).
+    Each version lives in its OWN venv so they coexist on disk and the
+    user can switch per-node without reinstalling.
+    """
     def emit(line: str) -> str:
         esc = str(line).replace("\\", "\\\\").replace('"', '\\"')
         return 'data: {"line":"%s"}\n\n' % esc
+
+    norm_version = (version or "v4").lower()
+    if norm_version not in ("v3", "v4"):
+        norm_version = "v4"
 
     py = find_bootstrap_python()
     if not py:
@@ -438,10 +507,10 @@ def install_stream():
         yield 'data: {"done":true,"returncode":-1}\n\n'
         return
 
-    venv = cellpose_venv_dir()
+    venv = cellpose_venv_dir(norm_version)
     vpy = venv_python(venv)
     yield emit("bootstrap python: %s" % py)
-    yield emit("plugin environment: %s" % venv)
+    yield emit("plugin environment (%s): %s" % (norm_version, venv))
 
     # 1) Create the venv (idempotent).
     if not os.path.isfile(vpy):
@@ -483,9 +552,13 @@ def install_stream():
         yield emit("warning: bootstrap returned %d (continuing — pip may still work)" % boot.returncode)
 
     # 3) Install/upgrade cellpose + its I/O deps, streaming pip output.
+    #    Pin the cellpose major to the requested version so v3 (the
+    #    real cyto3 + nuclei model zoo) and v4 (cpsam generalist) can
+    #    coexist on disk in separate venvs.
+    cellpose_spec = "cellpose<4" if norm_version == "v3" else "cellpose>=4"
     cmd = [vpy, "-u", "-m", "pip", "install", "--upgrade", "--no-input",
-           "--progress-bar", "on", "cellpose", "numpy", "pillow"]
-    yield emit("pip install --upgrade cellpose numpy pillow (may take 5–15 min, ~500 MB)")
+           "--progress-bar", "on", cellpose_spec, "numpy", "pillow"]
+    yield emit("pip install --upgrade %r numpy pillow (may take 5–15 min, ~500 MB)" % cellpose_spec)
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1, env=env)
@@ -509,13 +582,38 @@ def install_stream():
 def run(images_in: List[Tuple[str, "object"]], cfg_dict: dict, timeout_sec: int = 600) -> dict:
     """Run Cellpose on already-extracted (label, ndarray) images via the venv
     subprocess. Returns the same envelope shape the endpoint returned before:
-    { success, stdout, stderr, plots, tables, images }."""
+    { success, stdout, stderr, plots, tables, images }.
+
+    cfg_dict["cellpose_version"] (optional, "v3" / "v4", default "v4")
+    selects which venv to dispatch into.  Falls back to the legacy
+    single-venv install when the requested version isn't installed
+    yet — keeps existing setups working without a forced re-install.
+    """
     from PIL import Image  # sidecar has pillow
 
-    vpy = venv_python(cellpose_venv_dir())
+    # Pull the version preference OUT of cfg_dict so it doesn't end up
+    # in the runner job (the runner doesn't care which venv it lives in;
+    # it just runs cellpose).
+    version = str(cfg_dict.pop("cellpose_version", "v4")).lower()
+    if version not in ("v3", "v4"):
+        version = "v4"
+    vpy = venv_python(cellpose_venv_dir(version))
+    chosen_venv_kind = version
+    if not os.path.isfile(vpy):
+        # Try the OTHER versioned venv.
+        alt = "v3" if version == "v4" else "v4"
+        vpy = venv_python(cellpose_venv_dir(alt))
+        if os.path.isfile(vpy):
+            chosen_venv_kind = alt + " (fallback)"
+        else:
+            # Fall back to the legacy single venv (pre-0.1.324 installs).
+            vpy = venv_python(legacy_cellpose_venv_dir())
+            if os.path.isfile(vpy):
+                chosen_venv_kind = "legacy"
     if not os.path.isfile(vpy):
         return {"success": False, "stdout": "",
-                "stderr": "Cellpose isn't installed yet. Click 'Install Cellpose 3' first.",
+                "stderr": ("Cellpose isn't installed yet. Open Plugins → "
+                           "Install Cellpose %s first." % version),
                 "plots": [], "tables": [], "images": []}
     try:
         write_runner()

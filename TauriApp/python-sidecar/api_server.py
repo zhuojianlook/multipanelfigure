@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.323"
+SIDECAR_BUILD = "0.1.324"
 
 
 @app.get("/api/version")
@@ -7010,6 +7010,10 @@ class FluorCellposePreview(BaseModel):
     # see both cell + nucleus outlines on the composite. Doesn't change
     # the rest of the response shape.
     measure_compartments: bool = False
+    # Cellpose major version: "v3" → real cyto3 / cyto2 / nuclei model
+    # zoo; "v4" → cpsam (the only model v4 ships).  Routes to the
+    # matching plugin venv.
+    cellpose_version: str = "v4"
 
 
 class FluorPreviewRequest(BaseModel):
@@ -7121,6 +7125,8 @@ def fluor_preview_segment(body: FluorPreviewRequest):
             "diameter": float(cp.diameter or 0) or None,
             "min_size": int(cp.min_size or 30),
             "channels": [seg_ch, nuc_ch],
+            # Route to the v3 or v4 venv (Side-by-side install, 0.1.324+).
+            "cellpose_version": str(cp.cellpose_version or "v4"),
             # Try GPU acceleration. cellpose-pytorch picks the best backend
             # available — CUDA on Nvidia, MPS (Metal Performance Shaders)
             # on Apple Silicon, falls back to CPU when neither works. Net
@@ -8000,25 +8006,43 @@ from fastapi.responses import StreamingResponse  # noqa: E402
 
 @app.get("/api/analysis/check-cellpose")
 def check_cellpose_installed():
-    """Whether Cellpose is installed in the dedicated plugin virtualenv
-    (a real Python kept in a persistent user-data dir, survives app
-    updates). Returns the version for the UI tooltip when present."""
+    """Whether Cellpose is installed in the dedicated plugin venv(s).
+    Returns BOTH versioned slots so the dual install UI can render
+    v3 and v4 cards independently, plus the legacy single-slot fields
+    for back-compat with older frontend builds.
+
+    Shape:
+      {
+        installed, kind, path,       # legacy aggregate (v4 → v3 → none)
+        versions: {
+          v3: {installed, kind, path, major?, legacy?},
+          v4: {installed, kind, path, major?, legacy?},
+          legacy: {installed, kind, path, major?},
+        },
+      }
+    """
     try:
-        return cellpose_plugin.check()
+        all_ = cellpose_plugin.check_all()
+        legacy = cellpose_plugin.check()
+        return {**legacy, "versions": all_}
     except Exception as e:
         return {"installed": False, "kind": "", "path": "", "error": str(e)[:200]}
 
 
 @app.post("/api/analysis/install-cellpose")
-def install_cellpose():
+def install_cellpose(version: str = "v4"):
     """Non-streaming install: build/refresh the plugin venv + install
     Cellpose into it. Drains the streaming installer for a final summary.
-    Most callers should use the streaming endpoint for live progress."""
+    Most callers should use the streaming endpoint for live progress.
+
+    ?version=v3 pins cellpose<4 (real cyto3 + nuclei model zoo).
+    ?version=v4 pins cellpose>=4 (cpsam-only).  Default v4.
+    """
     lines: List[str] = []
     rc = -1
     try:
         import json as _json
-        for chunk in cellpose_plugin.install_stream():
+        for chunk in cellpose_plugin.install_stream(version):
             payload = chunk[len("data: "):].strip() if chunk.startswith("data: ") else chunk.strip()
             try:
                 obj = _json.loads(payload)
@@ -8034,11 +8058,12 @@ def install_cellpose():
 
 
 @app.post("/api/analysis/install-cellpose-stream")
-def install_cellpose_stream():
+def install_cellpose_stream(version: str = "v4"):
     """Streaming install: builds the plugin venv from a real system Python
     and installs Cellpose into it, piping pip output line-by-line via SSE.
-    Works in the packaged app (the frozen sidecar can't pip into itself)."""
-    return StreamingResponse(cellpose_plugin.install_stream(), media_type="text/event-stream")
+    Works in the packaged app (the frozen sidecar can't pip into itself).
+    ?version=v3 or v4 selects the target venv; they coexist on disk."""
+    return StreamingResponse(cellpose_plugin.install_stream(version), media_type="text/event-stream")
 
 
 class CellposeAnalysisRequest(BaseModel):
@@ -8061,6 +8086,10 @@ class CellposeAnalysisRequest(BaseModel):
     # match the native image dimensions (we NN-upscale preview-res
     # masks frontend-side before submitting).
     edited_masks: Optional[Dict[str, str]] = None
+    # Cellpose major version: "v3" or "v4".  Routes to the matching
+    # plugin venv (side-by-side install introduced in 0.1.324).  When
+    # absent the field in `config` is honoured, then defaults to v4.
+    cellpose_version: Optional[str] = None
 
 
 @app.post("/api/analysis/run-cellpose")
@@ -8128,6 +8157,13 @@ def run_cellpose_pipeline(body: CellposeAnalysisRequest):
     #    them via cfg_dict so the runner can substitute them per-image.
     if body.edited_masks:
         cfg_dict = {**cfg_dict, "edited_masks": dict(body.edited_masks)}
+    # cellpose_version routes between the v3 / v4 venvs.  Top-level
+    # body field wins over the embedded one in the JSON config so a
+    # caller can override per-call without touching the saved config.
+    if body.cellpose_version:
+        cfg_dict["cellpose_version"] = str(body.cellpose_version)
+    elif "cellpose_version" not in cfg_dict:
+        cfg_dict["cellpose_version"] = "v4"
     return cellpose_plugin.run(images_in, cfg_dict, body.timeout_sec)
 
 

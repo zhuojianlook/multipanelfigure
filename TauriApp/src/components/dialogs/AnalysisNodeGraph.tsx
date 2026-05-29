@@ -3941,7 +3941,15 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // the import succeeds in the sidecar's Python env, empty string
   // otherwise.  The Add-Cellpose-node button reads this.
   const [cellposeKind, setCellposeKind] = useState<string>("");
-  const [cellposeInstalling, setCellposeInstalling] = useState(false);
+  // Per-version install status from /api/analysis/check-cellpose
+  // (introduced in 0.1.324 along with side-by-side v3 + v4 venvs).
+  // Each slot carries { installed, kind } so the dual install cards
+  // can render independently.
+  const [cellposeVersions, setCellposeVersions] = useState<{
+    v3: { installed: boolean; kind?: string };
+    v4: { installed: boolean; kind?: string };
+  }>({ v3: { installed: false }, v4: { installed: false } });
+  const [cellposeInstalling, setCellposeInstalling] = useState<"v3" | "v4" | null>(null);
   // Latches the last install's exit code so the button can surface
   // "Install failed — see console" instead of silently reverting to
   // the idle label.  Cleared when the user clicks Retry.
@@ -3951,16 +3959,16 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
 
   // Install Cellpose into the sidecar's Python (streaming pip log). Extracted
   // so the Plugins menu can trigger it. Re-probes availability when done.
-  const installCellpose = async () => {
-    setCellposeInstalling(true);
+  const installCellpose = async (version: "v3" | "v4" = "v4") => {
+    setCellposeInstalling(version);
     setCellposeInstallFailed(false);
     setConsoleOpen(true);
-    consoleRef.current += `\n=== Install Cellpose 3 ===\n`;
+    consoleRef.current += `\n=== Install Cellpose ${version === "v3" ? "3 (cyto3 + nuclei zoo)" : "4 (cpsam)"} ===\n`;
     setConsoleOut(consoleRef.current);
     const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
     let lastRc: number | null = null;
     try {
-      const resp = await fetch(`${apiBase}/api/analysis/install-cellpose-stream`, {
+      const resp = await fetch(`${apiBase}/api/analysis/install-cellpose-stream?version=${version}`, {
         method: "POST", headers: { "Accept": "text/event-stream" },
       });
       if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
@@ -3985,10 +3993,18 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         }
       }
       const probe = await fetch(`${apiBase}/api/analysis/check-cellpose`);
-      const pd: { installed?: boolean; kind?: string } = await probe.json();
+      const pd: {
+        installed?: boolean; kind?: string;
+        versions?: { v3?: { installed?: boolean; kind?: string }; v4?: { installed?: boolean; kind?: string } };
+      } = await probe.json();
       setCellposeKind(pd?.installed ? (pd.kind || "cellpose") : "");
-      if (pd?.installed) {
-        consoleRef.current += `[Cellpose ready: ${pd.kind}]\n`;
+      setCellposeVersions({
+        v3: { installed: !!pd?.versions?.v3?.installed, kind: pd?.versions?.v3?.kind },
+        v4: { installed: !!pd?.versions?.v4?.installed, kind: pd?.versions?.v4?.kind },
+      });
+      const thisSlot = pd?.versions?.[version]?.installed;
+      if (thisSlot) {
+        consoleRef.current += `[Cellpose ${version} ready: ${pd.versions?.[version]?.kind || "?"}]\n`;
         setConsoleOut(consoleRef.current);
         setCellposeInstallFailed(false);
       } else {
@@ -4001,7 +4017,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       setConsoleOut(consoleRef.current);
       setCellposeInstallFailed(true);
     } finally {
-      setCellposeInstalling(false);
+      setCellposeInstalling(null);
     }
   };
 
@@ -4178,8 +4194,17 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       .catch(() => setImagejKind(""));
     fetch(`${apiBase}/api/analysis/check-cellpose`)
       .then((r) => r.json())
-      .then((m: { installed?: boolean; kind?: string }) => setCellposeKind(m?.installed ? (m.kind || "cellpose") : ""))
-      .catch(() => setCellposeKind(""));
+      .then((m: {
+        installed?: boolean; kind?: string;
+        versions?: { v3?: { installed?: boolean; kind?: string }; v4?: { installed?: boolean; kind?: string } };
+      }) => {
+        setCellposeKind(m?.installed ? (m.kind || "cellpose") : "");
+        setCellposeVersions({
+          v3: { installed: !!m?.versions?.v3?.installed, kind: m?.versions?.v3?.kind },
+          v4: { installed: !!m?.versions?.v4?.installed, kind: m?.versions?.v4?.kind },
+        });
+      })
+      .catch(() => { setCellposeKind(""); setCellposeVersions({ v3: { installed: false }, v4: { installed: false } }); });
   }, [open, enginePaths]);
 
   // ── Graph handlers ─────────────────────────────────────────
@@ -6230,23 +6255,43 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
                     color: "text.disabled", fontWeight: 700, textTransform: "uppercase" }}>
               Engines
             </Typography>
-            {cellposeKind ? (
+            {(cellposeVersions.v3.installed || cellposeVersions.v4.installed || cellposeKind) && (
               <MenuItem onClick={() => { addProcessNode("cellpose"); setPluginsAnchor(null); }} sx={{ fontSize: "0.72rem" }}>
                 🧬 Add Cellpose node
-                <Typography component="span" variant="caption" sx={{ ml: "auto", pl: 2, color: "text.secondary" }}>{cellposeKind}</Typography>
-              </MenuItem>
-            ) : (
-              <MenuItem disabled={cellposeInstalling}
-                onClick={() => { setPluginsAnchor(null); void installCellpose(); }}
-                sx={{ fontSize: "0.72rem", color: cellposeInstallFailed ? "error.main" : undefined }}>
-                {cellposeInstalling
-                  ? "Installing Cellpose…"
-                  : cellposeInstallFailed
-                    ? "⚠ Cellpose install failed — Retry"
-                    : "⤓ Install Cellpose 3"}
-                <Typography component="span" variant="caption" sx={{ ml: "auto", pl: 2, color: "text.secondary" }}>~500 MB</Typography>
+                <Typography component="span" variant="caption" sx={{ ml: "auto", pl: 2, color: "text.secondary" }}>
+                  {[cellposeVersions.v3.installed && "v3",
+                    cellposeVersions.v4.installed && "v4"].filter(Boolean).join(" + ") || cellposeKind || "?"}
+                </Typography>
               </MenuItem>
             )}
+            {/* Cellpose 3 install — real cyto3 / nuclei zoo (smaller,
+                faster, separate nuclei head). */}
+            <MenuItem disabled={cellposeInstalling === "v3"}
+              onClick={() => { setPluginsAnchor(null); void installCellpose("v3"); }}
+              sx={{ fontSize: "0.72rem", color: cellposeInstallFailed && cellposeInstalling === null ? "error.main" : undefined }}>
+              {cellposeInstalling === "v3"
+                ? "Installing Cellpose 3…"
+                : cellposeVersions.v3.installed
+                  ? "✓ Cellpose 3 installed — Reinstall / repair"
+                  : "⤓ Install Cellpose 3 (cyto3 + nuclei)"}
+              <Typography component="span" variant="caption" sx={{ ml: "auto", pl: 2, color: "text.secondary" }}>
+                {cellposeVersions.v3.installed ? (cellposeVersions.v3.kind || "v3") : "~500 MB"}
+              </Typography>
+            </MenuItem>
+            {/* Cellpose 4 install — cpsam-only generalist (one model,
+                ~100 MB, often slower but more general). */}
+            <MenuItem disabled={cellposeInstalling === "v4"}
+              onClick={() => { setPluginsAnchor(null); void installCellpose("v4"); }}
+              sx={{ fontSize: "0.72rem", color: cellposeInstallFailed && cellposeInstalling === null ? "error.main" : undefined }}>
+              {cellposeInstalling === "v4"
+                ? "Installing Cellpose 4…"
+                : cellposeVersions.v4.installed
+                  ? "✓ Cellpose 4 installed — Reinstall / repair"
+                  : "⤓ Install Cellpose 4 (cpsam)"}
+              <Typography component="span" variant="caption" sx={{ ml: "auto", pl: 2, color: "text.secondary" }}>
+                {cellposeVersions.v4.installed ? (cellposeVersions.v4.kind || "v4") : "~500 MB"}
+              </Typography>
+            </MenuItem>
           </Menu>
           <Box sx={{ flex: 1 }} />
           {/* Delete selected — operates on whatever React Flow has

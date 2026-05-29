@@ -59,8 +59,15 @@ export interface FluorGroup {
   images: string[];
 }
 export interface FluorCellpose {
-  /** Cellpose 4 model name. "cyto3" = the recommended cell-body model
-   *  (default; ~25 MB, ~3x faster than cpsam). */
+  /** Which cellpose major to dispatch into.  "v3" → real cyto3 /
+   *  cyto2 / nuclei model zoo (smaller, faster, more predictable
+   *  semantics).  "v4" → cpsam (generalist SAM-based, ~100 MB, the
+   *  only model v4 ships).  The plugin host keeps both venvs side-
+   *  by-side; the user picks per-node. */
+  cellposeVersion?: "v3" | "v4";
+  /** Model name.  Valid choices depend on cellposeVersion:
+   *  v3 → "cyto3" | "cyto2" | "cyto" | "nuclei"
+   *  v4 → "cpsam" */
   model: string;
   /** Object diameter prior in px. 0 = auto-estimate. */
   diameter: number;
@@ -175,7 +182,8 @@ export function emptyFluorConfig(): FluorIntensityConfig {
     // types. Users can switch to cpsam in the dropdown when they need
     // its higher-accuracy segmentation.
     cellpose: {
-      model: "cyto3", diameter: 0, segChannel: "b",
+      cellposeVersion: "v4",
+      model: "cpsam", diameter: 0, segChannel: "b",
       nucleiChannel: null, measureCompartments: false, minSize: 80,
     },
     controlChannel: null,
@@ -206,12 +214,21 @@ function migrateConfig(cfg: FluorIntensityConfig): FluorIntensityConfig {
   };
   // Already migrated → leave alone.
   if (cfg.thresholds && (cfg.mode === "simple" || cfg.mode === "cellpose")) {
+    // Backfill cellposeVersion for configs saved before 0.1.324.
+    // Heuristic: if the user picked a v3-only model (cyto3 / cyto2 /
+    // nuclei) treat it as v3; otherwise default to v4.
+    const cpIn = cfg.cellpose || fresh.cellpose;
+    const cp = {
+      ...cpIn,
+      cellposeVersion: cpIn.cellposeVersion
+        ?? (["cyto3", "cyto2", "cyto", "nuclei"].includes(String(cpIn.model || "")) ? "v3" : "v4"),
+    };
     return {
       ...out,
       thresholds: cfg.thresholds || fresh.thresholds,
       rollingRadius: typeof cfg.rollingRadius === "number" ? cfg.rollingRadius : fresh.rollingRadius,
       controlChannel: cfg.controlChannel ?? null,
-      cellpose: cfg.cellpose || fresh.cellpose,
+      cellpose: cp,
     };
   }
   // Choose new mode based on legacy combination.
@@ -433,6 +450,11 @@ def _cellpose_labels_batch(items, model, channels, isolate_channel=0, diameter_o
                     # Strip the "data:image/png;base64," prefix if present.
                     _edited[_lbl] = v.split(",", 1)[-1] if v.startswith("data:") else v
     _diam = float(diameter_override) if diameter_override else float(cp_cfg.get("diameter") or 0)
+    # Cellpose major: v3 (real cyto3 + nuclei model zoo) or v4 (cpsam).
+    # Routes to the matching plugin venv on the backend.  Forwarded as
+    # a top-level field on the request so the v3 path doesn't get its
+    # model name silently remapped to cpsam.
+    _cp_ver = str(cp_cfg.get("cellposeVersion") or "v4")
     payload_obj = {
         "config": json.dumps({
             "model": model,
@@ -445,6 +467,7 @@ def _cellpose_labels_batch(items, model, channels, isolate_channel=0, diameter_o
         }),
         "extra_inputs": sent,
         "sources": [], "timeout_sec": 600,
+        "cellpose_version": _cp_ver,
     }
     if _edited:
         payload_obj["edited_masks"] = _edited
@@ -1155,7 +1178,11 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     setRepairing(true);
     setRepairLog("");
     try {
-      const resp = await fetch("http://127.0.0.1:8765/api/analysis/install-cellpose-stream", {
+      // Reinstall the version this dialog is currently configured to
+      // use — so a v3 user doesn't accidentally get v4 reinstalled
+      // and lose their cyto3 + nuclei model zoo.
+      const ver = cfg.cellpose.cellposeVersion || "v4";
+      const resp = await fetch(`http://127.0.0.1:8765/api/analysis/install-cellpose-stream?version=${ver}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
       });
@@ -1286,6 +1313,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         body.channels = { r: chBody("r"), g: chBody("g"), b: chBody("b") };
       } else {
         body.cellpose = {
+          cellpose_version: cfg.cellpose.cellposeVersion || "v4",
           model: cfg.cellpose.model,
           diameter: cfg.cellpose.diameter,
           seg_channel: cfg.cellpose.segChannel,
@@ -2948,17 +2976,63 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
               // whole TextField in a Tooltip used to capture hover and
               // block the click on the dropdown trigger itself.
               <Box sx={{ display: "flex", flexDirection: "column", gap: 0.75 }}>
-                {/* Row 1 — model + cell-body channel. */}
+                {/* Version chip row — picks v3 (real cyto3 + nuclei
+                    model zoo) or v4 (cpsam-only).  Routes to a
+                    separate plugin venv per version; install each
+                    independently from Plugins → Install Cellpose 3/4.
+                    Switching version auto-snaps the model to the
+                    default for that major. */}
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.6, flexWrap: "wrap" }}>
+                  <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.7rem" }}>
+                    Cellpose
+                  </Typography>
+                  {([
+                    { v: "v3" as const, label: "v3 (cyto3 / nuclei)", hint: "Real model zoo — smaller, faster, separate nuclei head" },
+                    { v: "v4" as const, label: "v4 (cpsam)",            hint: "SAM-based generalist — one model, ~100 MB" },
+                  ] as const).map(({ v, label, hint }) => {
+                    const active = (cfg.cellpose.cellposeVersion || "v4") === v;
+                    return (
+                      <Tooltip key={v} title={hint}>
+                        <Box
+                          onClick={() => setCellpose({
+                            cellposeVersion: v,
+                            model: v === "v3" ? "cyto3" : "cpsam",
+                          })}
+                          sx={{
+                            cursor: "pointer", userSelect: "none",
+                            fontSize: "0.62rem", px: 0.6, py: 0.15, borderRadius: 0.5,
+                            border: "1px solid",
+                            borderColor: active ? "primary.main" : "divider",
+                            bgcolor: active ? "primary.main" : "transparent",
+                            color: active ? "primary.contrastText" : "text.secondary",
+                            fontWeight: active ? 700 : 500,
+                          }}>
+                          {label}
+                        </Box>
+                      </Tooltip>
+                    );
+                  })}
+                  <Typography variant="caption" sx={{ color: "text.disabled", ml: "auto", fontSize: "0.6rem" }}>
+                    install via Plugins menu
+                  </Typography>
+                </Box>
+                {/* Row 1 — model + cell-body channel.  Model list is
+                    filtered by the version above; v3 surfaces the
+                    full cyto + nuclei zoo, v4 only cpsam. */}
                 <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1 }}>
                   <TextField select size="small" label="Model" value={cfg.cellpose.model}
                     onChange={(e) => setCellpose({ model: e.target.value })}
                     inputProps={{ style: { fontSize: "0.78rem" } }}
                     InputLabelProps={{ style: { fontSize: "0.78rem" } }}
                     SelectProps={SELECT_MENU_PROPS}>
-                    <MenuItem value="cyto3" sx={{ fontSize: "0.78rem" }}>cyto3 (fast, default)</MenuItem>
-                    <MenuItem value="cpsam" sx={{ fontSize: "0.78rem" }}>cpsam (slow, accurate)</MenuItem>
-                    <MenuItem value="cyto2" sx={{ fontSize: "0.78rem" }}>cyto2</MenuItem>
-                    <MenuItem value="nuclei" sx={{ fontSize: "0.78rem" }}>nuclei</MenuItem>
+                    {(cfg.cellpose.cellposeVersion || "v4") === "v3" ? [
+                      <MenuItem key="cyto3"  value="cyto3"  sx={{ fontSize: "0.78rem" }}>cyto3 (fast, default)</MenuItem>,
+                      <MenuItem key="cyto2"  value="cyto2"  sx={{ fontSize: "0.78rem" }}>cyto2</MenuItem>,
+                      <MenuItem key="cyto"   value="cyto"   sx={{ fontSize: "0.78rem" }}>cyto</MenuItem>,
+                      <MenuItem key="nuclei" value="nuclei" sx={{ fontSize: "0.78rem" }}>nuclei (DAPI-only)</MenuItem>,
+                    ] : [
+                      <MenuItem key="cpsam" value="cpsam" sx={{ fontSize: "0.78rem" }}>cpsam (only v4 model)</MenuItem>,
+                    ]}
                   </TextField>
                   <Box sx={{ display: "flex", alignItems: "center", gap: 0.4 }}>
                     <TextField select size="small" label="Cell channel" value={cfg.cellpose.segChannel}
