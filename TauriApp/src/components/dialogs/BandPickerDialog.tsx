@@ -1327,6 +1327,147 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
               </Typography>
             </Box>
           )}
+          {/* ── Floating quick-edit popover ──
+              Shown when a band is selected (drawn, clicked, or just
+              created).  Lets the user set Lane / Level / Group + flag
+              as loading control WITHOUT scrolling down to the table
+              row.  Positioned in the outer (unscaled) imgArea box so
+              its size stays constant at any zoom level.  Math:
+                inner box top-left = (cxOff + panX, cyOff + panY)
+                band right-edge in outer = cxOff + panX + (x+w)*disp.w*zoom
+              When the popover would overflow the canvas right edge we
+              flip it to the band's LEFT side. */}
+          {(() => {
+            const lane = cfg.lanes.find((l) => l.id === selId);
+            if (!lane || !dispUrl) return null;
+            const cxOff = Math.max(0, ((box.w || 0) - disp.w) / 2);
+            const cyOff = Math.max(0, ((box.h || 0) - disp.h) / 2);
+            const z = Math.max(0.1, view.zoom);
+            const rightEdgeX = cxOff + view.panX + (lane.x + lane.w) * disp.w * z;
+            const leftEdgeX = cxOff + view.panX + lane.x * disp.w * z;
+            const topY = cyOff + view.panY + lane.y * disp.h * z;
+            const POP_W = 220;
+            const POP_H = 220;
+            const margin = 8;
+            // Prefer right of band; flip to left when no room.
+            const wantRight = rightEdgeX + margin + POP_W <= (box.w || 0);
+            const x = wantRight ? rightEdgeX + margin : Math.max(4, leftEdgeX - margin - POP_W);
+            // Keep popover inside the visible canvas vertically.
+            const y = Math.min(Math.max(4, topY), Math.max(4, (box.h || 0) - POP_H - 4));
+            // Suggestions for Lane + Level fields.
+            const uniqLanes = Array.from(new Set(cfg.lanes.map((l) => (l.label || "").trim()).filter(Boolean)));
+            const uniqLevels = levelOrder.filter((lv) => lv && lv.toLowerCase() !== "ladder");
+            // LC eligibility — only when LC normalisation is on.
+            const lcEnabled = !!cfg.loadingControlEnabled;
+            const lcMap = cfg.lcBandByLane || {};
+            const isLCForThisLane = lcEnabled && lcMap[lane.label || ""] === roiName(lane);
+            // Group membership — which groups include this band?
+            const groupsForBand = (cfg.groups ?? []).filter((g) => (g.bands ?? []).includes(roiName(lane)));
+            return (
+              <Box
+                onPointerDown={(e) => e.stopPropagation()}
+                sx={{
+                  position: "absolute", left: x, top: y, width: POP_W,
+                  bgcolor: "background.paper", border: "1px solid",
+                  borderColor: "primary.main", borderRadius: 1,
+                  boxShadow: 4, p: 1, zIndex: 10,
+                  display: "flex", flexDirection: "column", gap: 0.6,
+                  fontSize: "0.7rem",
+                }}>
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.4 }}>
+                  <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.68rem", color: "primary.main" }}>
+                    Edit band
+                  </Typography>
+                  <Typography variant="caption" sx={{ ml: "auto", color: "text.disabled", fontSize: "0.6rem" }}>
+                    Esc to deselect
+                  </Typography>
+                </Box>
+                <TextField label="Name" size="small" value={roiName(lane)}
+                  onChange={(e) => setName(lane.id, e.target.value)}
+                  inputProps={{ style: { fontSize: "0.74rem", padding: "4px 6px" } }}
+                  InputLabelProps={{ style: { fontSize: "0.7rem" } }} />
+                <TextField label="Lane (column)" size="small" value={lane.label}
+                  onChange={(e) => setLabel(lane.id, e.target.value)}
+                  inputProps={{ list: `qe-lanes-${lane.id}`, style: { fontSize: "0.74rem", padding: "4px 6px" } }}
+                  InputLabelProps={{ style: { fontSize: "0.7rem" } }}
+                  helperText="↓ for existing lanes"
+                  FormHelperTextProps={{ sx: { fontSize: "0.58rem", mt: 0, lineHeight: 1.2 } }} />
+                <datalist id={`qe-lanes-${lane.id}`}>
+                  {uniqLanes.map((l) => <option key={l} value={l} />)}
+                </datalist>
+                <TextField label="Level (row)" size="small" value={roiLevel(lane)}
+                  onChange={(e) => setLevel(lane.id, e.target.value)}
+                  inputProps={{ list: `qe-levels-${lane.id}`, style: { fontSize: "0.74rem", padding: "4px 6px" } }}
+                  InputLabelProps={{ style: { fontSize: "0.7rem" } }} />
+                <datalist id={`qe-levels-${lane.id}`}>
+                  {uniqLevels.map((lv) => <option key={lv} value={lv} />)}
+                </datalist>
+                {/* Group toggle chips — assigning a band to a group is
+                    a prerequisite for the downstream plot. */}
+                {(cfg.groups ?? []).length > 0 && (
+                  <Box sx={{ display: "flex", flexDirection: "column", gap: 0.25 }}>
+                    <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary", fontWeight: 700 }}>
+                      Group
+                    </Typography>
+                    <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.25 }}>
+                      {(cfg.groups ?? []).map((g) => {
+                        const inG = (g.bands ?? []).includes(roiName(lane));
+                        return (
+                          <Box key={g.id}
+                            onClick={() => toggleBandInGroup(g.id, roiName(lane))}
+                            sx={{
+                              cursor: "pointer", userSelect: "none",
+                              fontSize: "0.62rem", px: 0.5, py: 0.1, borderRadius: 0.4,
+                              border: "1px solid",
+                              borderColor: inG ? "success.main" : "divider",
+                              bgcolor: inG ? "success.main" : "transparent",
+                              color: inG ? "common.white" : "text.secondary",
+                              fontWeight: inG ? 700 : 500,
+                            }}>
+                            {g.name || "(unnamed)"}
+                          </Box>
+                        );
+                      })}
+                    </Box>
+                  </Box>
+                )}
+                {groupsForBand.length === 0 && (cfg.groups ?? []).length > 0 && (
+                  <Typography variant="caption" sx={{ fontSize: "0.58rem", color: "warning.main" }}>
+                    Not in any group — won't appear in the plot.
+                  </Typography>
+                )}
+                {/* LC for this lane — only when LC normalisation is on.
+                    Toggling sets this band as the LC for its OWN lane.
+                    Cross-lane picks (B in lane S2 → LC for lane S1) still
+                    require the lane's dropdown in the LC config below. */}
+                {lcEnabled && lane.label && (
+                  <Box
+                    onClick={() => {
+                      setCfg((c) => {
+                        const m = { ...(c.lcBandByLane || {}) };
+                        if (isLCForThisLane) delete m[lane.label || ""];
+                        else m[lane.label || ""] = roiName(lane);
+                        return { ...c, lcBandByLane: m };
+                      });
+                    }}
+                    sx={{
+                      cursor: "pointer", userSelect: "none",
+                      fontSize: "0.62rem", px: 0.5, py: 0.2, borderRadius: 0.4,
+                      border: "1px solid",
+                      borderColor: isLCForThisLane ? "warning.main" : "divider",
+                      bgcolor: isLCForThisLane ? "warning.main" : "transparent",
+                      color: isLCForThisLane ? "common.white" : "text.secondary",
+                      fontWeight: isLCForThisLane ? 700 : 500,
+                      textAlign: "center",
+                    }}>
+                    {isLCForThisLane
+                      ? `★ LC for lane "${lane.label}" — click to unset`
+                      : `Set as LC for lane "${lane.label}"`}
+                  </Box>
+                )}
+              </Box>
+            );
+          })()}
         </Box>
 
         {/* Controls — fixed-width column on the left, scrolls if tall. */}
