@@ -2882,6 +2882,24 @@ if not lc_by_lane:
 have_lc = len(lc_by_lane) > 0
 if have_lc:
     print(f"loading control present for {len(lc_by_lane)} lane(s): {sorted(lc_by_lane.keys())}")
+    # Sanity print: which band's IOD is normalising which lane(s).
+    # Verifies the picker's custom-box / cross-lane LC selection
+    # actually flowed through.  Resolve each lane → the band-row
+    # whose iod matches what we stored (the row that produced it).
+    _lookup = {}
+    for r in table:
+        if _truthy(r.get("is_loading_control")):
+            for ln in str(r.get("lc_for_lane") or r.get("lane") or "").split(","):
+                ln = ln.strip()
+                if not ln: continue
+                _lookup[ln] = (str(r.get("band") or "?"), str(r.get("lane") or "?"), _num(r.get("iod")))
+    for ln in sorted(lc_by_lane.keys()):
+        if ln in _lookup:
+            _bn, _bl, _bi = _lookup[ln]
+            cross = " (cross-lane)" if _bl != ln else ""
+            print(f"  lane {ln!r} normalised by band {_bn!r} from lane {_bl!r} (IOD={_bi:.1f}){cross}")
+        else:
+            print(f"  lane {ln!r} normalised by IOD={lc_by_lane[ln]:.1f} (legacy is_loading_control marker)")
 else:
     print("no loading-control set — passing raw IOD through (normalized == iod)")
 

@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.327"
+SIDECAR_BUILD = "0.1.328"
 
 
 @app.get("/api/version")
@@ -5838,10 +5838,23 @@ def run_r_code(body: RAnalysisRequest):
         script += body.code
         script += '\n\n# Close any open graphics devices and snapshot the FINAL plot.\n'
         script += 'while (dev.cur() > 1) try(dev.off(), silent=TRUE)\n'
-        script += 'if (.plot_count > 0 && requireNamespace("ggplot2", quietly=TRUE)) {\n'
-        script += '  .lp <- tryCatch(ggplot2::last_plot(), error=function(e) NULL)\n'
-        script += '  if (!is.null(.lp) && is.null(.mpfig_plots[[.plot_count]])) .mpfig_plots[[.plot_count]] <<- .lp\n'
-        script += '}\n'
+        # Wrap the snapshot in try() — R\'s [[]] on a list errors with
+        # "subscript out of bounds" when the index exceeds the list
+        # length, and we may legitimately be assigning past the end
+        # (mpfig_plot snapshots BEFORE opening the next device, so the
+        # LAST plot has never been written into .mpfig_plots yet —
+        # .plot_count is N, length(.mpfig_plots) is N-1).  Always
+        # assign unconditionally: R grows the list on <<- assignment,
+        # so .mpfig_plots[[.plot_count]] <<- .lp is safe whether the
+        # slot existed or not.  Older form used is.null(.mpfig_plots[[.plot_count]])
+        # to gate the assignment — but the [[]] read fails for the
+        # out-of-bounds case and halts the script.
+        script += 'try({\n'
+        script += '  if (.plot_count > 0 && requireNamespace("ggplot2", quietly=TRUE)) {\n'
+        script += '    .lp <- tryCatch(ggplot2::last_plot(), error=function(e) NULL)\n'
+        script += '    if (!is.null(.lp)) .mpfig_plots[[.plot_count]] <<- .lp\n'
+        script += '  }\n'
+        script += '}, silent = TRUE)\n'
         # Per-element text overrides (collage R-plot text editing): re-render
         # the targeted plot with title/axis/legend overrides into
         # zz_mpfig_override.png.  `render_override` forces this re-render
