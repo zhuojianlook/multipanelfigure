@@ -381,6 +381,10 @@ function CollageSidebar() {
                 overrideOnly: true,
                 overrideWidth: it.naturalW || 800,
                 overrideHeight: it.naturalH || 600,
+                // Critical: target THIS item's source plot, not last_plot().
+                // Two outputs from the same multi-plot script otherwise both
+                // render the script's last plot and visually duplicate.
+                overridePlotIndex: it.rPlotIndex ?? 0,
               } : undefined);
             const idx = hasOv ? 0 : (it.rPlotIndex ?? 0);
             const png = res.plots?.[idx] ?? res.plots?.[0];

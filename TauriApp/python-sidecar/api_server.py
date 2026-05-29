@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.324"
+SIDECAR_BUILD = "0.1.325"
 
 
 @app.get("/api/version")
@@ -5495,6 +5495,16 @@ class RAnalysisRequest(BaseModel):
     # via ggplot2::last_plot(), so they win over the user's theming. Used by
     # the collage to make R-plot title/axis/legend text editable.
     text_overrides: Optional[dict] = None
+    # Which plot from a multi-plot script the override should target.
+    # 0-indexed against the order in which mpfig_plot()/print() calls
+    # appear.  Default 0 = first plot.  Without this, the override
+    # block grabbed ggplot2::last_plot(), which silently meant "the
+    # LAST plot the script printed" — two outputs from the same multi-
+    # plot script both ended up overriding the same (last) plot,
+    # producing duplicates in the collage.  The matching prelude
+    # captures each plot into .mpfig_plots so the override can index
+    # the right one.
+    override_plot_index: int = 0
     # When True (with text_overrides), return ONLY the override-applied plot
     # (named zz_mpfig_override.png) instead of all of the script's plots.
     override_only: bool = False
@@ -5599,12 +5609,15 @@ def _r_face(o: dict) -> str:
     return "plain"
 
 
-def _r_text_override_block(ov: dict, width: int, height: int, force: bool = False, res: int = 150, svg: bool = False) -> str:
-    """Build an R snippet that takes ggplot2::last_plot(), applies per-slot
-    text/size/color/face overrides via labs()+theme(), and writes it to
-    zz_mpfig_override.png. When `force` is set, the plot is re-rendered at the
-    given size even with no overrides (used for high-DPI export). Returns ""
-    only when there is nothing to do (no overrides and not forced)."""
+def _r_text_override_block(ov: dict, width: int, height: int, force: bool = False, res: int = 150, svg: bool = False, target_idx: int = 0) -> str:
+    """Build an R snippet that picks the target plot out of the prelude's
+    .mpfig_plots capture list (0-indexed, falls back to ggplot2::last_plot()),
+    applies per-slot text/size/color/face overrides via labs()+theme(), and
+    writes it to zz_mpfig_override.png. When `force` is set, the plot is re-
+    rendered at the given size even with no overrides (used for high-DPI
+    export). target_idx selects which captured plot to render — pass the
+    rPlotIndex of the collage item being re-rendered so a multi-plot
+    script doesn't collapse to last_plot() for every output."""
     ov = ov if isinstance(ov, dict) else {}
     if not ov and not force:
         return ""
@@ -5694,11 +5707,24 @@ def _r_text_override_block(ov: dict, width: int, height: int, force: bool = Fals
         )
     else:
         device = f'      png(file.path(.plot_dir, "zz_mpfig_override.png"), width={int(width)}, height={int(height)}, res={_res})\n'
+    # R indices are 1-based; the prelude's .mpfig_plots is keyed by
+    # the plot_count value at capture time, so target_idx + 1 reads
+    # the right slot.  Falls back to last_plot() when the requested
+    # index is missing (e.g. a single-plot script asking for index 0
+    # before the script finalised) — the prelude's end-of-script hook
+    # backfills .mpfig_plots[[.plot_count]] so this fallback is rare.
+    target_r = int(target_idx) + 1
     return (
         "\n# ── mpfig R text overrides (collage) ──\n"
         "try({\n"
         '  if (requireNamespace("ggplot2", quietly=TRUE)) {\n'
-        "    .mpfig_p <- tryCatch(ggplot2::last_plot(), error=function(e) NULL)\n"
+        f"    .mpfig_target_idx <- {target_r}\n"
+        "    .mpfig_p <- tryCatch(\n"
+        "      if (.mpfig_target_idx >= 1 && exists('.mpfig_plots') && length(.mpfig_plots) >= .mpfig_target_idx)\n"
+        "        .mpfig_plots[[.mpfig_target_idx]]\n"
+        "      else ggplot2::last_plot(),\n"
+        "      error=function(e) ggplot2::last_plot()\n"
+        "    )\n"
         '    if (!is.null(.mpfig_p) && inherits(.mpfig_p, "ggplot")) {\n'
         f"{apply_line}"
         f"{device}"
@@ -5752,8 +5778,27 @@ def run_r_code(body: RAnalysisRequest):
         script += f'# Auto-generated data loading\ndata <- read.csv("{data_path.replace(chr(92), "/")}")\n\n'
         script += f'# Set plot output directory\n.plot_dir <- "{plot_dir.replace(chr(92), "/")}"\n'
         script += '.plot_count <- 0\n'
+        # Per-plot capture list — drives the text-override block's
+        # ability to target a SPECIFIC plot from a multi-plot script.
+        # Each mpfig_plot() call snapshots the previous device's
+        # last_plot() into this list keyed by the (just-finalised)
+        # plot index, so the override block can pick .mpfig_plots[[N]]
+        # rather than blindly using last_plot() (which is the LAST
+        # plot — wrong target whenever the script produced >1).
+        script += '.mpfig_plots <- list()\n'
         _base_fs = body.base_font_size if (body.base_font_size and body.base_font_size > 0) else None
         script += 'mpfig_plot <- function(filename=NULL, width=800, height=600, res=150) {\n'
+        script += '  # Finalise the previous plot before opening a new device:\n'
+        script += '  # close the current device so last_plot() / display state is\n'
+        script += '  # consistent, then capture the just-printed ggplot for the\n'
+        script += '  # override block.\n'
+        script += '  if (.plot_count > 0) {\n'
+        script += '    while (dev.cur() > 1) try(dev.off(), silent=TRUE)\n'
+        script += '    if (requireNamespace("ggplot2", quietly=TRUE)) {\n'
+        script += '      .lp <- tryCatch(ggplot2::last_plot(), error=function(e) NULL)\n'
+        script += '      if (!is.null(.lp)) .mpfig_plots[[.plot_count]] <<- .lp\n'
+        script += '    }\n'
+        script += '  }\n'
         script += '  .plot_count <<- .plot_count + 1\n'
         script += '  if (is.null(filename)) filename <- paste0("plot_", .plot_count, ".png")\n'
         script += '  png(file.path(.plot_dir, filename), width=width, height=height, res=res)\n'
@@ -5791,16 +5836,24 @@ def run_r_code(body: RAnalysisRequest):
         script += '}\n\n'
         script += '# User code\n'
         script += body.code
-        script += '\n\n# Close any open graphics devices\nwhile (dev.cur() > 1) dev.off()\n'
+        script += '\n\n# Close any open graphics devices and snapshot the FINAL plot.\n'
+        script += 'while (dev.cur() > 1) try(dev.off(), silent=TRUE)\n'
+        script += 'if (.plot_count > 0 && requireNamespace("ggplot2", quietly=TRUE)) {\n'
+        script += '  .lp <- tryCatch(ggplot2::last_plot(), error=function(e) NULL)\n'
+        script += '  if (!is.null(.lp) && is.null(.mpfig_plots[[.plot_count]])) .mpfig_plots[[.plot_count]] <<- .lp\n'
+        script += '}\n'
         # Per-element text overrides (collage R-plot text editing): re-render
-        # last_plot() with title/axis/legend overrides into zz_mpfig_override.png.
-        # `render_override` forces this re-render even with no overrides (used by
-        # Save Collage to re-render at higher resolution for high-DPI export).
+        # the targeted plot with title/axis/legend overrides into
+        # zz_mpfig_override.png.  `render_override` forces this re-render
+        # even with no overrides (used by Save Collage to re-render at
+        # higher resolution for high-DPI export).
+        # `override_plot_index` is 0-based — 1-based in R as the list index.
         if body.text_overrides or body.render_override or body.render_svg:
             script += _r_text_override_block(
                 body.text_overrides or {}, body.override_width, body.override_height,
                 force=bool(body.render_override or body.render_svg), res=body.override_res,
                 svg=bool(body.render_svg),
+                target_idx=int(body.override_plot_index or 0),
             )
         if body.emit_labels:
             script += (

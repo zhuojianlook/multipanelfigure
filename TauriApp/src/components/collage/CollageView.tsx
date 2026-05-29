@@ -439,6 +439,7 @@ export function CollageView() {
         overrideWidth: nW,
         overrideHeight: nH,
         overrideRes: 150,
+        overridePlotIndex: it.rPlotIndex ?? 0,
       });
       if (res.success && res.svg) {
         // Keep naturalW/H as the stable px reference (aspect = nW:nH); the SVG
@@ -568,7 +569,8 @@ export function CollageView() {
           emitLabels: true,
           ...(needsSvg ? { renderSvg: true, renderOverride: true, overrideOnly: true,
             overrideWidth: nW, overrideHeight: nH, overrideRes: 150,
-            textOverrides: (it.rTextOverrides || {}) as Record<string, unknown> } : {}),
+            textOverrides: (it.rTextOverrides || {}) as Record<string, unknown>,
+            overridePlotIndex: it.rPlotIndex ?? 0 } : {}),
         });
         if (cancelled) return;
         setRLabelsByItem((m) => ({ ...m, [it.id]: mapRLabels(res.labels || {}) }));

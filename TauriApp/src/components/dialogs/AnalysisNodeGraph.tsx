@@ -3934,6 +3934,11 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // Open MPF docs from the collage store (the tab strip is rendered there).
   const openDocs = useCollageStore((s) => s.openDocs);
   const activeDocId = useCollageStore((s) => s.activeDocId);
+  // Live collage items — the drawer's "→ Collage" sentTo chip is
+  // derived from this so removing an item from the timeline clears
+  // the chip automatically.  Only the items array is subscribed (no
+  // selection / view state) to keep render churn low.
+  const collageItems = useCollageStore((s) => s.items);
 
   // ImageJ availability — surfaced like checkMatlab.
   const [imagejKind, setImagejKind] = useState<string>("");
@@ -5754,6 +5759,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           h: Math.round(h * scale),
           naturalW: w,
           naturalH: h,
+          // Back-link so the analysis drawer can derive the "→ Collage"
+          // chip from live collage state — removing the item from the
+          // timeline now clears the chip automatically.
+          analysisSource: { nodeId: o.nodeId, outputId: o.outputId },
           ...(o.rCode ? {
             rCode: o.rCode,
             rDataCsv: "Panel,Name,Group,Value,Unit\n",
@@ -6866,23 +6875,36 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
                             </Typography>
                           )}
                           {/* "Sent to" chips — one per destination committed.
-                              The output stays visible after a send so the
-                              user can route the same asset to another tab. */}
-                          {(o.sentTo || []).length > 0 && (
-                            <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.25, mt: 0.25 }}>
-                              {(o.sentTo || []).map((dest, i) => (
-                                <Box key={`${dest}-${i}`}
-                                  sx={{
-                                    fontSize: "0.5rem", px: 0.5, py: 0.05, borderRadius: 0.5,
-                                    bgcolor: "success.dark", color: "common.white",
-                                    maxWidth: 140, overflow: "hidden",
-                                    textOverflow: "ellipsis", whiteSpace: "nowrap",
-                                  }}>
-                                  → {dest}
-                                </Box>
-                              ))}
-                            </Box>
-                          )}
+                              The "Collage" chip is derived from LIVE collage
+                              state (any item with a matching analysisSource);
+                              if the user deletes the timeline item the chip
+                              disappears automatically.  MPF chips stay until
+                              the next re-run, since the file is persistent on
+                              that side. */}
+                          {(() => {
+                            const isInCollage = collageItems.some(
+                              (it) => it.analysisSource?.nodeId === o.nodeId
+                                   && it.analysisSource?.outputId === o.outputId,
+                            );
+                            const effective = (o.sentTo || []).filter((d) => d !== "Collage")
+                              .concat(isInCollage ? ["Collage"] : []);
+                            if (effective.length === 0) return null;
+                            return (
+                              <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.25, mt: 0.25 }}>
+                                {effective.map((dest, i) => (
+                                  <Box key={`${dest}-${i}`}
+                                    sx={{
+                                      fontSize: "0.5rem", px: 0.5, py: 0.05, borderRadius: 0.5,
+                                      bgcolor: "success.dark", color: "common.white",
+                                      maxWidth: 140, overflow: "hidden",
+                                      textOverflow: "ellipsis", whiteSpace: "nowrap",
+                                    }}>
+                                    → {dest}
+                                  </Box>
+                                ))}
+                              </Box>
+                            );
+                          })()}
                           {/* Previous-run archive tag. Pinned to the bottom-
                               right corner of the thumb so it's clearly NOT
                               the current run when comparing side-by-side. */}

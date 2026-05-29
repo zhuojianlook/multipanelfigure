@@ -609,6 +609,7 @@ function SaveCollageButton() {
             overrideWidth: Math.round(nW * k),
             overrideHeight: Math.round(nH * k),
             overrideRes: Math.round(150 * k),
+            overridePlotIndex: it.rPlotIndex ?? 0,
           });
           const png = res.plots?.[0];
           if (res.success && png) hiRes.set(it.id, `data:image/png;base64,${png}`);

@@ -552,6 +552,12 @@ class ApiClient {
       /** Render the override plot as SVG (vector) and return it under `svg` —
        *  used so collage R plots are crisp at any zoom. */
       renderSvg?: boolean;
+      /** 0-indexed plot to target in the override re-render.  Without this
+       *  the backend grabs ggplot2::last_plot(), which collapses every
+       *  output of a multi-plot script to the SAME plot — so two figures
+       *  from one script both ended up identical after a re-render.  Pass
+       *  the collage item's rPlotIndex here. */
+      overridePlotIndex?: number;
     },
   ): Promise<{
     success: boolean;
@@ -579,6 +585,7 @@ class ApiClient {
       render_override: !!opts?.renderOverride,
       emit_labels: !!opts?.emitLabels,
       render_svg: !!opts?.renderSvg,
+      override_plot_index: Math.max(0, Math.floor(opts?.overridePlotIndex ?? 0)),
     }));
   }
 

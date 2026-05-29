@@ -130,6 +130,12 @@ export type CollageItem = {
    *  Analysis dialog. The collage builder doesn't yet save to disk,
    *  so on app-close we warn the user to download any such plots. */
   fromAnalysis?: boolean;
+  /** Back-link to the analysis output that produced this item — used by
+   *  the analysis drawer to derive the "→ Collage" sentTo chip from
+   *  live collage state.  Removing the item clears the chip
+   *  automatically; without this back-link the chip stuck around
+   *  even after the user deleted the output from the timeline. */
+  analysisSource?: { nodeId: string; outputId: string };
   /** Provenance for re-running an analysis (R) plot at a new font size via
    *  the collage's "Synchronize headers". Captured when the plot is added
    *  from the Analysis dialog. rPlotIndex selects which plot from the
