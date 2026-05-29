@@ -42,6 +42,7 @@ import PanToolAltIcon from "@mui/icons-material/PanToolAlt";
 import BrushIcon from "@mui/icons-material/Brush";
 import HighlightOffIcon from "@mui/icons-material/HighlightOff";
 import CallMergeIcon from "@mui/icons-material/CallMerge";
+import AutoFixOffIcon from "@mui/icons-material/AutoFixOff";
 import UndoIcon from "@mui/icons-material/Undo";
 import RedoIcon from "@mui/icons-material/Redo";
 import LayersClearIcon from "@mui/icons-material/LayersClear";
@@ -1101,7 +1102,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // click-drag-to-pan behaviour; "paint" draws a new cell with a
   // round brush stroke; "delete" zeroes whichever cell the user
   // clicks; "merge" reassigns one cell's pixels to the ID of another.
-  type EditTool = "pan" | "paint" | "delete" | "merge";
+  type EditTool = "pan" | "paint" | "erase" | "delete" | "merge";
   const [editTool, setEditTool] = useState<EditTool>("pan");
   // Brush radius (preview-pixel space).  Cellpose's GUI uses 3 / 5 / 7;
   // 12 is a forgiving default for human pointing.  `[` / `]` adjusts.
@@ -1644,18 +1645,38 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     }
     pushHistorySnapshot(label);
     const next = new Int32Array(ap.cellLabels);
-    let nextId = 0;
-    for (let i = 0; i < next.length; i++) if (next[i] > nextId) nextId = next[i];
-    nextId += 1;
     let touched = 0;
-    for (let i = 0; i < mask.length; i++) {
-      if (!mask[i]) continue;
-      next[i] = nextId; touched++;
+    if (paintingToolRef.current === "erase") {
+      // Erase tool: set every pixel under the stroke to background.
+      // Useful for pulling a cell's boundary BACK (the inverse of
+      // paint-extend).  Doesn't delete an entire cell — it just
+      // shaves whichever pixels the user dragged over.
+      for (let i = 0; i < mask.length; i++) {
+        if (!mask[i]) continue;
+        if (next[i] !== 0) { next[i] = 0; touched++; }
+      }
+    } else {
+      // Paint tool: if the stroke STARTED on an existing cell, every
+      // stroke pixel is assigned that cell's ID — extending /
+      // pushing the cell's boundary along the brush path.  Useful for
+      // dendritic cells where cellpose under-segments processes.
+      // Stroke starting in background → allocate a fresh cell ID.
+      let targetId = paintStartIdRef.current | 0;
+      if (targetId === 0) {
+        let maxId = 0;
+        for (let i = 0; i < next.length; i++) if (next[i] > maxId) maxId = next[i];
+        targetId = maxId + 1;
+      }
+      for (let i = 0; i < mask.length; i++) {
+        if (!mask[i]) continue;
+        if (next[i] !== targetId) { next[i] = targetId; touched++; }
+      }
     }
     if (touched > 0) writeBackLabels(label, next);
     strokeMaskRef.current = null;
     paintingRef.current = false;
     lastPaintXYRef.current = null;
+    paintStartIdRef.current = 0;
     setStrokeTick((t) => t + 1);
   }, [previewByImage, pushHistorySnapshot, writeBackLabels]);
 
@@ -1755,7 +1776,15 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     const pt = clientToImage(e.clientX, e.clientY);
     if (!pt) return;
     const w = ap!.labelW!, h = ap!.labelH!;
-    if (editTool === "paint") {
+    if (editTool === "paint" || editTool === "erase") {
+      // Capture the under-cursor cell ID + the active tool at the
+      // start of the stroke so changing tools mid-drag (or moving
+      // off an existing cell during the drag) doesn't change the
+      // commit semantics of THIS stroke.
+      paintingToolRef.current = editTool === "erase" ? "erase" : "paint";
+      paintStartIdRef.current = editTool === "paint"
+        ? (ap!.cellLabels![pt.y * w + pt.x] | 0)
+        : 0;  // erase doesn't use start id
       strokeMaskRef.current = new Uint8Array(w * h);
       paintingRef.current = true;
       lastPaintXYRef.current = null;
@@ -1842,6 +1871,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       const k = e.key.toLowerCase();
       if (k === "v") { setEditTool("pan"); setMergeFirstId(null); }
       else if (k === "b") { setEditTool("paint"); setMergeFirstId(null); }
+      else if (k === "e") { setEditTool("erase"); setMergeFirstId(null); }
       else if (k === "d") { setEditTool("delete"); setMergeFirstId(null); }
       else if (k === "m") { setEditTool("merge"); setMergeFirstId(null); }
       else if (k === "escape") { setMergeFirstId(null); }
@@ -1997,6 +2027,17 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // On mouseup it's committed into cellLabels with a fresh ID.
   const strokeMaskRef = useRef<Uint8Array | null>(null);
   const paintingRef = useRef(false);
+  // Which tool the IN-PROGRESS stroke belongs to ("paint" vs "erase").
+  // Captured at mousedown so changing the tool mid-drag doesn't alter
+  // the commit semantics for an active stroke.
+  const paintingToolRef = useRef<"paint" | "erase">("paint");
+  // The cell ID under the cursor at mousedown.  Drives "extend an
+  // existing cell vs make a new one" — when the user starts the
+  // paint stroke ON a cell (non-zero label), the whole stroke is
+  // assigned that cell's ID, pushing its boundary outwards along
+  // the brush path.  Set to 0 when the stroke started in background;
+  // commit then allocates a fresh ID.
+  const paintStartIdRef = useRef<number>(0);
   const lastPaintXYRef = useRef<{ x: number; y: number } | null>(null);
   // Bumped on every paint stamp so the compositor re-runs.  Cheaper
   // than copying the Int32Array on every move.
@@ -2060,27 +2101,53 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         if (nucleusBoundaryCnv) ctx.drawImage(nucleusBoundaryCnv, 0, 0);
         else if (nucImgEl) ctx.drawImage(nucImgEl, 0, 0);
       }
-      // Transient paint stroke (semi-transparent yellow fill).
+      // Transient paint / erase stroke (semi-transparent fill).
+      // Critical: putImageData on the main ctx REPLACES every pixel
+      // (alpha is honoured but pixel-for-pixel — the (0,0,0,0) gaps
+      // wipe the base layer to transparent → the user saw a black
+      // canvas while painting).  Build a temp canvas, put the stroke
+      // image there, then drawImage it so the gaps are honest no-ops
+      // and the underlying composite shows through.
       const stroke = strokeMaskRef.current;
       if (stroke && stroke.length === w * h) {
-        const id = ctx.createImageData(w, h);
-        const d = id.data;
-        for (let i = 0; i < stroke.length; i++) {
-          if (!stroke[i]) continue;
-          d[i * 4] = 255; d[i * 4 + 1] = 255; d[i * 4 + 2] = 80; d[i * 4 + 3] = 110;
+        const tmp = document.createElement("canvas");
+        tmp.width = w; tmp.height = h;
+        const tctx = tmp.getContext("2d");
+        if (tctx) {
+          const id = tctx.createImageData(w, h);
+          const d = id.data;
+          // Yellow tint for "paint", red tint for "erase".  The
+          // ref is set at mousedown; defaults to paint when missing.
+          const isErase = paintingToolRef.current === "erase";
+          const r = isErase ? 255 : 255;
+          const g = isErase ? 60 : 255;
+          const b = isErase ? 60 : 80;
+          for (let i = 0; i < stroke.length; i++) {
+            if (!stroke[i]) continue;
+            d[i * 4] = r; d[i * 4 + 1] = g; d[i * 4 + 2] = b; d[i * 4 + 3] = 130;
+          }
+          tctx.putImageData(id, 0, 0);
+          ctx.drawImage(tmp, 0, 0);
         }
-        ctx.putImageData(id, 0, 0);
       }
       // Highlight the cell that's mid-merge (waiting for second click).
+      // Same drawImage-via-temp pattern so the highlight blends
+      // instead of erasing everything around it.
       if (mergeFirstId != null && activePreview?.cellLabels) {
         const lbl = activePreview.cellLabels;
-        const id = ctx.createImageData(w, h);
-        const d = id.data;
-        for (let i = 0; i < lbl.length; i++) {
-          if (lbl[i] !== mergeFirstId) continue;
-          d[i * 4] = 255; d[i * 4 + 1] = 80; d[i * 4 + 2] = 255; d[i * 4 + 3] = 80;
+        const tmp = document.createElement("canvas");
+        tmp.width = w; tmp.height = h;
+        const tctx = tmp.getContext("2d");
+        if (tctx) {
+          const id = tctx.createImageData(w, h);
+          const d = id.data;
+          for (let i = 0; i < lbl.length; i++) {
+            if (lbl[i] !== mergeFirstId) continue;
+            d[i * 4] = 255; d[i * 4 + 1] = 80; d[i * 4 + 2] = 255; d[i * 4 + 3] = 100;
+          }
+          tctx.putImageData(id, 0, 0);
+          ctx.drawImage(tmp, 0, 0);
         }
-        ctx.putImageData(id, 0, 0);
       }
       // Scale disk — translucent circle of `diameter` px in the
       // bottom-right corner, so the user can sanity-check whether
@@ -2108,10 +2175,11 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         ctx.save();
         ctx.lineWidth = 1.5;
         const col = editTool === "paint" ? "#fff58a"
+                  : editTool === "erase" ? "#ff5050"
                   : editTool === "delete" ? "#ff7a7a"
                   : editTool === "merge" ? "#ff8aff" : "#ffffff";
         ctx.strokeStyle = col;
-        if (editTool === "paint") {
+        if (editTool === "paint" || editTool === "erase") {
           ctx.beginPath();
           ctx.arc(cx, cy, brushPx, 0, Math.PI * 2);
           ctx.stroke();
@@ -2298,7 +2366,10 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
               }}>
                 {([
                   { tool: "pan" as const,    icon: <PanToolAltIcon sx={{ fontSize: 16 }} />,    title: "Pan (V)" },
-                  { tool: "paint" as const,  icon: <BrushIcon sx={{ fontSize: 16 }} />,         title: "Paint new cell (B)" },
+                  { tool: "paint" as const,  icon: <BrushIcon sx={{ fontSize: 16 }} />,
+                    title: "Paint (B) — start on an EXISTING cell to extend / push its boundary along the brush path (great for dendrites); start in empty area to make a NEW cell" },
+                  { tool: "erase" as const,  icon: <AutoFixOffIcon sx={{ fontSize: 16 }} />,
+                    title: "Erase pixels (E) — pulls a cell's boundary BACK by setting brushed pixels to background.  Doesn't remove the whole cell — for that, use Delete." },
                   { tool: "delete" as const, icon: <HighlightOffIcon sx={{ fontSize: 16 }} />,  title: "Delete cell under cursor (D)" },
                   { tool: "merge" as const,  icon: <CallMergeIcon sx={{ fontSize: 16 }} />,     title: "Merge two cells (M) — click first cell, then the cell to merge it INTO" },
                 ] as const).map(({ tool, icon, title }) => (
@@ -2318,9 +2389,10 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                     </Box>
                   </Tooltip>
                 ))}
-                {/* Brush radius (paint tool only).  Shows the actual px
-                    radius so the user understands the units. */}
-                {editTool === "paint" && (
+                {/* Brush radius (paint / erase tools).  Shows the
+                    actual px radius so the user understands the
+                    units; same control governs both tools. */}
+                {(editTool === "paint" || editTool === "erase") && (
                   <Box sx={{ display: "inline-flex", alignItems: "center", gap: 0.3, ml: 0.4 }}>
                     <Typography variant="caption" sx={{ fontSize: "0.62rem", opacity: 0.85 }}>
                       brush {brushPx}px
