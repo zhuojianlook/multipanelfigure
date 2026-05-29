@@ -304,11 +304,22 @@ ch_name = {
 control_key = CFG.get("controlChannel")  # "r" | "g" | "b" | null
 control_name = ch_name.get(str(control_key).upper(), None) if control_key else None
 img2group = {}
+import re as _re_grp
 for g in CFG.get("groups", []) or []:
     nm = (g.get("name") or "").strip()
     if not nm: continue
     for im in g.get("images", []) or []:
-        img2group[str(im)] = nm
+        s = str(im)
+        img2group[s] = nm
+        # Back-compat: 0.1.330's first cut stored the collectInputs-
+        # prefixed id (inset_N_<key>) instead of the underlying
+        # <key> the runtime sees, so any config saved during that
+        # window misses every lookup.  Also map the stripped form
+        # so re-running an existing project doesn't require the user
+        # to re-assign every image.
+        _m = _re_grp.match(r"^inset_\d+_(.+)$", s)
+        if _m:
+            img2group[_m.group(1)] = nm
 thresholds = CFG.get("thresholds", {}) or {}
 rolling_radius = int(CFG.get("rollingRadius", 35) or 0)
 cp_cfg = CFG.get("cellpose", {}) or {}

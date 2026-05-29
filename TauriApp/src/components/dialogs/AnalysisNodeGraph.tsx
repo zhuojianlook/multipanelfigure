@@ -5275,11 +5275,16 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       // back to the base64 thumbnail for preview.
       const skey = x.key.startsWith("inset_") ? x.key.split("_").slice(2).join("_") : "";
       const source = skey ? srcByKey.get(skey) : undefined;
-      // `id` is the input KEY — stable, survives label collisions
-      // and " #N" suffixing.  cfg.groups[].images stores this so the
-      // group assignment round-trips correctly even when two images
-      // share a display label.
-      pickerImages.push({ id: x.key, label: baseLbl, image_b64: x.image_b64 || "", source });
+      // `id` must match the RUNTIME inputs key.  For source-inset
+      // inputs, collectInputs prefixes the key as `inset_N_<src.key>`,
+      // but the runner strips that prefix before keying inputs_dict —
+      // so the picker has to do the same strip.  Upstream-node
+      // outputs (`up_image_N_<name>`) keep their full key both sides
+      // of the round-trip.  Get this wrong and `img2group.get(key)`
+      // misses every assignment at runtime — exactly the bug
+      // 0.1.330's first cut hit.
+      const idKey = skey || x.key;
+      pickerImages.push({ id: idKey, label: baseLbl, image_b64: x.image_b64 || "", source });
     }
     // Second pass: when a label is shared by 2+ entries, suffix every
     // occurrence with " #N" so each tile in the cycler has a unique name.
