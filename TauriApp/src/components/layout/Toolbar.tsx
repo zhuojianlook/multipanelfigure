@@ -1776,6 +1776,25 @@ export function RecordAppButton() {
   }, []);
   const [recording, setRecording] = useState(false);
   const [recError, setRecError] = useState<string>("");
+  // Recording quality preset.  "demo" defaults — 720p, ~2 Mbps, CRF
+  // 28, h.264 mp4 → ~7-8 MB / 30 s.  Persisted in localStorage so the
+  // user's pick survives an app restart.  "Native" keeps the previous
+  // unconstrained behaviour for users who want the original quality.
+  type RecQuality = "demo" | "balanced" | "native";
+  const RECORDING_QUALITY = {
+    demo:     { maxHeight: 720,  crf: 28, bitrate: 2_000_000,  label: "Demo (720p)" },
+    balanced: { maxHeight: 1080, crf: 24, bitrate: 5_000_000,  label: "Balanced (1080p)" },
+    native:   { maxHeight: 0,    crf: 0,  bitrate: 0,          label: "Native (no cap)" },
+  } as const;
+  const [recQuality, setRecQuality] = useState<RecQuality>(() => {
+    try {
+      const saved = localStorage.getItem("mpfig.recordingQuality") as RecQuality | null;
+      return saved && saved in RECORDING_QUALITY ? saved : "demo";
+    } catch { return "demo"; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("mpfig.recordingQuality", recQuality); } catch { /* ignore */ }
+  }, [recQuality]);
   const mediaRecRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -2069,15 +2088,29 @@ export function RecordAppButton() {
             if (cw >= 2 && ch >= 2 && (cw < capW || ch < capH)) cropFilter = `crop=${cw}:${ch}:${cx}:${cy}`;
           }
         } catch { /* geometry unavailable → full-screen capture */ }
+        // Compose the video filter — crop first (when we have window
+        // geometry), then scale-down to the quality preset's max
+        // height (preserving aspect ratio).  `force_original_aspect_ratio`
+        // + `-2` keeps the output even-dimensional for H.264 / yuv420p.
+        const q = RECORDING_QUALITY[recQuality];
+        const filters: string[] = [];
+        if (cropFilter) filters.push(cropFilter);
+        if (q.maxHeight > 0) filters.push(`scale=-2:${q.maxHeight}`);
+        const vf = filters.length ? filters.join(",") : "";
         const cmd = Command.sidecar("binaries/ffmpeg", [
           "-hide_banner", "-y",
           "-f", "avfoundation", "-capture_cursor", "1", "-framerate", "30",
           "-i", `${idx}:none`,
-          ...(cropFilter ? ["-vf", cropFilter] : []),
+          ...(vf ? ["-vf", vf] : []),
           // CFR resample — avfoundation's erratic timestamps otherwise yield a
           // "1000k fps / 0 duration" file that plays as a single frame.
           "-fps_mode", "cfr", "-r", "30",
-          "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+          "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+          // Quality cap — CRF 28 + ~2 Mbps bitrate ceiling at 720p
+          // produces ~7-8 MB / 30 s.  "Native" preset (crf=0 / bitrate=0)
+          // skips both and falls back to the previous ultrafast path.
+          ...(q.crf > 0 ? ["-crf", String(q.crf)] : []),
+          ...(q.bitrate > 0 ? ["-maxrate", String(q.bitrate), "-bufsize", String(q.bitrate * 2)] : []),
           "-g", "60",
           "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
           path,
@@ -2091,11 +2124,17 @@ export function RecordAppButton() {
       try {
         const { invoke } = await import("@tauri-apps/api/core");
         const pid = await invoke<number>("app_pid");
+        const q = RECORDING_QUALITY[recQuality];
         const sck = Command.sidecar("binaries/mpfb-recorder", [
           "--pid", String(pid),
           "--out", path,
           "--fps", "30",
           "--title", "Multi-Panel Figure Builder",
+          // 0 = no cap (native).  Otherwise SCK does the downscale on
+          // the GPU + AVAssetWriter caps the bitrate, so the demo
+          // preset clocks in around 2 Mbps vs the previous 20-40 Mbps.
+          "--max-height", String(q.maxHeight),
+          "--bitrate", String(q.bitrate),
         ]);
         await beginRecorder(sck as never, path, { onEarlyFail: startFfmpeg });
         return;
@@ -2249,9 +2288,35 @@ export function RecordAppButton() {
   if (!visible) return null;
   return (
     <>
+      {/* Quality preset chip — hidden during an active recording so the
+          user can't change params mid-capture.  Default "demo" (720p,
+          ~2 Mbps) keeps demo recordings small (~7 MB / 30 s) vs the
+          previous unconstrained 20-40 Mbps that produced 90+ MB files
+          on high-DPI displays.  "Native" preserves the old behaviour
+          for users who want archival quality. */}
+      {!recording && (
+        <Tooltip title="Recording quality — Demo (720p, small files) / Balanced (1080p) / Native (no cap)">
+          <Box
+            onClick={() => {
+              const order: RecQuality[] = ["demo", "balanced", "native"];
+              const i = order.indexOf(recQuality);
+              setRecQuality(order[(i + 1) % order.length]);
+            }}
+            sx={{
+              cursor: "pointer", userSelect: "none",
+              px: 0.6, py: 0.1, borderRadius: 0.5, mr: 0.3,
+              border: "1px solid", borderColor: "divider",
+              fontSize: "0.6rem", fontWeight: 600, color: "text.secondary",
+              height: 22, display: "inline-flex", alignItems: "center", lineHeight: 1,
+              "&:hover": { borderColor: "primary.main", color: "primary.main" },
+            }}>
+            {RECORDING_QUALITY[recQuality].label}
+          </Box>
+        </Tooltip>
+      )}
       <Tooltip title={recording
         ? "Recording — click to stop"
-        : (recError || "Record the app window (asks the OS for screen-share permission, then saves to a file)")}>
+        : (recError || `Record the app window — quality: ${RECORDING_QUALITY[recQuality].label}`)}>
         <span>
           <Button
             variant={recording ? "contained" : "outlined"}

@@ -124,7 +124,15 @@ export interface FluorImageSource {
 }
 
 export interface FluorPickerImage {
-  /** Display label (matches an entry in `groups[].images`). */
+  /** Stable input key that survives label-collision suffixing and
+   *  sanitisation.  cfg.groups[].images stores THIS, not the display
+   *  label — so two images with the same display name (e.g. "image1"
+   *  from two upstream nodes) can still be grouped distinctly.
+   *  Legacy configs stored labels here; the generator accepts both. */
+  id: string;
+  /** Display label (what the user sees in the cycler chips).  Suffixed
+   *  with " #N" when multiple inputs share a name, but the GROUPING
+   *  identity is `id`, not `label`. */
   label: string;
   /** Base64 PNG of the thumbnail — what the dialog shows as the preview
    *  fallback when the backend overlay hasn't returned yet. */
@@ -450,6 +458,36 @@ def _cellpose_labels_batch(items, model, channels, isolate_channel=0, diameter_o
                 if isinstance(v, str) and v:
                     # Strip the "data:image/png;base64," prefix if present.
                     _edited[_lbl] = v.split(",", 1)[-1] if v.startswith("data:") else v
+
+    # ── FAST PATH: every requested image already has an edited mask ──
+    # Decode the supplied PNGs inline and skip the cellpose subprocess
+    # ENTIRELY.  The dialog's Run preview just did the segmentation; the
+    # user's saved labels ARE the result we'd otherwise re-derive.
+    # Previously the 0.1.327 fix made the backend RUNNER skip model.eval,
+    # but the JS still POSTed /api/analysis/run-cellpose every time,
+    # which paid ~5-15 s for the subprocess spawn + cellpose Python
+    # import.  This short-circuit eliminates that.
+    if _edited and len(_edited) == len(items):
+        print(f"[intensity] cellpose ({model}): all {len(items)} image(s) carry "
+              f"user-supplied mask(s) — skipping cellpose subprocess entirely")
+        labels_by_label = {}
+        errors = {}
+        for label, _ in items:
+            try:
+                # Same decode the backend runner would do: RGBA-packed
+                # PNG, R = label low byte, G = label high byte.
+                rgba = np.asarray(
+                    _Im.open(_io.BytesIO(_b64.b64decode(_edited[label]))).convert("RGBA")
+                )
+                arr = (rgba[..., 0].astype(np.int32)
+                       | (rgba[..., 1].astype(np.int32) << 8))
+                h_n, w_n = sizes_native[label]
+                arr = _upsize_labels(arr, h_n, w_n)
+                labels_by_label[label] = arr
+            except Exception as _e:
+                errors[label] = f"edited-mask decode failed: {_e}"
+        return labels_by_label, errors
+
     _diam = float(diameter_override) if diameter_override else float(cp_cfg.get("diameter") or 0)
     # Cellpose major: v3 (real cyto3 + nuclei model zoo) or v4 (cpsam).
     # Routes to the matching plugin venv on the backend.  Forwarded as
@@ -537,11 +575,15 @@ if mode == "cellpose":
     # the uint8 RGB Cellpose will see. Skipped (no group) images don't
     # go to Cellpose.
     prepared = []     # list of (key, src, label, grp, raw, corrected, a8)
+    _unassigned = []
     for key, src in imgs:
         label = _label_of(src, key)
-        grp = img2group.get(label)
+        # Look up by input KEY first (new stable id, 0.1.330+) then
+        # fall back to label (legacy configs saved before 0.1.330).
+        grp = img2group.get(str(key)) or img2group.get(label)
         if not grp:
-            print(f"[intensity] {label}: not assigned to any group — skipping")
+            print(f"[intensity] {label} (key={key}): not assigned to any group — skipping")
+            _unassigned.append(label)
             continue
         raw = _pixels(src)
         corrected = np.zeros_like(raw, dtype=np.float64)
@@ -553,7 +595,15 @@ if mode == "cellpose":
         a8 = np.clip(raw, 0, 255).astype(np.uint8)
         prepared.append((key, src, label, grp, raw, corrected, a8))
     if not prepared:
-        raise SystemExit("[intensity] no images are in any group — assign images to groups in the picker.")
+        _hint = (f" Dropped: {_unassigned}." if _unassigned else "")
+        raise SystemExit(f"[intensity] no images are in any group — "
+                         f"assign images to groups in the picker.{_hint}")
+    if _unassigned:
+        # Cellpose mode silently drops un-grouped images by skipping
+        # them above; surface that explicitly so the user notices
+        # which inputs didn't reach the plot.
+        print(f"[intensity] WARNING: dropped {len(_unassigned)} un-grouped image(s) "
+              f"in cellpose mode: {_unassigned}")
     # Second pass: ONE cellpose call for the whole batch — for WHOLE-CELL
     # segmentation. cyto3 (the default) uses both the cytoplasm channel
     # AND the nuclei channel (when set) for noticeably better cell
@@ -758,7 +808,15 @@ if mode == "cellpose":
 ch_colors = {"r": (255, 64, 64), "g": (96, 220, 96), "b": (96, 160, 255)}
 for key, src in imgs:
     label = _label_of(src, key)
-    grp = img2group.get(label, label)  # unassigned → label as own group (one bar)
+    # Look up by input KEY (stable id, 0.1.330+) then label (legacy).
+    # When neither matches, surface a "(unassigned)" group label so
+    # the user can see the image fell through in the table + plot
+    # — silently collapsing into the image's own label was masking
+    # the bug.
+    grp = img2group.get(str(key)) or img2group.get(label) or "(unassigned)"
+    if grp == "(unassigned)":
+        print(f"[intensity] {label} (key={key}): not assigned to any group — "
+              f"surfacing as '(unassigned)' so the plot shows it dropped")
     raw = _pixels(src)
     corrected = np.zeros_like(raw, dtype=np.float64)
     masks = {}
@@ -1246,13 +1304,17 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   const activeImage = images[activeIdx] || null;
 
   // Distinct images currently upstream — chips for group assignment.
-  // Pull from props.images (the full source set) so the group panel
-  // matches what the cycler is showing.
-  const imageLabels = useMemo(
-    () => Array.from(new Set(images.map((i) => i.label.trim()))).filter(Boolean),
+  // Pulled from props.images so the group panel matches what the
+  // cycler is showing.  Keyed by stable `id` (input key) rather than
+  // display label, so two images that share a name (e.g. "image1"
+  // from two upstream nodes) stay distinct for group-assignment.
+  const imageEntries = useMemo(
+    () => images.map((i) => ({ id: i.id, label: i.label.trim() || i.id })),
     [images],
   );
-  // Per-image group lookup (last group wins if duplicated; the UI prevents that).
+  // Per-image group lookup keyed by id (last group wins if duplicated;
+  // the UI prevents that).  Accepts legacy label entries too — saved
+  // configs from before 0.1.330 stored labels in cfg.groups[].images.
   const imgToGroup = useMemo(() => {
     const m = new Map<string, string>();
     for (const g of cfg.groups) for (const im of g.images) m.set(im, g.name);
@@ -2237,16 +2299,16 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   const deleteGroup = useCallback((id: string) => {
     setCfg((c) => ({ ...c, groups: c.groups.filter((g) => g.id !== id) }));
   }, []);
-  const toggleImageInGroup = useCallback((gid: string, label: string) => {
+  const toggleImageInGroup = useCallback((gid: string, imageId: string) => {
     setCfg((c) => ({
       ...c,
       groups: c.groups.map((g) => {
         if (g.id === gid) {
-          const has = g.images.includes(label);
-          return { ...g, images: has ? g.images.filter((x) => x !== label) : [...g.images, label] };
+          const has = g.images.includes(imageId);
+          return { ...g, images: has ? g.images.filter((x) => x !== imageId) : [...g.images, imageId] };
         }
         // Enforce single membership — remove from other groups when adding here.
-        return { ...g, images: g.images.filter((x) => x !== label) };
+        return { ...g, images: g.images.filter((x) => x !== imageId) };
       }),
     }));
   }, []);
@@ -3241,12 +3303,12 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
               <Tooltip title="Group images into experimental conditions (Control, Treatment, …). The R plot draws one bar per (group, channel) with mean ± SD and pairwise stats.">
                 <Typography variant="caption" sx={{ fontWeight: 700 }}>Groups</Typography>
               </Tooltip>
-              <Button size="small" variant="outlined" onClick={addGroup} disabled={imageLabels.length === 0}
+              <Button size="small" variant="outlined" onClick={addGroup} disabled={imageEntries.length === 0}
                 sx={{ textTransform: "none", fontSize: "0.62rem", py: 0.05, px: 0.6, ml: "auto" }}>
                 + Group
               </Button>
             </Box>
-            {imageLabels.length === 0 ? (
+            {imageEntries.length === 0 ? (
               <Typography variant="caption" sx={{ color: "text.disabled", fontStyle: "italic", display: "block" }}>
                 Wire image sources upstream first — then come back here to assign them to groups.
               </Typography>
@@ -3263,23 +3325,31 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                       onChange={(e) => renameGroup(g.id, e.target.value)}
                       inputProps={{ style: { fontSize: "0.76rem", fontWeight: 700, width: 110 } }} />
                     <Box sx={{ flex: 1, display: "flex", flexWrap: "wrap", gap: 0.35 }}>
-                      {imageLabels.map((im) => {
-                        const on = g.images.includes(im);
-                        const inOther = imgToGroup.has(im) && imgToGroup.get(im) !== g.name;
+                      {imageEntries.map((entry) => {
+                        // Toggle membership by stable id; chip text is the
+                        // display label.  Backward-compat: accept legacy
+                        // configs that stored labels in g.images by
+                        // matching either id or label.
+                        const on = g.images.includes(entry.id) || g.images.includes(entry.label);
+                        const inOtherGroup =
+                          (imgToGroup.has(entry.id) && imgToGroup.get(entry.id) !== g.name)
+                          || (imgToGroup.has(entry.label) && imgToGroup.get(entry.label) !== g.name);
+                        const otherGroupName =
+                          imgToGroup.get(entry.id) || imgToGroup.get(entry.label) || "";
                         return (
-                          <Tooltip key={im} title={inOther ? `Already in "${imgToGroup.get(im)}" — clicking will move it here.` : im}>
-                            <Box onClick={() => toggleImageInGroup(g.id, im)}
+                          <Tooltip key={entry.id} title={inOtherGroup ? `Already in "${otherGroupName}" — clicking will move it here.` : entry.label}>
+                            <Box onClick={() => toggleImageInGroup(g.id, entry.id)}
                               sx={{
                                 fontSize: "0.62rem", px: 0.5, py: 0.08, borderRadius: 0.6,
                                 cursor: "pointer", userSelect: "none",
                                 bgcolor: on ? "primary.main" : "transparent",
-                                color: on ? "primary.contrastText" : (inOther ? "text.disabled" : "text.secondary"),
+                                color: on ? "primary.contrastText" : (inOtherGroup ? "text.disabled" : "text.secondary"),
                                 border: "1px solid", borderColor: on ? "primary.main" : "divider",
                                 fontWeight: on ? 700 : 500,
-                                opacity: inOther && !on ? 0.65 : 1,
+                                opacity: inOtherGroup && !on ? 0.65 : 1,
                                 maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
                               }}>
-                              {im}
+                              {entry.label}
                             </Box>
                           </Tooltip>
                         );

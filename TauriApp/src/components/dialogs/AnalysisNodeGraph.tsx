@@ -2641,6 +2641,12 @@ if (has_norm) data$mean_intensity_norm <- suppressWarnings(as.numeric(data$mean_
   s <- .summary(d, y_col)
   br <- .brackets(d, s, y_col)
   multi_compart <- nlevels(d$compartment) > 1
+  # Force every group level (including ones with zero rows) to appear
+  # on the x-axis so a missing group shows as an empty slot the user
+  # can see — instead of silently shrinking the axis and pretending
+  # the comparison ran fine.  drop = FALSE on scale_x_discrete +
+  # droplevels OFF for the group factor.
+  group_levels_all <- levels(d$group)
   p <- ggplot() +
     geom_col(data = s, aes(x = group, y = mean, fill = group),
              width = 0.7, color = "grey25", linewidth = 0.3) +
@@ -2649,8 +2655,11 @@ if (has_norm) data$mean_intensity_norm <- suppressWarnings(as.numeric(data$mean_
     geom_jitter(data = d, aes(x = group, y = !!sym(y_col)),
                 width = 0.13, height = 0, size = 1.0, alpha = 0.7,
                 color = "grey20", stroke = 0) +
+    scale_x_discrete(drop = FALSE) +
+    scale_fill_brewer(palette = "Set2", drop = FALSE,
+                      guide = guide_legend(title = "Group")) +
     theme_prism(base_size = 11) +
-    theme(legend.position = "none",
+    theme(legend.position = "right",
           axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
           plot.margin = margin(10, 10, 6, 10),
           plot.title = element_text(size = 11, face = "bold",
@@ -2773,6 +2782,83 @@ if (nrow(analysis_data) == 0 && nrow(control_data) == 0) {
                             FALSE, "mean_intensity_norm", "Per-image normalised intensity"))
       }
     }
+  }
+
+  # ── Cross-group comparison: log2 fold-change vs first group. ─────
+  # The descriptive panels above show every group's mean side by side,
+  # but the comparison the reader actually wants is "how much higher /
+  # lower is group N relative to baseline?".  This panel collapses
+  # that to a single bar per (group, channel[, compartment]) anchored
+  # at log2(group / baseline).  Only emitted when ≥2 groups carry data.
+  .fold_change_panel <- function(d, y_col, base_group) {
+    dd <- d[is.finite(d[[y_col]]), , drop = FALSE]
+    if (nrow(dd) == 0) return(NULL)
+    fml <- as.formula(paste(y_col, "~ group + channel + compartment"))
+    grp <- aggregate(fml, data = dd, FUN = mean, na.rm = TRUE)
+    base <- grp[as.character(grp$group) == as.character(base_group), , drop = FALSE]
+    if (nrow(base) == 0) return(NULL)
+    out <- merge(grp, base[, c("channel", "compartment", y_col)],
+                 by = c("channel", "compartment"),
+                 suffixes = c("", ".base"))
+    out$log2fc <- log2(pmax(out[[y_col]], 1e-9) / pmax(out[[paste0(y_col, ".base")]], 1e-9))
+    out <- out[as.character(out$group) != as.character(base_group), , drop = FALSE]
+    if (nrow(out) == 0) return(NULL)
+    p <- ggplot(out, aes(x = group, y = log2fc, fill = group)) +
+      geom_col(color = "grey25", linewidth = 0.3, width = 0.7) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+      scale_fill_brewer(palette = "Set2", drop = FALSE,
+                        guide = guide_legend(title = "Group")) +
+      theme_prism(base_size = 11) +
+      theme(legend.position = "right",
+            axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
+            plot.title = element_text(size = 11, face = "bold")) +
+      labs(x = NULL, y = paste0("log2(group / ", base_group, ")"),
+           title = paste0("Cross-group comparison vs ", base_group, " (log2 fold-change)"))
+    if (nlevels(droplevels(out$compartment)) > 1) {
+      p <- p + facet_grid(compartment ~ channel, scales = "free_y", switch = "y")
+    } else {
+      p <- p + facet_wrap(~ channel, scales = "free_y", nrow = 1)
+    }
+    p
+  }
+  groups_with_data <- unique(as.character(analysis_data$group[is.finite(analysis_data$mean_intensity)]))
+  groups_with_data <- groups_with_data[groups_with_data != "(unassigned)"]
+  if (length(groups_with_data) >= 2 && nrow(analysis_data) > 0) {
+    base_grp <- groups_with_data[1]
+    fc <- .fold_change_panel(analysis_data, "mean_intensity", base_grp)
+    if (!is.null(fc)) {
+      dms <- .dims_for(analysis_data)
+      mpfig_plot("channel_intensity_fc.png", width = dms$w, height = dms$h, res = 300)
+      print(fc)
+    }
+    if (has_norm) {
+      fc_n <- .fold_change_panel(analysis_data, "mean_intensity_norm", base_grp)
+      if (!is.null(fc_n)) {
+        dms <- .dims_for(analysis_data)
+        mpfig_plot("channel_intensity_norm_fc.png", width = dms$w, height = dms$h, res = 300)
+        print(fc_n)
+      }
+    }
+  } else if (nrow(analysis_data) > 0) {
+    # Single-group case — explicit warning panel so the user knows
+    # the comparison plots can't be generated, and which groups
+    # ended up with no rows (helps diagnose the picker's image-to-
+    # group mapping).
+    all_defined <- unique(as.character(analysis_data$group))
+    missing_grps <- setdiff(all_defined, groups_with_data)
+    msg <- if (length(missing_grps) > 0)
+      paste0("Only 1 group has data (", paste(groups_with_data, collapse = ", "),
+             "). Missing: ", paste(missing_grps, collapse = ", "),
+             ". Check the Intensity picker's image-to-group assignments.")
+    else
+      "Only 1 group is defined. Add a second group in the Intensity picker to enable cross-group comparison."
+    mpfig_plot("channel_intensity_warning.png", width = 1400, height = 500, res = 300)
+    print(ggplot() + theme_void() +
+          annotate("text", x = 0.5, y = 0.55, size = 5.5, color = "#b03030",
+                   label = "⚠ Only 1 group has data — comparison plots skipped") +
+          annotate("text", x = 0.5, y = 0.35, size = 3.8, color = "grey30",
+                   label = msg) +
+          xlim(0, 1) + ylim(0, 1))
   }
 
   # ── Control sanity check — unchanged. Stays per-cell (or per-image
@@ -5189,7 +5275,11 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       // back to the base64 thumbnail for preview.
       const skey = x.key.startsWith("inset_") ? x.key.split("_").slice(2).join("_") : "";
       const source = skey ? srcByKey.get(skey) : undefined;
-      pickerImages.push({ label: baseLbl, image_b64: x.image_b64 || "", source });
+      // `id` is the input KEY — stable, survives label collisions
+      // and " #N" suffixing.  cfg.groups[].images stores this so the
+      // group assignment round-trips correctly even when two images
+      // share a display label.
+      pickerImages.push({ id: x.key, label: baseLbl, image_b64: x.image_b64 || "", source });
     }
     // Second pass: when a label is shared by 2+ entries, suffix every
     // occurrence with " #N" so each tile in the cycler has a unique name.

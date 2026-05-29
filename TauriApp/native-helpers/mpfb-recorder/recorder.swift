@@ -41,6 +41,16 @@ guard let outPath = argValue("--out") else { die("--out <path> required", 2) }
 let targetPid = Int(argValue("--pid") ?? "") ?? -1
 let titleHint = argValue("--title")
 let fps = Int32(argValue("--fps") ?? "30") ?? 30
+// Cap the output to this many pixels tall, preserving aspect ratio.
+// Default 720 — matches the ffmpeg fallback's demo-quality target.
+// 0 disables the cap (capture at native pixel density).  Drives both
+// the SCStream config (so SCK does the GPU downscale) and the
+// AVAssetWriter output dimensions.
+let maxHeight = Int(argValue("--max-height") ?? "720") ?? 720
+// Average video bitrate.  Default 2 Mbps — produces ~7-8 MB / 30 s
+// at 720p.  0 = let AVAssetWriter pick (typically 20-40 Mbps which
+// is what produced the user's large files).
+let bitrate = Int(argValue("--bitrate") ?? "2000000") ?? 2000000
 
 final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     let outURL: URL
@@ -82,6 +92,17 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         // Even pixel dimensions (H.264 / yuv420p requirement).
         var w = Int((filter.contentRect.width * scale).rounded()); w -= w % 2
         var h = Int((filter.contentRect.height * scale).rounded()); h -= h % 2
+        // Cap to --max-height while preserving aspect ratio.  SCK does
+        // the downscale on the GPU when we set config.width/height
+        // smaller than the native capture — costs ~nothing and slashes
+        // file size from ~95 MB / 30 s to ~7 MB / 30 s.
+        if maxHeight > 0 && h > maxHeight {
+            let aspect = Double(w) / Double(max(h, 1))
+            h = maxHeight
+            w = Int((Double(h) * aspect).rounded())
+            h -= h % 2
+            w -= w % 2
+        }
         config.width = max(w, 2)
         config.height = max(h, 2)
         config.minimumFrameInterval = CMTime(value: 1, timescale: fps)
@@ -92,11 +113,23 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         do {
             try? FileManager.default.removeItem(at: outURL)
             let writer = try AVAssetWriter(outputURL: outURL, fileType: .mp4)
-            let settings: [String: Any] = [
+            // Compression cap.  Without AVVideoCompressionPropertiesKey
+            // AVAssetWriter picks a quality-only target around 20-40
+            // Mbps — fine for archival capture, painful for demos.
+            // 2 Mbps + a key-frame every 2 s gives reasonable scrub
+            // performance without bloating the file.
+            var settings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
                 AVVideoWidthKey: config.width,
                 AVVideoHeightKey: config.height,
             ]
+            if bitrate > 0 {
+                settings[AVVideoCompressionPropertiesKey] = [
+                    AVVideoAverageBitRateKey: bitrate,
+                    AVVideoMaxKeyFrameIntervalKey: Int(fps) * 2,
+                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                ]
+            }
             let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
             input.expectsMediaDataInRealTime = true
             if writer.canAdd(input) { writer.add(input) }
