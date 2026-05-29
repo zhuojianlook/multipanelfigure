@@ -173,6 +173,12 @@ export interface FluorIntensityConfig {
    *  /api/analysis/run-cellpose so the FINAL quantification uses the
    *  user's edits instead of a fresh cellpose run for those images. */
   editedMasks?: Record<string, string>;
+  /** Optional user-painted per-channel SIMPLE-mode binary masks,
+   *  keyed by image label → channel → "L" PNG data URL (255 in mask,
+   *  0 out).  When present for an image's channel, the generated
+   *  Python skips the threshold step for that (image, channel) and
+   *  uses the user's mask instead. */
+  editedChannelMasks?: Record<string, Partial<Record<"r" | "g" | "b", string>>>;
 }
 
 export function emptyFluorConfig(): FluorIntensityConfig {
@@ -865,6 +871,18 @@ for key, src in imgs:
     raw = _pixels(src)
     corrected = np.zeros_like(raw, dtype=np.float64)
     masks = {}
+    # Edited channel masks (simple-mode paint/erase, 0.1.333+).  When
+    # the dialog supplied a user-painted mask for an (image, channel),
+    # we skip the threshold step and use the supplied mask directly —
+    # NN-resized to native if needed.  Lookup tries the same multi-id
+    # forms as img2group (key / label / etc).
+    _edited_ch_cfg = CFG.get("editedChannelMasks") or {}
+    _edited_ch_for_image = None
+    if isinstance(_edited_ch_cfg, dict):
+        for _candidate in (str(key), label, _re_grp.sub(r"^inset_\d+_", "", str(key))):
+            v = _edited_ch_cfg.get(_candidate)
+            if isinstance(v, dict):
+                _edited_ch_for_image = v; break
     for ci, ck in enumerate(("R", "G", "B")):
         key_lc = ck.lower()
         spec = thresholds.get(key_lc) or {}
@@ -877,14 +895,40 @@ for key, src in imgs:
         corr[corr < 0] = 0
         # IMPORTANT: corrected[..., ci] stores the BG-corrected intensity
         # used for the per-mask MEAN measurement — NOT the DoG response.
-        # We want intensity stats to reflect actual fluorescence, not a
-        # band-pass artefact. So we keep "corrected" here and build a
-        # separate "thresh_in" for the threshold step below.
         corrected[..., ci] = corr
+        # ── FAST PATH: user-supplied edited mask for this channel. ──
+        _user_mask_b64 = (_edited_ch_for_image or {}).get(key_lc) if _edited_ch_for_image else None
+        if _user_mask_b64:
+            try:
+                _raw_bytes = _b64.b64decode(_user_mask_b64.split(",", 1)[-1] if _user_mask_b64.startswith("data:") else _user_mask_b64)
+                _mask_img = _Im.open(_io.BytesIO(_raw_bytes)).convert("L")
+                if (_mask_img.size[1], _mask_img.size[0]) != raw.shape[:2] and _have_scipy:
+                    _mask_img = _mask_img.resize((raw.shape[1], raw.shape[0]), resample=_Im.NEAREST)
+                mask = (np.asarray(_mask_img) > 127)
+                masks[key_lc] = mask
+                print(f"[intensity] {label} ch {ck}: using user-edited mask ({int(mask.sum())} px)")
+                n_pixels = int(mask.sum())
+                if n_pixels == 0:
+                    continue
+                rv = raw[..., ci][mask].astype(np.float64)
+                cv = corrected[..., ci][mask]
+                rows.append({
+                    "source": label, "group": grp, "channel": ch_name[ck],
+                    "is_control": (control_name is not None and ch_name[ck] == control_name),
+                    "n_pixels": n_pixels,
+                    "raw_mean": float(rv.mean()), "raw_integrated_density": float(rv.sum()),
+                    "background_corrected_mean": float(cv.mean()),
+                    "background_corrected_integrated_density": float(cv.sum()),
+                    "mean_intensity": float(cv.mean()),
+                    "max_intensity": float(rv.max()),
+                    "compartment": "whole_image",
+                    "edited": True,
+                })
+                continue
+            except Exception as _ee:
+                print(f"[intensity] {label} ch {ck}: edited mask decode failed: {_ee}", file=_sys.stderr)
+                # fall through to threshold path
         thresh_in = corr
-        # Optional Difference-of-Gaussians band-pass: better separation
-        # for densely-packed cells / soft-edged signal. The threshold is
-        # applied to the DoG response; intensities still come from "corr".
         if bool(spec.get("enhanceEdges", False)) and _have_scipy:
             g_small = _cv2.GaussianBlur(corr.astype(np.float32), (0, 0), 1.0)
             g_large = _cv2.GaussianBlur(corr.astype(np.float32), (0, 0), 20.0)
@@ -1048,6 +1092,10 @@ type PreviewLayers = {
   nucleusLabels?: Int32Array;
   labelW?: number;
   labelH?: number;
+  /** Editable per-channel binary masks (simple-strategy paint/erase).
+   *  Each Uint8Array is `labelW * labelH` long; 1 = in mask, 0 = out.
+   *  Decoded from the backend's `channel_masks_b64` PNGs. */
+  channelMasks?: Partial<Record<"r" | "g" | "b", Uint8Array>>;
   /** Cellpose intermediate visualisations.  Tier 2 view modes. */
   flowsRgbSrc?: string;
   cellprobSrc?: string;
@@ -1057,6 +1105,67 @@ type PreviewLayers = {
   n_nuclei?: number;
   per_channel?: Record<string, number>;
 };
+
+/** Decode an 8-bit grayscale PNG into a Uint8Array (1 where pixel >
+ *  127, 0 elsewhere).  Used for simple-mode per-channel binary masks
+ *  the user can paint or erase. */
+async function decodeBinaryMaskPng(b64: string): Promise<{ mask: Uint8Array; w: number; h: number } | null> {
+  return new Promise((resolve) => {
+    const img = new window.Image();
+    img.onload = () => {
+      const cnv = document.createElement("canvas");
+      cnv.width = img.naturalWidth;
+      cnv.height = img.naturalHeight;
+      const ctx = cnv.getContext("2d");
+      if (!ctx) { resolve(null); return; }
+      ctx.drawImage(img, 0, 0);
+      const data = ctx.getImageData(0, 0, cnv.width, cnv.height).data;
+      const n = cnv.width * cnv.height;
+      const mask = new Uint8Array(n);
+      for (let i = 0; i < n; i++) mask[i] = data[i * 4] > 127 ? 1 : 0;
+      resolve({ mask, w: cnv.width, h: cnv.height });
+    };
+    img.onerror = () => resolve(null);
+    img.src = `data:image/png;base64,${b64}`;
+  });
+}
+
+/** Encode a Uint8Array binary mask back to a single-channel "L" PNG
+ *  data URL for round-tripping to the backend. */
+function encodeBinaryMaskPng(mask: Uint8Array, w: number, h: number): string {
+  const cnv = document.createElement("canvas");
+  cnv.width = w; cnv.height = h;
+  const ctx = cnv.getContext("2d");
+  if (!ctx) return "";
+  const imageData = ctx.createImageData(w, h);
+  const d = imageData.data;
+  for (let i = 0; i < mask.length; i++) {
+    const v = mask[i] ? 255 : 0;
+    d[i * 4] = v; d[i * 4 + 1] = v; d[i * 4 + 2] = v; d[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(imageData, 0, 0);
+  return cnv.toDataURL("image/png");
+}
+
+/** Derive a 1-pixel boundary from a binary mask (Uint8Array).  Same
+ *  4-neighbour transition logic as deriveBoundary() but for binary
+ *  data — used by the simple-mode compositor to draw per-channel
+ *  outlines after the user paints / erases. */
+function deriveBinaryBoundary(mask: Uint8Array, w: number, h: number): Uint8Array {
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      if (!mask[i]) continue;
+      const up = y > 0 ? mask[i - w] : 0;
+      const dn = y < h - 1 ? mask[i + w] : 0;
+      const lf = x > 0 ? mask[i - 1] : 0;
+      const rt = x < w - 1 ? mask[i + 1] : 0;
+      if (!up || !dn || !lf || !rt) out[i] = 1;
+    }
+  }
+  return out;
+}
 
 /** Decode the backend's RGBA-packed labels PNG into an Int32Array.
  *  Uses a hidden canvas (browser-native PNG decode), then reads
@@ -1207,6 +1316,13 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // clicks; "merge" reassigns one cell's pixels to the ID of another.
   type EditTool = "pan" | "paint" | "erase" | "delete" | "merge";
   const [editTool, setEditTool] = useState<EditTool>("pan");
+  // Simple-mode edit target — which channel's binary mask the paint /
+  // erase tools operate on.  Hidden when in cellpose mode (where the
+  // tools operate on cellLabels instead).  Disabled-checkbox channels
+  // are skipped at run time so editing them is a no-op; the picker
+  // still shows them so the user can paint into a previously-disabled
+  // channel and then enable it.
+  const [simpleEditChannel, setSimpleEditChannel] = useState<"r" | "g" | "b">("r");
   // Brush radius (preview-pixel space).  Cellpose's GUI uses 3 / 5 / 7;
   // 12 is a forgiving default for human pointing.  `[` / `]` adjusts.
   const [brushPx, setBrushPx] = useState(12);
@@ -1511,6 +1627,23 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
           const dec = await decodeRgbaLabels(data.nucleus_labels_b64);
           if (dec) { layers.nucleusLabels = dec.labels; }
         }
+        // Simple-mode per-channel binary masks — Uint8Array per
+        // channel for the paint/erase tools.
+        if (data.channel_masks_b64 && typeof data.channel_masks_b64 === "object") {
+          const cm = data.channel_masks_b64 as Record<string, string>;
+          const out: Partial<Record<"r" | "g" | "b", Uint8Array>> = {};
+          for (const k of ["r", "g", "b"] as const) {
+            if (!cm[k]) continue;
+            const dec = await decodeBinaryMaskPng(cm[k]);
+            if (dec) {
+              out[k] = dec.mask;
+              // Use the channel mask dims as labelW/H for the editor
+              // when no cellpose labels are present (simple mode).
+              if (!layers.labelW) { layers.labelW = dec.w; layers.labelH = dec.h; }
+            }
+          }
+          if (Object.keys(out).length > 0) layers.channelMasks = out;
+        }
         // Cache by THIS image's label so Run-all stores results
         // against each image's own label, not the (stale) activeIdx.
         const key = img.label;
@@ -1685,6 +1818,18 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     });
   }, [previewByImage]);
 
+  // Simple-mode writeback: update ONE channel's binary mask in
+  // previewByImage so the boundary canvas re-derives and the
+  // compositor redraws.  Other channels keep their existing masks.
+  const writeBackChannelMask = useCallback((label: string, ch: "r" | "g" | "b", next: Uint8Array) => {
+    setPreviewByImage((cur) => {
+      const ap = cur[label];
+      if (!ap) return cur;
+      const cm = { ...(ap.channelMasks || {}), [ch]: next };
+      return { ...cur, [label]: { ...ap, channelMasks: cm, edited: true } };
+    });
+  }, []);
+
   const writeBackLabels = useCallback((label: string, next: Int32Array, nextNuc?: Int32Array | null) => {
     setPreviewByImage((cur) => {
       const ap = cur[label];
@@ -1743,7 +1888,49 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   const commitPaintStroke = useCallback((label: string) => {
     const mask = strokeMaskRef.current;
     const ap = previewByImage[label];
-    if (!mask || !ap?.cellLabels || !ap.labelW || !ap.labelH) {
+    if (!mask || !ap?.labelW || !ap.labelH) {
+      strokeMaskRef.current = null;
+      paintingRef.current = false;
+      lastPaintXYRef.current = null;
+      setStrokeTick((t) => t + 1);
+      return;
+    }
+    // ── Simple-mode branch: edit ONE channel's binary mask. ──
+    // Cellpose's labeled-blob semantics don't apply; paint just
+    // sets, erase just clears.  No new ID allocation, no merge
+    // behaviour.  Undo history is per-channel-mask too — pushed
+    // BEFORE the mutation so the user can revert exactly one step.
+    if (cfg.mode === "simple") {
+      const ch = simpleEditChannel;
+      const cur = ap.channelMasks?.[ch];
+      if (!cur) {
+        strokeMaskRef.current = null;
+        paintingRef.current = false;
+        lastPaintXYRef.current = null;
+        setStrokeTick((t) => t + 1);
+        return;
+      }
+      const next = new Uint8Array(cur);
+      let touched = 0;
+      if (paintingToolRef.current === "erase") {
+        for (let i = 0; i < mask.length; i++) {
+          if (!mask[i]) continue;
+          if (next[i]) { next[i] = 0; touched++; }
+        }
+      } else {
+        for (let i = 0; i < mask.length; i++) {
+          if (!mask[i]) continue;
+          if (!next[i]) { next[i] = 1; touched++; }
+        }
+      }
+      if (touched > 0) writeBackChannelMask(label, ch, next);
+      strokeMaskRef.current = null;
+      paintingRef.current = false;
+      lastPaintXYRef.current = null;
+      setStrokeTick((t) => t + 1);
+      return;
+    }
+    if (!ap.cellLabels) {
       strokeMaskRef.current = null;
       paintingRef.current = false;
       lastPaintXYRef.current = null;
@@ -1862,7 +2049,13 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     if (e.button !== 0) return;
     const label = activeImage?.label;
     const ap = label ? previewByImage[label] : undefined;
-    const editable = cfg.mode === "cellpose" && !!ap?.cellLabels && !!ap.labelW && !!ap.labelH;
+    // Editable in cellpose mode when cellLabels are decoded; editable
+    // in simple mode when the CURRENTLY-SELECTED channel has a binary
+    // mask.  Delete + merge only make sense for cellpose (labeled
+    // blobs) — paint + erase are valid in both modes.
+    const cellposeEditable = cfg.mode === "cellpose" && !!ap?.cellLabels;
+    const simpleEditable = cfg.mode === "simple" && !!ap?.channelMasks?.[simpleEditChannel];
+    const editable = (cellposeEditable || simpleEditable) && !!ap?.labelW && !!ap?.labelH;
     if (!editable || editTool === "pan") {
       // Existing pan behaviour.
       e.preventDefault();
@@ -1889,9 +2082,13 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       // off an existing cell during the drag) doesn't change the
       // commit semantics of THIS stroke.
       paintingToolRef.current = editTool === "erase" ? "erase" : "paint";
-      paintStartIdRef.current = editTool === "paint"
-        ? (ap!.cellLabels![pt.y * w + pt.x] | 0)
-        : 0;  // erase doesn't use start id
+      // Cellpose: start id determines whether paint extends an
+      // existing cell (>0) or makes a new one (0).  Simple mode:
+      // no labeled blobs, so start id is always 0.
+      paintStartIdRef.current =
+        cfg.mode === "cellpose" && editTool === "paint"
+          ? (ap!.cellLabels![pt.y * w + pt.x] | 0)
+          : 0;
       strokeMaskRef.current = new Uint8Array(w * h);
       paintingRef.current = true;
       lastPaintXYRef.current = null;
@@ -1928,7 +2125,8 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       return;
     }
   }, [view, activeImage, previewByImage, cfg.mode, editTool, clientToImage,
-      paintSegment, commitPaintStroke, deleteCellAt, mergeCellInto, mergeFirstId]);
+      paintSegment, commitPaintStroke, deleteCellAt, mergeCellInto, mergeFirstId,
+      simpleEditChannel]);
 
   // Hover tracking — updates the brush cursor + cell-ID tooltip.
   const onPreviewMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
@@ -2015,14 +2213,38 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // to FORCE a fresh full-res cellpose pass just re-open the
   // dialog, click Run preview (regenerates the labels), and save.
   const handleSave = useCallback(() => {
+    // Cellpose masks (full per-image label rasters).
     const masks: Record<string, string> = {};
+    // Simple-mode per-channel binary masks — only emitted for
+    // (image, channel) pairs where the user actually edited (we
+    // can't tell EDITED vs unmodified from the binary content
+    // alone, so we conservatively emit every image's current
+    // channel masks; the runtime fast-path then uses them
+    // instead of re-running the threshold).
+    const chMasks: Record<string, Partial<Record<"r" | "g" | "b", string>>> = {};
     for (const img of images) {
       const ap = previewByImage[img.label];
-      if (!ap?.cellLabels || !ap.labelW || !ap.labelH) continue;
-      const url = encodeRgbaLabels(ap.cellLabels, ap.labelW, ap.labelH);
-      if (url) masks[img.label] = url;
+      if (!ap?.labelW || !ap.labelH) continue;
+      if (ap.cellLabels) {
+        const url = encodeRgbaLabels(ap.cellLabels, ap.labelW, ap.labelH);
+        if (url) masks[img.label] = url;
+      }
+      if (ap.channelMasks) {
+        const out: Partial<Record<"r" | "g" | "b", string>> = {};
+        for (const k of ["r", "g", "b"] as const) {
+          const m = ap.channelMasks[k];
+          if (!m) continue;
+          const url = encodeBinaryMaskPng(m, ap.labelW, ap.labelH);
+          if (url) out[k] = url;
+        }
+        if (Object.keys(out).length > 0) chMasks[img.label] = out;
+      }
     }
-    onSave({ ...cfg, editedMasks: Object.keys(masks).length ? masks : undefined });
+    onSave({
+      ...cfg,
+      editedMasks: Object.keys(masks).length ? masks : undefined,
+      editedChannelMasks: Object.keys(chMasks).length ? chMasks : undefined,
+    });
   }, [cfg, images, previewByImage, onSave]);
 
   // Load composite + overlay layers (per-channel for simple, cells +
@@ -2121,6 +2343,11 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // bootstrap and falls back when labels weren't returned.
   const [cellBoundaryCnv, setCellBoundaryCnv] = useState<HTMLCanvasElement | null>(null);
   const [nucleusBoundaryCnv, setNucleusBoundaryCnv] = useState<HTMLCanvasElement | null>(null);
+  // Simple-mode per-channel boundary canvases derived from the
+  // editable binary masks.  When present, override chImgEls — the
+  // server's pre-rendered overlay PNG is only used until the user
+  // touches the mask.
+  const [simpleBoundaryCnvs, setSimpleBoundaryCnvs] = useState<Partial<Record<"r" | "g" | "b", HTMLCanvasElement>>>({});
   useEffect(() => {
     if (!activePreview || !activePreview.cellLabels || !activePreview.labelW || !activePreview.labelH) {
       setCellBoundaryCnv(null);
@@ -2137,6 +2364,29 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       setNucleusBoundaryCnv(null);
     }
   }, [activePreview]);
+
+  // Simple-mode per-channel boundary canvases — derived from the
+  // editable Uint8Array masks.  Each channel rendered in its own
+  // colour matching the existing per-channel scheme.  When the user
+  // paints / erases, the binary mask updates and this effect re-runs.
+  useEffect(() => {
+    const ap = activePreview;
+    if (!ap || cfg.mode !== "simple" || !ap.channelMasks || !ap.labelW || !ap.labelH) {
+      setSimpleBoundaryCnvs({});
+      return;
+    }
+    const out: Partial<Record<"r" | "g" | "b", HTMLCanvasElement>> = {};
+    const colors: Record<"r" | "g" | "b", [number, number, number]> = {
+      r: [255, 80, 80], g: [120, 220, 120], b: [120, 170, 255],
+    };
+    for (const k of ["r", "g", "b"] as const) {
+      const m = ap.channelMasks[k];
+      if (!m) continue;
+      const bnd = deriveBinaryBoundary(m, ap.labelW, ap.labelH);
+      out[k] = renderBoundaryCanvas(bnd, ap.labelW, ap.labelH, colors[k]);
+    }
+    setSimpleBoundaryCnvs(out);
+  }, [activePreview, cfg.mode]);
 
   // ── Editor: transient paint stroke + brush-cursor overlays ─────
   // While the user holds left-mouse with the paint tool, every
@@ -2203,8 +2453,14 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       ctx.drawImage(compImgEl, 0, 0);
     }
     if (cfg.mode === "simple") {
+      // Prefer the LOCALLY-derived boundary canvas (always current
+      // with the user's paint / erase edits); fall back to the
+      // server's per-channel overlay PNG when no edits have happened
+      // yet (or when channelMasks weren't supplied).
       for (const k of ["r", "g", "b"] as const) {
         if (!maskVisible[k]) continue;
+        const local = simpleBoundaryCnvs[k];
+        if (local) { ctx.drawImage(local, 0, 0); continue; }
         const im = chImgEls[k];
         if (im) ctx.drawImage(im, 0, 0);
       }
@@ -2316,7 +2572,8 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [compImgEl, chImgEls, maskVisible, cellImgEl, nucImgEl, cpMaskVisible, cfg.mode,
       cellBoundaryCnv, nucleusBoundaryCnv, hoverInfo, editTool, brushPx, mergeFirstId,
-      strokeTick, viewMode, flowsImgEl, cellprobImgEl, scaleDiskOn, cfg.cellpose.diameter]);
+      strokeTick, viewMode, flowsImgEl, cellprobImgEl, scaleDiskOn, cfg.cellpose.diameter,
+      simpleBoundaryCnvs]);
 
   const setChannel = useCallback((k: keyof FluorChannels, v: string) => {
     setCfg((c) => ({ ...c, channels: { ...c.channels, [k]: v } }));
@@ -2476,22 +2733,70 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                 right or the stats footer at the bottom.
                 Hotkeys: V (pan), B (paint), D (delete), M (merge),
                 [/] (brush ±2 px), Cmd+Z / Cmd+Shift+Z, Cmd+0. */}
-            {cfg.mode === "cellpose" && activePreview?.cellLabels && (
+            {((cfg.mode === "cellpose" && activePreview?.cellLabels)
+              || (cfg.mode === "simple" && activePreview?.channelMasks)) && (
               <Box sx={{
                 position: "absolute", top: 4, left: 4, zIndex: 5,
                 display: "flex", alignItems: "center", gap: 0.4, flexWrap: "wrap",
                 bgcolor: "rgba(0,0,0,0.55)", color: "common.white",
                 px: 0.6, py: 0.35, borderRadius: 0.6,
               }}>
+                {/* Simple-mode channel selector — picks which of R/G/B
+                    the paint / erase tools modify.  Hidden in cellpose
+                    mode (no per-channel concept there).  Disabled
+                    channels still appear so the user can paint into
+                    one even before re-enabling it in the threshold UI. */}
+                {cfg.mode === "simple" && (
+                  <Box sx={{ display: "inline-flex", alignItems: "center", gap: 0.3, mr: 0.4,
+                             borderRight: "1px solid rgba(255,255,255,0.25)", pr: 0.4 }}>
+                    <Typography variant="caption" sx={{ fontSize: "0.6rem", opacity: 0.85, mr: 0.2 }}>
+                      Edit ch:
+                    </Typography>
+                    {(["r", "g", "b"] as const).map((k) => {
+                      const sw = k === "r" ? "#ff6868" : k === "g" ? "#6fdc6f" : "#7fa3ff";
+                      const active = simpleEditChannel === k;
+                      const hasMask = !!activePreview?.channelMasks?.[k];
+                      return (
+                        <Tooltip key={k} title={hasMask
+                          ? `Edit ${cfg.channels[k]} mask (${k.toUpperCase()})`
+                          : `${cfg.channels[k]} has no mask yet — Run preview first`}>
+                          <Box
+                            onClick={() => { if (hasMask) setSimpleEditChannel(k); }}
+                            sx={{
+                              cursor: hasMask ? "pointer" : "not-allowed",
+                              opacity: hasMask ? 1 : 0.35, userSelect: "none",
+                              px: 0.5, py: 0.1, borderRadius: 0.4,
+                              border: "1px solid",
+                              borderColor: active ? sw : "rgba(255,255,255,0.25)",
+                              bgcolor: active ? sw : "transparent",
+                              color: active ? "common.white" : "rgba(255,255,255,0.85)",
+                              fontSize: "0.65rem", fontWeight: active ? 700 : 500,
+                              minWidth: 18, textAlign: "center",
+                            }}>
+                            {k.toUpperCase()}
+                          </Box>
+                        </Tooltip>
+                      );
+                    })}
+                  </Box>
+                )}
                 {([
-                  { tool: "pan" as const,    icon: <PanToolAltIcon sx={{ fontSize: 16 }} />,    title: "Pan (V)" },
+                  { tool: "pan" as const,    icon: <PanToolAltIcon sx={{ fontSize: 16 }} />,    title: "Pan (V)", cellposeOnly: false },
                   { tool: "paint" as const,  icon: <BrushIcon sx={{ fontSize: 16 }} />,
-                    title: "Paint (B) — start on an EXISTING cell to extend / push its boundary along the brush path (great for dendrites); start in empty area to make a NEW cell" },
+                    title: cfg.mode === "simple"
+                      ? "Paint (B) — adds pixels to the SELECTED channel's mask along the brush path"
+                      : "Paint (B) — start on an EXISTING cell to extend / push its boundary along the brush path (great for dendrites); start in empty area to make a NEW cell",
+                    cellposeOnly: false },
                   { tool: "erase" as const,  icon: <AutoFixOffIcon sx={{ fontSize: 16 }} />,
-                    title: "Erase pixels (E) — pulls a cell's boundary BACK by setting brushed pixels to background.  Doesn't remove the whole cell — for that, use Delete." },
-                  { tool: "delete" as const, icon: <HighlightOffIcon sx={{ fontSize: 16 }} />,  title: "Delete cell under cursor (D)" },
-                  { tool: "merge" as const,  icon: <CallMergeIcon sx={{ fontSize: 16 }} />,     title: "Merge two cells (M) — click first cell, then the cell to merge it INTO" },
-                ] as const).map(({ tool, icon, title }) => (
+                    title: cfg.mode === "simple"
+                      ? "Erase (E) — removes pixels from the SELECTED channel's mask along the brush path"
+                      : "Erase pixels (E) — pulls a cell's boundary BACK by setting brushed pixels to background.  Doesn't remove the whole cell — for that, use Delete.",
+                    cellposeOnly: false },
+                  { tool: "delete" as const, icon: <HighlightOffIcon sx={{ fontSize: 16 }} />,  title: "Delete cell under cursor (D)", cellposeOnly: true },
+                  { tool: "merge" as const,  icon: <CallMergeIcon sx={{ fontSize: 16 }} />,     title: "Merge two cells (M) — click first cell, then the cell to merge it INTO", cellposeOnly: true },
+                ] as const).filter(({ cellposeOnly }) =>
+                    !cellposeOnly || cfg.mode === "cellpose"
+                ).map(({ tool, icon, title }) => (
                   <Tooltip key={tool} title={title}>
                     <Box
                       onClick={() => { setEditTool(tool); setMergeFirstId(null); }}

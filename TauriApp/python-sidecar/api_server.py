@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.332"
+SIDECAR_BUILD = "0.1.333"
 
 
 @app.get("/api/version")
@@ -7458,6 +7458,14 @@ def fluor_preview_segment(body: FluorPreviewRequest):
 
     per_channel: Dict[str, int] = {}
     channel_overlays: Dict[str, str] = {}
+    # Per-channel binary masks at preview resolution — single-channel
+    # PNGs (mode "L"), 255 where the threshold mask is True.  Enables
+    # the dialog's paint/erase tools on simple-mode masks: the frontend
+    # decodes these into Uint8Arrays, lets the user paint or erase,
+    # then round-trips the edits back via cfg.editedChannelMasks so the
+    # final quantification uses the user's mask instead of re-running
+    # threshold.
+    channel_masks: Dict[str, str] = {}
     rolling_radius = int(body.rolling_radius or 0)
     # Channel colour for the outline: pure R/G/B so the user can tell at
     # a glance which contour belongs to which channel.
@@ -7526,6 +7534,17 @@ def fluor_preview_segment(body: FluorPreviewRequest):
         except Exception as _e:
             print(f"[fluor-preview] ch {ch_key}: overlay PNG failed: {_e}",
                   file=__s.stderr, flush=True)
+        # Raw binary mask PNG — 8-bit "L" mode, 255 inside the mask,
+        # 0 outside.  Decoded into a Uint8Array on the frontend for
+        # paint / erase; round-trips back via cfg.editedChannelMasks.
+        try:
+            mask_u8 = (mask.astype(_np.uint8) * 255)
+            _mbuf = io.BytesIO()
+            Image.fromarray(mask_u8, mode="L").save(_mbuf, format="PNG")
+            channel_masks[ch_key] = base64.b64encode(_mbuf.getvalue()).decode()
+        except Exception as _e:
+            print(f"[fluor-preview] ch {ch_key}: binary mask PNG failed: {_e}",
+                  file=__s.stderr, flush=True)
 
     # Emit combined overlay (legacy) + base composite + per-channel overlays.
     _buf = io.BytesIO()
@@ -7537,6 +7556,7 @@ def fluor_preview_segment(body: FluorPreviewRequest):
         "overlay_b64": base64.b64encode(_buf.getvalue()).decode(),  # legacy combined
         "composite_b64": base64.b64encode(_cbuf.getvalue()).decode(),  # base layer
         "channel_overlays": channel_overlays,                         # per-channel transparent
+        "channel_masks_b64": channel_masks,                           # per-channel binary mask PNGs
         "src_w": int(src_w0), "src_h": int(src_h0),
         "preview_w": int(w), "preview_h": int(h),
         "per_channel": per_channel,
