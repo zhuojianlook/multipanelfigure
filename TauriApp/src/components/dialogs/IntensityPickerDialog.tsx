@@ -320,6 +320,40 @@ for g in CFG.get("groups", []) or []:
         _m = _re_grp.match(r"^inset_\d+_(.+)$", s)
         if _m:
             img2group[_m.group(1)] = nm
+        # Also map the "up_image_N_<rest>" form for upstream-node
+        # outputs and the trailing-filename form so a saved label
+        # with embedded slashes still matches a bare-filename
+        # runtime label.
+        _m2 = _re_grp.match(r"^up_(?:image|table)_\d+_(.+)$", s)
+        if _m2:
+            img2group[_m2.group(1)] = nm
+        if "/" in s:
+            img2group[s.rsplit("/", 1)[-1]] = nm
+
+def _resolve_group(key, label, mapping):
+    """Multi-level group lookup with explicit fallbacks.
+    1) exact key match (the post-0.1.331 stable id)
+    2) exact label match (legacy configs)
+    3) substring match on either side (catches edge cases where the
+       saved entry has the label as a substring, e.g. a path)"""
+    if not mapping: return None
+    if key and mapping.get(str(key)): return mapping[str(key)]
+    if label and mapping.get(label): return mapping[label]
+    # Last-resort substring match — only when nothing exact hit.
+    if label:
+        lbl_lc = label.lower()
+        for k, v in mapping.items():
+            kk = k.lower()
+            if lbl_lc in kk or kk in lbl_lc:
+                return v
+    return None
+
+# Diagnostic — print what img2group ended up with so the user can
+# verify their picker assignments actually reached the runtime.
+# (When a group is "silently missing", this surfaces whether the
+# bug is in saving vs in resolution.)
+print(f"[intensity] img2group has {len(img2group)} entries (showing keys): "
+      f"{sorted(set(img2group.keys()))[:8]}")
 thresholds = CFG.get("thresholds", {}) or {}
 rolling_radius = int(CFG.get("rollingRadius", 35) or 0)
 cp_cfg = CFG.get("cellpose", {}) or {}
@@ -589,13 +623,12 @@ if mode == "cellpose":
     _unassigned = []
     for key, src in imgs:
         label = _label_of(src, key)
-        # Look up by input KEY first (new stable id, 0.1.330+) then
-        # fall back to label (legacy configs saved before 0.1.330).
-        grp = img2group.get(str(key)) or img2group.get(label)
+        grp = _resolve_group(key, label, img2group)
         if not grp:
             print(f"[intensity] {label} (key={key}): not assigned to any group — skipping")
             _unassigned.append(label)
             continue
+        print(f"[intensity] {label} (key={key}) → group {grp!r}")
         raw = _pixels(src)
         corrected = np.zeros_like(raw, dtype=np.float64)
         for ci in range(3):
@@ -819,15 +852,16 @@ if mode == "cellpose":
 ch_colors = {"r": (255, 64, 64), "g": (96, 220, 96), "b": (96, 160, 255)}
 for key, src in imgs:
     label = _label_of(src, key)
-    # Look up by input KEY (stable id, 0.1.330+) then label (legacy).
-    # When neither matches, surface a "(unassigned)" group label so
-    # the user can see the image fell through in the table + plot
-    # — silently collapsing into the image's own label was masking
-    # the bug.
-    grp = img2group.get(str(key)) or img2group.get(label) or "(unassigned)"
+    # Multi-level lookup: exact key → exact label → substring fallback.
+    # When nothing matches we surface "(unassigned)" so the image
+    # shows on the plot instead of vanishing — silently collapsing
+    # into the image's own label was masking missing-group bugs.
+    grp = _resolve_group(key, label, img2group) or "(unassigned)"
     if grp == "(unassigned)":
         print(f"[intensity] {label} (key={key}): not assigned to any group — "
               f"surfacing as '(unassigned)' so the plot shows it dropped")
+    else:
+        print(f"[intensity] {label} (key={key}) → group {grp!r}")
     raw = _pixels(src)
     corrected = np.zeros_like(raw, dtype=np.float64)
     masks = {}
@@ -3202,7 +3236,9 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                       <MenuItem value="g" sx={{ fontSize: "0.78rem" }}>{cfg.channels.g}</MenuItem>
                       <MenuItem value="b" sx={{ fontSize: "0.78rem" }}>{cfg.channels.b}</MenuItem>
                     </TextField>
-                    <Tooltip title="Channel cellpose uses as the cell-body / cytoplasm signal. cyto3 uses this PLUS the nuclei channel to find whole-cell boundaries. Intensity is measured in EVERY channel inside each detected cell — you don't need to pick this as the channel of interest, only the one whose signal best outlines cell bodies."
+                    <Tooltip title={(cfg.cellpose.cellposeVersion || "v4") === "v4"
+                      ? "cpsam (cellpose 4) is a SAM-based generalist — it segments whichever objects are visible.  This dropdown still picks the channel cpsam isolates as its single grayscale input, but the v3-style dual-channel cyto+nuclei pairing doesn't apply (only the nuclei pass uses the Nuclei channel below)."
+                      : "Channel cellpose uses as the cell-body / cytoplasm signal. cyto3 uses this PLUS the nuclei channel to find whole-cell boundaries. Intensity is measured in EVERY channel inside each detected cell — you don't need to pick this as the channel of interest, only the one whose signal best outlines cell bodies."}
                       placement="top" enterDelay={200}>
                       <Box sx={{
                         width: 16, height: 16, borderRadius: "50%",
@@ -3227,7 +3263,9 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                       <MenuItem value="g" sx={{ fontSize: "0.78rem" }}>{cfg.channels.g}</MenuItem>
                       <MenuItem value="b" sx={{ fontSize: "0.78rem" }}>{cfg.channels.b}</MenuItem>
                     </TextField>
-                    <Tooltip title="DAPI / Hoechst channel. Feeding cyto3 a nuclei channel as well gives noticeably better whole-cell boundaries (the model was trained on both inputs). Also REQUIRED for 'Measure compartments'."
+                    <Tooltip title={(cfg.cellpose.cellposeVersion || "v4") === "v4"
+                      ? "DAPI / Hoechst channel.  cpsam (cellpose 4) does NOT use it for the cell-body pass (that's a cyto3-only feature).  Required ONLY for 'Measure compartments' — the second pass isolates this channel and segments the nuclei from it."
+                      : "DAPI / Hoechst channel. Feeding cyto3 a nuclei channel as well gives noticeably better whole-cell boundaries (the model was trained on both inputs). Also REQUIRED for 'Measure compartments'."}
                       placement="top" enterDelay={200}>
                       <Box sx={{
                         width: 16, height: 16, borderRadius: "50%",

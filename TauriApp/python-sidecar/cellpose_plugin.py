@@ -251,14 +251,48 @@ def main():
                 log.append("[%d/%d] %r: skipped (model unavailable: %s)"
                            % (i, len(inputs), label, _model.get("err") or "?"))
                 continue
-            log.append("[%d/%d] segmenting %r shape=%s" % (i, len(inputs), label, img.shape))
+            log.append("[%d/%d] segmenting %r shape=%s api=%s"
+                       % (i, len(inputs), label, img.shape, "v4" if is_v4 else "v3"))
             ek = dict(diameter=diameter, flow_threshold=flow_threshold,
                       cellprob_threshold=cellprob_threshold, min_size=min_size)
+            # Cellpose 4 (cpsam) doesn't take `channels` — it operates on
+            # the raw RGB / grayscale image directly.  The TypeError
+            # catch handles the most common v4 signature mismatch, but
+            # v4 can also reject other v3-only kwargs (flow_threshold
+            # interpretation changed, min_size accepted but ignored in
+            # some 4.x dev builds).  Any non-TypeError exception means
+            # cellpose actually FAILED on this image and we must skip
+            # it cleanly — emitting the original ERROR back to the
+            # caller so the UI doesn't show the generic "cellpose
+            # returned no labels image" line that masks the real
+            # problem.
             try:
-                res = m.eval(img, channels=channels, **ek)
-            except TypeError:
-                res = m.eval(img, **ek)
-            masks = res[0]
+                try:
+                    res = m.eval(img, channels=channels, **ek)
+                except TypeError as _te:
+                    log.append("[%d/%d] %r: retry without `channels` (%s)"
+                               % (i, len(inputs), label, _te))
+                    res = m.eval(img, **ek)
+            except Exception as _ee:
+                err_msg = ("cellpose %s eval failed on %r: %s"
+                           % ("v4" if is_v4 else "v3", label, _ee))
+                log.append("[%d/%d] %s" % (i, len(inputs), err_msg))
+                # Surface the FIRST failure as result["error"] so the
+                # caller sees a useful message instead of "no labels".
+                if not result.get("error"):
+                    result["error"] = err_msg
+                continue
+            # Cellpose 4 may return a list-of-masks for batch input;
+            # we always pass a single image so res[0] is a 2D array.
+            try:
+                masks = res[0] if not isinstance(res[0], list) else res[0][0]
+            except Exception as _re:
+                log.append("[%d/%d] %r: unpacking eval result failed: %s"
+                           % (i, len(inputs), label, _re))
+                if not result.get("error"):
+                    result["error"] = ("cellpose returned unexpected result shape: %s"
+                                       % type(res).__name__)
+                continue
             # flows is a list — flows[0] = HxWx3 RGB direction visualisation,
             # flows[2] = HxW cellprob (float).  Shape varies slightly across
             # cellpose versions; guard each access.
