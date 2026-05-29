@@ -1889,22 +1889,34 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     return () => window.removeEventListener("keydown", onKey);
   }, [open, cfg.mode, activeImage, doUndo, doRedo, clearAllMasks]);
 
-  // ── Save: pack edited masks into cfg ─────────────────────────
-  // The dialog only ships the edited mask for images that the user
-  // actually painted on (edit count > 0).  Encoded as RGBA-packed
-  // PNG data URLs so the generated Python forwards them straight to
-  // /api/analysis/run-cellpose's `edited_masks` field.
+  // ── Save: pack EVERY image's preview labels into cfg.editedMasks ──
+  // Previously the dialog only saved masks the user had actively
+  // painted on, which meant the workflow's Run step re-ran cellpose
+  // from scratch on every "unedited" image — even ones the user had
+  // already segmented in the preview.  That wasted ~30s of model
+  // cold-start + ~1s/image of inference.
+  //
+  // Now we pack every image that has a cached preview, edited or
+  // not.  The backend already supports per-image mask overrides
+  // (cellpose_plugin's edited_label_paths); supplied masks skip
+  // model.eval.  When ALL images have masks, the runner also skips
+  // loading cellpose entirely (lazy-load — see runner code).
+  //
+  // Staleness is already prevented: every cellpose-relevant param
+  // change clears previewByImage, so a non-empty preview entry is
+  // by-definition current with the saved config.  Users who want
+  // to FORCE a fresh full-res cellpose pass just re-open the
+  // dialog, click Run preview (regenerates the labels), and save.
   const handleSave = useCallback(() => {
-    const edited: Record<string, string> = {};
-    for (const [lbl, hist] of Object.entries(editHistory)) {
-      if (hist.past.length === 0) continue;
-      const ap = previewByImage[lbl];
+    const masks: Record<string, string> = {};
+    for (const img of images) {
+      const ap = previewByImage[img.label];
       if (!ap?.cellLabels || !ap.labelW || !ap.labelH) continue;
       const url = encodeRgbaLabels(ap.cellLabels, ap.labelW, ap.labelH);
-      if (url) edited[lbl] = url;
+      if (url) masks[img.label] = url;
     }
-    onSave({ ...cfg, editedMasks: Object.keys(edited).length ? edited : undefined });
-  }, [cfg, editHistory, previewByImage, onSave]);
+    onSave({ ...cfg, editedMasks: Object.keys(masks).length ? masks : undefined });
+  }, [cfg, images, previewByImage, onSave]);
 
   // Load composite + overlay layers (per-channel for simple, cells +
   // nuclei for cellpose) as HTMLImageElement instances whenever the

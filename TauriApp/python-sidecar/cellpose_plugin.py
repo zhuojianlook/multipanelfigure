@@ -167,17 +167,30 @@ def main():
     if is_v4 and model_name not in {"cpsam"}:
         log.append("WARNING: cellpose 4.x only ships 'cpsam' — %r falls back to cpsam." % model_name)
         model_name = "cpsam"
-    try:
-        if is_v4:
-            model = cp_models.CellposeModel(gpu=use_gpu, pretrained_model=model_name)
-        else:
-            model = cp_models.Cellpose(gpu=use_gpu, model_type=model_name)
-        log.append("loaded cellpose %s model=%r gpu=%s api=%s"
-                   % (cp_ver or "(unknown)", model_name, use_gpu, "v4" if is_v4 else "v3"))
-    except Exception as e:
-        result["error"] = "Failed to load cellpose model: %s" % e
-        result["stdout"] = "\n".join(log)
-        _write(out_dir, result); return
+
+    # Lazy model loader.  The model (~100 MB for cpsam) takes ~30 s
+    # cold-start, so we defer the load until the FIRST image that
+    # actually needs cellpose.eval().  When every image carries a
+    # user-supplied mask (the common case after a dialog preview +
+    # Save), the model is never loaded — turning what used to be a
+    # 30 s+ run into a fraction of a second.
+    _model = {"m": None, "err": None}
+    def _ensure_model():
+        if _model["m"] is not None: return _model["m"]
+        if _model["err"] is not None: return None
+        _t = time.monotonic()
+        try:
+            if is_v4:
+                _model["m"] = cp_models.CellposeModel(gpu=use_gpu, pretrained_model=model_name)
+            else:
+                _model["m"] = cp_models.Cellpose(gpu=use_gpu, model_type=model_name)
+            log.append("loaded cellpose %s model=%r gpu=%s api=%s in %.1fs (lazy)"
+                       % (cp_ver or "(unknown)", model_name, use_gpu,
+                          "v4" if is_v4 else "v3", time.monotonic() - _t))
+        except Exception as _le:
+            _model["err"] = "Failed to load cellpose model: %s" % _le
+            log.append("cellpose model load FAILED: %s" % _le)
+        return _model["m"]
 
     # Optional pre-supplied label rasters keyed by image label.  When
     # the user has interactively painted/deleted cells in the dialog,
@@ -233,13 +246,18 @@ def main():
                            % (i, len(inputs), label))
 
         if masks is None:
+            m = _ensure_model()
+            if m is None:
+                log.append("[%d/%d] %r: skipped (model unavailable: %s)"
+                           % (i, len(inputs), label, _model.get("err") or "?"))
+                continue
             log.append("[%d/%d] segmenting %r shape=%s" % (i, len(inputs), label, img.shape))
             ek = dict(diameter=diameter, flow_threshold=flow_threshold,
                       cellprob_threshold=cellprob_threshold, min_size=min_size)
             try:
-                res = model.eval(img, channels=channels, **ek)
+                res = m.eval(img, channels=channels, **ek)
             except TypeError:
-                res = model.eval(img, **ek)
+                res = m.eval(img, **ek)
             masks = res[0]
             # flows is a list — flows[0] = HxWx3 RGB direction visualisation,
             # flows[2] = HxW cellprob (float).  Shape varies slightly across
