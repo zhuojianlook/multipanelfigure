@@ -179,6 +179,12 @@ export interface FluorIntensityConfig {
    *  Python skips the threshold step for that (image, channel) and
    *  uses the user's mask instead. */
   editedChannelMasks?: Record<string, Partial<Record<"r" | "g" | "b", string>>>;
+  /** Optional user-painted NUCLEI masks (cellpose compartment mode),
+   *  keyed by image label.  RGBA-packed PNG data URL, same encoding as
+   *  editedMasks.  When present, the generated Python uses these as
+   *  the nucleus labels for the compartment pass instead of running
+   *  the cellpose nuclei model. */
+  editedNucleiMasks?: Record<string, string>;
 }
 
 export function emptyFluorConfig(): FluorIntensityConfig {
@@ -198,8 +204,11 @@ export function emptyFluorConfig(): FluorIntensityConfig {
     // its higher-accuracy segmentation.
     cellpose: {
       cellposeVersion: "v4",
-      model: "cpsam", diameter: 0, segChannel: "b",
-      nucleiChannel: null, measureCompartments: false, minSize: 80,
+      // Defaults match the common DAPI-in-blue / target-in-red layout:
+      // cell-body signal on Channel R, nuclei (DAPI / Hoechst) on
+      // Channel B.  Users can override per-node.
+      model: "cpsam", diameter: 0, segChannel: "r",
+      nucleiChannel: "b", measureCompartments: false, minSize: 80,
     },
     controlChannel: null,
     groups: [],
@@ -498,17 +507,16 @@ def _cellpose_labels_batch(items, model, channels, isolate_channel=0, diameter_o
             "image_b64": _b64.b64encode(_png_bytes(a8_small)).decode(),
         })
     # Forward user-edited masks (Intensity dialog Tier-1 editing).
-    # Only relevant for the WHOLE-CELL pass; the nuclei pass uses a
-    # different model and edits aren't tracked separately for nuclei.
+    # The WHOLE-CELL pass uses editedMasks; the NUCLEI pass uses
+    # editedNucleiMasks (painted via the Cells/Nuclei target toggle).
     _edited = {}
-    if model != "nuclei":
-        _edited_cfg = CFG.get("editedMasks") or {}
-        if isinstance(_edited_cfg, dict):
-            for _lbl in [label for label, _ in items]:
-                v = _edited_cfg.get(_lbl)
-                if isinstance(v, str) and v:
-                    # Strip the "data:image/png;base64," prefix if present.
-                    _edited[_lbl] = v.split(",", 1)[-1] if v.startswith("data:") else v
+    _edited_cfg = (CFG.get("editedNucleiMasks") if model == "nuclei" else CFG.get("editedMasks")) or {}
+    if isinstance(_edited_cfg, dict):
+        for _lbl in [label for label, _ in items]:
+            v = _edited_cfg.get(_lbl)
+            if isinstance(v, str) and v:
+                # Strip the "data:image/png;base64," prefix if present.
+                _edited[_lbl] = v.split(",", 1)[-1] if v.startswith("data:") else v
 
     # ── FAST PATH: every requested image already has an edited mask ──
     # Decode the supplied PNGs inline and skip the cellpose subprocess
@@ -1299,6 +1307,12 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   // visibility above): cells = yellow outline, nuclei = cyan. Both
   // default ON so the user immediately sees what cellpose found.
   const [cpMaskVisible, setCpMaskVisible] = useState<{ cells: boolean; nuclei: boolean }>({ cells: true, nuclei: true });
+  // Which cellpose mask the paint / erase / delete / merge tools edit:
+  // the whole-cell labels or the nucleus labels.  Nuclei are only
+  // editable when a nuclei pass produced labels (measure compartments
+  // on) — the chip is disabled otherwise.  Lets the user paint missed
+  // nuclei or carve over-merged ones, same as cells.
+  const [cellposeEditTarget, setCellposeEditTarget] = useState<"cells" | "nuclei">("cells");
   // ── Tier 2: view mode (base layer) ────────────────────────────
   // "composite" = full contrast-stretched RGB; "r"/"g"/"b" isolate
   // one channel as a grayscale view; "flows" / "cellprob" swap the
@@ -1459,6 +1473,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       setHoverInfo(null);
       setViewMode("composite");
       setScaleDiskOn(false);
+      setCellposeEditTarget("cells");
     }
   }, [open, initial]);
 
@@ -1847,6 +1862,28 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     });
   }, []);
 
+  // Read the label array for the CURRENT cellpose edit target.
+  const activeTargetLabels = useCallback((ap: PreviewLayers | undefined): Int32Array | undefined => {
+    if (!ap) return undefined;
+    return cellposeEditTarget === "nuclei" ? ap.nucleusLabels : ap.cellLabels;
+  }, [cellposeEditTarget]);
+
+  // Write back the label array for the CURRENT cellpose edit target.
+  // Cells → cellLabels (+ recompute n_cells); nuclei → nucleusLabels
+  // (+ recompute n_nuclei).  Edits flag is set either way.
+  const writeBackTargetLabels = useCallback((label: string, next: Int32Array) => {
+    setPreviewByImage((cur) => {
+      const ap = cur[label];
+      if (!ap) return cur;
+      if (cellposeEditTarget === "nuclei") {
+        return { ...cur, [label]: { ...ap, nucleusLabels: next, edited: true,
+                                    n_nuclei: countNonZeroIds(next) } };
+      }
+      return { ...cur, [label]: { ...ap, cellLabels: next, edited: true,
+                                  n_cells: countNonZeroIds(next) } };
+    });
+  }, [cellposeEditTarget]);
+
   // Paint a filled circle into the stroke mask at image-space (x, y).
   const stampCircle = useCallback((cx: number, cy: number, r: number, w: number, h: number) => {
     const mask = strokeMaskRef.current;
@@ -1930,7 +1967,9 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       setStrokeTick((t) => t + 1);
       return;
     }
-    if (!ap.cellLabels) {
+    // Cellpose branch — operates on the ACTIVE target (cells or nuclei).
+    const cur = activeTargetLabels(ap);
+    if (!cur) {
       strokeMaskRef.current = null;
       paintingRef.current = false;
       lastPaintXYRef.current = null;
@@ -1938,23 +1977,19 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       return;
     }
     pushHistorySnapshot(label);
-    const next = new Int32Array(ap.cellLabels);
+    const next = new Int32Array(cur);
     let touched = 0;
     if (paintingToolRef.current === "erase") {
       // Erase tool: set every pixel under the stroke to background.
-      // Useful for pulling a cell's boundary BACK (the inverse of
-      // paint-extend).  Doesn't delete an entire cell — it just
-      // shaves whichever pixels the user dragged over.
       for (let i = 0; i < mask.length; i++) {
         if (!mask[i]) continue;
         if (next[i] !== 0) { next[i] = 0; touched++; }
       }
     } else {
-      // Paint tool: if the stroke STARTED on an existing cell, every
-      // stroke pixel is assigned that cell's ID — extending /
-      // pushing the cell's boundary along the brush path.  Useful for
-      // dendritic cells where cellpose under-segments processes.
-      // Stroke starting in background → allocate a fresh cell ID.
+      // Paint tool: if the stroke STARTED on an existing object, every
+      // stroke pixel is assigned that object's ID — extending its
+      // boundary along the brush path.  Starting in background →
+      // allocate a fresh ID.  Works identically for cells and nuclei.
       let targetId = paintStartIdRef.current | 0;
       if (targetId === 0) {
         let maxId = 0;
@@ -1966,42 +2001,46 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         if (next[i] !== targetId) { next[i] = targetId; touched++; }
       }
     }
-    if (touched > 0) writeBackLabels(label, next);
+    if (touched > 0) writeBackTargetLabels(label, next);
     strokeMaskRef.current = null;
     paintingRef.current = false;
     lastPaintXYRef.current = null;
     paintStartIdRef.current = 0;
     setStrokeTick((t) => t + 1);
-  }, [previewByImage, pushHistorySnapshot, writeBackLabels]);
+  }, [previewByImage, pushHistorySnapshot, writeBackChannelMask, cfg.mode,
+      simpleEditChannel, activeTargetLabels, writeBackTargetLabels]);
 
   const deleteCellAt = useCallback((label: string, x: number, y: number) => {
     const ap = previewByImage[label];
-    if (!ap?.cellLabels || !ap.labelW || !ap.labelH) return;
+    const cur = activeTargetLabels(ap);
+    if (!cur || !ap?.labelW || !ap.labelH) return;
     const idx = y * ap.labelW + x;
-    const id = ap.cellLabels[idx];
+    const id = cur[idx];
     if (!id) return;
     pushHistorySnapshot(label);
-    const next = new Int32Array(ap.cellLabels);
+    const next = new Int32Array(cur);
     for (let i = 0; i < next.length; i++) if (next[i] === id) next[i] = 0;
-    writeBackLabels(label, next);
-  }, [previewByImage, pushHistorySnapshot, writeBackLabels]);
+    writeBackTargetLabels(label, next);
+  }, [previewByImage, pushHistorySnapshot, activeTargetLabels, writeBackTargetLabels]);
 
   const mergeCellInto = useCallback((label: string, srcId: number, dstId: number) => {
     if (srcId === dstId || !srcId || !dstId) return;
     const ap = previewByImage[label];
-    if (!ap?.cellLabels) return;
+    const cur = activeTargetLabels(ap);
+    if (!cur) return;
     pushHistorySnapshot(label);
-    const next = new Int32Array(ap.cellLabels);
+    const next = new Int32Array(cur);
     for (let i = 0; i < next.length; i++) if (next[i] === srcId) next[i] = dstId;
-    writeBackLabels(label, next);
-  }, [previewByImage, pushHistorySnapshot, writeBackLabels]);
+    writeBackTargetLabels(label, next);
+  }, [previewByImage, pushHistorySnapshot, activeTargetLabels, writeBackTargetLabels]);
 
   const clearAllMasks = useCallback((label: string) => {
     const ap = previewByImage[label];
-    if (!ap?.cellLabels) return;
+    const cur = activeTargetLabels(ap);
+    if (!cur) return;
     pushHistorySnapshot(label);
-    writeBackLabels(label, new Int32Array(ap.cellLabels.length));
-  }, [previewByImage, pushHistorySnapshot, writeBackLabels]);
+    writeBackTargetLabels(label, new Int32Array(cur.length));
+  }, [previewByImage, pushHistorySnapshot, activeTargetLabels, writeBackTargetLabels]);
 
   const doUndo = useCallback((label: string) => {
     setEditHistory((cur) => {
@@ -2049,11 +2088,13 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     if (e.button !== 0) return;
     const label = activeImage?.label;
     const ap = label ? previewByImage[label] : undefined;
-    // Editable in cellpose mode when cellLabels are decoded; editable
-    // in simple mode when the CURRENTLY-SELECTED channel has a binary
-    // mask.  Delete + merge only make sense for cellpose (labeled
-    // blobs) — paint + erase are valid in both modes.
-    const cellposeEditable = cfg.mode === "cellpose" && !!ap?.cellLabels;
+    // Editable in cellpose mode when the ACTIVE target's labels are
+    // decoded (cells always; nuclei only when a nuclei pass ran);
+    // editable in simple mode when the CURRENTLY-SELECTED channel has
+    // a binary mask.  Delete + merge only make sense for cellpose
+    // (labeled blobs) — paint + erase are valid in both modes.
+    const cpLabels = cfg.mode === "cellpose" ? activeTargetLabels(ap) : undefined;
+    const cellposeEditable = cfg.mode === "cellpose" && !!cpLabels;
     const simpleEditable = cfg.mode === "simple" && !!ap?.channelMasks?.[simpleEditChannel];
     const editable = (cellposeEditable || simpleEditable) && !!ap?.labelW && !!ap?.labelH;
     if (!editable || editTool === "pan") {
@@ -2083,11 +2124,12 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       // commit semantics of THIS stroke.
       paintingToolRef.current = editTool === "erase" ? "erase" : "paint";
       // Cellpose: start id determines whether paint extends an
-      // existing cell (>0) or makes a new one (0).  Simple mode:
-      // no labeled blobs, so start id is always 0.
+      // existing object (>0) or makes a new one (0) — read from the
+      // ACTIVE target (cells or nuclei).  Simple mode: no labeled
+      // blobs, so start id is always 0.
       paintStartIdRef.current =
-        cfg.mode === "cellpose" && editTool === "paint"
-          ? (ap!.cellLabels![pt.y * w + pt.x] | 0)
+        cfg.mode === "cellpose" && editTool === "paint" && cpLabels
+          ? (cpLabels[pt.y * w + pt.x] | 0)
           : 0;
       strokeMaskRef.current = new Uint8Array(w * h);
       paintingRef.current = true;
@@ -2114,7 +2156,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     }
     if (editTool === "merge" && label) {
       const idx = pt.y * w + pt.x;
-      const id = ap!.cellLabels![idx];
+      const id = cpLabels ? cpLabels[idx] : 0;
       if (!id) return;
       if (mergeFirstId == null) {
         setMergeFirstId(id);
@@ -2126,22 +2168,25 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     }
   }, [view, activeImage, previewByImage, cfg.mode, editTool, clientToImage,
       paintSegment, commitPaintStroke, deleteCellAt, mergeCellInto, mergeFirstId,
-      simpleEditChannel]);
+      simpleEditChannel, activeTargetLabels]);
 
-  // Hover tracking — updates the brush cursor + cell-ID tooltip.
+  // Hover tracking — updates the brush cursor + object-ID tooltip
+  // (reads the ACTIVE target so the readout matches what paint/delete
+  // will act on).
   const onPreviewMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if (cfg.mode !== "cellpose") return;
     const label = activeImage?.label;
     const ap = label ? previewByImage[label] : undefined;
-    if (!ap?.cellLabels || !ap.labelW || !ap.labelH) {
+    const cur = activeTargetLabels(ap);
+    if (!cur || !ap?.labelW || !ap.labelH) {
       setHoverInfo(null);
       return;
     }
     const pt = clientToImage(e.clientX, e.clientY);
     if (!pt) { setHoverInfo(null); return; }
-    const cellId = ap.cellLabels[pt.y * ap.labelW + pt.x] | 0;
+    const cellId = cur[pt.y * ap.labelW + pt.x] | 0;
     setHoverInfo({ x: pt.x, y: pt.y, clientX: e.clientX, clientY: e.clientY, cellId });
-  }, [cfg.mode, activeImage, previewByImage, clientToImage]);
+  }, [cfg.mode, activeImage, previewByImage, clientToImage, activeTargetLabels]);
 
   const onPreviewMouseLeave = useCallback(() => {
     setHoverInfo(null);
@@ -2222,12 +2267,18 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     // channel masks; the runtime fast-path then uses them
     // instead of re-running the threshold).
     const chMasks: Record<string, Partial<Record<"r" | "g" | "b", string>>> = {};
+    // Edited nuclei masks (cellpose compartment mode).
+    const nucMasks: Record<string, string> = {};
     for (const img of images) {
       const ap = previewByImage[img.label];
       if (!ap?.labelW || !ap.labelH) continue;
       if (ap.cellLabels) {
         const url = encodeRgbaLabels(ap.cellLabels, ap.labelW, ap.labelH);
         if (url) masks[img.label] = url;
+      }
+      if (ap.nucleusLabels) {
+        const url = encodeRgbaLabels(ap.nucleusLabels, ap.labelW, ap.labelH);
+        if (url) nucMasks[img.label] = url;
       }
       if (ap.channelMasks) {
         const out: Partial<Record<"r" | "g" | "b", string>> = {};
@@ -2244,6 +2295,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       ...cfg,
       editedMasks: Object.keys(masks).length ? masks : undefined,
       editedChannelMasks: Object.keys(chMasks).length ? chMasks : undefined,
+      editedNucleiMasks: Object.keys(nucMasks).length ? nucMasks : undefined,
     });
   }, [cfg, images, previewByImage, onSave]);
 
@@ -2508,8 +2560,9 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       // Highlight the cell that's mid-merge (waiting for second click).
       // Same drawImage-via-temp pattern so the highlight blends
       // instead of erasing everything around it.
-      if (mergeFirstId != null && activePreview?.cellLabels) {
-        const lbl = activePreview.cellLabels;
+      const mergeLbl = cellposeEditTarget === "nuclei" ? activePreview?.nucleusLabels : activePreview?.cellLabels;
+      if (mergeFirstId != null && mergeLbl) {
+        const lbl = mergeLbl;
         const tmp = document.createElement("canvas");
         tmp.width = w; tmp.height = h;
         const tctx = tmp.getContext("2d");
@@ -2573,7 +2626,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   }, [compImgEl, chImgEls, maskVisible, cellImgEl, nucImgEl, cpMaskVisible, cfg.mode,
       cellBoundaryCnv, nucleusBoundaryCnv, hoverInfo, editTool, brushPx, mergeFirstId,
       strokeTick, viewMode, flowsImgEl, cellprobImgEl, scaleDiskOn, cfg.cellpose.diameter,
-      simpleBoundaryCnvs]);
+      simpleBoundaryCnvs, cellposeEditTarget]);
 
   const setChannel = useCallback((k: keyof FluorChannels, v: string) => {
     setCfg((c) => ({ ...c, channels: { ...c.channels, [k]: v } }));
@@ -2774,6 +2827,48 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                               minWidth: 18, textAlign: "center",
                             }}>
                             {k.toUpperCase()}
+                          </Box>
+                        </Tooltip>
+                      );
+                    })}
+                  </Box>
+                )}
+                {/* Cellpose edit-target selector — Cells vs Nuclei.
+                    Nuclei chip is enabled only when a nuclei pass
+                    produced labels (Measure compartments on + nuclei
+                    channel set).  All tools then act on the chosen
+                    target, so the user can paint missed nuclei or
+                    carve over-merged ones just like cells. */}
+                {cfg.mode === "cellpose" && (
+                  <Box sx={{ display: "inline-flex", alignItems: "center", gap: 0.3, mr: 0.4,
+                             borderRight: "1px solid rgba(255,255,255,0.25)", pr: 0.4 }}>
+                    <Typography variant="caption" sx={{ fontSize: "0.6rem", opacity: 0.85, mr: 0.2 }}>
+                      Edit:
+                    </Typography>
+                    {([
+                      { t: "cells" as const,  label: "Cells",  color: "#cdb336", enabled: !!activePreview?.cellLabels },
+                      { t: "nuclei" as const, label: "Nuclei", color: "#5fbcdc", enabled: !!activePreview?.nucleusLabels },
+                    ]).map(({ t, label, color, enabled }) => {
+                      const active = cellposeEditTarget === t;
+                      return (
+                        <Tooltip key={t} title={enabled
+                          ? `Edit the ${label.toLowerCase()} mask`
+                          : (t === "nuclei"
+                              ? "No nuclei mask — enable 'Measure compartments' + a nuclei channel, then Run preview"
+                              : "No cell mask yet — Run preview first")}>
+                          <Box
+                            onClick={() => { if (enabled) { setCellposeEditTarget(t); setMergeFirstId(null); } }}
+                            sx={{
+                              cursor: enabled ? "pointer" : "not-allowed",
+                              opacity: enabled ? 1 : 0.35, userSelect: "none",
+                              px: 0.5, py: 0.1, borderRadius: 0.4,
+                              border: "1px solid",
+                              borderColor: active ? color : "rgba(255,255,255,0.25)",
+                              bgcolor: active ? color : "transparent",
+                              color: active ? "common.white" : "rgba(255,255,255,0.85)",
+                              fontSize: "0.62rem", fontWeight: active ? 700 : 500,
+                            }}>
+                            {label}
                           </Box>
                         </Tooltip>
                       );

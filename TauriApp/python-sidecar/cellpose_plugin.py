@@ -181,7 +181,19 @@ def main():
         _t = time.monotonic()
         try:
             if is_v4:
-                _model["m"] = cp_models.CellposeModel(gpu=use_gpu, pretrained_model=model_name)
+                # Cellpose 4.x ships ONE model (cpsam) whose bundled
+                # weights are auto-resolved ONLY when pretrained_model
+                # is left at its default.  Passing the literal string
+                # "cpsam" makes 4.x treat it as a (missing) weights-file
+                # PATH → FileNotFoundError at construction → the model
+                # never builds and the run returns "no labels".  So we
+                # construct with the default first; only if that ctor
+                # signature rejects gpu-only do we fall back to passing
+                # the name explicitly.
+                try:
+                    _model["m"] = cp_models.CellposeModel(gpu=use_gpu)
+                except TypeError:
+                    _model["m"] = cp_models.CellposeModel(gpu=use_gpu, pretrained_model=model_name)
             else:
                 _model["m"] = cp_models.Cellpose(gpu=use_gpu, model_type=model_name)
             log.append("loaded cellpose %s model=%r gpu=%s api=%s in %.1fs (lazy)"
@@ -248,31 +260,39 @@ def main():
         if masks is None:
             m = _ensure_model()
             if m is None:
+                _err = _model.get("err") or "cellpose model failed to load"
                 log.append("[%d/%d] %r: skipped (model unavailable: %s)"
-                           % (i, len(inputs), label, _model.get("err") or "?"))
+                           % (i, len(inputs), label, _err))
+                # CRITICAL: surface the model-LOAD failure as result["error"]
+                # so cellpose_plugin.run() (which only propagates the error
+                # when no labels were emitted) shows the REAL reason
+                # ("Failed to load cellpose model: …") instead of the
+                # generic "no labels image".  0.1.334 only set this on the
+                # eval / unpack paths, missing the load-failure path —
+                # which is exactly where cellpose v4 was dying (the cpsam
+                # constructor raised because "cpsam" was treated as a
+                # file path).
+                if not result.get("error"):
+                    result["error"] = _err
                 continue
             log.append("[%d/%d] segmenting %r shape=%s api=%s"
                        % (i, len(inputs), label, img.shape, "v4" if is_v4 else "v3"))
             ek = dict(diameter=diameter, flow_threshold=flow_threshold,
                       cellprob_threshold=cellprob_threshold, min_size=min_size)
             # Cellpose 4 (cpsam) doesn't take `channels` — it operates on
-            # the raw RGB / grayscale image directly.  The TypeError
-            # catch handles the most common v4 signature mismatch, but
-            # v4 can also reject other v3-only kwargs (flow_threshold
-            # interpretation changed, min_size accepted but ignored in
-            # some 4.x dev builds).  Any non-TypeError exception means
-            # cellpose actually FAILED on this image and we must skip
-            # it cleanly — emitting the original ERROR back to the
-            # caller so the UI doesn't show the generic "cellpose
-            # returned no labels image" line that masks the real
-            # problem.
+            # the raw RGB / grayscale image directly.  Call WITHOUT
+            # channels on v4 (no TypeError round-trip); v3 keeps the
+            # channels arg with a TypeError fallback for safety.
             try:
-                try:
-                    res = m.eval(img, channels=channels, **ek)
-                except TypeError as _te:
-                    log.append("[%d/%d] %r: retry without `channels` (%s)"
-                               % (i, len(inputs), label, _te))
+                if is_v4:
                     res = m.eval(img, **ek)
+                else:
+                    try:
+                        res = m.eval(img, channels=channels, **ek)
+                    except TypeError as _te:
+                        log.append("[%d/%d] %r: retry without `channels` (%s)"
+                                   % (i, len(inputs), label, _te))
+                        res = m.eval(img, **ek)
             except Exception as _ee:
                 err_msg = ("cellpose %s eval failed on %r: %s"
                            % ("v4" if is_v4 else "v3", label, _ee))

@@ -5000,6 +5000,17 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     const result: Array<{ key: string; kind: DataKind; label: string; image_b64?: string; csv?: string }> = [];
     let imgCount = 0;
     let tblCount = 0;
+    // One image edge from a source node means "analyse EVERY inset on
+    // that source" — not just the single out_image_<idx> handle the
+    // edge points at.  Rationale: the canvas auto-wires ONLY the first
+    // image (out_image_0) when a node is attached, so a user who drops
+    // 2+ images onto a source and hits Run graph would otherwise get
+    // just image 0 analysed (the 2nd+ image gets a handle but never an
+    // auto-edge).  Fanning out here fixes Run graph, the picker, and
+    // the band picker in one place since they all funnel through
+    // collectInputs.  Deduped per source so multiple image edges from
+    // the same source don't double-count.
+    const seenImageSources = new Set<string>();
     for (const e of edges) {
       if (e.target !== nodeId) continue;
       const upstream = nodeMap.get(e.source);
@@ -5009,18 +5020,17 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       // the measurements table.
       if (upstreamData.kind === "source") {
         if ((e.sourceHandle || "").startsWith("out_image_")) {
-          const idx = parseInt((e.sourceHandle || "").replace("out_image_", ""), 10);
-          const src = (upstreamData.sources || [])[idx];
-          if (!src) continue;
-          const key = `inset_${imgCount++}_${src.key}`;
-          // Source insets get base64 PNG of their thumbnail — the
-          // backend has the full image too via _extract_inset_image
-          // but we use the thumbnail here for speed. The runner
-          // sends the FULL image as a regular `sources` entry below.
-          // Pass the user's renamed label downstream (falls back to
-          // the backend-supplied default).  Lets the corneal-haze
-          // group inference key off "Control_1" instead of "R1C1·1".
-          result.push({ key, kind: "image", label: displayName(src, sourceNameOverrides), image_b64: src.thumbnail });
+          if (seenImageSources.has(e.source)) continue;
+          seenImageSources.add(e.source);
+          // Fan out: emit every inset on this source node.  Source
+          // insets get a base64 PNG thumbnail — the backend re-extracts
+          // the FULL image via the regular `sources` entry built in
+          // buildSources.  The user's renamed label flows downstream so
+          // group inference can key off "Control_1" not "R1C1·1".
+          for (const src of (upstreamData.sources || [])) {
+            const key = `inset_${imgCount++}_${src.key}`;
+            result.push({ key, kind: "image", label: displayName(src, sourceNameOverrides), image_b64: src.thumbnail });
+          }
         } else if (e.sourceHandle === "out_table_measurements") {
           const key = `measurements`;
           result.push({ key, kind: "table", label: "measurements", csv: measurementsCsv });
@@ -5190,6 +5200,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       const result: Array<{ key: string; kind: DataKind; label: string; image_b64?: string; csv?: string }> = [];
       let imgCount = 0;
       let tblCount = 0;
+      // Same fan-out as the shared collectInputs: one image edge from a
+      // source = analyse every inset on it.  Keeps the picker preview
+      // and Run graph in agreement about how many images are wired.
+      const seenImageSources = new Set<string>();
       for (const e of effectiveEdges) {
         if (e.target !== nodeId) continue;
         const upstream = nm.get(e.source);
@@ -5197,11 +5211,12 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         const upstreamData = upstream.data;
         if (upstreamData.kind === "source") {
           if ((e.sourceHandle || "").startsWith("out_image_")) {
-            const idx = parseInt((e.sourceHandle || "").replace("out_image_", ""), 10);
-            const src = (upstreamData.sources || [])[idx];
-            if (!src) continue;
-            const key = `inset_${imgCount++}_${src.key}`;
-            result.push({ key, kind: "image", label: displayName(src, sourceNameOverrides), image_b64: src.thumbnail });
+            if (seenImageSources.has(e.source)) continue;
+            seenImageSources.add(e.source);
+            for (const src of (upstreamData.sources || [])) {
+              const key = `inset_${imgCount++}_${src.key}`;
+              result.push({ key, kind: "image", label: displayName(src, sourceNameOverrides), image_b64: src.thumbnail });
+            }
           } else if (e.sourceHandle === "out_table_measurements") {
             const key = `measurements`;
             result.push({ key, kind: "table", label: "measurements", csv: measurementsCsv });
