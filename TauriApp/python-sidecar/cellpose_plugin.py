@@ -744,8 +744,25 @@ def run(images_in: List[Tuple[str, "object"]], cfg_dict: dict, timeout_sec: int 
             csv_lines.append(",".join(str(r.get(k, "")) for k in
                              ("source", "n_cells", "mean_area_px", "median_area_px", "model")))
         tables = [{"name": "cellpose_counts", "csv": "\n".join(csv_lines) + "\n"}]
+        # Per-image failures (e.g. cellpose v4 eval raised on this image)
+        # set result["error"] but keep result["success"] = True so other
+        # images in the batch still produce output.  Surface that error
+        # via the stderr field so the caller sees the real failure
+        # instead of a misleading "no labels image" from the API layer
+        # when the plugin completed but with errors.  Also flag success=
+        # False when NO images returned labels — otherwise the caller
+        # treats an empty result as a clean run.
+        err_blob = res.get("error", "")
+        has_labels = any(im.get("name", "").endswith("_labels16")
+                         or im.get("name", "").endswith("_labels")
+                         for im in images_out)
+        if err_blob and not has_labels:
+            return {"success": False, "stdout": res.get("stdout", ""),
+                    "stderr": err_blob, "plots": [], "tables": tables,
+                    "images": images_out}
         return {"success": True, "kind": "cellpose",
-                "stdout": res.get("stdout", ""), "stderr": "",
+                "stdout": res.get("stdout", ""),
+                "stderr": err_blob,  # may be empty; surfaces per-image errors when some images succeeded
                 "plots": [], "tables": tables, "images": images_out}
     finally:
         try:

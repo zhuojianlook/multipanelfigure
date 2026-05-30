@@ -3657,11 +3657,40 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
               <Tooltip title="Group images into experimental conditions (Control, Treatment, …). The R plot draws one bar per (group, channel) with mean ± SD and pairwise stats.">
                 <Typography variant="caption" sx={{ fontWeight: 700 }}>Groups</Typography>
               </Tooltip>
+              <Typography variant="caption" sx={{ color: "text.secondary", fontSize: "0.62rem" }}>
+                · {imageEntries.length} image{imageEntries.length === 1 ? "" : "s"} wired
+              </Typography>
               <Button size="small" variant="outlined" onClick={addGroup} disabled={imageEntries.length === 0}
                 sx={{ textTransform: "none", fontSize: "0.62rem", py: 0.05, px: 0.6, ml: "auto" }}>
                 + Group
               </Button>
             </Box>
+            {/* Stale-assignment banner: the saved config references
+                images that aren't wired to this node right now.  This
+                hits when the user uploaded N images to the source node
+                but only drew a connection from SOME of those outputs
+                to this picker — the unwired ones can't be analysed
+                but their group assignments still take up cfg.groups
+                slots, hiding the wiring gap.  Telling them up-front
+                avoids the "Group 2 has no data" mystery. */}
+            {(() => {
+              const wiredKeys = new Set<string>(imageEntries.flatMap((e) => [e.id, e.label]));
+              const orphans = cfg.groups.flatMap((g) =>
+                g.images.filter((im) => !wiredKeys.has(im))
+              );
+              if (orphans.length === 0) return null;
+              return (
+                <Box sx={{
+                  mb: 0.5, px: 0.7, py: 0.4, borderRadius: 0.4,
+                  bgcolor: "rgba(220,150,60,0.12)",
+                  border: "1px solid rgba(220,150,60,0.4)",
+                  fontSize: "0.62rem", color: "#c0a060",
+                }}>
+                  ⚠ {orphans.length} group assignment{orphans.length === 1 ? "" : "s"} reference image{orphans.length === 1 ? "" : "s"} not wired to this node — those won't be analysed.
+                  Draw a connection from each upstream source-node output you want included.
+                </Box>
+              );
+            })()}
             {imageEntries.length === 0 ? (
               <Typography variant="caption" sx={{ color: "text.disabled", fontStyle: "italic", display: "block" }}>
                 Wire image sources upstream first — then come back here to assign them to groups.
