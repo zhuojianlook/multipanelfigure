@@ -641,6 +641,12 @@ def _cellpose_labels_batch(items, model, channels, isolate_channel=0, diameter_o
             "channels": channels,
             "flow_threshold": _flow_thr,
             "cellprob_threshold": _cellprob_thr,
+            # Reconnect dendrite slices into their soma after eval (only
+            # in "capture thin processes" mode).  Without this, cellpose
+            # returns a long process as many little cells; with it, the
+            # fragments merge into the cell body they adjoin.  Not for
+            # the nuclei pass (nuclei have no thin processes).
+            "merge_fragments": bool(cp_cfg.get("captureThinProcesses")) and model != "nuclei",
             # Use GPU when available (CUDA / Apple Silicon MPS). Falls
             # back to CPU automatically if neither is compiled in.
             "use_gpu": True,
@@ -1737,6 +1743,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
           min_size: 15,
           flow_threshold: dendrite ? DENDRITE_FLOW_THRESHOLD : (cfg.cellpose.flowThreshold ?? 0.4),
           cellprob_threshold: dendrite ? DENDRITE_CELLPROB_THRESHOLD : (cfg.cellpose.cellprobThreshold ?? 0.0),
+          merge_fragments: dendrite,
           measure_compartments: !!cfg.cellpose.measureCompartments,
         };
       }

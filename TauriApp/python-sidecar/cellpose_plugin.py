@@ -162,6 +162,88 @@ def main():
     cellprob_threshold = float(cfg.get("cellprob_threshold", 0.0))
     min_size = int(cfg.get("min_size", 15))
     use_gpu = bool(cfg.get("use_gpu", False))
+    # Dendrite reconnection.  cellpose's flow model slices a long thin
+    # process into many separate basins, so a dendrite comes back as
+    # "lots of little cells" instead of one cell.  When merge_fragments
+    # is set (the "capture thin processes" toggle), we re-merge each
+    # small fragment into its SINGLE large neighbour after eval — see
+    # _merge_fragments_into_cells below.
+    merge_fragments = bool(cfg.get("merge_fragments", False))
+
+    def _frag_elongation(mask):
+        # Orientation-independent thinness: ratio of the major to minor
+        # standard deviation of the pixel cloud (sqrt of the covariance
+        # eigenvalue ratio).  ~1 for a disk, large for a sliver — and,
+        # unlike bbox extent/aspect, it catches diagonal AND axis-aligned
+        # slivers alike.
+        ys, xs = np.nonzero(mask)
+        n = ys.size
+        if n < 6:
+            return 99.0   # too tiny to have a shape → treat as fragment
+        ys = ys.astype(np.float64); xs = xs.astype(np.float64)
+        ys -= ys.mean(); xs -= xs.mean()
+        sxx = float((xs * xs).mean()); syy = float((ys * ys).mean())
+        sxy = float((xs * ys).mean())
+        tr = sxx + syy
+        det = sxx * syy - sxy * sxy
+        disc = max(tr * tr / 4.0 - det, 0.0) ** 0.5
+        l1 = tr / 2.0 + disc
+        l2 = max(tr / 2.0 - disc, 1e-6)
+        return float((l1 / l2) ** 0.5)
+
+    def _merge_fragments_into_cells(masks_in):
+        # Re-attach thin-process fragments (dendrite slices) to the cell
+        # body they adjoin.  cellpose's flow model slices a long process
+        # into many basins, so we must NOT key the cutoff off the median
+        # object size — when a dendrite is over-sliced the fragments
+        # dominate the population and drag the median down to themselves.
+        # Instead a "fragment" is identified by SHAPE (clearly elongated)
+        # or by being a small remnant relative to the LARGEST body, and
+        # is merged into a neighbour ONLY when it touches exactly one
+        # label that is >=1.5x its size — so two genuinely separate round
+        # cells that merely touch are never fused.  Iterated so a chain
+        # of slices collapses onto the soma from the inside out: each
+        # pass the slice next to the (growing) soma joins it, exposing
+        # the next slice on the following pass.
+        try:
+            from scipy import ndimage as _ndi
+        except Exception:
+            return masks_in
+        lab = masks_in.astype(np.int32).copy()
+        H, W = lab.shape
+        for _ in range(20):
+            ids = np.unique(lab); ids = ids[ids > 0]
+            if ids.size < 2:
+                break
+            sizes = np.bincount(lab.ravel())
+            big_ref = float(sizes[ids].max())
+            merged_any = False
+            for i in ids:
+                si = int(sizes[i])
+                if si == 0:
+                    continue
+                ys, xs = np.nonzero(lab == i)
+                if ys.size == 0:
+                    continue
+                # crop to a padded bounding box so dilation stays cheap
+                y0 = max(0, int(ys.min()) - 3); y1 = min(H, int(ys.max()) + 4)
+                x0 = max(0, int(xs.min()) - 3); x1 = min(W, int(xs.max()) + 4)
+                sub = lab[y0:y1, x0:x1]
+                sm = (sub == i)
+                # candidate? elongated process-slice, or small remnant
+                if not (_frag_elongation(sm) > 2.5 or si < 0.12 * big_ref):
+                    continue
+                ring = _ndi.binary_dilation(sm, iterations=2) & ~sm
+                neigh = np.unique(sub[ring]); neigh = neigh[(neigh > 0) & (neigh != i)]
+                larger = [int(n) for n in neigh if sizes[n] >= 1.5 * si]
+                if len(larger) == 1:
+                    tgt = larger[0]
+                    sub[sm] = tgt   # writes through into lab (view)
+                    sizes[tgt] += si; sizes[i] = 0
+                    merged_any = True
+            if not merged_any:
+                break
+        return lab
 
     is_v4 = not hasattr(cp_models, "Cellpose")
     if is_v4 and model_name not in {"cpsam"}:
@@ -320,6 +402,14 @@ def main():
                 flows = res[1]
             except Exception:
                 flows = None
+            # Reconnect dendrite slices into their soma (only on the
+            # cellpose-eval path, not on user-supplied edited masks).
+            if merge_fragments:
+                _before = int(masks.max())
+                masks = _merge_fragments_into_cells(masks)
+                _after = int(masks.max())
+                log.append("[%d/%d] %r: merge_fragments %d → %d object(s)"
+                           % (i, len(inputs), label, _before, _after))
         n_cells = int(masks.max())
 
         # coloured mask png
