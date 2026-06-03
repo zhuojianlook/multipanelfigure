@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.336"
+SIDECAR_BUILD = "0.1.337"
 
 
 @app.get("/api/version")
@@ -7102,6 +7102,13 @@ class FluorPreviewRequest(BaseModel):
     # threshold; Cellpose is internally capped further (its host runs
     # on CPU on most installs).
     preview_max_w: int = 1024
+    # When True, SKIP the strategy entirely and return ONLY the
+    # contrast-stretched composite (the base RGB layer) at preview
+    # resolution.  Used by the Intensity dialog to re-hydrate saved
+    # masks on reopen: it fetches the cheap composite here, then
+    # overlays the user's previously-painted masks — no cellpose /
+    # threshold re-run, so corrections are visible instantly.
+    composite_only: bool = False
 
 
 @app.post("/api/analysis/fluor-preview-segment")
@@ -7171,6 +7178,20 @@ def fluor_preview_segment(body: FluorPreviewRequest):
         return (comp * 255).astype(_np.uint8)
 
     composite = _composite_u8(rgb)
+
+    # Composite-only fast path: the dialog asks for just the base RGB
+    # layer (no segmentation) so it can overlay the user's previously-
+    # saved masks on reopen without re-running cellpose / threshold.
+    if bool(getattr(body, "composite_only", False)):
+        _cobuf = io.BytesIO()
+        Image.fromarray(_np.ascontiguousarray(composite)).save(_cobuf, format="PNG")
+        return {
+            "success": True,
+            "composite_b64": base64.b64encode(_cobuf.getvalue()).decode(),
+            "src_w": int(src_w0), "src_h": int(src_h0),
+            "preview_w": int(w), "preview_h": int(h),
+            "composite_only": True,
+        }
 
     # 4) Branch on strategy.
     strategy = (body.strategy or "simple").lower()

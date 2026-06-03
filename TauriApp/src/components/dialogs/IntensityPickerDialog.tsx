@@ -1482,6 +1482,80 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     }
   }, [open, initial]);
 
+  // ── Re-hydrate saved masks on reopen ──────────────────────────
+  // When the dialog opens on a node that already has saved masks
+  // (editedMasks / editedNucleiMasks / editedChannelMasks), fetch
+  // just the contrast-stretched COMPOSITE for each such image (cheap
+  // — no cellpose / threshold) and overlay the decoded saved masks.
+  // The user immediately SEES their previous corrections and can keep
+  // editing without a re-run that would discard them.  "composite_only"
+  // is a dedicated backend fast path added in 0.1.337.
+  useEffect(() => {
+    if (!open || !initial) return;
+    const cm = initial.editedMasks || {};
+    const nm = initial.editedNucleiMasks || {};
+    const chm = initial.editedChannelMasks || {};
+    const labelsWithMasks = new Set<string>([
+      ...Object.keys(cm), ...Object.keys(nm), ...Object.keys(chm),
+    ]);
+    if (labelsWithMasks.size === 0) return;
+    let cancelled = false;
+    (async () => {
+      // Wait for warmup so the first composite fetch doesn't hit a
+      // cold cv2/scipy import.
+      if (warmupRef.current) { try { await warmupRef.current; } catch { /* ignore */ } }
+      for (const img of images) {
+        if (cancelled) return;
+        if (!labelsWithMasks.has(img.label)) continue;
+        try {
+          const body: Record<string, unknown> = {
+            image_b64: img.image_b64 || "",
+            source: img.source ? {
+              key: img.source.key, row: img.source.row, col: img.source.col,
+              inset_index: img.source.inset_index, name: img.source.name,
+            } : undefined,
+            strategy: "simple",   // ignored — composite_only short-circuits
+            preview_max_w: 1024,
+            composite_only: true,
+          };
+          const resp = await fetch("http://127.0.0.1:8765/api/analysis/fluor-preview-segment", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const data = await resp.json();
+          if (cancelled || !data?.success || !data.composite_b64) continue;
+          const layers: PreviewLayers = {
+            compositeSrc: `data:image/png;base64,${data.composite_b64}`,
+            edited: true,
+          };
+          // Decode the saved cell / nuclei label rasters.
+          if (cm[img.label]) {
+            const dec = await decodeRgbaLabels(cm[img.label].split(",").pop() || cm[img.label]);
+            if (dec) { layers.cellLabels = dec.labels; layers.labelW = dec.w; layers.labelH = dec.h; layers.n_cells = countNonZeroIds(dec.labels); }
+          }
+          if (nm[img.label]) {
+            const dec = await decodeRgbaLabels(nm[img.label].split(",").pop() || nm[img.label]);
+            if (dec) { layers.nucleusLabels = dec.labels; layers.n_nuclei = countNonZeroIds(dec.labels); if (!layers.labelW) { layers.labelW = dec.w; layers.labelH = dec.h; } }
+          }
+          // Decode the saved simple-mode per-channel binary masks.
+          if (chm[img.label]) {
+            const out: Partial<Record<"r" | "g" | "b", Uint8Array>> = {};
+            for (const k of ["r", "g", "b"] as const) {
+              const url = chm[img.label][k];
+              if (!url) continue;
+              const dec = await decodeBinaryMaskPng(url.split(",").pop() || url);
+              if (dec) { out[k] = dec.mask; if (!layers.labelW) { layers.labelW = dec.w; layers.labelH = dec.h; } }
+            }
+            if (Object.keys(out).length > 0) layers.channelMasks = out;
+          }
+          if (cancelled) return;
+          setPreviewByImage((cur) => (cur[img.label] ? cur : { ...cur, [img.label]: layers }));
+        } catch { /* best-effort hydration — leave un-hydrated on failure */ }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [open, initial, images]);
+
   const activeImage = images[activeIdx] || null;
 
   // Distinct images currently upstream — chips for group assignment.
