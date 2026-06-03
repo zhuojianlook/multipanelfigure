@@ -73,6 +73,37 @@ jobs:
         with:
           node-version: 22
       - uses: dtolnay/rust-toolchain@stable
+      # Force the app version (tauri.conf.json + package.json) to MATCH
+      # the release tag before building.  Guards against a forgotten
+      # `git add tauri.conf.json` shipping an updater bundle whose
+      # baked-in version is older than the tag — which makes the
+      # updater offer the "new" version forever because the installed
+      # build keeps reporting the old one (the 0.1.340 bug).  The
+      # latest.json manifest also derives its version from the tag, so
+      # syncing the build to the tag keeps the two in lockstep no
+      # matter what was committed.
+      - name: Sync app version to release tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" == exp-* ]]; then VERSION="${TAG#exp-}";
+          elif [[ "$TAG" == v* ]]; then VERSION="${TAG#v}";
+          else VERSION=""; fi
+          if [ -n "$VERSION" ]; then
+            echo "Pinning app version to $VERSION (from tag $TAG)"
+            node -e '
+              const fs = require("fs");
+              const v = process.argv[1];
+              for (const p of ["TauriApp/src-tauri/tauri.conf.json", "TauriApp/package.json"]) {
+                const c = JSON.parse(fs.readFileSync(p, "utf8"));
+                c.version = v;
+                fs.writeFileSync(p, JSON.stringify(c, null, 2) + "\n");
+                console.log(p, "->", v);
+              }
+            ' "$VERSION"
+          else
+            echo "Not a version tag ($TAG) — leaving versions as committed."
+          fi
+        shell: bash
       - name: Download sidecar
         uses: actions/download-artifact@v4
         with:
