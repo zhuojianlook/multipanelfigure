@@ -2661,10 +2661,17 @@ if (has_norm) data$mean_intensity_norm <- suppressWarnings(as.numeric(data$mean_
     theme_prism(base_size = 11) +
     theme(legend.position = "right",
           axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
-          plot.margin = margin(10, 10, 6, 10),
-          plot.title = element_text(size = 11, face = "bold",
+          # Generous top margin + full-plot title positioning so the
+          # (often long) wrapped header is never clipped at the top or
+          # right edge when the figure is exported / sent to collage.
+          plot.margin = margin(16, 14, 8, 12),
+          plot.title.position = "plot",
+          plot.title = element_text(size = 11, face = "bold", lineheight = 1.05,
+                                    margin = margin(b = 8),
                                     color = if (flag_warning) "#b03030" else "grey25")) +
-    labs(x = NULL, y = y_label, title = title)
+    # Wrap the title so a long header breaks onto multiple lines
+    # instead of running off the right edge of the PNG.
+    labs(x = NULL, y = y_label, title = paste(strwrap(title, width = 64), collapse = "\n"))
   if (multi_compart) {
     p <- p + facet_grid(compartment ~ channel, scales = "free_y", switch = "y")
   } else {
@@ -2719,12 +2726,13 @@ control_data  <- data[data$is_control == TRUE, , drop = FALSE]
 analysis_data <- data[data$is_control == FALSE, , drop = FALSE]
 
 # Plot dimension helper — wider when we have multiple channels and
-# taller when we have multiple compartments.
+# taller when we have multiple compartments.  Extra +160 px height
+# headroom so a wrapped 2-line title isn't squeezed against the top.
 .dims_for <- function(d) {
   nch <- length(unique(d$channel))
   nco <- length(unique(d$compartment))
   list(w = max(1100, 520 * min(nch, 4)),
-       h = if (nco > 1) (550 * nco + 100) else 1050)
+       h = (if (nco > 1) (550 * nco + 100) else 1050) + 160)
 }
 
 if (nrow(analysis_data) == 0 && nrow(control_data) == 0) {
@@ -2811,9 +2819,13 @@ if (nrow(analysis_data) == 0 && nrow(control_data) == 0) {
       theme_prism(base_size = 11) +
       theme(legend.position = "right",
             axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
-            plot.title = element_text(size = 11, face = "bold")) +
+            plot.margin = margin(16, 14, 8, 12),
+            plot.title.position = "plot",
+            plot.title = element_text(size = 11, face = "bold", lineheight = 1.05,
+                                      margin = margin(b = 8))) +
       labs(x = NULL, y = paste0("log2(group / ", base_group, ")"),
-           title = paste0("Cross-group comparison vs ", base_group, " (log2 fold-change)"))
+           title = paste(strwrap(paste0("Cross-group comparison vs ", base_group,
+                                        " (log2 fold-change)"), width = 64), collapse = "\n"))
     if (nlevels(droplevels(out$compartment)) > 1) {
       p <- p + facet_grid(compartment ~ channel, scales = "free_y", switch = "y")
     } else {

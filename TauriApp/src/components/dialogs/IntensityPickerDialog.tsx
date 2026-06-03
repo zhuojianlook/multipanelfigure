@@ -191,26 +191,31 @@ export function emptyFluorConfig(): FluorIntensityConfig {
   return {
     version: 1,
     channels: { r: "Channel R", g: "Channel G", b: "Channel B" },
-    mode: "simple",
+    // Default strategy = Cellpose (per-cell).  Most fluorescence
+    // experiments want per-cell compartment-aware quantification out
+    // of the box; the simple threshold strategy is still one click
+    // away.
+    mode: "cellpose",
     thresholds: {
       r: { enabled: true, thresholdMethod: "percentile", thresholdPercentile: 95, minArea: 30, enhanceEdges: false },
       g: { enabled: true, thresholdMethod: "percentile", thresholdPercentile: 95, minArea: 30, enhanceEdges: false },
       b: { enabled: true, thresholdMethod: "percentile", thresholdPercentile: 95, minArea: 30, enhanceEdges: false },
     },
     rollingRadius: 35,
-    // Default to cyto3 — much smaller (~25 MB vs ~100 MB for cpsam),
-    // ~3x faster inference, works great on most fluorescence cell
-    // types. Users can switch to cpsam in the dropdown when they need
-    // its higher-accuracy segmentation.
     cellpose: {
+      // Default to cellpose 4 (cpsam) with compartment measurement on.
+      // Layout assumes the common DAPI-in-blue / target-in-red setup:
+      //   • cell-body signal on Channel R  (segChannel)
+      //   • nuclei (DAPI / Hoechst) on Channel B  (nucleiChannel)
+      // measureCompartments ON so the nuclei pass runs and the plot
+      // breaks down whole-cell / nucleus / cytoplasm by default.
       cellposeVersion: "v4",
-      // Defaults match the common DAPI-in-blue / target-in-red layout:
-      // cell-body signal on Channel R, nuclei (DAPI / Hoechst) on
-      // Channel B.  Users can override per-node.
       model: "cpsam", diameter: 0, segChannel: "r",
-      nucleiChannel: "b", measureCompartments: false, minSize: 80,
+      nucleiChannel: "b", measureCompartments: true, minSize: 80,
     },
-    controlChannel: null,
+    // Control channel = blue (the DAPI / nuclei channel) — the plot's
+    // sanity panel checks it's statistically similar across groups.
+    controlChannel: "b",
     groups: [],
   };
 }
@@ -2291,11 +2296,23 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         if (Object.keys(out).length > 0) chMasks[img.label] = out;
       }
     }
+    // MERGE over any masks already saved on the config, rather than
+    // replacing.  Critical: if the user reopens the dialog (preview
+    // cache empty), tweaks a group, and saves WITHOUT re-running the
+    // preview, the loops above produce empty maps — replacing would
+    // WIPE the masks they painted last session.  Merging keeps every
+    // previously-saved mask and only overwrites the images that have
+    // a fresh preview this session.  This is what makes "run once,
+    // corrections preserved forever" actually hold.
+    const mergedMasks = { ...(cfg.editedMasks || {}), ...masks };
+    const mergedNuc = { ...(cfg.editedNucleiMasks || {}), ...nucMasks };
+    const mergedCh: Record<string, Partial<Record<"r" | "g" | "b", string>>> = { ...(cfg.editedChannelMasks || {}) };
+    for (const [lbl, m] of Object.entries(chMasks)) mergedCh[lbl] = { ...(mergedCh[lbl] || {}), ...m };
     onSave({
       ...cfg,
-      editedMasks: Object.keys(masks).length ? masks : undefined,
-      editedChannelMasks: Object.keys(chMasks).length ? chMasks : undefined,
-      editedNucleiMasks: Object.keys(nucMasks).length ? nucMasks : undefined,
+      editedMasks: Object.keys(mergedMasks).length ? mergedMasks : undefined,
+      editedChannelMasks: Object.keys(mergedCh).length ? mergedCh : undefined,
+      editedNucleiMasks: Object.keys(mergedNuc).length ? mergedNuc : undefined,
     });
   }, [cfg, images, previewByImage, onSave]);
 
