@@ -3892,6 +3892,53 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     if (!activeWfId && workflowTabs.length > 0) setActiveWfId(workflowTabs[0].id);
   }, [activeWfId, workflowTabs]);
 
+  // ── Auto-wire reconciliation: one connecting line PER image ──────
+  // The first-attach auto-wire (addSourceToNode) draws a single edge
+  // from out_image_0.  Adding more images to the source spawns more
+  // out_image_<idx> HANDLES but no edges, so the canvas showed only
+  // one line even though Run graph analyses every inset (collectInputs
+  // fans out per source).  This effect closes that visual gap: for any
+  // source node that already has ≥1 outgoing image edge, it mirrors
+  // that wiring to EVERY inset handle — so each image gets its own
+  // visible line to the same downstream node(s).
+  //   • Adds only; never removes (so deleting the WHOLE source's edges
+  //     to disconnect it still works — we skip sources with 0 image
+  //     edges).
+  //   • setEdges bails on a same-reference return, so when there's no
+  //     gap this is a no-op and can't loop.
+  useEffect(() => {
+    const toAdd: Edge[] = [];
+    for (const n of nodes) {
+      if (n.data.kind !== "source") continue;
+      const nInsets = (n.data.sources || []).length;
+      if (nInsets <= 1) continue;   // nothing to fan out
+      const imgEdges = edges.filter(
+        (e) => e.source === n.id && (e.sourceHandle || "").startsWith("out_image_"),
+      );
+      if (imgEdges.length === 0) continue;   // source not wired — leave it
+      // Distinct (target, targetHandle) pairs this source already feeds.
+      const targets = new Map<string, string>();
+      for (const e of imgEdges) targets.set(e.target, e.targetHandle || "in_image");
+      for (const [targetId, targetHandle] of targets) {
+        for (let idx = 0; idx < nInsets; idx++) {
+          const handle = `out_image_${idx}`;
+          const exists = edges.some(
+            (e) => e.source === n.id && e.sourceHandle === handle && e.target === targetId,
+          );
+          if (exists) continue;
+          toAdd.push({
+            id: `e_${n.id}_${handle}__${targetId}_${targetHandle}`,
+            source: n.id, sourceHandle: handle,
+            target: targetId, targetHandle,
+            type: "deletable", animated: false,
+            style: { stroke: PORT_COLOR.image, strokeWidth: 2 },
+          });
+        }
+      }
+    }
+    if (toAdd.length > 0) setEdges((eds) => [...eds, ...toAdd]);
+  }, [nodes, edges, setEdges]);
+
   // Persist the open tabs + active id to localStorage on every change so
   // leaving and returning to the Analysis tab WITHIN A RUN restores in-flight
   // work. A fresh app launch deliberately starts empty (see
