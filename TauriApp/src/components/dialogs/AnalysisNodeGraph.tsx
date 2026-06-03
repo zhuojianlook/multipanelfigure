@@ -2122,8 +2122,33 @@ const ANALYSIS_UPLOADS_KEY = "mpfig.analysis.uploads";
 // Per-source name-overrides (rename source in the Sources panel) persist too,
 // so the displayed labels survive a tab switch (the Sources panel re-renders
 // from the restored uploads + the override map).
+// Session marker (sessionStorage) — present for the lifetime of ONE
+// app run (survives tab-switch component remounts + soft reloads),
+// wiped when the app process exits.  We use its ABSENCE to detect a
+// fresh launch.
+const ANALYSIS_SESSION_MARKER = "mpfig.analysis.sessionMarker";
 function loadAnalysisUploads(): InsetSource[] {
   try {
+    // Fresh app launch?  On a new process the backend sidecar has
+    // restarted too, so any previously-uploaded analysis images are
+    // GONE from its in-memory store — the persisted upload tiles would
+    // be ghosts that 404 on click.  Discard them on a fresh launch.
+    // The earlier clear in restoreSessionUnlessFreshLaunch ran AFTER
+    // this useState initializer, so the stale uploads were loaded into
+    // state before that clear fired — hence they survived restarts.
+    // Doing the check HERE (at load time) fixes the ordering.
+    // sessionStorage is empty on a fresh window and persists across
+    // tab-switch remounts within a run, so it's the right session
+    // signal.
+    let freshLaunch = false;
+    try {
+      freshLaunch = !sessionStorage.getItem(ANALYSIS_SESSION_MARKER);
+      sessionStorage.setItem(ANALYSIS_SESSION_MARKER, "1");
+    } catch { /* sessionStorage disabled — fall through, keep uploads */ }
+    if (freshLaunch) {
+      try { localStorage.removeItem(ANALYSIS_UPLOADS_KEY); } catch { /* ignore */ }
+      return [];
+    }
     const raw = localStorage.getItem(ANALYSIS_UPLOADS_KEY);
     if (!raw) return [];
     const arr = JSON.parse(raw);
