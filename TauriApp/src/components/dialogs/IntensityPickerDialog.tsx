@@ -72,6 +72,10 @@ export interface FluorCellpose {
   model: string;
   /** Object diameter prior in px. 0 = auto-estimate. */
   diameter: number;
+  /** When true (default), let cellpose AUTO-estimate the object
+   *  diameter (diameter sent as None).  The `diameter` field is only
+   *  used when this is false. */
+  autoDiameter?: boolean;
   /** Which channel carries the cell-body / cytoplasm signal for the
    *  cyto3/cpsam segmentation. Cellpose's "channels[0]". */
   segChannel: "r" | "g" | "b";
@@ -82,6 +86,28 @@ export interface FluorCellpose {
   nucleiChannel?: "r" | "g" | "b" | null;
   /** Min object size in px² — filters out spurious tiny masks. */
   minSize: number;
+  /** When true (default), DERIVE the min object size from the detected
+   *  cells' own size distribution at run time (≈10% of the median
+   *  object area, floored at 15 px²) instead of a fixed `minSize`.
+   *  Avoids the user guessing — and the lower floor helps keep thin
+   *  dendritic fragments that a large fixed minSize would discard. */
+  autoMinSize?: boolean;
+  /** cellpose flow_threshold — higher tolerates more irregular
+   *  (non-round) mask shapes.  Default 0.4.  Raised by the
+   *  "capture thin processes" toggle so dendritic / stellate cells
+   *  whose flow fields aren't disk-like still pass cellpose's shape
+   *  filter. */
+  flowThreshold?: number;
+  /** cellpose cellprob_threshold — LOWER (more negative) grows masks
+   *  into dimmer peripheral pixels.  Default 0.0.  Lowered by the
+   *  "capture thin processes" toggle so faint dendrites (dimmer than
+   *  the soma) get included in the cell mask. */
+  cellprobThreshold?: number;
+  /** Dendrite mode — when on, sets flow/cellprob to values tuned for
+   *  long thin processes (high flow_threshold + negative
+   *  cellprob_threshold) so cellpose extends masks down dendrites
+   *  instead of clipping them at the soma. */
+  captureThinProcesses?: boolean;
   /** When true AND nucleiChannel is set, run a SECOND cellpose pass
    *  with the `nuclei` model on the nuclei channel, then emit per-cell
    *  measurements separately for WHOLE-CELL / NUCLEUS / CYTOPLASM
@@ -89,6 +115,12 @@ export interface FluorCellpose {
    *  nuclear-vs-cytoplasmic localisation of a target. */
   measureCompartments?: boolean;
 }
+
+/** Dendrite-mode flow/cellprob preset.  flow_threshold up (tolerate
+ *  the irregular flow fields of stellate / dendritic cells), cellprob
+ *  down (grow masks into dimmer peripheral pixels = the dendrites). */
+export const DENDRITE_FLOW_THRESHOLD = 0.9;
+export const DENDRITE_CELLPROB_THRESHOLD = -2.0;
 
 /** Per-channel threshold knobs for the SIMPLE strategy. Each channel
  *  gets its own rule because fluorescent stains have very different
@@ -212,6 +244,12 @@ export function emptyFluorConfig(): FluorIntensityConfig {
       cellposeVersion: "v4",
       model: "cpsam", diameter: 0, segChannel: "r",
       nucleiChannel: "b", measureCompartments: true, minSize: 80,
+      // Diameter + min-size are auto-determined by default — no manual
+      // guessing.  flow/cellprob at cellpose defaults until the user
+      // flips "capture thin processes" for dendritic cells.
+      autoDiameter: true, autoMinSize: true,
+      flowThreshold: 0.4, cellprobThreshold: 0.0,
+      captureThinProcesses: false,
     },
     // Control channel = blue (the DAPI / nuclei channel) — the plot's
     // sanity panel checks it's statistically similar across groups.
@@ -251,6 +289,18 @@ function migrateConfig(cfg: FluorIntensityConfig): FluorIntensityConfig {
       ...cpIn,
       cellposeVersion: cpIn.cellposeVersion
         ?? (["cyto3", "cyto2", "cyto", "nuclei"].includes(String(cpIn.model || "")) ? "v3" : "v4"),
+      // Backfill the auto flags for configs saved before 0.1.340.  If
+      // the old config had a manual diameter (>0), preserve it as
+      // Manual; a 0/absent diameter means it was already auto.  Same
+      // logic for min-size (the old default was a fixed 80, but we
+      // can't distinguish "deliberate 80" from "default 80", so we
+      // honour autoMinSize=true by default — the user can flip to
+      // Manual if they relied on a specific value).
+      autoDiameter: cpIn.autoDiameter ?? !((cpIn.diameter ?? 0) > 0),
+      autoMinSize: cpIn.autoMinSize ?? true,
+      flowThreshold: cpIn.flowThreshold ?? 0.4,
+      cellprobThreshold: cpIn.cellprobThreshold ?? 0.0,
+      captureThinProcesses: cpIn.captureThinProcesses ?? false,
     };
     return {
       ...out,
@@ -552,7 +602,27 @@ def _cellpose_labels_batch(items, model, channels, isolate_channel=0, diameter_o
                 errors[label] = f"edited-mask decode failed: {_e}"
         return labels_by_label, errors
 
-    _diam = float(diameter_override) if diameter_override else float(cp_cfg.get("diameter") or 0)
+    # Diameter: AUTO (None → cellpose estimates) unless the user pinned
+    # a manual value AND turned auto off.  The nuclei pass still uses
+    # diameter_override (~60% of the cell diameter) when one was passed.
+    _auto_diam = bool(cp_cfg.get("autoDiameter", True))
+    if diameter_override:
+        _diam = float(diameter_override)
+    elif _auto_diam:
+        _diam = 0.0   # → None below → cellpose auto-estimate
+    else:
+        _diam = float(cp_cfg.get("diameter") or 0)
+    # Flow / cellprob thresholds.  "Capture thin processes" overrides
+    # both with dendrite-friendly values; otherwise honour the explicit
+    # fields (default 0.4 / 0.0).  Lowering cellprob_threshold grows
+    # masks into faint dendrites; raising flow_threshold tolerates
+    # their non-round shape.
+    if bool(cp_cfg.get("captureThinProcesses")):
+        _flow_thr = ${DENDRITE_FLOW_THRESHOLD}
+        _cellprob_thr = ${DENDRITE_CELLPROB_THRESHOLD}
+    else:
+        _flow_thr = float(cp_cfg.get("flowThreshold", 0.4))
+        _cellprob_thr = float(cp_cfg.get("cellprobThreshold", 0.0))
     # Cellpose major: v3 (real cyto3 + nuclei model zoo) or v4 (cpsam).
     # Routes to the matching plugin venv on the backend.  Forwarded as
     # a top-level field on the request so the v3 path doesn't get its
@@ -562,8 +632,15 @@ def _cellpose_labels_batch(items, model, channels, isolate_channel=0, diameter_o
         "config": json.dumps({
             "model": model,
             "diameter": _diam or None,
-            "min_size": int(cp_cfg.get("minSize") or 30),
+            # min_size kept PERMISSIVE here (cellpose's own debris floor);
+            # the real size filtering happens in the per-image loop where
+            # we can derive it from the detected cells (auto) or apply the
+            # user's manual value.  A low floor also preserves thin
+            # dendrite fragments cellpose would otherwise drop.
+            "min_size": 15,
             "channels": channels,
+            "flow_threshold": _flow_thr,
+            "cellprob_threshold": _cellprob_thr,
             # Use GPU when available (CUDA / Apple Silicon MPS). Falls
             # back to CPU automatically if neither is compiled in.
             "use_gpu": True,
@@ -723,9 +800,25 @@ if mode == "cellpose":
             err = cp_errors.get(label) or "shape mismatch"
             print(f"[intensity] {label}: cellpose unusable ({err}) — skipping")
             continue
-        # Drop tiny components.
-        min_area = int(cp_cfg.get("minSize") or 30)
+        # Drop tiny components.  AUTO min-size derives the cutoff from
+        # the detected cells' OWN size distribution (≈10% of the median
+        # object area, floored at 15 px²) so the user doesn't have to
+        # guess a value — and the data-relative floor keeps thin
+        # dendritic fragments that a fixed large minSize would discard.
         labels = lbl_arr.astype(np.int32)
+        _auto_min = bool(cp_cfg.get("autoMinSize", True))
+        if _auto_min and _have_scipy:
+            _sz = np.bincount(labels.ravel())
+            if _sz.size > 1:
+                _sz[0] = 0
+                _present = _sz[_sz > 0]
+                _med = float(np.median(_present)) if _present.size else 0.0
+                min_area = max(15, int(round(0.10 * _med)))
+            else:
+                min_area = 15
+            print(f"[intensity] {label}: auto min-size = {min_area} px² (median object {int(_med) if _present.size else 0} px²)")
+        else:
+            min_area = int(cp_cfg.get("minSize") or 30)
         if _have_scipy:
             sizes = np.bincount(labels.ravel())
             if sizes.size > 1:
@@ -1630,13 +1723,20 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         });
         body.channels = { r: chBody("r"), g: chBody("g"), b: chBody("b") };
       } else {
+        const dendrite = !!cfg.cellpose.captureThinProcesses;
         body.cellpose = {
           cellpose_version: cfg.cellpose.cellposeVersion || "v4",
           model: cfg.cellpose.model,
-          diameter: cfg.cellpose.diameter,
+          // Auto diameter → 0 (backend treats 0 as None = auto-estimate).
+          diameter: (cfg.cellpose.autoDiameter ?? true) ? 0 : cfg.cellpose.diameter,
           seg_channel: cfg.cellpose.segChannel,
           nuclei_channel: cfg.cellpose.nucleiChannel || null,
-          min_size: cfg.cellpose.minSize,
+          // Permissive min_size for the preview so the overlay shows the
+          // same thin fragments the run will keep (auto-min-size in the
+          // generated code does the data-relative filtering at run time).
+          min_size: 15,
+          flow_threshold: dendrite ? DENDRITE_FLOW_THRESHOLD : (cfg.cellpose.flowThreshold ?? 0.4),
+          cellprob_threshold: dendrite ? DENDRITE_CELLPROB_THRESHOLD : (cfg.cellpose.cellprobThreshold ?? 0.0),
           measure_compartments: !!cfg.cellpose.measureCompartments,
         };
       }
@@ -3805,25 +3905,73 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                     </Typography>
                   </Box>
                 </Box>
-                {/* Auto-by-default override row. alignItems: "center" so
-                    the "Diameter + min-size are AUTO..." caption and
-                    the two number fields share a baseline. */}
-                <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, flexWrap: "wrap" }}>
-                  <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.65rem", alignSelf: "center" }}>
-                    Diameter + min-size are AUTO (recommended). Override:
-                  </Typography>
-                  <TextField size="small" label="Diameter (px)" type="number" value={cfg.cellpose.diameter || ""}
-                    onChange={(e) => setCellpose({ diameter: Math.max(0, Number(e.target.value) || 0) })}
-                    placeholder="auto"
-                    inputProps={{ min: 0, max: 400, step: 5, style: { fontSize: "0.7rem", padding: "3px 5px" } }}
-                    InputLabelProps={{ style: { fontSize: "0.7rem" } }}
-                    sx={{ width: 110 }} />
-                  <TextField size="small" label="Min size (px²)" type="number" value={cfg.cellpose.minSize}
-                    onChange={(e) => setCellpose({ minSize: Math.max(0, Number(e.target.value) || 0) })}
-                    inputProps={{ min: 0, max: 10000, step: 5, style: { fontSize: "0.7rem", padding: "3px 5px" } }}
-                    InputLabelProps={{ style: { fontSize: "0.7rem" } }}
-                    sx={{ width: 110 }} />
-                </Box>
+                {/* Diameter + min-size: AUTO by default (cellpose
+                    estimates the diameter; min-size is derived from the
+                    detected cells' size distribution at run time).  Each
+                    has an Auto/Manual toggle; Manual reveals a field.
+                    Typing into a Manual field flips its auto flag off. */}
+                {(() => {
+                  const autoDiam = cfg.cellpose.autoDiameter ?? true;
+                  const autoMin = cfg.cellpose.autoMinSize ?? true;
+                  const ToggleChip = ({ on, label, onClick }: { on: boolean; label: string; onClick: () => void }) => (
+                    <Box onClick={onClick}
+                      sx={{
+                        cursor: "pointer", userSelect: "none",
+                        fontSize: "0.6rem", px: 0.55, py: 0.12, borderRadius: 0.5,
+                        border: "1px solid", borderColor: on ? "primary.main" : "divider",
+                        bgcolor: on ? "primary.main" : "transparent",
+                        color: on ? "primary.contrastText" : "text.secondary",
+                        fontWeight: on ? 700 : 500,
+                      }}>{label}</Box>
+                  );
+                  return (
+                    <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5 }}>
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, flexWrap: "wrap" }}>
+                        <Typography variant="caption" sx={{ fontSize: "0.65rem", fontWeight: 600, minWidth: 62 }}>Diameter</Typography>
+                        <ToggleChip on={autoDiam} label="Auto" onClick={() => setCellpose({ autoDiameter: true })} />
+                        <ToggleChip on={!autoDiam} label="Manual" onClick={() => setCellpose({ autoDiameter: false })} />
+                        {!autoDiam && (
+                          <TextField size="small" type="number" value={cfg.cellpose.diameter || ""}
+                            onChange={(e) => setCellpose({ diameter: Math.max(0, Number(e.target.value) || 0), autoDiameter: false })}
+                            placeholder="px"
+                            inputProps={{ min: 0, max: 400, step: 5, style: { fontSize: "0.7rem", padding: "3px 5px" } }}
+                            sx={{ width: 90 }} />
+                        )}
+                      </Box>
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, flexWrap: "wrap" }}>
+                        <Typography variant="caption" sx={{ fontSize: "0.65rem", fontWeight: 600, minWidth: 62 }}>Min size</Typography>
+                        <ToggleChip on={autoMin} label="Auto" onClick={() => setCellpose({ autoMinSize: true })} />
+                        <ToggleChip on={!autoMin} label="Manual" onClick={() => setCellpose({ autoMinSize: false })} />
+                        {!autoMin && (
+                          <TextField size="small" type="number" value={cfg.cellpose.minSize}
+                            onChange={(e) => setCellpose({ minSize: Math.max(0, Number(e.target.value) || 0), autoMinSize: false })}
+                            placeholder="px²"
+                            inputProps={{ min: 0, max: 10000, step: 5, style: { fontSize: "0.7rem", padding: "3px 5px" } }}
+                            sx={{ width: 90 }} />
+                        )}
+                      </Box>
+                      {/* Dendrite mode — bumps flow_threshold up + cellprob
+                          down so cellpose extends masks down long thin
+                          processes instead of clipping at the soma. */}
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 0.6 }}>
+                        <Box
+                          onClick={() => setCellpose({ captureThinProcesses: !cfg.cellpose.captureThinProcesses })}
+                          sx={{
+                            width: 14, height: 14, borderRadius: 0.4, cursor: "pointer",
+                            bgcolor: cfg.cellpose.captureThinProcesses ? "primary.main" : "transparent",
+                            border: "1px solid", borderColor: "primary.main",
+                            display: "flex", alignItems: "center", justifyContent: "center",
+                            color: "common.white", fontSize: "0.7rem", fontWeight: 700, flexShrink: 0,
+                          }}>{cfg.cellpose.captureThinProcesses ? "✓" : ""}</Box>
+                        <Tooltip title="For dendritic / stellate / neuronal cells with long thin processes. Raises cellpose's flow_threshold (tolerate non-round shapes) and lowers cellprob_threshold (grow the mask into dimmer dendrite pixels) so the processes are captured instead of clipped at the cell body.">
+                          <Typography variant="caption" sx={{ fontSize: "0.7rem", fontWeight: 600 }}>
+                            Capture thin processes (dendrites)
+                          </Typography>
+                        </Tooltip>
+                      </Box>
+                    </Box>
+                  );
+                })()}
                 {/* Quick clarifier line: cellpose segments ONCE using the
                     chosen channels — the OTHER channels are not
                     re-segmented but ARE measured inside each detected

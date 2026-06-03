@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.339"
+SIDECAR_BUILD = "0.1.340"
 
 
 @app.get("/api/version")
@@ -7071,6 +7071,11 @@ class FluorCellposePreview(BaseModel):
     seg_channel: str = "b"      # "r" | "g" | "b" — cytoplasm / cell-body channel
     nuclei_channel: Optional[str] = None    # "r" | "g" | "b" | None — DAPI for cyto3
     min_size: int = 30
+    # cellpose shape / probability thresholds.  flow_threshold higher =
+    # tolerate irregular (dendritic) shapes; cellprob_threshold lower
+    # (negative) = grow masks into faint peripheral pixels (dendrites).
+    flow_threshold: float = 0.4
+    cellprob_threshold: float = 0.0
     # When True AND nuclei_channel is set, the PREVIEW additionally runs
     # cellpose's `nuclei` model on the nuclei channel so the user can
     # see both cell + nucleus outlines on the composite. Doesn't change
@@ -7212,6 +7217,10 @@ def fluor_preview_segment(body: FluorPreviewRequest):
             "diameter": float(cp.diameter or 0) or None,
             "min_size": int(cp.min_size or 30),
             "channels": [seg_ch, nuc_ch],
+            # Dendrite-capture levers: forwarded so the live preview
+            # matches what the run will produce.
+            "flow_threshold": float(getattr(cp, "flow_threshold", 0.4)),
+            "cellprob_threshold": float(getattr(cp, "cellprob_threshold", 0.0)),
             # Route to the v3 or v4 venv (Side-by-side install, 0.1.324+).
             "cellpose_version": str(cp.cellpose_version or "v4"),
             # Try GPU acceleration. cellpose-pytorch picks the best backend
