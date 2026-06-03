@@ -116,12 +116,6 @@ export interface FluorCellpose {
   measureCompartments?: boolean;
 }
 
-/** Dendrite-mode flow/cellprob preset.  flow_threshold up (tolerate
- *  the irregular flow fields of stellate / dendritic cells), cellprob
- *  down (grow masks into dimmer peripheral pixels = the dendrites). */
-export const DENDRITE_FLOW_THRESHOLD = 0.9;
-export const DENDRITE_CELLPROB_THRESHOLD = -2.0;
-
 /** Per-channel threshold knobs for the SIMPLE strategy. Each channel
  *  gets its own rule because fluorescent stains have very different
  *  intensity distributions — DAPI baseline ≠ a sparse marker like
@@ -612,14 +606,16 @@ def _cellpose_labels_batch(items, model, channels, isolate_channel=0, diameter_o
         _diam = 0.0   # → None below → cellpose auto-estimate
     else:
         _diam = float(cp_cfg.get("diameter") or 0)
-    # Flow / cellprob thresholds.  "Capture thin processes" overrides
-    # both with dendrite-friendly values; otherwise honour the explicit
-    # fields (default 0.4 / 0.0).  Lowering cellprob_threshold grows
-    # masks into faint dendrites; raising flow_threshold tolerates
-    # their non-round shape.
+    # Flow / cellprob thresholds.  IMPORTANT: "Capture thin processes"
+    # does NOT crank flow_threshold up any more — a high flow_threshold
+    # makes cellpose's flow model SHATTER a dendrite into many little
+    # cells (the "lots of slices" bug).  Instead we keep flow normal so
+    # the cell BODIES come out clean, nudge cellprob slightly negative to
+    # pick up dimmer somata, and recover the processes afterwards with a
+    # marker-controlled watershed on the backend (expand_processes).
     if bool(cp_cfg.get("captureThinProcesses")):
-        _flow_thr = ${DENDRITE_FLOW_THRESHOLD}
-        _cellprob_thr = ${DENDRITE_CELLPROB_THRESHOLD}
+        _flow_thr = 0.4
+        _cellprob_thr = -1.0
     else:
         _flow_thr = float(cp_cfg.get("flowThreshold", 0.4))
         _cellprob_thr = float(cp_cfg.get("cellprobThreshold", 0.0))
@@ -641,12 +637,13 @@ def _cellpose_labels_batch(items, model, channels, isolate_channel=0, diameter_o
             "channels": channels,
             "flow_threshold": _flow_thr,
             "cellprob_threshold": _cellprob_thr,
-            # Reconnect dendrite slices into their soma after eval (only
-            # in "capture thin processes" mode).  Without this, cellpose
-            # returns a long process as many little cells; with it, the
-            # fragments merge into the cell body they adjoin.  Not for
-            # the nuclei pass (nuclei have no thin processes).
-            "merge_fragments": bool(cp_cfg.get("captureThinProcesses")) and model != "nuclei",
+            # Capture dendrites/axons: after cellpose finds the cell
+            # BODIES, the backend floods each one outward along the real
+            # fluorescent signal (marker-controlled watershed) so a
+            # neuron comes back as soma+processes — ONE object — instead
+            # of cellpose's flow model slicing the process into many
+            # little cells.  Cell pass only (nuclei have no processes).
+            "expand_processes": bool(cp_cfg.get("captureThinProcesses")) and model != "nuclei",
             # Use GPU when available (CUDA / Apple Silicon MPS). Falls
             # back to CPU automatically if neither is compiled in.
             "use_gpu": True,
@@ -1741,9 +1738,12 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
           // same thin fragments the run will keep (auto-min-size in the
           // generated code does the data-relative filtering at run time).
           min_size: 15,
-          flow_threshold: dendrite ? DENDRITE_FLOW_THRESHOLD : (cfg.cellpose.flowThreshold ?? 0.4),
-          cellprob_threshold: dendrite ? DENDRITE_CELLPROB_THRESHOLD : (cfg.cellpose.cellprobThreshold ?? 0.0),
-          merge_fragments: dendrite,
+          // Dendrite mode keeps flow NORMAL (a high flow_threshold
+          // shatters processes) and recovers them via expand_processes
+          // (marker-controlled watershed) on the backend instead.
+          flow_threshold: dendrite ? 0.4 : (cfg.cellpose.flowThreshold ?? 0.4),
+          cellprob_threshold: dendrite ? -1.0 : (cfg.cellpose.cellprobThreshold ?? 0.0),
+          expand_processes: dendrite,
           measure_compartments: !!cfg.cellpose.measureCompartments,
         };
       }

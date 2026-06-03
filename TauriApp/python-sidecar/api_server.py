@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.342"
+SIDECAR_BUILD = "0.1.343"
 
 
 @app.get("/api/version")
@@ -7080,6 +7080,11 @@ class FluorCellposePreview(BaseModel):
     # the "capture thin processes" toggle.  Avoids a long process
     # coming back as many little cells.
     merge_fragments: bool = False
+    # Capture dendrites/axons by flooding each cell BODY outward along
+    # the real fluorescent signal (marker-controlled watershed) — the
+    # preferred dendrite-capture path (replaces the high-flow_threshold
+    # trick that shattered processes).
+    expand_processes: bool = False
     # When True AND nuclei_channel is set, the PREVIEW additionally runs
     # cellpose's `nuclei` model on the nuclei channel so the user can
     # see both cell + nucleus outlines on the composite. Doesn't change
@@ -7228,6 +7233,8 @@ def fluor_preview_segment(body: FluorPreviewRequest):
             # Reconnect dendrite slices into their soma (the "capture
             # thin processes" toggle) so the preview matches the run.
             "merge_fragments": bool(getattr(cp, "merge_fragments", False)),
+            # Marker-controlled watershed dendrite capture (preferred).
+            "expand_processes": bool(getattr(cp, "expand_processes", False)),
             # Route to the v3 or v4 venv (Side-by-side install, 0.1.324+).
             "cellpose_version": str(cp.cellpose_version or "v4"),
             # Try GPU acceleration. cellpose-pytorch picks the best backend

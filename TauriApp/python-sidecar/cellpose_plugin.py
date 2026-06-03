@@ -169,6 +169,18 @@ def main():
     # small fragment into its SINGLE large neighbour after eval — see
     # _merge_fragments_into_cells below.
     merge_fragments = bool(cfg.get("merge_fragments", False))
+    # Dendrite/process CAPTURE (the better approach).  cellpose is good
+    # at finding cell BODIES but its flow model cannot trace a thin
+    # neurite — so instead of fighting it with extreme thresholds, we
+    # let it find clean somata and then flood each one outward along the
+    # real fluorescent signal with a marker-controlled watershed (see
+    # _expand_cells_into_processes).  seg_ch_idx selects which colour
+    # plane carries the cell signal (1=R, 2=G, 3=B; 0/other = luminance).
+    expand_processes = bool(cfg.get("expand_processes", False))
+    try:
+        seg_ch_idx = int(channels[0]) if isinstance(channels, (list, tuple)) and channels else 0
+    except Exception:
+        seg_ch_idx = 0
 
     def _frag_elongation(mask):
         # Orientation-independent thinness: ratio of the major to minor
@@ -244,6 +256,79 @@ def main():
             if not merged_any:
                 break
         return lab
+
+    def _expand_cells_into_processes(masks_in, image_rgb, seg_idx):
+        # Dendrite/axon capture by multi-source geodesic flood.
+        #
+        # cellpose reliably finds the cell BODIES (somata) but its flow
+        # model cannot follow a thin process — it either ignores it or
+        # (at a high flow_threshold) shatters it into many little basins.
+        # So we keep the clean bodies and GROW each one outward through
+        # the connected bright signal:
+        #   1. Build a foreground mask of "signal" pixels — thresholded
+        #      RELATIVE TO BACKGROUND (a dendrite sits well above the dim
+        #      sea but far below the soma, so a global Otsu, which isolates
+        #      only the bright somata, would miss it entirely).
+        #   2. Flood every cell body simultaneously, one ring per step,
+        #      confined to that foreground.  Each free pixel joins the
+        #      first body whose front reaches it; pixels equidistant from
+        #      two bodies split between them — so two neurons whose
+        #      processes touch are divided at the midline instead of one
+        #      swallowing the other.  A bright blob with NO body inside it
+        #      (debris) is never reached and stays background.
+        # Uses only scipy.ndimage (no scikit-image / watershed_ift, whose
+        # max-path cost can't split a flat-intensity bridge at the middle).
+        try:
+            from scipy import ndimage as _ndi
+        except Exception:
+            return masks_in
+        lab0 = masks_in.astype(np.int32)
+        n = int(lab0.max())
+        if n < 1:
+            return masks_in
+        # cell-signal plane (1=R, 2=G, 3=B; 0/other = luminance)
+        if image_rgb.ndim == 3 and seg_idx in (1, 2, 3):
+            gray = image_rgb[..., seg_idx - 1].astype(np.float32)
+        elif image_rgb.ndim == 3:
+            gray = image_rgb.mean(axis=2).astype(np.float32)
+        else:
+            gray = image_rgb.astype(np.float32)
+        if gray.shape != lab0.shape:
+            return masks_in
+        gray = _ndi.gaussian_filter(gray, 1.0)
+        gmax = float(gray.max())
+        if gmax <= 0:
+            return masks_in
+        g8 = np.clip(gray * (255.0 / gmax), 0, 255).astype(np.uint8)
+        # background-relative foreground floor
+        bg_level = float(np.median(g8))
+        soma_vals = g8[lab0 > 0]
+        soma_med = float(np.median(soma_vals)) if soma_vals.size else 255.0
+        thr = max(bg_level + 5.0, bg_level + 0.12 * max(1.0, soma_med - bg_level))
+        st = np.ones((3, 3), dtype=bool)
+        fg = g8 >= thr
+        if not fg.any():
+            return masks_in
+        # bridge small staining gaps so the flood doesn't stop at a break,
+        # and guarantee the bodies themselves are always floodable
+        fg = _ndi.binary_closing(fg, structure=st, iterations=2)
+        fg |= (lab0 > 0)
+        # multi-source geodesic flood (one ring of growth per iteration)
+        cur = np.where(lab0 > 0, lab0, 0).astype(np.int32)
+        cur[~fg] = -1   # walls: never claimed
+        max_iter = min(int(sum(fg.shape)), 1000)
+        for _ in range(max_iter):
+            free = (cur == 0)
+            if not free.any():
+                break
+            maxn = _ndi.maximum_filter(cur, footprint=st)
+            grow = free & (maxn > 0)
+            if not grow.any():
+                break
+            cur[grow] = maxn[grow]
+        out = np.where(cur > 0, cur, 0).astype(np.int32)
+        out[lab0 > 0] = lab0[lab0 > 0]   # never lose a body
+        return out
 
     is_v4 = not hasattr(cp_models, "Cellpose")
     if is_v4 and model_name not in {"cpsam"}:
@@ -402,9 +487,18 @@ def main():
                 flows = res[1]
             except Exception:
                 flows = None
-            # Reconnect dendrite slices into their soma (only on the
-            # cellpose-eval path, not on user-supplied edited masks).
-            if merge_fragments:
+            # Capture dendrites/processes (only on the cellpose-eval
+            # path, never on user-supplied edited masks).  Preferred:
+            # flood each cell body along the real signal so a neuron
+            # comes back as soma+processes.  Legacy fallback: merge the
+            # over-segmented fragments a high flow_threshold produced.
+            if expand_processes:
+                _before = int(masks.max())
+                masks = _expand_cells_into_processes(masks, img, seg_ch_idx)
+                _px = int((masks > 0).sum())
+                log.append("[%d/%d] %r: expand_processes — flooded %d cell body(ies) along signal (%d fg px)"
+                           % (i, len(inputs), label, _before, _px))
+            elif merge_fragments:
                 _before = int(masks.max())
                 masks = _merge_fragments_into_cells(masks)
                 _after = int(masks.max())
