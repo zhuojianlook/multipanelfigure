@@ -4572,6 +4572,41 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     setSelectedNodeId(id);
   }, [setNodes]);
 
+  // Spawn a fluorescence intensity-picker node.  Like the band picker
+  // it's a Python node flagged `interactive: "fluor_intensity"` so the
+  // detail panel shows "Configure intensity…" and its code is
+  // auto-generated from the intensity editor.  Exposed as a standalone
+  // tool (not just inside the canned template) so users can wire it into
+  // any custom pipeline — drop it in, connect a Source (or any
+  // image-producing node) to it, then configure.
+  const addIntensityPickerNode = useCallback(() => {
+    const id = newId("python");
+    const cfg = emptyFluorConfig();
+    let pos = { x: 350, y: 120 };
+    const inst = rfRef.current;
+    if (inst) {
+      try {
+        const container = document.querySelector(".react-flow") as HTMLElement | null;
+        if (container) {
+          const rect = container.getBoundingClientRect();
+          pos = inst.screenToFlowPosition({ x: rect.left + rect.width * 0.35 + Math.random() * 60, y: rect.top + rect.height * 0.30 + Math.random() * 60 });
+        }
+      } catch { /* default pos */ }
+    }
+    setNodes((cur) => [
+      ...cur,
+      {
+        id, type: "python", position: pos,
+        data: {
+          label: "Intensity picker", kind: "python", interactive: "fluor_intensity", intensity: cfg,
+          code: generateFluorCode(cfg), outputs: [], inputs: [],
+          status: "idle", currentPreset: "custom",
+        } as NodeData,
+      },
+    ]);
+    setSelectedNodeId(id);
+  }, [setNodes]);
+
   const removeNode = useCallback((nodeId: string) => {
     if (nodeId === "source") return;  // primary source is undeletable
     setNodes((cur) => cur.filter((n) => n.id !== nodeId));
@@ -6431,7 +6466,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               </Button>
             </span>
           </Tooltip>
-          <Tooltip placement="bottom" title="Plugins — optional analysis engines">
+          <Tooltip placement="bottom" title="Plugins — reusable picker tools (band / intensity) + analysis engines (Cellpose). Add one to the canvas and wire it into any pipeline.">
             <Button size="small" variant="outlined" startIcon={<ExtensionIcon sx={{ fontSize: 14 }} />}
               onClick={(e) => setPluginsAnchor(e.currentTarget)}
               sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25 }}>
@@ -6444,29 +6479,30 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
             onClose={() => setPluginsAnchor(null)}
             MenuListProps={{ dense: true }}
           >
-            {/* ── Pre-built analysis workflows. One-click templates that
-                drop a Source → Picker → Stats pipeline as a new tab.
-                Mirrors the "Load template…" dropdown but at one click
-                so users don't have to remember it lives there. ── */}
+            {/* ── Picker tools. Reusable interactive nodes the user can
+                drop into ANY pipeline (not just the canned templates):
+                wire a Source / image-producing node into them, then
+                open the editor. The full end-to-end templates still
+                live in the "Load template / saved" dropdown. ── */}
             <Typography variant="caption"
               sx={{ display: "block", px: 1.25, pt: 0.5, fontSize: "0.6rem",
                     color: "text.disabled", fontWeight: 700, textTransform: "uppercase" }}>
-              Analysis workflows
+              Picker tools
             </Typography>
             <MenuItem
-              onClick={() => { loadSavedWorkflow("builtin:western_blot"); setPluginsAnchor(null); }}
+              onClick={() => { addBandPickerNode(); setPluginsAnchor(null); }}
               sx={{ fontSize: "0.72rem" }}>
-              🟦 Detect bands (Western blot)
+              🟦 Band picker (Western blot)
               <Typography component="span" variant="caption" sx={{ ml: "auto", pl: 2, color: "text.secondary" }}>
-                new tab
+                add node
               </Typography>
             </MenuItem>
             <MenuItem
-              onClick={() => { loadSavedWorkflow("builtin:intensity_per_channel"); setPluginsAnchor(null); }}
+              onClick={() => { addIntensityPickerNode(); setPluginsAnchor(null); }}
               sx={{ fontSize: "0.72rem" }}>
-              🌈 Channel intensities (fluorescence)
+              🌈 Intensity picker (fluorescence)
               <Typography component="span" variant="caption" sx={{ ml: "auto", pl: 2, color: "text.secondary" }}>
-                new tab
+                add node
               </Typography>
             </MenuItem>
             <Divider sx={{ my: 0.25 }} />
