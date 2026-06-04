@@ -72,6 +72,7 @@ import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import HourglassEmptyIcon from "@mui/icons-material/HourglassEmpty";
 import EditIcon from "@mui/icons-material/Edit";
+import TextFieldsIcon from "@mui/icons-material/TextFields";
 import TextField from "@mui/material/TextField";
 import DialogActions from "@mui/material/DialogActions";
 import CodeMirror, { EditorView } from "@uiw/react-codemirror";
@@ -907,6 +908,34 @@ export interface InsetSource {
   figure_cell_bbox?: [number, number, number, number];
 }
 
+/** Per-slot ggplot text styling for an R-plot output — mirrors the
+ *  collage's RTextOverride and the backend's _r_text_override_block.
+ *  `text` is honoured only for the editable label slots (title, axes,
+ *  legend title, caption); the tick/legend-label slots take styling
+ *  only (they're data-driven). */
+export interface RTextOverride {
+  text?: string;
+  size?: number;
+  color?: string;
+  bold?: boolean;
+  italic?: boolean;
+  font?: string;
+}
+
+/** The R text slots the editor exposes — keys match the backend
+ *  _r_text_override_block mapping exactly. */
+export const R_TEXT_SLOTS: { key: string; label: string; editable: boolean }[] = [
+  { key: "title",        label: "Title",          editable: true },
+  { key: "subtitle",     label: "Subtitle",       editable: true },
+  { key: "xaxis",        label: "X-axis title",   editable: true },
+  { key: "yaxis",        label: "Y-axis title",   editable: true },
+  { key: "legend_title", label: "Legend title",   editable: true },
+  { key: "caption",      label: "Caption",        editable: true },
+  { key: "xticks",       label: "X tick labels",  editable: false },
+  { key: "yticks",       label: "Y tick labels",  editable: false },
+  { key: "legend_text",  label: "Legend labels",  editable: false },
+];
+
 export interface NodeOutput {
   /** Stable id within a node — `out_image_<idx>`, `out_table_<name>`,
    *  `out_plot_<idx>`. Used as the handle id. Archived previous-run
@@ -938,6 +967,10 @@ export interface NodeOutput {
    *  slot (older versions drop on the next re-run). Image / plot only;
    *  tables aren't archived. */
   versionLabel?: string;
+  /** Per-slot R text styling applied to THIS plot output (Edit text…).
+   *  Re-applied on top of rCode via the override re-render so the edits
+   *  survive in the drawer; cleared/replaced on the next node run. */
+  rTextOverrides?: Record<string, RTextOverride>;
 }
 
 /** Placeholder output entry — what the code DECLARES it will produce.
@@ -3811,6 +3844,8 @@ export interface AggregatedOutput {
   rCode?: string;
   rInterpreter?: string | null;
   rPlotIndex?: number;
+  /** Mirrors NodeOutput.rTextOverrides — per-slot R text styling. */
+  rTextOverrides?: Record<string, RTextOverride>;
   /** Mirrors NodeOutput.sentTo — destinations this output was committed to. */
   sentTo?: string[];
   /** Mirrors NodeOutput.versionLabel — "v1" / "v2" for previous-run archives. */
@@ -5840,6 +5875,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       rCode: o.rCode,
       rInterpreter: o.rInterpreter,
       rPlotIndex: o.rPlotIndex,
+      rTextOverrides: o.rTextOverrides,
       sentTo: o.sentTo || [],
       versionLabel: o.versionLabel,
     })));
@@ -5887,6 +5923,88 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       if (cur) nodeOutputsCache.set(outputsCacheKey(tabId, nodeId), cur.filter((o) => o.id !== outputId));
     }
   }, [setNodes, activeWf]);
+
+  // ── Per-element R text editor (Edit text… on an R plot output) ──
+  // Re-renders the SAME plot with title/axis/legend styling overrides via
+  // the run-r override path (the very mechanism the collage uses), then
+  // swaps the new PNG into the drawer card.  Overrides are stored on the
+  // output so reopening the editor shows the current values and the edit
+  // survives until the node is re-run.
+  const [rTextEditor, setRTextEditor] = useState<{
+    nodeId: string; outputId: string; name: string;
+    rCode: string; rInterpreter?: string | null; rPlotIndex: number;
+    draft: Record<string, RTextOverride>;
+    applying: boolean; error?: string;
+  } | null>(null);
+
+  const openRTextEditor = useCallback((o: AggregatedOutput) => {
+    if (!o.rCode) return;
+    setRTextEditor({
+      nodeId: o.nodeId, outputId: o.outputId, name: o.name,
+      rCode: o.rCode, rInterpreter: o.rInterpreter, rPlotIndex: o.rPlotIndex ?? 0,
+      draft: JSON.parse(JSON.stringify(o.rTextOverrides || {})),
+      applying: false,
+    });
+  }, []);
+
+  // Read a base64 PNG's pixel dimensions so the override re-render uses the
+  // SAME canvas size as the original plot (the built-in templates render at
+  // 300 DPI; matching width/height + res keeps text at the same scale so
+  // only the styling changes, not the layout).
+  const _pngDims = (b64: string) => new Promise<{ w: number; h: number }>((resolve) => {
+    const im = new Image();
+    im.onload = () => resolve({ w: im.naturalWidth || 0, h: im.naturalHeight || 0 });
+    im.onerror = () => resolve({ w: 0, h: 0 });
+    im.src = `data:image/png;base64,${b64}`;
+  });
+
+  const applyRTextEditor = useCallback(async () => {
+    const ed = rTextEditor;
+    if (!ed) return;
+    // Prune empty slots — only send styling that's actually set.
+    const ov: Record<string, RTextOverride> = {};
+    for (const [k, v] of Object.entries(ed.draft)) {
+      const e: RTextOverride = {};
+      if (v.text && v.text.trim()) e.text = v.text;
+      if (typeof v.size === "number" && v.size > 0) e.size = v.size;
+      if (v.color) e.color = v.color;
+      if (v.bold) e.bold = true;
+      if (v.italic) e.italic = true;
+      if (v.font) e.font = v.font;
+      if (Object.keys(e).length) ov[k] = e;
+    }
+    setRTextEditor((s) => s && ({ ...s, applying: true, error: undefined }));
+    try {
+      const cur = allOutputsRef.current.find((o) => o.nodeId === ed.nodeId && o.outputId === ed.outputId);
+      const dims = cur ? await _pngDims(cur.payload) : { w: 0, h: 0 };
+      const res = await api.runR(ed.rCode, "", ed.rInterpreter ?? undefined, null, {
+        textOverrides: ov,
+        overrideOnly: true,
+        renderOverride: true,   // force the single-plot re-render even when ov is empty (reset)
+        overridePlotIndex: ed.rPlotIndex,
+        overrideWidth: dims.w || 1100,
+        overrideHeight: dims.h || 850,
+        overrideRes: 300,
+      });
+      if (res.success && res.plots && res.plots[0]) {
+        const newPng = res.plots[0];
+        const storeOv = Object.keys(ov).length ? ov : undefined;
+        setNodes((curNodes) => curNodes.map((n) => n.id !== ed.nodeId ? n : {
+          ...n,
+          data: {
+            ...n.data,
+            outputs: (n.data.outputs || []).map((o) =>
+              o.id === ed.outputId ? { ...o, payload: newPng, rTextOverrides: storeOv } : o),
+          },
+        }));
+        setRTextEditor(null);
+      } else {
+        setRTextEditor((s) => s && ({ ...s, applying: false, error: (res.stderr || "Re-render failed").slice(-400) }));
+      }
+    } catch (e) {
+      setRTextEditor((s) => s && ({ ...s, applying: false, error: String(e) }));
+    }
+  }, [rTextEditor, setNodes]);
 
   // ── Drawer selection + batch actions ──────────────────────────
 
@@ -7202,6 +7320,19 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
                               sx={{ flex: 1, fontSize: "0.55rem", textTransform: "none", py: 0, minWidth: 0 }}>
                               Download
                             </Button>
+                            {/* Per-element R text styling — only for R plot
+                                outputs (they carry the self-contained rCode
+                                needed to re-render with theme overrides). */}
+                            {o.kind === "plot" && o.rCode && (
+                              <Tooltip placement="top" title="Edit the plot's text — title, axis & legend labels, ticks: font, size, colour, bold/italic. Re-renders this plot only.">
+                                <IconButton size="small"
+                                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); openRTextEditor(o); }}
+                                  onMouseDown={(e) => { e.stopPropagation(); }}
+                                  sx={{ p: 0.25, color: o.rTextOverrides && Object.keys(o.rTextOverrides).length ? "primary.main" : "text.disabled", "&:hover": { color: "primary.main" } }}>
+                                  <TextFieldsIcon sx={{ fontSize: 14 }} />
+                                </IconButton>
+                              </Tooltip>
+                            )}
                             <Tooltip placement="top" title="Remove this output from the drawer. The next node re-run will produce a fresh one (the version-archive keeps prior runs separately).">
                               <IconButton size="small"
                                 onClick={(e) => { e.preventDefault(); e.stopPropagation(); deleteOutput(o.nodeId, o.outputId); }}
@@ -7386,6 +7517,84 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         onClose={closeIntensityPicker}
         onSave={saveIntensityPicker}
       />
+
+      {/* ── Per-element R-plot text editor ────────────────────────
+          Edit each ggplot text slot (title / axes / legend / ticks):
+          wording (editable slots), size, colour, bold/italic, font.
+          Re-renders THIS plot only via the run-r override path. ── */}
+      {rTextEditor && (
+        <Dialog open onClose={() => { if (!rTextEditor.applying) setRTextEditor(null); }} maxWidth="md" fullWidth>
+          <DialogTitle sx={{ fontSize: "0.95rem", py: 1.25 }}>
+            Edit plot text — {rTextEditor.name}
+          </DialogTitle>
+          <DialogContent dividers>
+            <Typography variant="caption" sx={{ display: "block", mb: 1, color: "text.secondary", fontSize: "0.7rem", lineHeight: 1.4 }}>
+              Style each text element of this R plot. Leave a Text box empty to keep the plot's current wording.
+              Tick / legend-label rows are styling-only (their text comes from the data). Applying re-renders this one plot.
+            </Typography>
+            <Box sx={{ display: "grid", gridTemplateColumns: "120px 1fr 70px 46px auto 96px", gap: 0.75, alignItems: "center" }}>
+              <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.6rem", textTransform: "uppercase", color: "text.secondary" }}>Element</Typography>
+              <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.6rem", textTransform: "uppercase", color: "text.secondary" }}>Text</Typography>
+              <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.6rem", textTransform: "uppercase", color: "text.secondary" }}>Size</Typography>
+              <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.6rem", textTransform: "uppercase", color: "text.secondary" }}>Colour</Typography>
+              <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.6rem", textTransform: "uppercase", color: "text.secondary" }}>Style</Typography>
+              <Typography variant="caption" sx={{ fontWeight: 700, fontSize: "0.6rem", textTransform: "uppercase", color: "text.secondary" }}>Font</Typography>
+              {R_TEXT_SLOTS.map((slot) => {
+                const v: RTextOverride = rTextEditor.draft[slot.key] || {};
+                const set = (patch: Partial<RTextOverride>) =>
+                  setRTextEditor((s) => s && ({ ...s, draft: { ...s.draft, [slot.key]: { ...(s.draft[slot.key] || {}), ...patch } } }));
+                return (
+                  <Box key={slot.key} sx={{ display: "contents" }}>
+                    <Typography variant="caption" sx={{ fontSize: "0.65rem" }}>{slot.label}</Typography>
+                    <TextField size="small" variant="standard"
+                      placeholder={slot.editable ? "(keep current)" : "— from data —"}
+                      value={v.text || ""} disabled={!slot.editable}
+                      onChange={(e) => set({ text: e.target.value })}
+                      inputProps={{ style: { fontSize: "0.7rem" } }} />
+                    <TextField size="small" variant="standard" type="number" placeholder="auto"
+                      value={v.size ?? ""}
+                      onChange={(e) => set({ size: e.target.value === "" ? undefined : Math.max(1, Math.min(96, Number(e.target.value))) })}
+                      inputProps={{ style: { fontSize: "0.7rem" }, min: 1, max: 96 }} />
+                    <input type="color" value={v.color || "#222222"}
+                      onChange={(e) => set({ color: e.target.value })}
+                      style={{ width: 30, height: 22, border: "none", background: "none", cursor: "pointer", padding: 0 }} />
+                    <Box sx={{ display: "flex", gap: 0.25 }}>
+                      <Button size="small" variant={v.bold ? "contained" : "outlined"} onClick={() => set({ bold: !v.bold })}
+                        sx={{ minWidth: 26, px: 0.5, fontWeight: 700, fontSize: "0.65rem", py: 0 }}>B</Button>
+                      <Button size="small" variant={v.italic ? "contained" : "outlined"} onClick={() => set({ italic: !v.italic })}
+                        sx={{ minWidth: 26, px: 0.5, fontStyle: "italic", fontSize: "0.65rem", py: 0 }}>I</Button>
+                    </Box>
+                    <Select size="small" variant="standard" value={v.font || ""} displayEmpty
+                      onChange={(e) => set({ font: (e.target.value as string) || undefined })}
+                      sx={{ fontSize: "0.65rem" }}>
+                      <MenuItem value="" sx={{ fontSize: "0.7rem" }}>default</MenuItem>
+                      <MenuItem value="sans" sx={{ fontSize: "0.7rem" }}>sans</MenuItem>
+                      <MenuItem value="serif" sx={{ fontSize: "0.7rem" }}>serif</MenuItem>
+                      <MenuItem value="mono" sx={{ fontSize: "0.7rem" }}>mono</MenuItem>
+                    </Select>
+                  </Box>
+                );
+              })}
+            </Box>
+            {rTextEditor.error && (
+              <Typography variant="caption" sx={{ display: "block", mt: 1.25, color: "error.main", fontFamily: "monospace", fontSize: "0.6rem", whiteSpace: "pre-wrap" }}>
+                {rTextEditor.error}
+              </Typography>
+            )}
+          </DialogContent>
+          <DialogActions>
+            <Button size="small" onClick={() => setRTextEditor((s) => s && ({ ...s, draft: {} }))} disabled={rTextEditor.applying}>
+              Reset all
+            </Button>
+            <Box sx={{ flex: 1 }} />
+            <Button size="small" onClick={() => setRTextEditor(null)} disabled={rTextEditor.applying}>Cancel</Button>
+            <Button size="small" variant="contained" onClick={applyRTextEditor} disabled={rTextEditor.applying}
+              startIcon={rTextEditor.applying ? <CircularProgress size={12} color="inherit" /> : undefined}>
+              {rTextEditor.applying ? "Rendering…" : "Apply"}
+            </Button>
+          </DialogActions>
+        </Dialog>
+      )}
     </Box>
   );
 }
