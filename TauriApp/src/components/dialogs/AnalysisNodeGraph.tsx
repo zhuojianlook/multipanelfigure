@@ -86,6 +86,8 @@ import { useCollageStore } from "../../store/collageStore";
 import { switchToDocument } from "../../utils/projectNav";
 import BandPickerDialog, {
   type BandPickerConfig,
+  type BandImageConfig,
+  type BandPickerImage,
   generateBandPickerCode,
   emptyBandConfig,
 } from "./BandPickerDialog";
@@ -3170,14 +3172,6 @@ if (length(inputs) == 0 || is.null(inputs[[1]]) || nrow(inputs[[1]]) == 0) {
 
 df <- inputs[[1]]
 
-# Detect LC mode from any of: lc_enabled flag, presence of normalized
-# column with a meaningful is_loading_control marker, or a fallback.
-lc_flag <- "lc_enabled" %in% names(df) &&
-  any(tolower(as.character(df$lc_enabled)) %in% c("true", "1", "yes"))
-has_normalised <- "normalized" %in% names(df)
-val_col <- if (lc_flag && has_normalised) "normalized" else "iod"
-df$value <- suppressWarnings(as.numeric(df[[val_col]]))
-
 # Make sure the columns we need exist with sensible defaults.
 if (!"band"  %in% names(df)) df$band  <- as.character(seq_len(nrow(df)))
 if (!"lane"  %in% names(df)) df$lane  <- df$band
@@ -3191,14 +3185,7 @@ df$lane  <- as.character(df$lane)
 df$level <- as.character(df$level)
 df$group <- as.character(df$group)
 df$image <- as.character(df$image)
-df <- df[is.finite(df$value), , drop = FALSE]
 
-# When LC mode is on, the LC band normalises to 1 by definition →
-# excluding it sharpens the comparison. When LC is off, keep all bands.
-if (lc_flag && "is_loading_control" %in% names(df)) {
-  is_lc <- tolower(as.character(df$is_loading_control)) %in% c("true", "1", "yes")
-  df <- df[!is_lc, , drop = FALSE]
-}
 # Always drop the molecular-weight ladder (size reference, not a sample).
 df <- df[tolower(as.character(df$level)) != "ladder" & df$lane != "L", , drop = FALSE]
 # Keep only bands with a group assigned (user-defined). Ungrouped bands
@@ -3208,10 +3195,10 @@ df$group[!nzchar(df$group)] <- "(ungrouped)"
 if (nrow(df) == 0)
   stop("No bands left to plot after filtering — check the picker's Groups and (when LC is on) the lane LC picks.")
 
-y_lab <- if (val_col == "normalized") "Relative density (vs loading control)" else "Integrated optical density (a.u.)"
-plot_subtitle <- if (val_col == "normalized")
-  "loading-control corrected (each band ÷ its lane's LC band)"
-else "raw IOD — no loading-control normalisation"
+# NOTE: loading-control mode, the value column (normalized vs raw iod), the
+# y-axis label and the LC-band exclusion are all decided PER IMAGE inside
+# render_image — each membrane has its own LC choice, so a mixed batch can
+# show one blot normalised and another raw, each labelled correctly.
 
 # Picker toggle "Plot layout" — one figure per group vs combined facets
 # (applied WITHIN each image).
@@ -3223,7 +3210,7 @@ plot_per_group <- "plot_per_group" %in% names(df) &&
 # Render one ggplot (a single group, or all groups faceted). Layout is
 # picked to avoid clipped axes: generous margins, 10% top headroom, a
 # magnitude-aware y-tick formatter, and small-but-legible facet titles.
-render_one <- function(d_sub, s_sub, facet_var, w, h, fname, title_text, n_facets = 3) {
+render_one <- function(d_sub, s_sub, facet_var, w, h, fname, title_text, val_col, y_lab, plot_subtitle, n_facets = 3) {
   ymax_v <- if (nrow(s_sub) > 0) max(s_sub$mean + s_sub$sd, na.rm = TRUE) else 1
   y_fmt <- if (val_col == "normalized") scales::label_number(accuracy = 0.1)
            else if (is.finite(ymax_v) && ymax_v >= 1e5) scales::label_scientific(digits = 2)
@@ -3270,6 +3257,26 @@ render_one <- function(d_sub, s_sub, facet_var, w, h, fname, title_text, n_facet
 # ("wb_band_comparison.png" / "wb_<group>.png") so downstream is unchanged.
 render_image <- function(df_img, im, multi) {
   if (nrow(df_img) == 0) return(invisible(NULL))
+  # LC mode is PER IMAGE — each membrane has its own loading-control choice,
+  # so detect it from THIS image's rows. A mixed batch can have one blot
+  # normalised and another raw, each labelled correctly.
+  lc_flag <- "lc_enabled" %in% names(df_img) &&
+    any(tolower(as.character(df_img$lc_enabled)) %in% c("true", "1", "yes"))
+  has_normalised <- "normalized" %in% names(df_img)
+  val_col <- if (lc_flag && has_normalised) "normalized" else "iod"
+  df_img$value <- suppressWarnings(as.numeric(df_img[[val_col]]))
+  # When LC is on, the LC band normalises to 1 by definition → drop it so the
+  # comparison is sharper. When LC is off, keep every band.
+  if (lc_flag && "is_loading_control" %in% names(df_img)) {
+    is_lc <- tolower(as.character(df_img$is_loading_control)) %in% c("true", "1", "yes")
+    df_img <- df_img[!is_lc, , drop = FALSE]
+  }
+  df_img <- df_img[is.finite(df_img$value), , drop = FALSE]
+  if (nrow(df_img) == 0) return(invisible(NULL))
+  y_lab <- if (val_col == "normalized") "Relative density (vs loading control)" else "Integrated optical density (a.u.)"
+  plot_subtitle <- if (val_col == "normalized")
+    "loading-control corrected (each band ÷ its lane's LC band)"
+  else "raw IOD — no loading-control normalisation"
   groups <- unique(df_img$group)
   agg <- aggregate(value ~ group + band, data = df_img,
                    FUN = function(v) c(m = mean(v), s = sd(v), n = length(v)))
@@ -3289,7 +3296,8 @@ render_image <- function(df_img, im, multi) {
       render_one(d_sub, s_sub, NULL,
                  w = max(900, 120 * n_bands + 480), h = 1000,
                  fname = paste0("wb_", pfx, .wb_safe(g), ".png"),
-                 title_text = ttl, n_facets = n_facets)
+                 title_text = ttl, val_col = val_col, y_lab = y_lab,
+                 plot_subtitle = plot_subtitle, n_facets = n_facets)
     }
   } else {
     n_bands_max <- max(vapply(groups, function(g) length(unique(as.character(df_img$band[df_img$group == g]))), integer(1)))
@@ -3299,7 +3307,8 @@ render_image <- function(df_img, im, multi) {
                w = per_panel_w * min(n_facets, 3) + 80,
                h = 1000 * ceiling(n_facets / 3),
                fname = paste0("wb_", pfx, "band_comparison.png"),
-               title_text = ttl, n_facets = n_facets)
+               title_text = ttl, val_col = val_col, y_lab = y_lab,
+               plot_subtitle = plot_subtitle, n_facets = n_facets)
   }
 }
 
@@ -4130,8 +4139,8 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // Band-picker (western-blot lane editor) modal state.  `image` is
   // the upstream membrane resolved at open time (base64 PNG); `cfg`
   // seeds the editor from the node's saved ROIs.
-  const [bandPicker, setBandPicker] = useState<{ open: boolean; nodeId: string | null; image: string | null; source: { key: string; name?: string; row?: number; col?: number; inset_index?: number } | null; cfg: BandPickerConfig | null }>(
-    () => ({ open: false, nodeId: null, image: null, source: null, cfg: null }),
+  const [bandPicker, setBandPicker] = useState<{ open: boolean; nodeId: string | null; images: BandPickerImage[]; cfg: BandPickerConfig | null }>(
+    () => ({ open: false, nodeId: null, images: [], cfg: null }),
   );
   // When a workflow run opens the band picker, the run AWAITS this resolver so
   // it pauses until the user finishes specifying bands (Save → cfg, Cancel →
@@ -5388,37 +5397,49 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // from the node's saved ROIs.
   const openBandPicker = useCallback((nodeId: string) => {
     const nm = new Map(nodes.map((n) => [n.id, n]));
+    // collectInputs already fans out EVERY inset on each wired source, so this
+    // returns one entry per membrane that Run would analyse — exactly what we
+    // want the picker to cycle through.
     const ins = collectInputs(nodeId, nm);
-    const imgEntry = ins.find((x) => x.kind === "image" && x.image_b64);
-    const img = imgEntry?.image_b64 || null;
-    // Resolve the upstream source descriptor so the backend can re-extract the
-    // FULL-RESOLUTION image for detection (the node only carries a 256px
-    // thumbnail; detecting on that is far worse than the full-res membrane).
-    // Prefer the live inset list, but fall back to the upstream Source node's
-    // OWN cached source entry — which still carries row/col/inset_index — so
-    // detection stays full-res even when the live inset list is momentarily
-    // empty (e.g. right after a backend restart).
-    let source: { key: string; name?: string; row?: number; col?: number; inset_index?: number } | null = null;
-    if (imgEntry?.key?.startsWith("inset_")) {
-      const insetKey = imgEntry.key.replace(/^inset_\d+_/, "");
-      let s: InsetSource | undefined = insetSources.find((x) => x.key === insetKey);
-      if (!s) {
-        for (const n of nodes) {
-          if (n.data.kind !== "source") continue;
-          const found = (n.data.sources || []).find((x) => x.key === insetKey);
-          if (found) { s = found; break; }
-        }
-      }
-      if (s) {
-        // Standalone uploads resolve by name (whole image, full bit depth);
-        // builder insets resolve by row/col/inset_index.
-        source = s.name
-          ? { key: s.key, name: s.name }
-          : { key: s.key, row: s.row, col: s.col, inset_index: s.inset_index };
+    // Source-descriptor lookup so each membrane can re-extract full-res for
+    // detection + the wb-preview contrast stretch. Standalone uploads resolve
+    // by name; builder insets by row/col/inset_index.
+    const srcByKey = new Map<string, { key: string; name?: string; row?: number; col?: number; inset_index?: number }>();
+    const addSrc = (s: InsetSource) => {
+      if (srcByKey.has(s.key)) return;
+      srcByKey.set(s.key, s.name
+        ? { key: s.key, name: s.name }
+        : { key: s.key, row: s.row, col: s.col, inset_index: s.inset_index });
+    };
+    for (const s of insetSources) addSrc(s);
+    for (const n of nodes) {
+      if (n.data.kind !== "source") continue;
+      for (const s of (n.data.sources || [])) addSrc(s);
+    }
+    // Build one picker image per wired membrane, keyed by the RUNTIME id
+    // (the stripped src.key — what the sidecar uses for the `inputs` dict),
+    // so each membrane's per-image picking matches at run time. Suffix
+    // duplicate display labels so each cycler chip stays distinguishable.
+    const imgs = ins.filter((x) => x.kind === "image");
+    const labelCounts = new Map<string, number>();
+    const built: BandPickerImage[] = [];
+    for (const x of imgs) {
+      const baseLbl = (x.label || "").split("/").pop() || x.label || "image";
+      labelCounts.set(baseLbl, (labelCounts.get(baseLbl) || 0) + 1);
+      const skey = x.key.startsWith("inset_") ? x.key.split("_").slice(2).join("_") : "";
+      const idKey = skey || x.key;
+      built.push({ id: idKey, label: baseLbl, image_b64: x.image_b64 || "", source: skey ? srcByKey.get(skey) : undefined });
+    }
+    const counters = new Map<string, number>();
+    for (const im of built) {
+      if ((labelCounts.get(im.label) || 0) > 1) {
+        const n = (counters.get(im.label) || 0) + 1;
+        counters.set(im.label, n);
+        im.label = `${im.label} #${n}`;
       }
     }
     const node = nm.get(nodeId);
-    setBandPicker({ open: true, nodeId, image: img, source, cfg: (node?.data.roi as BandPickerConfig | undefined) || emptyBandConfig() });
+    setBandPicker({ open: true, nodeId, images: built, cfg: (node?.data.roi as BandPickerConfig | undefined) || emptyBandConfig() });
   }, [nodes, collectInputs, insetSources]);
 
   // Persist the edited ROIs back onto the node and regenerate its
@@ -5430,7 +5451,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           ? { ...n, data: { ...n.data, roi: cfg, code: generateBandPickerCode(cfg), status: "idle" as const } }
           : n));
       }
-      return { open: false, nodeId: null, image: null, source: null, cfg: null };
+      return { open: false, nodeId: null, images: [], cfg: null };
     });
     // Resume any run that was waiting on the picker.
     const r = bandPickerResolveRef.current; bandPickerResolveRef.current = null;
@@ -5439,7 +5460,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
 
   /** Close the picker and tell a waiting run it was cancelled (null). */
   const closeBandPicker = useCallback(() => {
-    setBandPicker({ open: false, nodeId: null, image: null, source: null, cfg: null });
+    setBandPicker({ open: false, nodeId: null, images: [], cfg: null });
     const r = bandPickerResolveRef.current; bandPickerResolveRef.current = null;
     if (r) r(null);
   }, []);
@@ -5659,16 +5680,26 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     // hitting "No bands defined") or letting a full "Run graph" barrel on to the
     // downstream Normalize/Plot before any bands exist.
     if (node.data.interactive === "wb_bands") {
+      // Per-image-aware checks: each wired membrane has its OWN picking
+      // (roi.images keyed by runtime id); legacy saves keep one shared
+      // picking at the top level. "Has bands" / "has grouped bands" look
+      // across whichever applies.
+      const cfgImageList = (c?: BandPickerConfig): BandImageConfig[] => {
+        if (!c) return [];
+        if (c.images && Object.keys(c.images).length) return Object.values(c.images);
+        return [{ lanes: c.lanes ?? [], groups: c.groups ?? [] }];
+      };
+      const cfgHasBands = (c?: BandPickerConfig) =>
+        cfgImageList(c).some((im) => (im.lanes?.length ?? 0) > 0);
+      const cfgHasGroupedBands = (c?: BandPickerConfig) =>
+        cfgImageList(c).some((im) =>
+          (im.groups?.length ?? 0) > 0 && (im.groups || []).some((g) => (g.bands?.length ?? 0) > 0));
       const roiNow = node.data.roi as BandPickerConfig | undefined;
-      const needBands = !roiNow || (roiNow.lanes?.length ?? 0) === 0;
-      // Require at least one group with at least one band assigned. An empty
-      // groups[] OR groups that exist but have no bands BOTH halt the run
-      // (the downstream R plot would otherwise show empty bars). The picker
-      // disables Save until this condition is met, so this gate mostly
-      // catches legacy configs.
-      const groupsHaveBands = !needBands
-        && (roiNow!.groups?.length ?? 0) > 0
-        && (roiNow!.groups || []).some((g) => (g.bands?.length ?? 0) > 0);
+      const needBands = !cfgHasBands(roiNow);
+      // Require at least one group with at least one band assigned somewhere.
+      // The picker disables Save until every membrane-with-bands has a group,
+      // so this gate mostly catches legacy / cancelled configs.
+      const groupsHaveBands = !needBands && cfgHasGroupedBands(roiNow);
       const needGroups = !needBands && !groupsHaveBands;
       if (needBands || needGroups) {
         const why = needBands
@@ -5678,11 +5709,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         setConsoleOut(consoleRef.current);
         setNodes((cur) => cur.map((n) => n.id === node.id ? { ...n, data: { ...n.data, status: "idle" } } : n));
         const picked = await openBandPickerAndWait(node.id);
-        const pickedHasGroupedBands = !!picked
-          && (picked.groups?.length ?? 0) > 0
-          && (picked.groups || []).some((g) => (g.bands?.length ?? 0) > 0);
-        if (!picked || (picked.lanes?.length ?? 0) === 0 || !pickedHasGroupedBands) {
-          const stop = !picked || (picked.lanes?.length ?? 0) === 0
+        const pickedHasGroupedBands = !!picked && cfgHasGroupedBands(picked);
+        if (!picked || !cfgHasBands(picked) || !pickedHasGroupedBands) {
+          const stop = !picked || !cfgHasBands(picked)
             ? "no bands specified"
             : "no group has any bands assigned";
           consoleRef.current += `=== ${node.data.label}: ${stop} — run stopped ===\n`;
@@ -7716,8 +7745,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
       {/* Western-blot band picker — interactive lane ROI editor. */}
       <BandPickerDialog
         open={bandPicker.open}
-        imageSrc={bandPicker.image}
-        source={bandPicker.source}
+        images={bandPicker.images}
         initial={bandPicker.cfg}
         onClose={closeBandPicker}
         onSave={saveBandPicker}

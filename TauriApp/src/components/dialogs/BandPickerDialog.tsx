@@ -69,8 +69,46 @@ export interface LaneBound {
   x1: number; y1: number; x2: number; y2: number;   // all 0..1 normalised
 }
 
+/** Per-IMAGE picking — everything that is specific to one membrane's
+ *  geometry.  Each wired western blot has its OWN lanes / groups / loading
+ *  control / orientation, because blots differ entirely (different lane
+ *  layout, different proteins, different housekeeping band).  Stored on
+ *  BandPickerConfig.images keyed by the RUNTIME input key (the Source
+ *  inset's `key`, which is what the sidecar uses to key the Python
+ *  `inputs` dict), so the generated code can map each membrane to its
+ *  own ROIs.  `imageKey` / `imageLabel` are echoed inside the entry so the
+ *  generator can fall back to a label match if the key ever drifts. */
+export interface BandImageConfig {
+  imageKey?: string;
+  imageLabel?: string;
+  lanes: BandRoi[];
+  groups?: BandGroup[];
+  loadingControlEnabled?: boolean;
+  lcBandByLane?: Record<string, string>;
+  loadingControlLevel?: string | null;
+  bandOrientation?: "auto" | "dark_on_light" | "light_on_dark";
+  laneBounds?: LaneBound[];
+  defaultBoxW?: number;
+  defaultBoxH?: number;
+}
+
+/** One wired membrane shown in the picker's image cycler.  `id` is the
+ *  stable runtime key (Source inset `key`) used to key per-image config —
+ *  identical contract to the fluorescence intensity picker's images. */
+export interface BandPickerImage {
+  id: string;
+  label: string;
+  image_b64: string;
+  source?: { key: string; name?: string; row?: number; col?: number; inset_index?: number };
+}
+
 export interface BandPickerConfig {
   version: 1;
+  /** Per-image picking, keyed by the runtime input key.  Authoritative for
+   *  multi-image (and single-image) runs saved by the new picker.  When
+   *  absent (legacy saves), the top-level fields below act as a single
+   *  shared config applied to every wired membrane. */
+  images?: Record<string, BandImageConfig>;
   lanes: BandRoi[];
   /** Master switch for loading-control normalisation. When true, downstream
    *  Normalize divides each lane's bands by that lane's chosen LC band's
@@ -133,6 +171,49 @@ export function emptyBandConfig(): BandPickerConfig {
     groups: [], laneBounds: [],
     plotPerGroup: false,
     bandOrientation: "auto",
+    images: {},
+  };
+}
+
+/** Fresh empty per-image config (a membrane with nothing picked yet). */
+export function emptyImageConfig(): BandImageConfig {
+  return {
+    lanes: [], groups: [],
+    loadingControlEnabled: false, lcBandByLane: {}, loadingControlLevel: null,
+    bandOrientation: "auto", laneBounds: [],
+  };
+}
+
+/** Pull the per-image (geometry-specific) fields out of a full config —
+ *  used to STASH the active membrane's picking before switching images. */
+export function extractImageConfig(c: BandPickerConfig): BandImageConfig {
+  return {
+    lanes: c.lanes ?? [],
+    groups: c.groups ?? [],
+    loadingControlEnabled: c.loadingControlEnabled ?? false,
+    lcBandByLane: c.lcBandByLane ?? {},
+    loadingControlLevel: c.loadingControlLevel ?? null,
+    bandOrientation: c.bandOrientation ?? "auto",
+    laneBounds: c.laneBounds ?? [],
+    defaultBoxW: c.defaultBoxW,
+    defaultBoxH: c.defaultBoxH,
+  };
+}
+
+/** Overlay a per-image config onto a full config (global fields kept) —
+ *  used to LOAD a membrane's picking when the cycler moves to it. */
+export function applyImageConfig(c: BandPickerConfig, img: BandImageConfig): BandPickerConfig {
+  return {
+    ...c,
+    lanes: img.lanes ?? [],
+    groups: img.groups ?? [],
+    loadingControlEnabled: img.loadingControlEnabled ?? false,
+    lcBandByLane: img.lcBandByLane ?? {},
+    loadingControlLevel: img.loadingControlLevel ?? null,
+    bandOrientation: img.bandOrientation ?? "auto",
+    laneBounds: img.laneBounds ?? [],
+    defaultBoxW: img.defaultBoxW,
+    defaultBoxH: img.defaultBoxH,
   };
 }
 
@@ -238,39 +319,82 @@ import re as _re, sys as _sys
 def _safe_name(s):
     return (_re.sub(r"[^A-Za-z0-9_-]+", "_", str(s)).strip("_") or "image")
 
-# Loading-control + grouping config — image-INDEPENDENT (the picker's ROIs
-# and group/LC choices apply identically to every wired membrane).
-#   - loadingControlEnabled → flag is_loading_control on the picked bands.
-#   - Legacy fallback: loadingControlLevel string flags by level.
-lc_enabled = bool(CFG.get("loadingControlEnabled"))
+# Western-blot analysis is PER IMAGE, and so is the PICKING.  Each wired
+# membrane has its OWN ROIs / groups / loading control / orientation,
+# because blots differ entirely (different lane layout, proteins,
+# housekeeping band).  CFG["images"] holds those per-image configs keyed by
+# the runtime input key (the Source inset key the sidecar uses for the
+# Python inputs dict).  Legacy single-config saves have no images map — then
+# the top-level fields act as one shared config for the single wired membrane.
 plot_per_group = bool(CFG.get("plotPerGroup"))
-lc_pick_for_lane = {str(k): str(v) for k, v in (CFG.get("lcBandByLane") or {}).items()}
-lc_for_by_band: dict = {}
-for _ln, _bn in lc_pick_for_lane.items():
-    if _bn:
-        lc_for_by_band.setdefault(_bn, []).append(_ln)
-lc_level   = CFG.get("loadingControlLevel")          # legacy
-band2group = {}; lane2group = {}
-for g in CFG.get("groups", []) or []:
-    nm = (g.get("name") or "").strip()
-    if not nm: continue
-    for bn in g.get("bands", []) or []:
-        band2group[str(bn)] = nm
-    for ln in g.get("lanes", []) or []:
-        lane2group[str(ln)] = nm
+_images_cfg = CFG.get("images") or {}
 
-# Western-blot analysis is PER IMAGE: every wired membrane is quantified
-# independently with the picker's (fractional) ROIs.  Each band row is
-# tagged with its source image, each membrane emits its own annotated
-# overlay, and (downstream) one graph per image is produced.  No
-# cross-image comparison.
-image_items = [(str(v.get("label") or _k), v) for _k, v in inputs.items()
+def _legacy_cfg():
+    return {
+        "lanes": CFG.get("lanes", []) or [],
+        "groups": CFG.get("groups", []) or [],
+        "loadingControlEnabled": CFG.get("loadingControlEnabled"),
+        "lcBandByLane": CFG.get("lcBandByLane") or {},
+        "loadingControlLevel": CFG.get("loadingControlLevel"),
+        "bandOrientation": CFG.get("bandOrientation") or "auto",
+        "laneBounds": CFG.get("laneBounds", []) or [],
+    }
+
+def _img_cfg_for(_k, _label):
+    # No per-image map → truly legacy save → one shared top-level config.
+    if not _images_cfg:
+        return _legacy_cfg()
+    # 1) exact runtime-key match (the stable Source inset key).
+    ic = _images_cfg.get(str(_k))
+    if ic is None:
+        # 2) echoed-key / label match so a config still resolves if the key
+        #    ever drifts (e.g. a re-imported project).
+        for _ekey, _ev in _images_cfg.items():
+            if not isinstance(_ev, dict):
+                continue
+            if str(_ev.get("imageKey") or _ekey) == str(_k):
+                ic = _ev; break
+            if _label and str(_ev.get("imageLabel") or "") == str(_label):
+                ic = _ev; break
+    # 3) new-style config but THIS membrane wasn't picked → empty (no bands).
+    #    Crucially do NOT borrow another image's ROIs — blots differ.
+    if not isinstance(ic, dict):
+        return {"lanes": [], "groups": [], "loadingControlEnabled": False,
+                "lcBandByLane": {}, "loadingControlLevel": None,
+                "bandOrientation": "auto", "laneBounds": []}
+    return ic
+
+def _maps_for_cfg(icfg):
+    lc_enabled = bool(icfg.get("loadingControlEnabled"))
+    lc_pick = {str(k): str(v) for k, v in (icfg.get("lcBandByLane") or {}).items()}
+    lc_for_band = {}
+    for _ln, _bn in lc_pick.items():
+        if _bn:
+            lc_for_band.setdefault(_bn, []).append(_ln)
+    lc_lvl = icfg.get("loadingControlLevel")             # legacy by-level flag
+    b2g = {}; l2g = {}
+    for g in (icfg.get("groups", []) or []):
+        nm = (g.get("name") or "").strip()
+        if not nm: continue
+        for bn in (g.get("bands", []) or []):
+            b2g[str(bn)] = nm
+        for ln in (g.get("lanes", []) or []):
+            l2g[str(ln)] = nm
+    return lc_enabled, lc_pick, lc_for_band, lc_lvl, b2g, l2g
+
+image_items = [(str(v.get("label") or _k), str(_k), v) for _k, v in inputs.items()
                if isinstance(v, dict) and ("image_raw" in v or "image" in v)]
 if not image_items:
     raise SystemExit("No membrane image — wire the blot (Source) into this node.")
 _multi = len(image_items) > 1
 
-def _quantify_image(_img_label, src):
+def _quantify_image(_img_label, src, icfg):
+    # Per-image picking → per-image LC + group maps + orientation.
+    lc_enabled, lc_pick_for_lane, lc_for_by_band, lc_level, band2group, lane2group = _maps_for_cfg(icfg)
+    _lanes = icfg.get("lanes", []) or []
+    if not _lanes:
+        print(f"[{_img_label}] no bands picked for this membrane — skipped (open 'Pick bands…' and select it in the image cycler)")
+        return []
     # FULL-BIT-DEPTH pixels (e.g. 16-bit) for quantitative IOD; fall back to
     # the 8-bit display image only when raw isn't available.
     use_raw = "image_raw" in src
@@ -290,7 +414,7 @@ def _quantify_image(_img_label, src):
     # (film + fluorescent) is each handled correctly.
     vmax = 65535.0 if float(plane.max()) > 255.0 else 255.0
     median_v = float(np.median(plane))
-    _orient = str(CFG.get("bandOrientation") or "auto").lower()
+    _orient = str(icfg.get("bandOrientation") or "auto").lower()
     if _orient == "dark_on_light":
         dark_on_light = True
     elif _orient == "light_on_dark":
@@ -312,10 +436,10 @@ def _quantify_image(_img_label, src):
 
     # Pre-compute ALL ROI rects so background sampling excludes pixels
     # falling inside ANOTHER band's box (densely packed blots).
-    all_rects = [(_px(b), id(b)) for b in (CFG.get("lanes", []) or [])]
+    all_rects = [(_px(b), id(b)) for b in _lanes]
 
     img_rows = []
-    for i, band in enumerate(CFG.get("lanes", [])):
+    for i, band in enumerate(_lanes):
         x0, y0, x1, y1 = _px(band)
         if x1 <= x0 or y1 <= y0:
             continue
@@ -429,7 +553,7 @@ def _quantify_image(_img_label, src):
                 font = _PIL_F.load_default()
                 target_font_size = 14
             font_size = int(getattr(font, "size", None) or target_font_size)
-            for band in (CFG.get("lanes", []) or []):
+            for band in _lanes:
                 try:
                     x0, y0, x1, y1 = _px(band)
                     if x1 <= x0 or y1 <= y0: continue
@@ -448,7 +572,7 @@ def _quantify_image(_img_label, src):
                     bands_skipped += 1
                     print(f"[band-picker] band draw skipped ({band.get('name', '?')}): {_be}", file=_sys.stderr)
             if lc_enabled:
-                for lb in (CFG.get("laneBounds", []) or []):
+                for lb in (icfg.get("laneBounds", []) or []):
                     try:
                         lx0 = int(round(float(lb.get("x1", 0)) * W))
                         lx1 = int(round(float(lb.get("x2", 0)) * W))
@@ -477,20 +601,21 @@ def _quantify_image(_img_label, src):
     return img_rows
 
 rows = []
-for _lab, _src in image_items:
-    rows.extend(_quantify_image(_lab, _src))
+for _lab, _key, _src in image_items:
+    rows.extend(_quantify_image(_lab, _src, _img_cfg_for(_key, _lab)))
 
 if not rows:
-    raise SystemExit("No bands defined — open 'Pick bands…' and mark each band.")
+    raise SystemExit("No bands defined — open 'Pick bands…' and mark each band (select each wired membrane in the image cycler).")
 
-_n_imgs = len(image_items)
+_n_imgs = len({r["image"] for r in rows})
 _n_lanes = len({r["lane"] for r in rows})
 _n_levels = len({r["level"] for r in rows})
 print(f"quantified {len(rows)} band-row(s) across {_n_imgs} image(s), {_n_lanes} lane(s) x {_n_levels} level(s)")
-if lc_level:
-    print(f"loading control level = {lc_level!r}")
+_lc_rows = sum(1 for r in rows if r.get("is_loading_control"))
+if _lc_rows:
+    print(f"{_lc_rows} loading-control band(s) flagged — Normalize will divide each lane by its own LC")
 else:
-    print("no loading-control level set — Normalize will pass IOD through unchanged")
+    print("no loading control flagged — Normalize will pass IOD through unchanged")
 mpfig_data(rows, name="band_iod")
 `;
 }
@@ -641,13 +766,11 @@ interface DragState {
 
 interface BandPickerDialogProps {
   open: boolean;
-  /** Membrane image as a base64 PNG (no data: prefix) or a data URL — used for
-   *  the editor DISPLAY and as the detection fallback. */
-  imageSrc: string | null;
-  /** Source descriptor so the backend can re-extract the FULL-RES (and
-   *  full-bit-depth) image for detection. Either a builder inset
-   *  (row/col/inset_index) or a standalone analysis upload ({name}). */
-  source?: { key: string; name?: string; row?: number; col?: number; inset_index?: number } | null;
+  /** EVERY wired membrane — each with its stable runtime id (Source inset
+   *  key), display label, base64 thumbnail and source descriptor.  The
+   *  dialog shows one at a time via the image cycler; each gets its own
+   *  picking (lanes / groups / loading control / orientation). */
+  images: BandPickerImage[];
   initial: BandPickerConfig | null;
   onClose: () => void;
   onSave: (cfg: BandPickerConfig) => void;
@@ -657,8 +780,25 @@ const MAX_DISP_W = 900;
 const MAX_DISP_H = 760;
 
 export default function BandPickerDialog(props: BandPickerDialogProps) {
-  const { open, imageSrc, source, initial, onClose, onSave } = props;
+  const { open, images, initial, onClose, onSave } = props;
+  // The dialog edits ONE membrane at a time. `cfg` holds the ACTIVE image's
+  // picking (lanes/groups/LC/orientation) plus the GLOBAL fields
+  // (plotPerGroup / bg*). Every other image's picking lives in
+  // `perImageStore`, keyed by its runtime id. Switching the cycler stashes
+  // the active picking into the store and loads the target's. Save assembles
+  // them all into cfg.images. This keeps the entire existing single-image
+  // editor body unchanged.
   const [cfg, setCfg] = useState<BandPickerConfig>(initial ?? emptyBandConfig());
+  const [perImageStore, setPerImageStore] = useState<Record<string, BandImageConfig>>({});
+  const [activeIdx, setActiveIdx] = useState(0);
+  // Always-current cfg snapshot so switchImage can stash without stale reads.
+  const cfgRef = useRef(cfg);
+  useEffect(() => { cfgRef.current = cfg; }, [cfg]);
+  // The membrane currently shown + its source/thumbnail (drives the editor
+  // display, wb-preview fetch and auto-detect — same vars the body used).
+  const activeImage = images[activeIdx] || null;
+  const imageSrc = activeImage?.image_b64 || null;
+  const source = activeImage?.source || null;
   const [selId, setSelId] = useState<string | null>(null);
   const [detecting, setDetecting] = useState(false);
   const [detectInfo, setDetectInfo] = useState<string | null>(null);
@@ -686,16 +826,83 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
   const imgAreaRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<DragState | null>(null);
 
-  // Reset state whenever the dialog (re)opens with fresh inputs.
+  // Reset + MIGRATE state whenever the dialog (re)opens. Builds the
+  // per-image store from `initial`:
+  //   • new-style config (has .images) → use it directly.
+  //   • legacy config (top-level .lanes, no .images) → assign that single
+  //     picking to the FIRST wired image (the only one the old single-image
+  //     dialog could ever have shown).
+  // Every currently-wired image then gets an entry (empty if never picked),
+  // and the dialog opens on image 0 with that image's picking loaded.
   useEffect(() => {
-    if (open) {
-      setCfg(initial ? structuredClone(initial) : emptyBandConfig());
-      setSelId(null);
-      setDetectInfo(null);
-      setPreviewSrc(null);
-      setView({ zoom: 1, panX: 0, panY: 0 });
+    if (!open) return;
+    const base = initial ? structuredClone(initial) : emptyBandConfig();
+    const store: Record<string, BandImageConfig> = {};
+    if (base.images && Object.keys(base.images).length) {
+      for (const [k, v] of Object.entries(base.images)) store[k] = v;
+    } else if ((base.lanes?.length ?? 0) > 0 && images.length) {
+      store[images[0].id] = extractImageConfig(base);
     }
-  }, [open, initial]);
+    for (const im of images) if (!store[im.id]) store[im.id] = emptyImageConfig();
+    const firstId = images[0]?.id;
+    const activeImg = firstId ? store[firstId] : extractImageConfig(base);
+    // Working cfg = GLOBAL fields (kept from base) overlaid with image 0.
+    const globalCfg: BandPickerConfig = {
+      ...base, images: store,
+      // clear top-level per-image fields; applyImageConfig sets the active ones.
+      lanes: [], groups: [], laneBounds: [], lcBandByLane: {},
+    };
+    setPerImageStore(store);
+    setActiveIdx(0);
+    setCfg(applyImageConfig(globalCfg, activeImg));
+    setSelId(null);
+    setDetectInfo(null);
+    setPreviewSrc(null);
+    setView({ zoom: 1, panX: 0, panY: 0 });
+  }, [open, initial, images]);
+
+  /** Stash the active membrane's picking into the store and load another
+   *  membrane's. The single-image editor body keeps working unchanged —
+   *  it only ever sees the active image's cfg. */
+  const switchImage = useCallback((nextIdx: number) => {
+    if (nextIdx === activeIdx || nextIdx < 0 || nextIdx >= images.length) return;
+    const curId = images[activeIdx]?.id;
+    const nextId = images[nextIdx]?.id;
+    if (!nextId) return;
+    setPerImageStore((store) => {
+      const stash = { ...store };
+      if (curId) stash[curId] = extractImageConfig(cfgRef.current);
+      const nextImg = stash[nextId] || emptyImageConfig();
+      setCfg((c) => applyImageConfig(c, nextImg));
+      return stash;
+    });
+    setActiveIdx(nextIdx);
+    setSelId(null);
+    setDetectInfo(null);
+    setPreviewSrc(null);
+    setView({ zoom: 1, panX: 0, panY: 0 });
+  }, [activeIdx, images]);
+
+  /** Assemble the final multi-image config and hand it to onSave. Stashes the
+   *  active image first, echoes each image's key+label for robust runtime
+   *  resolution, and keeps a top-level mirror of the FIRST image for
+   *  back-compat with code that still reads cfg.lanes / cfg.groups. */
+  const handleSave = useCallback(() => {
+    const store: Record<string, BandImageConfig> = { ...perImageStore };
+    const curId = images[activeIdx]?.id;
+    if (curId) store[curId] = extractImageConfig(cfgRef.current);
+    // Echo key + label into each entry (label fallback for runtime matching).
+    for (const im of images) {
+      if (store[im.id]) store[im.id] = { ...store[im.id], imageKey: im.id, imageLabel: im.label };
+    }
+    const firstId = images[0]?.id;
+    const firstImg = firstId ? (store[firstId] || emptyImageConfig()) : extractImageConfig(cfgRef.current);
+    const final: BandPickerConfig = {
+      ...applyImageConfig(cfgRef.current, firstImg), // top-level mirror = first image
+      images: store,
+    };
+    onSave(final);
+  }, [perImageStore, images, activeIdx, onSave]);
 
   // High-resolution preview on open. The upstream Source node's image_b64 is
   // a sub-512 px thumbnail (that's all collectInputs ships through the graph),
@@ -1428,6 +1635,54 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
 
         {/* Controls — fixed-width column on the left, scrolls if tall. */}
         <Box sx={{ width: 380, flexShrink: 0, display: "flex", flexDirection: "column", gap: 1.25, overflowY: "auto", overflowX: "hidden" }}>
+          {/* ── Image cycler ──
+              Western blots are analysed PER IMAGE, so each wired membrane
+              needs its OWN band picking. Move between membranes with ‹ ›
+              (or click a chip); each keeps its own lanes / groups / loading
+              control. A ✓ chip = that membrane already has bands. */}
+          {images.length > 1 && (
+            <Box sx={{ border: "1px solid", borderColor: "primary.main", borderRadius: 1, p: 1, bgcolor: "action.hover" }}>
+              <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                <Tooltip title="Each western blot is analysed independently and produces its own graph(s). Pick bands for EACH membrane — use ‹ › or the chips below to switch. Every membrane keeps its own lanes, groups and loading control.">
+                  <Typography variant="caption" sx={{ fontWeight: 700 }}>
+                    Membrane {activeIdx + 1} / {images.length}
+                  </Typography>
+                </Tooltip>
+                <Box sx={{ ml: "auto", display: "flex", gap: 0.5 }}>
+                  <Button size="small" variant="outlined" sx={{ minWidth: 0, px: 1, py: 0.1, lineHeight: 1 }}
+                    disabled={activeIdx <= 0} onClick={() => switchImage(activeIdx - 1)}>‹</Button>
+                  <Button size="small" variant="outlined" sx={{ minWidth: 0, px: 1, py: 0.1, lineHeight: 1 }}
+                    disabled={activeIdx >= images.length - 1} onClick={() => switchImage(activeIdx + 1)}>›</Button>
+                </Box>
+              </Box>
+              <Typography variant="caption" sx={{ display: "block", mt: 0.25, fontWeight: 600, color: "primary.main", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {activeImage?.label || "(membrane)"}
+              </Typography>
+              <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.4, mt: 0.5 }}>
+                {images.map((im, i) => {
+                  const icfg = i === activeIdx ? cfg : (perImageStore[im.id] || emptyImageConfig());
+                  const n = icfg.lanes?.length ?? 0;
+                  const done = n > 0;
+                  const active = i === activeIdx;
+                  return (
+                    <Tooltip key={im.id} title={`${im.label} — ${n} band(s)`}>
+                      <Box onClick={() => switchImage(i)} sx={{
+                        cursor: "pointer", userSelect: "none", fontSize: "0.6rem",
+                        px: 0.5, py: 0.15, borderRadius: 0.5, border: "1px solid",
+                        borderColor: active ? "primary.main" : (done ? "success.main" : "divider"),
+                        bgcolor: active ? "primary.main" : "transparent",
+                        color: active ? "primary.contrastText" : (done ? "success.main" : "text.secondary"),
+                        fontWeight: active ? 700 : 500,
+                        maxWidth: 100, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      }}>
+                        {done ? "✓ " : "• "}{im.label}
+                      </Box>
+                    </Tooltip>
+                  );
+                })}
+              </Box>
+            </Box>
+          )}
           <Box sx={{ display: "flex", gap: 1, alignItems: "center", flexWrap: "wrap" }}>
             <Button size="small" variant="contained" startIcon={<AutoFixHighIcon sx={{ fontSize: 16 }} />}
               onClick={runAutoDetect} disabled={!srcUrl || detecting}>
@@ -1790,17 +2045,29 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
             least one group has at least one band assigned, so the user
             doesn't keep cycling Run graph → picker → save → halt. */}
         {(() => {
-          const hasBands = cfg.lanes.length > 0;
-          const groupCount = (cfg.groups ?? []).length;
-          const groupsWithBands = (cfg.groups ?? []).filter((g) => (g.bands?.length ?? 0) > 0).length;
-          const canSave = !hasBands || (groupCount > 0 && groupsWithBands > 0);
+          // Validate EVERY membrane (active cfg + stashed store): each image
+          // that has bands must have at least one group with an assigned
+          // band, else its per-image plot would be empty. Surfaces which
+          // membrane is incomplete so the user knows which to open.
+          const curId = images[activeIdx]?.id;
+          const perImg = (images.length ? images : [{ id: "__single__", label: "this membrane", image_b64: "" } as BandPickerImage])
+            .map((im) => ({
+              label: im.label,
+              icfg: (images.length === 0 || im.id === curId)
+                ? extractImageConfig(cfg)
+                : (perImageStore[im.id] || emptyImageConfig()),
+            }));
+          const withBands = perImg.filter((p) => (p.icfg.lanes?.length ?? 0) > 0);
+          const offending = withBands.filter((p) => {
+            const gs = p.icfg.groups ?? [];
+            return !(gs.length > 0 && gs.some((g) => (g.bands?.length ?? 0) > 0));
+          });
+          const canSave = offending.length === 0;
           let reason = "";
-          if (hasBands && groupCount === 0) {
-            reason = "⚠ No groups defined yet — the analysis runner halts on save. "
-              + "Click \"+ Group\" above and assign at least one band before saving.";
-          } else if (hasBands && groupsWithBands === 0) {
-            reason = "⚠ You have groups but no bands assigned to any of them — "
-              + "click the band-name chips (B1, B2, …) inside a group row to assign them, then save.";
+          if (offending.length) {
+            reason = images.length > 1
+              ? `⚠ ${offending.length} membrane(s) have bands but no group with an assigned band: ${offending.map((p) => p.label).join(", ")}. Select each in the image cycler, click "+ Group" and assign bands (B1, B2, …), then save.`
+              : "⚠ You have bands but no group with an assigned band — click \"+ Group\" above and assign at least one band before saving.";
           }
           return (
             <>
@@ -1823,9 +2090,9 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
                          disableFocusListener={canSave}>
                   <span>
                     <Button variant="contained" disabled={!canSave}
-                            onClick={() => onSave(cfg)}
+                            onClick={handleSave}
                             sx={{ textTransform: "none" }}>
-                      Save bands
+                      {images.length > 1 ? "Save all bands" : "Save bands"}
                     </Button>
                   </span>
                 </Tooltip>
