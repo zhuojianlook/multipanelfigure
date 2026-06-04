@@ -925,6 +925,23 @@ if mode == "cellpose":
             b_right[:, :-1] = labels[:, :-1]   != labels[:, 1:]
             boundaries = (b_up | b_down | b_left | b_right) & (labels > 0)
             comp[boundaries] = (255, 255, 0)
+            # 2b) Nuclei outlines (CYAN) when a nuclei pass ran ("Measure
+            #     compartments" on).  Drawn AFTER the cell border so both
+            #     are visible: yellow = cell body, cyan = nucleus.  nuc_lbl
+            #     is the per-image nucleus label array at the same native
+            #     resolution as the cell labels (compartment block above).
+            if nuc_lbl is not None and getattr(nuc_lbl, "shape", None) == labels.shape:
+                _nl = nuc_lbl
+                nb_up    = np.zeros(_nl.shape, dtype=bool)
+                nb_down  = np.zeros(_nl.shape, dtype=bool)
+                nb_left  = np.zeros(_nl.shape, dtype=bool)
+                nb_right = np.zeros(_nl.shape, dtype=bool)
+                nb_up[1:, :]     = _nl[1:, :]    != _nl[:-1, :]
+                nb_down[:-1, :]  = _nl[:-1, :]   != _nl[1:, :]
+                nb_left[:, 1:]   = _nl[:, 1:]    != _nl[:, :-1]
+                nb_right[:, :-1] = _nl[:, :-1]   != _nl[:, 1:]
+                nuc_boundaries = (nb_up | nb_down | nb_left | nb_right) & (_nl > 0)
+                comp[nuc_boundaries] = (0, 255, 255)
             overlay = _Im.fromarray(comp)
             d = _ImD.Draw(overlay)
             for cid in cell_ids[:300]:
