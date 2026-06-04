@@ -3086,51 +3086,56 @@ def _num(x):
 # cross-lane LC, e.g. lane S1's bands divided by a band from S2). The
 # picker emits a "lc_for_lane" column per row listing every lane this
 # row serves as the LC for; we reverse it here.
+# Keyed by (image, lane) — western blots are analysed PER IMAGE, and the
+# same lane label (S1, S2, …) recurs on every membrane, so a lane-only key
+# would let one blot's loading control normalise another blot's bands.
 lc_by_lane = {}
 for r in table:
+    img = str(r.get("image") or "")
     targets = str(r.get("lc_for_lane") or "").strip()
     if not targets: continue
     for ln in targets.split(","):
         ln = ln.strip()
-        if ln: lc_by_lane[ln] = _num(r.get("iod"))
+        if ln: lc_by_lane[(img, ln)] = _num(r.get("iod"))
 
 # Legacy fallback: older picker output (or a non-picker workflow) carries
 # only is_loading_control, with no cross-lane mapping. Treat each LC band
-# as the normaliser for its OWN lane — same as the previous logic.
+# as the normaliser for its OWN (image, lane) — same as the previous logic.
 if not lc_by_lane:
     for r in table:
         if _truthy(r.get("is_loading_control")):
-            lc_by_lane[str(r.get("lane"))] = _num(r.get("iod"))
+            lc_by_lane[(str(r.get("image") or ""), str(r.get("lane")))] = _num(r.get("iod"))
 
 have_lc = len(lc_by_lane) > 0
 if have_lc:
-    print(f"loading control present for {len(lc_by_lane)} lane(s): {sorted(lc_by_lane.keys())}")
-    # Sanity print: which band's IOD is normalising which lane(s).
-    # Verifies the picker's custom-box / cross-lane LC selection
-    # actually flowed through.  Resolve each lane → the band-row
-    # whose iod matches what we stored (the row that produced it).
+    print(f"loading control present for {len(lc_by_lane)} (image, lane) pair(s)")
+    # Sanity print: which band's IOD normalises which (image, lane).
     _lookup = {}
     for r in table:
         if _truthy(r.get("is_loading_control")):
+            _img = str(r.get("image") or "")
             for ln in str(r.get("lc_for_lane") or r.get("lane") or "").split(","):
                 ln = ln.strip()
                 if not ln: continue
-                _lookup[ln] = (str(r.get("band") or "?"), str(r.get("lane") or "?"), _num(r.get("iod")))
-    for ln in sorted(lc_by_lane.keys()):
-        if ln in _lookup:
-            _bn, _bl, _bi = _lookup[ln]
-            cross = " (cross-lane)" if _bl != ln else ""
-            print(f"  lane {ln!r} normalised by band {_bn!r} from lane {_bl!r} (IOD={_bi:.1f}){cross}")
+                _lookup[(_img, ln)] = (str(r.get("band") or "?"), str(r.get("lane") or "?"), _num(r.get("iod")))
+    for key in sorted(lc_by_lane.keys()):
+        _img, _ln = key
+        _where = f"image {_img!r} lane {_ln!r}" if _img else f"lane {_ln!r}"
+        if key in _lookup:
+            _bn, _bl, _bi = _lookup[key]
+            cross = " (cross-lane)" if _bl != _ln else ""
+            print(f"  {_where} normalised by band {_bn!r} from lane {_bl!r} (IOD={_bi:.1f}){cross}")
         else:
-            print(f"  lane {ln!r} normalised by IOD={lc_by_lane[ln]:.1f} (legacy is_loading_control marker)")
+            print(f"  {_where} normalised by IOD={lc_by_lane[key]:.1f} (legacy is_loading_control marker)")
 else:
     print("no loading-control set — passing raw IOD through (normalized == iod)")
 
 rows = []
 for r in table:
+    img = str(r.get("image") or "")
     lane = str(r.get("lane", ""))
     iod = _num(r.get("iod"))
-    lc = lc_by_lane.get(lane, 0.0)
+    lc = lc_by_lane.get((img, lane), 0.0)
     norm = (iod / lc) if (have_lc and lc > 0) else iod
     rows.append({**r, "lc_iod": lc, "normalized": norm})
 
@@ -3178,10 +3183,14 @@ if (!"band"  %in% names(df)) df$band  <- as.character(seq_len(nrow(df)))
 if (!"lane"  %in% names(df)) df$lane  <- df$band
 if (!"level" %in% names(df)) df$level <- "Target"
 if (!"group" %in% names(df)) df$group <- ""
+# Source membrane — western blots are analysed PER IMAGE, so we render one
+# graph per distinct image. Older single-blot tables have no image column.
+if (!"image" %in% names(df)) df$image <- ""
 df$band  <- as.character(df$band)
 df$lane  <- as.character(df$lane)
 df$level <- as.character(df$level)
 df$group <- as.character(df$group)
+df$image <- as.character(df$image)
 df <- df[is.finite(df$value), , drop = FALSE]
 
 # When LC mode is on, the LC band normalises to 1 by definition →
@@ -3199,59 +3208,26 @@ df$group[!nzchar(df$group)] <- "(ungrouped)"
 if (nrow(df) == 0)
   stop("No bands left to plot after filtering — check the picker's Groups and (when LC is on) the lane LC picks.")
 
-groups <- unique(df$group)
-
-# Per-(group, band) mean ± SD. Replicates of the same name within a
-# group → one bar with SD; unique bands → one bar with SD=0.
-agg <- aggregate(value ~ group + band, data = df,
-                 FUN = function(v) c(m = mean(v), s = sd(v), n = length(v)))
-summ <- data.frame(group = agg$group, band = agg$band,
-                   mean = agg$value[, "m"], sd = agg$value[, "s"], n = agg$value[, "n"])
-summ$sd[is.na(summ$sd)] <- 0
-# Stable band order within each facet: first-appearance order in df.
-summ$band <- factor(summ$band, levels = unique(df$band))
-df$band   <- factor(df$band,   levels = unique(df$band))
-
-n_facets <- length(groups)
 y_lab <- if (val_col == "normalized") "Relative density (vs loading control)" else "Integrated optical density (a.u.)"
 plot_subtitle <- if (val_col == "normalized")
   "loading-control corrected (each band ÷ its lane's LC band)"
 else "raw IOD — no loading-control normalisation"
 
-# Picker toggle "Plot layout" — one figure per group vs combined facets.
+# Picker toggle "Plot layout" — one figure per group vs combined facets
+# (applied WITHIN each image).
 plot_per_group <- "plot_per_group" %in% names(df) &&
   any(tolower(as.character(df$plot_per_group)) %in% c("true", "1", "yes"))
 
-# Helper: render one ggplot for either a single group's subset of df /
-# summ (per-group mode) or the whole thing (combined mode). Layout
-# decisions are picked to avoid the chronic cut-off-axes problem that
-# ggplot's default margins inflict on dense bar charts:
-#   • Generous plot margins (top 18, right 18, bottom 22, left 22) so
-#     angled x labels + Y axis titles never clip the edge of the PNG.
-#   • Y-axis scale uses expansion(mult = c(0, 0.10)) — starts hard at
-#     0 (so the bar bases sit on the axis) but adds 10% headroom on
-#     top so the tallest bar + error whisker + jittered points don't
-#     touch the top edge.
-#   • Y-axis label formatter switches between scientific (very large
-#     IODs) and compact decimal (relative density) based on the value
-#     range, so labels stay readable.
-#   • Smaller-but-still-legible facet titles + 10-pt body so 3-up
-#     panels don't squish the y-axis ticks into noise.
-render_one <- function(d_sub, s_sub, facet_var, w, h, fname, group_title = NULL) {
-  # Pick a y-tick formatter based on the magnitude of values.
+.wb_safe <- function(s) gsub("[^A-Za-z0-9_-]", "_", as.character(s))
+
+# Render one ggplot (a single group, or all groups faceted). Layout is
+# picked to avoid clipped axes: generous margins, 10% top headroom, a
+# magnitude-aware y-tick formatter, and small-but-legible facet titles.
+render_one <- function(d_sub, s_sub, facet_var, w, h, fname, title_text, n_facets = 3) {
   ymax_v <- if (nrow(s_sub) > 0) max(s_sub$mean + s_sub$sd, na.rm = TRUE) else 1
   y_fmt <- if (val_col == "normalized") scales::label_number(accuracy = 0.1)
            else if (is.finite(ymax_v) && ymax_v >= 1e5) scales::label_scientific(digits = 2)
            else scales::label_number(big.mark = ",", accuracy = 1)
-  # Plot title — when a single group is being rendered we show its
-  # name prominently so a saved per-group PNG is self-describing
-  # (was "wb_Treatment.png" with no on-figure label — easy to mix
-  # up once the figure left the analysis pane).  Combined / faceted
-  # plots get a generic title since the facet strips already carry
-  # the group names.
-  ptitle <- if (!is.null(group_title) && nzchar(as.character(group_title)))
-              paste0("Group: ", as.character(group_title))
-            else "Band quantification"
   p <- ggplot() +
     geom_col(data = s_sub, aes(x = band, y = mean, fill = band),
              width = 0.75, color = "grey25", linewidth = 0.3) +
@@ -3275,7 +3251,7 @@ render_one <- function(d_sub, s_sub, facet_var, w, h, fname, group_title = NULL)
                                        margin = margin(b = 6)),
           plot.margin = margin(t = 18, r = 18, b = 22, l = 22)) +
     labs(x = NULL, y = .mpfig_wrap(y_lab, 36),
-         title = .mpfig_fit(ptitle, width_in = w / 300),
+         title = .mpfig_fit(title_text, width_in = w / 300),
          subtitle = .mpfig_fit(plot_subtitle, width_in = w / 300, cpi = 13))
   if (!is.null(facet_var)) p <- p + facet_wrap(as.formula(paste("~", facet_var)),
                                                 scales = "free_y",
@@ -3288,32 +3264,50 @@ render_one <- function(d_sub, s_sub, facet_var, w, h, fname, group_title = NULL)
   print(p)
 }
 
-if (plot_per_group) {
-  # One PNG per group, each named "wb_<group>.png". Each one is movable
-  # into the figure timeline independently — useful when you want one
-  # panel per protein/condition rather than a shared grid. Per-panel
-  # canvas is slightly wider/taller than the old 700×900 so axes have
-  # the room they need for big-number IOD labels.
-  for (g in groups) {
-    d_sub <- df[df$group == g, , drop = FALSE]
-    s_sub <- summ[summ$group == g, , drop = FALSE]
-    n_bands <- length(unique(as.character(d_sub$band)))
-    safe_name <- gsub("[^A-Za-z0-9_-]", "_", g)
-    render_one(d_sub, s_sub, NULL,
-               w = max(900, 120 * n_bands + 480),
-               h = 1000, fname = paste0("wb_", safe_name, ".png"),
-               group_title = g)
+# Render every graph for ONE membrane. WB analysis is per-image, so when
+# more than one blot is wired each gets its own graph(s) with filenames +
+# titles namespaced by image; a single blot keeps the canonical names
+# ("wb_band_comparison.png" / "wb_<group>.png") so downstream is unchanged.
+render_image <- function(df_img, im, multi) {
+  if (nrow(df_img) == 0) return(invisible(NULL))
+  groups <- unique(df_img$group)
+  agg <- aggregate(value ~ group + band, data = df_img,
+                   FUN = function(v) c(m = mean(v), s = sd(v), n = length(v)))
+  summ <- data.frame(group = agg$group, band = agg$band,
+                     mean = agg$value[, "m"], sd = agg$value[, "s"], n = agg$value[, "n"])
+  summ$sd[is.na(summ$sd)] <- 0
+  summ$band  <- factor(summ$band,  levels = unique(df_img$band))
+  df_img$band <- factor(df_img$band, levels = unique(df_img$band))
+  n_facets <- length(groups)
+  pfx <- if (multi) paste0(.wb_safe(im), "_") else ""
+  if (plot_per_group) {
+    for (g in groups) {
+      d_sub <- df_img[df_img$group == g, , drop = FALSE]
+      s_sub <- summ[summ$group == g, , drop = FALSE]
+      n_bands <- length(unique(as.character(d_sub$band)))
+      ttl <- if (multi) paste0(im, " — ", g) else paste0("Group: ", g)
+      render_one(d_sub, s_sub, NULL,
+                 w = max(900, 120 * n_bands + 480), h = 1000,
+                 fname = paste0("wb_", pfx, .wb_safe(g), ".png"),
+                 title_text = ttl, n_facets = n_facets)
+    }
+  } else {
+    n_bands_max <- max(vapply(groups, function(g) length(unique(as.character(df_img$band[df_img$group == g]))), integer(1)))
+    per_panel_w <- max(520, 110 * n_bands_max + 280)
+    ttl <- if (multi) as.character(im) else "Band quantification"
+    render_one(df_img, summ, "group",
+               w = per_panel_w * min(n_facets, 3) + 80,
+               h = 1000 * ceiling(n_facets / 3),
+               fname = paste0("wb_", pfx, "band_comparison.png"),
+               title_text = ttl, n_facets = n_facets)
   }
-} else {
-  # Combined facets — width scales with facet count, height with the
-  # number of rows (max 3 columns). Generous baseline so the y-axis
-  # labels never get crowded out by the bars.
-  n_bands_max <- max(vapply(groups, function(g) length(unique(as.character(df$band[df$group == g]))), integer(1)))
-  per_panel_w <- max(520, 110 * n_bands_max + 280)
-  render_one(df, summ, "group",
-             w = per_panel_w * min(n_facets, 3) + 80,
-             h = 1000 * ceiling(n_facets / 3),
-             fname = "wb_band_comparison.png")
+}
+
+# One graph (set) per source membrane — the appropriate number of graphs.
+images <- unique(df$image)
+.multi_img <- length(images) > 1
+for (im in images) {
+  render_image(df[df$image == im, , drop = FALSE], im, .multi_img)
 }
 }
 `;

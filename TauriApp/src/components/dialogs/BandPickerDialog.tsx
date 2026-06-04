@@ -221,62 +221,6 @@ import numpy as np, json
 
 CFG = json.loads(r'''${json}''')
 
-imgs = [v for v in inputs.values() if isinstance(v, dict) and ("image_raw" in v or "image" in v)]
-if not imgs:
-    raise SystemExit("No membrane image — wire the blot (Source) into this node.")
-src = imgs[0]
-# FULL-BIT-DEPTH pixels (e.g. 16-bit) for quantitative IOD; fall back to the
-# 8-bit display image only when raw isn't available.
-use_raw = "image_raw" in src
-arr = np.asarray(src["image_raw"] if use_raw else src["image"]).astype(np.float32)
-# Measurement plane — max over RGB to match detect_bands_equal_boxes.py
-# (--measurement-channel max default).
-if arr.ndim == 3 and arr.shape[2] >= 3:
-    plane = np.max(arr[..., :3], axis=2)
-elif arr.ndim == 3:
-    plane = arr[..., 0]
-else:
-    plane = arr
-H, W = plane.shape[:2]
-
-# Orientation handling — DARK-on-LIGHT blots (chemiluminescent / film:
-# dark bands on a light background) need the plane inverted before
-# summing, so that "stronger band = LARGER IOD" matches the conventional
-# Western-blot semantics.  LIGHT-on-DARK blots (fluorescent, LI-COR /
-# Odyssey: bright bands on dark background) already satisfy that and
-# need no inversion.
-#
-# CFG["bandOrientation"]:
-#   "dark_on_light" — force inversion
-#   "light_on_dark" — force no inversion (raw sum = density)
-#   "auto" / missing — pick by the median of the plane (median > vmax/2
-#     → mostly-light background → dark-on-light → invert).  Wrong only
-#     when the image was contrast-stretched in a way that confuses the
-#     heuristic; flip the picker's "Image orientation" radio to fix.
-vmax = 65535.0 if float(plane.max()) > 255.0 else 255.0
-median_v = float(np.median(plane))
-_orient = str(CFG.get("bandOrientation") or "auto").lower()
-if _orient == "dark_on_light":
-    dark_on_light = True
-elif _orient == "light_on_dark":
-    dark_on_light = False
-else:
-    dark_on_light = median_v > vmax * 0.5
-if dark_on_light:
-    plane = vmax - plane
-    print(f"IOD orientation: DARK-on-LIGHT (median={median_v:.1f}/{vmax:.0f}, source={_orient}) "
-          f"— inverted plane so signal = integrated density (higher = more protein)")
-else:
-    print(f"IOD orientation: LIGHT-on-DARK (median={median_v:.1f}/{vmax:.0f}, source={_orient}) "
-          f"— summing raw pixels directly (bright bands → larger IOD)")
-
-def _px(rect):
-    x0 = int(round(rect["x"] * W)); x1 = int(round((rect["x"] + rect["w"]) * W))
-    y0 = int(round(rect["y"] * H)); y1 = int(round((rect["y"] + rect["h"]) * H))
-    x0, x1 = sorted((max(0, min(W, x0)), max(0, min(W, x1))))
-    y0, y1 = sorted((max(0, min(H, y0)), max(0, min(H, y1))))
-    return x0, y0, x1, y1
-
 def _robust_background(values):
     flat = np.asarray(values).reshape(-1).astype(np.float64)
     if flat.size == 0:
@@ -290,30 +234,22 @@ def _robust_background(values):
             flat = flat[keep]
     return float(np.mean(flat))
 
-# Loading-control configuration:
-#   - loadingControlEnabled == True → use the per-lane band picks (lcBandByLane:
-#       { laneName → bandName }) to flag is_loading_control=True on those rows.
-#   - loadingControlEnabled == False → no LC flagging; downstream Normalize
-#       will pass IOD through unchanged.
-#   - Legacy fallback: loadingControlLevel string flags any band whose level
-#       matches (kept so older saved nodes still normalise correctly).
+import re as _re, sys as _sys
+def _safe_name(s):
+    return (_re.sub(r"[^A-Za-z0-9_-]+", "_", str(s)).strip("_") or "image")
+
+# Loading-control + grouping config — image-INDEPENDENT (the picker's ROIs
+# and group/LC choices apply identically to every wired membrane).
+#   - loadingControlEnabled → flag is_loading_control on the picked bands.
+#   - Legacy fallback: loadingControlLevel string flags by level.
 lc_enabled = bool(CFG.get("loadingControlEnabled"))
 plot_per_group = bool(CFG.get("plotPerGroup"))
-# Picker UI saves { lane_being_normalized: band_name_to_use_as_LC }, which
-# CAN be cross-lane (user-drawn box in lane S2 chosen as the LC for lane S1).
 lc_pick_for_lane = {str(k): str(v) for k, v in (CFG.get("lcBandByLane") or {}).items()}
-# Reverse map: bandName → set of lanes it serves as the LC for. A single
-# band MAY serve multiple lanes (e.g. when the user has only one good
-# housekeeping band on the membrane and reuses it).
 lc_for_by_band: dict = {}
 for _ln, _bn in lc_pick_for_lane.items():
     if _bn:
         lc_for_by_band.setdefault(_bn, []).append(_ln)
 lc_level   = CFG.get("loadingControlLevel")          # legacy
-
-# Band → group(s) and lane → group fallback from the picker's Groups UI.
-# Groups can now contain band NAMES (B1, B5, ...) for arbitrary band-set
-# comparisons, OR lane labels (S1, S2, ...) for the older lane-based form.
 band2group = {}; lane2group = {}
 for g in CFG.get("groups", []) or []:
     nm = (g.get("name") or "").strip()
@@ -323,219 +259,239 @@ for g in CFG.get("groups", []) or []:
     for ln in g.get("lanes", []) or []:
         lane2group[str(ln)] = nm
 
-# Pre-compute ALL ROI rects in pixel space so the background sampling can
-# exclude pixels that fall inside ANOTHER band's box. Without this, densely
-# packed bands (3-row blots etc.) get IOD = 0 because the above/below
-# slabs land on neighbouring bands and inflate the background.
-def _band_px(b):
-    bx0, by0, bx1, by1 = _px(b)
-    return (bx0, by0, bx1, by1)
-all_rects = [(_band_px(b), id(b)) for b in (CFG.get("lanes", []) or [])]
+# Western-blot analysis is PER IMAGE: every wired membrane is quantified
+# independently with the picker's (fractional) ROIs.  Each band row is
+# tagged with its source image, each membrane emits its own annotated
+# overlay, and (downstream) one graph per image is produced.  No
+# cross-image comparison.
+image_items = [(str(v.get("label") or _k), v) for _k, v in inputs.items()
+               if isinstance(v, dict) and ("image_raw" in v or "image" in v)]
+if not image_items:
+    raise SystemExit("No membrane image — wire the blot (Source) into this node.")
+_multi = len(image_items) > 1
+
+def _quantify_image(_img_label, src):
+    # FULL-BIT-DEPTH pixels (e.g. 16-bit) for quantitative IOD; fall back to
+    # the 8-bit display image only when raw isn't available.
+    use_raw = "image_raw" in src
+    arr = np.asarray(src["image_raw"] if use_raw else src["image"]).astype(np.float32)
+    # Measurement plane — max over RGB (matches detect_bands_equal_boxes.py).
+    if arr.ndim == 3 and arr.shape[2] >= 3:
+        plane = np.max(arr[..., :3], axis=2)
+    elif arr.ndim == 3:
+        plane = arr[..., 0]
+    else:
+        plane = arr
+    H, W = plane.shape[:2]
+
+    # Orientation: DARK-on-LIGHT blots invert before summing so
+    # "stronger band = larger IOD"; LIGHT-on-DARK need no inversion.
+    # "auto" picks by the plane median.  Per-image so a mixed batch
+    # (film + fluorescent) is each handled correctly.
+    vmax = 65535.0 if float(plane.max()) > 255.0 else 255.0
+    median_v = float(np.median(plane))
+    _orient = str(CFG.get("bandOrientation") or "auto").lower()
+    if _orient == "dark_on_light":
+        dark_on_light = True
+    elif _orient == "light_on_dark":
+        dark_on_light = False
+    else:
+        dark_on_light = median_v > vmax * 0.5
+    if dark_on_light:
+        plane = vmax - plane
+        print(f"[{_img_label}] IOD orientation: DARK-on-LIGHT (median={median_v:.1f}/{vmax:.0f}, source={_orient}) — inverted plane")
+    else:
+        print(f"[{_img_label}] IOD orientation: LIGHT-on-DARK (median={median_v:.1f}/{vmax:.0f}, source={_orient}) — raw sum")
+
+    def _px(rect):
+        x0 = int(round(rect["x"] * W)); x1 = int(round((rect["x"] + rect["w"]) * W))
+        y0 = int(round(rect["y"] * H)); y1 = int(round((rect["y"] + rect["h"]) * H))
+        x0, x1 = sorted((max(0, min(W, x0)), max(0, min(W, x1))))
+        y0, y1 = sorted((max(0, min(H, y0)), max(0, min(H, y1))))
+        return x0, y0, x1, y1
+
+    # Pre-compute ALL ROI rects so background sampling excludes pixels
+    # falling inside ANOTHER band's box (densely packed blots).
+    all_rects = [(_px(b), id(b)) for b in (CFG.get("lanes", []) or [])]
+
+    img_rows = []
+    for i, band in enumerate(CFG.get("lanes", [])):
+        x0, y0, x1, y1 = _px(band)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        roi = plane[y0:y1, x0:x1].astype(np.float64)
+        area = int(roi.size)
+        others = [r for (r, ref) in all_rects if ref != id(band)]
+        def _excluded_mask(yslab1, yslab2):
+            if yslab2 <= yslab1: return np.zeros((0, x1 - x0), dtype=bool)
+            m = np.zeros((yslab2 - yslab1, x1 - x0), dtype=bool)
+            for (ox0, oy0, ox1, oy1) in others:
+                ix0 = max(x0, ox0); ix1 = min(x1, ox1)
+                iy0 = max(yslab1, oy0); iy1 = min(yslab2, oy1)
+                if ix1 > ix0 and iy1 > iy0:
+                    m[iy0 - yslab1:iy1 - yslab1, ix0 - x0:ix1 - x0] = True
+            return m
+        gap, hh = 6, (y1 - y0)
+        above_y2 = max(0, y0 - gap); above_y1 = max(0, above_y2 - hh)
+        below_y1 = min(H, y1 + gap); below_y2 = min(H, below_y1 + hh)
+        parts = []
+        if above_y2 > above_y1:
+            slab = plane[above_y1:above_y2, x0:x1]
+            msk = _excluded_mask(above_y1, above_y2)
+            parts.append(slab[~msk].reshape(-1))
+        if below_y2 > below_y1:
+            slab = plane[below_y1:below_y2, x0:x1]
+            msk = _excluded_mask(below_y1, below_y2)
+            parts.append(slab[~msk].reshape(-1))
+        bg_pixels = np.concatenate(parts) if parts else np.array([])
+        if bg_pixels.size >= max(20, area // 4):
+            bg_mean = _robust_background(bg_pixels)
+        else:
+            bg_mean = float(np.percentile(roi, 5)) if area else 0.0
+        raw_sum = float(np.sum(roi))
+        corrected = raw_sum - bg_mean * area
+        lane = (band.get("label") or "").strip() or f"Lane {i + 1}"
+        level = (band.get("level") or "").strip() or "Target"
+        band_name = (band.get("name") or "").strip() or f"B{i + 1}"
+        grp = band2group.get(band_name) or lane2group.get(lane) or ""
+        target_lanes_for_this_band = lc_for_by_band.get(band_name, []) if lc_enabled else []
+        if lc_enabled:
+            is_lc = len(target_lanes_for_this_band) > 0
+        elif lc_level:
+            is_lc = (level == lc_level)
+        else:
+            is_lc = False
+        img_rows.append({
+            "image": _img_label,                       # source membrane (per-image split)
+            "band": band_name,                         # UNIQUE per-row identifier
+            "lane": lane,                              # column / sample
+            "level": level,                            # target / MW row
+            "group": grp,                              # condition / experimental group
+            "lc_enabled": bool(lc_enabled),            # plot picks normalised vs raw
+            "plot_per_group": bool(plot_per_group),    # split groups across figures
+            "is_loading_control": bool(is_lc),
+            "lc_for_lane": ",".join(target_lanes_for_this_band),  # lanes this band normalises
+            "iod": float(max(corrected, 0.0)),
+            "raw_integrated_density": raw_sum,
+            "background_corrected_integrated_density": corrected,
+            "background_mean": bg_mean,
+            "mean_signal": float(roi.mean()) if area else 0.0,
+            "area_px": area,
+        })
+
+    # ── Annotated overlay for THIS membrane ──
+    # Single-image workflows keep the canonical "annotated_bands" name so
+    # downstream consumers are unchanged; multi-image runs namespace by
+    # the source label so every blot gets its own overlay.
+    _emit_name = (_safe_name(_img_label) + "_annotated_bands") if _multi else "annotated_bands"
+    annot = None
+    try:
+        from PIL import Image as _PIL_I, ImageDraw as _PIL_D, ImageFont as _PIL_F
+        if arr.ndim == 3 and arr.shape[2] >= 3:
+            rgb_disp = arr[..., :3].astype(np.float32)
+        elif arr.ndim == 3:
+            g = arr[..., 0]
+            rgb_disp = np.stack([g, g, g], axis=-1).astype(np.float32)
+        else:
+            rgb_disp = np.stack([arr, arr, arr], axis=-1).astype(np.float32)
+        _lo, _hi = np.percentile(rgb_disp, [0.5, 99.95])
+        _scaled = np.clip((rgb_disp - _lo) / max(_hi - _lo, 1), 0, 1)
+        _disp_u8 = np.clip(_scaled ** 0.5 * 255.0, 0, 255).astype(np.uint8)
+        annot = _PIL_I.fromarray(_disp_u8).convert("RGB")
+    except Exception as _e:
+        print(f"[band-picker] [{_img_label}] contrast-stretch failed: {_e}", file=_sys.stderr)
+        try:
+            from PIL import Image as _PIL_I2
+            a8 = np.clip(np.asarray(arr).astype(np.float32), 0, 255).astype(np.uint8)
+            if a8.ndim == 2:
+                annot = _PIL_I2.fromarray(a8).convert("RGB")
+            else:
+                annot = _PIL_I2.fromarray(a8[..., :3]).convert("RGB")
+        except Exception as _e2:
+            print(f"[band-picker] [{_img_label}] raw fallback also failed: {_e2}", file=_sys.stderr)
+
+    bands_drawn = 0
+    bands_skipped = 0
+    if annot is not None:
+        try:
+            draw = _PIL_D.Draw(annot)
+            PALETTE = ["#1976d2", "#43a047", "#e65100", "#8e24aa", "#00838f",
+                       "#c62828", "#5d4037", "#558b2f", "#6a1b9a", "#00695c"]
+            level_to_color = {}
+            for r in img_rows:
+                lv = str(r.get("level") or "Target")
+                if lv not in level_to_color:
+                    level_to_color[lv] = PALETTE[len(level_to_color) % len(PALETTE)]
+            try:
+                target_font_size = max(10, int(min(H, W) * 0.012))
+                font = _PIL_F.truetype("DejaVuSans.ttf", target_font_size)
+            except Exception:
+                font = _PIL_F.load_default()
+                target_font_size = 14
+            font_size = int(getattr(font, "size", None) or target_font_size)
+            for band in (CFG.get("lanes", []) or []):
+                try:
+                    x0, y0, x1, y1 = _px(band)
+                    if x1 <= x0 or y1 <= y0: continue
+                    lv = (band.get("level") or "Target").strip() or "Target"
+                    col = level_to_color.get(lv, PALETTE[0])
+                    nm = (band.get("name") or "").strip()
+                    sw = max(1, int(round(min(H, W) / 600)))
+                    is_lc_band = lc_enabled and lc_pick_for_lane.get(str(band.get("label") or ""), "") == nm
+                    draw.rectangle([x0, y0, x1 - 1, y1 - 1], outline=col, width=max(2, sw))
+                    if is_lc_band:
+                        draw.rectangle([x0 + sw, y0 + sw, x1 - sw - 1, y1 - sw - 1], outline=col, width=max(1, sw // 2))
+                    label_y = max(0, y0 - int(font_size * 1.1) - 2)
+                    draw.text((x0 + 2, label_y), nm or "?", fill=col, font=font)
+                    bands_drawn += 1
+                except Exception as _be:
+                    bands_skipped += 1
+                    print(f"[band-picker] band draw skipped ({band.get('name', '?')}): {_be}", file=_sys.stderr)
+            if lc_enabled:
+                for lb in (CFG.get("laneBounds", []) or []):
+                    try:
+                        lx0 = int(round(float(lb.get("x1", 0)) * W))
+                        lx1 = int(round(float(lb.get("x2", 0)) * W))
+                        ly0 = int(round(float(lb.get("y1", 0)) * H))
+                        ly1 = int(round(float(lb.get("y2", 0)) * H))
+                        if lx1 > lx0 and ly1 > ly0:
+                            draw.rectangle([lx0, ly0, lx1 - 1, ly1 - 1], outline="#2196f3", width=1)
+                    except Exception: pass
+        except Exception as _de:
+            print(f"[band-picker] band-overlay draw failed: {_de}", file=_sys.stderr)
+
+    if annot is not None:
+        try:
+            from PIL import Image as _PIL_RS
+            SAVE_MAX_W = 3000
+            if annot.width > SAVE_MAX_W:
+                ratio = SAVE_MAX_W / annot.width
+                annot = annot.resize((SAVE_MAX_W, max(1, int(round(annot.height * ratio)))), _PIL_RS.LANCZOS)
+            mpfig_image(annot, name=_emit_name)
+            print(f"[{_img_label}] emitted {_emit_name} ({annot.width}x{annot.height}): "
+                  f"{bands_drawn} band(s) drawn, {bands_skipped} skipped")
+        except Exception as _ee:
+            print(f"[band-picker] mpfig_image emit failed: {_ee}", file=_sys.stderr)
+    else:
+        print(f"[band-picker] [{_img_label}] no annotated image could be built — see errors above", file=_sys.stderr)
+    return img_rows
 
 rows = []
-for i, band in enumerate(CFG.get("lanes", [])):
-    x0, y0, x1, y1 = _px(band)
-    if x1 <= x0 or y1 <= y0:
-        continue
-    roi = plane[y0:y1, x0:x1].astype(np.float64)
-    area = int(roi.size)
-    # Other-band exclusion mask for the bg slabs.
-    others = [r for (r, ref) in all_rects if ref != id(band)]
-    def _excluded_mask(yslab1, yslab2):
-        if yslab2 <= yslab1: return np.zeros((0, x1 - x0), dtype=bool)
-        m = np.zeros((yslab2 - yslab1, x1 - x0), dtype=bool)
-        for (ox0, oy0, ox1, oy1) in others:
-            ix0 = max(x0, ox0); ix1 = min(x1, ox1)
-            iy0 = max(yslab1, oy0); iy1 = min(yslab2, oy1)
-            if ix1 > ix0 and iy1 > iy0:
-                m[iy0 - yslab1:iy1 - yslab1, ix0 - x0:ix1 - x0] = True
-        return m
-    # Local background: slabs above and below the ROI, same width, gap=6.
-    gap, hh = 6, (y1 - y0)
-    above_y2 = max(0, y0 - gap); above_y1 = max(0, above_y2 - hh)
-    below_y1 = min(H, y1 + gap); below_y2 = min(H, below_y1 + hh)
-    parts = []
-    if above_y2 > above_y1:
-        slab = plane[above_y1:above_y2, x0:x1]
-        msk = _excluded_mask(above_y1, above_y2)
-        parts.append(slab[~msk].reshape(-1))
-    if below_y2 > below_y1:
-        slab = plane[below_y1:below_y2, x0:x1]
-        msk = _excluded_mask(below_y1, below_y2)
-        parts.append(slab[~msk].reshape(-1))
-    bg_pixels = np.concatenate(parts) if parts else np.array([])
-    # If neighbouring boxes ate too much of the slab, fall back to a per-ROI
-    # 5th-percentile floor — guarantees a meaningful (non-zero) IOD even
-    # when bands are packed shoulder-to-shoulder.
-    if bg_pixels.size >= max(20, area // 4):
-        bg_mean = _robust_background(bg_pixels)
-    else:
-        bg_mean = float(np.percentile(roi, 5)) if area else 0.0
-    raw_sum = float(np.sum(roi))
-    corrected = raw_sum - bg_mean * area
-    lane = (band.get("label") or "").strip() or f"Lane {i + 1}"
-    level = (band.get("level") or "").strip() or "Target"
-    band_name = (band.get("name") or "").strip() or f"B{i + 1}"
-    # Group resolution: band-name match wins over lane match. Empty string
-    # means "ungrouped" — the downstream R plot leaves these out of the
-    # grouped bars (or shows them as their own bar, depending on plot mode).
-    grp = band2group.get(band_name) or lane2group.get(lane) or ""
-    # is_loading_control: new path uses the picker's per-lane band pick,
-    # which can be CROSS-LANE (user picks B5 in lane S2 as the LC for
-    # lane S1). A band is "an LC" if it serves as the chosen LC for any
-    # lane. lc_for_lane carries the comma-joined list of lanes this band
-    # serves, so the downstream Normalize node can divide the correct
-    # rows by THIS band's IOD — without it, cross-lane picks silently
-    # fell through and the user's custom LC pixel went unused.
-    target_lanes_for_this_band = lc_for_by_band.get(band_name, []) if lc_enabled else []
-    if lc_enabled:
-        is_lc = len(target_lanes_for_this_band) > 0
-    elif lc_level:
-        is_lc = (level == lc_level)
-    else:
-        is_lc = False
-    rows.append({
-        "band": band_name,                         # UNIQUE per-row identifier
-        "lane": lane,                              # column / sample
-        "level": level,                            # target / MW row
-        "group": grp,                              # condition / experimental group
-        "lc_enabled": bool(lc_enabled),            # plot picks normalised vs raw
-        "plot_per_group": bool(plot_per_group),    # split groups across figures
-        "is_loading_control": bool(is_lc),
-        "lc_for_lane": ",".join(target_lanes_for_this_band),  # lanes this band normalises
-        "iod": float(max(corrected, 0.0)),
-        "raw_integrated_density": raw_sum,
-        "background_corrected_integrated_density": corrected,
-        "background_mean": bg_mean,
-        "mean_signal": float(roi.mean()) if area else 0.0,
-        "area_px": area,
-    })
+for _lab, _src in image_items:
+    rows.extend(_quantify_image(_lab, _src))
 
 if not rows:
     raise SystemExit("No bands defined — open 'Pick bands…' and mark each band.")
 
-n_lanes = len({r["lane"] for r in rows})
-n_levels = len({r["level"] for r in rows})
-print(f"quantified {len(rows)} band(s) across {n_lanes} lane(s) x {n_levels} level(s)")
+_n_imgs = len(image_items)
+_n_lanes = len({r["lane"] for r in rows})
+_n_levels = len({r["level"] for r in rows})
+print(f"quantified {len(rows)} band-row(s) across {_n_imgs} image(s), {_n_lanes} lane(s) x {_n_levels} level(s)")
 if lc_level:
     print(f"loading control level = {lc_level!r}")
 else:
     print("no loading-control level set — Normalize will pass IOD through unchanged")
 mpfig_data(rows, name="band_iod")
-
-# ── Annotated preview output ──────────────────────────────────
-# Always emit an annotated_bands image so the downstream collage /
-# timeline has something to show. We build it in stages, each wrapped
-# defensively: as long as the basic contrast-stretch succeeds we emit
-# SOMETHING (raw membrane). Failing to draw the band-name labels (e.g.,
-# missing DejaVuSans font in the frozen sidecar) no longer wipes out
-# the entire image.
-import sys as _sys
-annot = None
-try:
-    from PIL import Image as _PIL_I, ImageDraw as _PIL_D, ImageFont as _PIL_F
-    # Stage 1: contrast-stretched display plane. Always runs.
-    if arr.ndim == 3 and arr.shape[2] >= 3:
-        rgb_disp = arr[..., :3].astype(np.float32)
-    elif arr.ndim == 3:
-        g = arr[..., 0]
-        rgb_disp = np.stack([g, g, g], axis=-1).astype(np.float32)
-    else:
-        rgb_disp = np.stack([arr, arr, arr], axis=-1).astype(np.float32)
-    _lo, _hi = np.percentile(rgb_disp, [0.5, 99.95])
-    _scaled = np.clip((rgb_disp - _lo) / max(_hi - _lo, 1), 0, 1)
-    _disp_u8 = np.clip(_scaled ** 0.5 * 255.0, 0, 255).astype(np.uint8)
-    annot = _PIL_I.fromarray(_disp_u8).convert("RGB")
-except Exception as _e:
-    print(f"[band-picker] contrast-stretch failed: {_e}", file=_sys.stderr)
-    # Final fallback: emit the raw bytes as a uint8 PNG so the user still
-    # sees the membrane (no detection overlay, but no missing-output).
-    try:
-        from PIL import Image as _PIL_I2
-        a8 = np.clip(np.asarray(arr).astype(np.float32), 0, 255).astype(np.uint8)
-        if a8.ndim == 2:
-            annot = _PIL_I2.fromarray(a8).convert("RGB")
-        else:
-            annot = _PIL_I2.fromarray(a8[..., :3]).convert("RGB")
-    except Exception as _e2:
-        print(f"[band-picker] raw fallback also failed: {_e2}", file=_sys.stderr)
-
-# Stage 2: draw the band rectangles. Done in its own try block so a
-# font / draw failure doesn't drop the image we already built.
-bands_drawn = 0
-bands_skipped = 0
-if annot is not None:
-    try:
-        draw = _PIL_D.Draw(annot)
-        PALETTE = ["#1976d2", "#43a047", "#e65100", "#8e24aa", "#00838f",
-                   "#c62828", "#5d4037", "#558b2f", "#6a1b9a", "#00695c"]
-        level_to_color = {}
-        for r in rows:
-            lv = str(r.get("level") or "Target")
-            if lv not in level_to_color:
-                level_to_color[lv] = PALETTE[len(level_to_color) % len(PALETTE)]
-        # Try to load DejaVuSans (bundled in the sidecar); fall back to the
-        # PIL default font. font.size is unreliable across Pillow versions
-        # for the default font, so we cache a fallback size separately.
-        try:
-            target_font_size = max(10, int(min(H, W) * 0.012))
-            font = _PIL_F.truetype("DejaVuSans.ttf", target_font_size)
-        except Exception:
-            font = _PIL_F.load_default()
-            target_font_size = 14
-        # Use getattr — Pillow's bitmap default doesn't have .size on
-        # every version, but FreeTypeFont does. Either way we fall back.
-        font_size = int(getattr(font, "size", None) or target_font_size)
-        for band in (CFG.get("lanes", []) or []):
-            try:
-                x0, y0, x1, y1 = _px(band)
-                if x1 <= x0 or y1 <= y0: continue
-                lv = (band.get("level") or "Target").strip() or "Target"
-                col = level_to_color.get(lv, PALETTE[0])
-                nm = (band.get("name") or "").strip()
-                sw = max(1, int(round(min(H, W) / 600)))
-                # NB: variable is lc_pick_for_lane (the per-lane LC band pick
-                # from the picker UI); an earlier draft used "lc_by_lane"
-                # here and every band's draw silently NameError'd under the
-                # per-band try/except, leaving only the lane outlines visible
-                # in the annotated_bands output.
-                is_lc_band = lc_enabled and lc_pick_for_lane.get(str(band.get("label") or ""), "") == nm
-                draw.rectangle([x0, y0, x1 - 1, y1 - 1], outline=col, width=max(2, sw))
-                if is_lc_band:
-                    draw.rectangle([x0 + sw, y0 + sw, x1 - sw - 1, y1 - sw - 1], outline=col, width=max(1, sw // 2))
-                label_y = max(0, y0 - int(font_size * 1.1) - 2)
-                draw.text((x0 + 2, label_y), nm or "?", fill=col, font=font)
-                bands_drawn += 1
-            except Exception as _be:
-                bands_skipped += 1
-                print(f"[band-picker] band draw skipped ({band.get('name', '?')}): {_be}", file=_sys.stderr)
-        if lc_enabled:
-            for lb in (CFG.get("laneBounds", []) or []):
-                try:
-                    lx0 = int(round(float(lb.get("x1", 0)) * W))
-                    lx1 = int(round(float(lb.get("x2", 0)) * W))
-                    ly0 = int(round(float(lb.get("y1", 0)) * H))
-                    ly1 = int(round(float(lb.get("y2", 0)) * H))
-                    if lx1 > lx0 and ly1 > ly0:
-                        draw.rectangle([lx0, ly0, lx1 - 1, ly1 - 1], outline="#2196f3", width=1)
-                except Exception: pass
-    except Exception as _de:
-        print(f"[band-picker] band-overlay draw failed: {_de}", file=_sys.stderr)
-
-# Stage 3: cap + emit. ALWAYS runs if we have any annot image at all.
-if annot is not None:
-    try:
-        SAVE_MAX_W = 3000
-        if annot.width > SAVE_MAX_W:
-            ratio = SAVE_MAX_W / annot.width
-            annot = annot.resize((SAVE_MAX_W, max(1, int(round(annot.height * ratio)))), _PIL_I.LANCZOS)
-        mpfig_image(annot, name="annotated_bands")
-        print(f"emitted annotated_bands ({annot.width}x{annot.height}): "
-              f"{bands_drawn} band(s) drawn, {bands_skipped} skipped")
-    except Exception as _ee:
-        print(f"[band-picker] mpfig_image emit failed: {_ee}", file=_sys.stderr)
-else:
-    print("[band-picker] no annotated image could be built — see errors above", file=_sys.stderr)
 `;
 }
 
