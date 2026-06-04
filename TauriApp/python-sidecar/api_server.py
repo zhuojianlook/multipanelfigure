@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.348"
+SIDECAR_BUILD = "0.1.349"
 
 
 @app.get("/api/version")
@@ -6747,23 +6747,70 @@ def list_inset_sources_for(body: InsetSourcesForRequest):
     return {"sources": sources}
 
 
+@app.post("/api/analysis/inset-sources-for-doc")
+def list_inset_sources_for_doc(body: DocStateRequest):
+    """Collect analysis sources for an OPEN-BUT-NOT-ACTIVE document tab from its
+    in-memory STASHED state (the same fast tab-switch cache).  This is what the
+    Analysis tab needs so a figure that was switched away from contributes its
+    sources — INCLUDING unsaved 'add to analysis' flags and Untitled docs that
+    were never written to disk (which inset-sources-for, reading the .mpf on
+    disk, can't see).  404 when the doc has no stash, so the caller can fall
+    back to the on-disk .mpf via inset-sources-for."""
+    global cfg, loaded_images, hidden_images, min_dims, custom_fonts
+    global loaded_videos, video_frames, loaded_zstacks, zstack_frames
+    global zstack_counts, channel_groups
+    st = _doc_state_cache.get(body.doc_id)
+    if st is None:
+        raise HTTPException(404, "No stashed state for that document.")
+    with _source_swap_lock:
+        saved = (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
+                 loaded_videos, video_frames, loaded_zstacks, zstack_frames,
+                 zstack_counts, channel_groups)
+        try:
+            _apply_doc_state(st)
+            sources = _collect_analysis_insets(include_thumbnails=True)
+        finally:
+            (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
+             loaded_videos, video_frames, loaded_zstacks, zstack_frames,
+             zstack_counts, channel_groups) = saved
+    return {"sources": sources}
+
+
 import contextlib as _contextlib
 
 
 @_contextlib.contextmanager
-def _project_context(project_path):
-    """Temporarily make the global figure state point at a DIFFERENT .mpf so
+def _project_context(doc_id="", project_path=""):
+    """Temporarily make the global figure state point at a DIFFERENT figure so
     inset extraction (`_extract_source_image` / `_extract_inset_image`, which
-    read the module globals) pulls pixels from that project instead of the
+    read the module globals) pulls pixels from that figure instead of the
     active builder doc.  Used by the analysis pipelines to run a workflow that
     combines sources from MORE THAN ONE MPF — each source carries its own
-    `project_path`; sources with none use the active doc as before.
+    `mpf_doc_id` and/or `project_path`.
 
-    A no-op (yields immediately, no swap) when project_path is empty or the
-    file can't be found, so single-MPF workflows behave exactly as today.
-    Serialised by the same lock as inset-sources-for; the restore is in a
-    finally so the active state is always put back."""
-    global cfg, loaded_images, loaded_videos, video_frames, loaded_zstacks, channel_groups, min_dims
+    Resolution order, so it works for unsaved tabs too:
+      1. `doc_id` present in the in-memory tab cache → swap to that STASHED
+         state (covers Untitled docs + unsaved 'add to analysis' edits).
+      2. else `project_path` is a real .mpf on disk → load it.
+      3. else no-op (active doc — single-MPF behaviour, unchanged).
+    Serialised by the same lock as inset-sources-for; restore in finally."""
+    global cfg, loaded_images, hidden_images, min_dims, custom_fonts
+    global loaded_videos, video_frames, loaded_zstacks, zstack_frames
+    global zstack_counts, channel_groups
+    st = _doc_state_cache.get(doc_id) if doc_id else None
+    if st is not None:
+        with _source_swap_lock:
+            saved = (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
+                     loaded_videos, video_frames, loaded_zstacks, zstack_frames,
+                     zstack_counts, channel_groups)
+            try:
+                _apply_doc_state(st)
+                yield
+            finally:
+                (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
+                 loaded_videos, video_frames, loaded_zstacks, zstack_frames,
+                 zstack_counts, channel_groups) = saved
+        return
     pp = os.path.expanduser((project_path or "").strip())
     if pp and not os.path.dirname(pp):
         pp = os.path.join(os.path.expanduser("~"), "Documents", pp)
@@ -6794,19 +6841,22 @@ def _project_context(project_path):
 
 
 def _group_sources_by_project(sources):
-    """Stable partition of a source list by their `project_path` (missing /
-    empty = the active doc, grouped under '').  Returns an ordered list of
-    (project_path, [sources]) so the active group (key '') extracts with no
-    swap and each other MPF is loaded once for all its sources."""
+    """Stable partition of a source list by their source figure — keyed by
+    (mpf_doc_id, project_path).  Missing both = the active doc (grouped under
+    ('','')) so it extracts with no swap.  Returns an ordered list of
+    (doc_id, project_path, [sources]) so each other figure is swapped in once
+    for all of its sources."""
     order = []
     buckets = {}
     for s in (sources or []):
+        did = str(s.get("mpf_doc_id") or "").strip()
         pp = str(s.get("project_path") or "").strip()
-        if pp not in buckets:
-            buckets[pp] = []
-            order.append(pp)
-        buckets[pp].append(s)
-    return [(pp, buckets[pp]) for pp in order]
+        k = (did, pp)
+        if k not in buckets:
+            buckets[k] = []
+            order.append(k)
+        buckets[k].append(s)
+    return [(k[0], k[1], buckets[k]) for k in order]
 
 
 class WbPreviewRequest(BaseModel):
@@ -7887,8 +7937,8 @@ def run_python_pipeline(body: PyAnalysisRequest):
         # Group by source MPF so a workflow mixing insets from TWO different
         # .mpf files extracts each from ITS OWN project (sources with no
         # project_path use the active doc — exactly as before).
-        for _proj, _grp in _group_sources_by_project(sources_in):
-            with _project_context(_proj):
+        for _did, _proj, _grp in _group_sources_by_project(sources_in):
+            with _project_context(_did, _proj):
                 for s in _grp:
                     try:
                         _materialise_py_source(s)
@@ -8387,8 +8437,8 @@ def run_cellpose_pipeline(body: CellposeAnalysisRequest):
     images_in: List[Tuple[str, _np.ndarray]] = []
     # Group by source MPF so a workflow mixing insets from two different .mpf
     # files extracts each from its own project (no project_path = active doc).
-    for _proj, _grp in _group_sources_by_project(body.sources or []):
-        with _project_context(_proj):
+    for _did, _proj, _grp in _group_sources_by_project(body.sources or []):
+        with _project_context(_did, _proj):
             for s in _grp:
                 try:
                     arr = _extract_source_image(s)  # dispatches: inset / panel / area

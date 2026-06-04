@@ -1565,6 +1565,11 @@ export const useFigureStore = create<FigureState>()(
             };
           }
           s.apiError = null;
+          // Uploading adds to the doc's loaded_images — that's an unsaved
+          // change even if the image isn't placed in a panel yet.  Mark it
+          // so a tab switch STASHES the doc (otherwise switching away and
+          // back reloads from disk and the upload vanishes).
+          if (names.length) s.unsaved = true;
         });
         get().requestPreview();
         return names;
@@ -1599,6 +1604,8 @@ export const useFigureStore = create<FigureState>()(
             };
           }
           s.apiError = null;
+          // See uploadImages — mark unsaved so the upload survives a tab switch.
+          if (names.length) s.unsaved = true;
         });
         get().requestPreview();
         return names;

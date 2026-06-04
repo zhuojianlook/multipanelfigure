@@ -627,6 +627,16 @@ class ApiClient {
     return apiJson("/api/analysis/inset-sources-for", "POST", JSON.stringify({ project_path: projectPath }));
   }
 
+  /** Analysis sources for an OPEN-but-not-active document tab, read from its
+   *  in-memory stashed state (covers unsaved 'add to analysis' edits and
+   *  Untitled docs). Rejects (404) when the doc has no stash — the caller
+   *  falls back to listInsetAnalysisSourcesFor(path) for saved-on-disk docs. */
+  async listInsetAnalysisSourcesForDoc(docId: string): Promise<{
+    sources: Array<Record<string, unknown>>;
+  }> {
+    return apiJson("/api/analysis/inset-sources-for-doc", "POST", JSON.stringify({ doc_id: docId }));
+  }
+
   /** Detect whether a MATLAB-compatible interpreter (Octave or MATLAB)
    *  is available on the host. The Analysis dialog hides the Run MATLAB
    *  button when this returns `installed: false`. */

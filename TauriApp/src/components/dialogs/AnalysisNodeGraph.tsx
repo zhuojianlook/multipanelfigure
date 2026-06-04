@@ -4413,21 +4413,40 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     const _docs = openDocs;
     const _active = activeDocId;
     const _activeName = _docs.find((d) => d.id === _active)?.name || "This figure";
+    // Docs whose live edits are parked as an in-memory stash (switched away
+    // from while dirty). For those we read the STASH — so unsaved
+    // "add to analysis" flags and Untitled (never-saved) docs still
+    // contribute — instead of the (stale or missing) .mpf on disk.
+    const _dirty = new Set(useCollageStore.getState().snapshotDirtyDocIds || []);
+    const _tag = (arr: Array<Record<string, unknown>>, d: { id: string; name: string }) =>
+      arr.map((s) => {
+        const src = s as unknown as InsetSource;
+        return { ...src, key: `${d.id}__${src.key}`, mpfId: d.id, mpf: d.name };
+      });
     const tasks: Promise<InsetSource[]>[] = [
       api.listInsetAnalysisSources()
         .then((r) => (r.sources || []).map((s) => ({ ...(s as unknown as InsetSource), mpfId: _active || "__active__", mpf: _activeName })))
         .catch(() => [] as InsetSource[]),
     ];
     for (const d of _docs) {
-      if (d.id === _active || !d.path) continue;
-      tasks.push(
-        api.listInsetAnalysisSourcesFor(d.path)
-          .then((r) => (r.sources || []).map((s) => {
-            const src = s as unknown as InsetSource;
-            return { ...src, key: `${d.id}__${src.key}`, mpfId: d.id, mpf: d.name };
-          }))
-          .catch(() => [] as InsetSource[]),
-      );
+      if (d.id === _active) continue;
+      if (_dirty.has(d.id)) {
+        // Unsaved-but-open tab → read its stashed live state; if the stash is
+        // gone (sidecar restart) fall back to the on-disk .mpf when saved.
+        tasks.push(
+          api.listInsetAnalysisSourcesForDoc(d.id)
+            .then((r) => _tag(r.sources || [], d))
+            .catch(() => (d.path
+              ? api.listInsetAnalysisSourcesFor(d.path).then((r) => _tag(r.sources || [], d)).catch(() => [] as InsetSource[])
+              : ([] as InsetSource[]))),
+        );
+      } else if (d.path) {
+        tasks.push(
+          api.listInsetAnalysisSourcesFor(d.path)
+            .then((r) => _tag(r.sources || [], d))
+            .catch(() => [] as InsetSource[]),
+        );
+      }
     }
     Promise.all(tasks)
       .then((groups) => {
@@ -5667,20 +5686,22 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
             }
           }
           if (!src) return null;
-          const base: { key: string; row: number; col: number; inset_index: number; label: string; name?: string; project_path?: string } =
+          const base: { key: string; row: number; col: number; inset_index: number; label: string; name?: string; project_path?: string; mpf_doc_id?: string } =
             { key: insetKey, row: src.row, col: src.col, inset_index: src.inset_index, label: displayName(src, sourceNameOverrides) };
           if (src.name) base.name = src.name;  // standalone whole-image source
           // Per-MPF (Task #32 Part B): a source from a NON-active figure
-          // carries its own project path so the backend extracts pixels from
-          // THAT .mpf, not the active doc.  Active-doc sources send nothing
-          // (backend uses the live figure — unchanged single-MPF behaviour).
+          // carries its own doc id + project path so the backend extracts
+          // pixels from THAT figure (the stashed live state by doc id, or
+          // the .mpf on disk), not the active doc.  Active-doc sources send
+          // nothing → backend uses the live figure (single-MPF unchanged).
           if (src.mpfId && src.mpfId !== "__active__" && src.mpfId !== activeDocId) {
+            base.mpf_doc_id = src.mpfId;
             const p = openDocs.find((d) => d.id === src.mpfId)?.path;
             if (p) base.project_path = p;
           }
           return base;
         })
-        .filter((s): s is { key: string; row: number; col: number; inset_index: number; label: string; name?: string; project_path?: string } => !!s);
+        .filter((s): s is { key: string; row: number; col: number; inset_index: number; label: string; name?: string; project_path?: string; mpf_doc_id?: string } => !!s);
 
       if (engine === "python") {
         const sources = buildSources();
