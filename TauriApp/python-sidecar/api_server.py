@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.344"
+SIDECAR_BUILD = "0.1.345"
 
 
 @app.get("/api/version")
@@ -5806,6 +5806,61 @@ def run_r_code(body: RAnalysisRequest):
             # Base-graphics best-effort: scale character expansion relative to
             # R's default 12pt so base plots roughly track the target size.
             script += f'  try(par(cex={_base_fs}/12, cex.axis={_base_fs}/12, cex.lab={_base_fs}/12, cex.main={_base_fs}/12, cex.sub={_base_fs}/12), silent=TRUE)\n'
+        script += '}\n\n'
+        # ── Anti-clipping text helpers (shared by EVERY R node) ───────
+        # The chronic "text gets cut off" problem in ggplot PNGs is almost
+        # always a single line of text wider than the figure: a long title,
+        # a long facet-strip label (channel / group / compartment name), or
+        # a long angled x-axis category that runs off the bottom-left.  The
+        # device has fixed dimensions, so the fix is to WRAP any such text
+        # onto multiple lines — ggplot then allocates a taller row for it
+        # and shrinks the panel instead of clipping.  These helpers give
+        # every template (and any user R) a consistent way to do that.
+        script += '# ── Anti-clipping text helpers (shared) ──────────────────\n'
+        # Word-wrap that ALSO hard-breaks tokens longer than `width`.
+        # strwrap() alone only breaks on whitespace, so a label like
+        # "Treatment-with-a-long-name" or "Anti_VegF_647" (no spaces) is
+        # never wrapped and runs straight off the edge.  We split on
+        # whitespace, hard-chop any over-long word into width-sized
+        # pieces, then greedily refill lines.
+        script += '.mpfig_wrap <- function(x, width = 24) {\n'
+        script += '  width <- max(4L, as.integer(width))\n'
+        script += '  vapply(as.character(x), function(s) {\n'
+        script += '    if (is.na(s) || !nzchar(s)) return(s)\n'
+        script += '    words <- unlist(strsplit(s, "[[:space:]]+"))\n'
+        script += '    broken <- unlist(lapply(words, function(w) {\n'
+        script += '      if (nchar(w) <= width) return(w)\n'
+        script += '      st <- seq(1, nchar(w), by = width)\n'
+        script += '      substring(w, st, pmin(st + width - 1, nchar(w)))\n'
+        script += '    }))\n'
+        script += '    lines <- character(0); cur <- ""\n'
+        script += '    for (w in broken) {\n'
+        script += '      cand <- if (nzchar(cur)) paste(cur, w) else w\n'
+        script += '      if (nchar(cand) > width && nzchar(cur)) { lines <- c(lines, cur); cur <- w }\n'
+        script += '      else cur <- cand\n'
+        script += '    }\n'
+        script += '    if (nzchar(cur)) lines <- c(lines, cur)\n'
+        script += '    paste(lines, collapse = "\\n")\n'
+        script += '  }, character(1), USE.NAMES = FALSE)\n'
+        script += '}\n'
+        # Wrap a TITLE/subtitle to whatever fits the *actual* figure width.
+        # The device is already open when the plot is built, so dev.size()
+        # tells us the canvas width in inches; cpi (chars-per-inch) is a
+        # conservative estimate for the title font so the wrapped lines are
+        # guaranteed to fit even when centred.  width_in can be passed
+        # explicitly for templates that build the plot BEFORE opening the
+        # device (e.g. the WB plot, which knows its width in px).
+        script += '.mpfig_fit <- function(s, width_in = NULL, cpi = 9, min_chars = 14) {\n'
+        script += '  if (is.null(width_in)) width_in <- tryCatch(grDevices::dev.size("in")[1], error = function(e) 6)\n'
+        script += '  if (!is.finite(width_in) || width_in <= 0) width_in <- 6\n'
+        script += '  .mpfig_wrap(s, max(min_chars, floor(width_in * cpi)))\n'
+        script += '}\n'
+        # A facet labeller that wraps strip text so long names never get
+        # truncated at the strip edge.  Falls back to ggplot2's default
+        # labeller if (somehow) ggplot2 isn't reachable.
+        script += '.mpfig_labeller <- function(width = 14) {\n'
+        script += '  if (!requireNamespace("ggplot2", quietly = TRUE)) return(ggplot2::label_value)\n'
+        script += '  ggplot2::as_labeller(function(v) .mpfig_wrap(v, width))\n'
         script += '}\n\n'
         if _base_fs:
             # ggplot2: force a base font size by (1) setting the active theme's

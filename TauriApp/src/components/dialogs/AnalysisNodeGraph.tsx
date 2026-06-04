@@ -2386,6 +2386,8 @@ if (groups_n >= 2 && requireNamespace("rstatix", quietly = TRUE)) {
 # transport, and a single line wraps cleanly under theme_prism.
 xlabs <- paste0(as.character(summ$group), " · n=", summ$n)
 names(xlabs) <- as.character(summ$group)
+# Wrap long group names so the x-axis ticks never run off the edge.
+xlabs <- setNames(.mpfig_wrap(unname(xlabs), 14), names(xlabs))
 
 # Set the output to publication dimensions: 5" × 4" at 300 DPI.
 mpfig_plot("haze_score.png", width = 1500, height = 1200, res = 300)
@@ -2418,20 +2420,20 @@ p <- ggplot() +
                     labels = c("TRUE" = if (tolower(ctrl_grp) == "control")
                                           "Control"
                                         else
-                                          paste0("Control (", ctrl_grp, ")"),
+                                          .mpfig_wrap(paste0("Control (", ctrl_grp, ")"), 22),
                                "FALSE" = "Treatment"),
                     breaks = c("TRUE", "FALSE")) +
   scale_x_discrete(labels = xlabs) +
   labs(x = NULL,
        y = expression(paste("Haze score (", Delta, " mean grey vs control)")),
-       subtitle = subtitle) +
+       subtitle = .mpfig_fit(subtitle, cpi = 13)) +
   theme_prism(base_size = 11) +
   theme(legend.position = "top",
         legend.text = element_text(size = 9),
         axis.text.x = element_text(size = 9.5, lineheight = 0.95),
         plot.subtitle = element_text(size = 9, color = "grey40",
                                      margin = margin(b = 4)),
-        plot.margin = margin(10, 10, 6, 10))
+        plot.margin = margin(12, 16, 10, 14))
 
 print(p)
 `;
@@ -2680,11 +2682,17 @@ if (has_norm) data$mean_intensity_norm <- suppressWarnings(as.numeric(data$mean_
     geom_jitter(data = d, aes(x = group, y = !!sym(y_col)),
                 width = 0.13, height = 0, size = 1.0, alpha = 0.7,
                 color = "grey20", stroke = 0) +
-    scale_x_discrete(drop = FALSE) +
+    scale_x_discrete(drop = FALSE, labels = function(z) .mpfig_wrap(z, 14)) +
     scale_fill_brewer(palette = "Set2", drop = FALSE,
+                      labels = function(z) .mpfig_wrap(z, 13),
                       guide = guide_legend(title = "Group")) +
     theme_prism(base_size = 11) +
-    theme(legend.position = "right",
+    # Legend at the BOTTOM (not the right): long group names on a right
+    # legend steal panel width and shove the facets off the canvas.  At
+    # the bottom they wrap across rows and never eat the plot.
+    theme(legend.position = "bottom",
+          legend.text = element_text(size = 8),
+          legend.title = element_text(size = 9),
           axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
           # Generous top margin + full-plot title positioning so the
           # (often long) wrapped header is never clipped at the top or
@@ -2694,13 +2702,16 @@ if (has_norm) data$mean_intensity_norm <- suppressWarnings(as.numeric(data$mean_
           plot.title = element_text(size = 11, face = "bold", lineheight = 1.05,
                                     margin = margin(b = 8),
                                     color = if (flag_warning) "#b03030" else "grey25")) +
-    # Wrap the title so a long header breaks onto multiple lines
-    # instead of running off the right edge of the PNG.
-    labs(x = NULL, y = y_label, title = paste(strwrap(title, width = 64), collapse = "\n"))
+    # Wrap the title to whatever fits THIS figure's width (dev.size) so a
+    # long header breaks onto multiple lines instead of running off the
+    # edge of the PNG.
+    labs(x = NULL, y = y_label, title = .mpfig_fit(title))
   if (multi_compart) {
-    p <- p + facet_grid(compartment ~ channel, scales = "free_y", switch = "y")
+    p <- p + facet_grid(compartment ~ channel, scales = "free_y", switch = "y",
+                        labeller = .mpfig_labeller(14))
   } else {
-    p <- p + facet_wrap(~ channel, scales = "free_y", nrow = 1)
+    p <- p + facet_wrap(~ channel, scales = "free_y", nrow = 1,
+                        labeller = .mpfig_labeller(14))
   }
   if (!is.null(br)) {
     p <- tryCatch(
@@ -2839,22 +2850,28 @@ if (nrow(analysis_data) == 0 && nrow(control_data) == 0) {
     p <- ggplot(out, aes(x = group, y = log2fc, fill = group)) +
       geom_col(color = "grey25", linewidth = 0.3, width = 0.7) +
       geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+      scale_x_discrete(labels = function(z) .mpfig_wrap(z, 14)) +
       scale_fill_brewer(palette = "Set2", drop = FALSE,
+                        labels = function(z) .mpfig_wrap(z, 13),
                         guide = guide_legend(title = "Group")) +
       theme_prism(base_size = 11) +
-      theme(legend.position = "right",
+      theme(legend.position = "bottom",
+            legend.text = element_text(size = 8),
+            legend.title = element_text(size = 9),
             axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
             plot.margin = margin(16, 14, 8, 12),
             plot.title.position = "plot",
             plot.title = element_text(size = 11, face = "bold", lineheight = 1.05,
                                       margin = margin(b = 8))) +
-      labs(x = NULL, y = paste0("log2(group / ", base_group, ")"),
-           title = paste(strwrap(paste0("Cross-group comparison vs ", base_group,
-                                        " (log2 fold-change)"), width = 64), collapse = "\n"))
+      labs(x = NULL, y = .mpfig_wrap(paste0("log2(group / ", base_group, ")"), 28),
+           title = .mpfig_fit(paste0("Cross-group comparison vs ", base_group,
+                                     " (log2 fold-change)")))
     if (nlevels(droplevels(out$compartment)) > 1) {
-      p <- p + facet_grid(compartment ~ channel, scales = "free_y", switch = "y")
+      p <- p + facet_grid(compartment ~ channel, scales = "free_y", switch = "y",
+                          labeller = .mpfig_labeller(14))
     } else {
-      p <- p + facet_wrap(~ channel, scales = "free_y", nrow = 1)
+      p <- p + facet_wrap(~ channel, scales = "free_y", nrow = 1,
+                          labeller = .mpfig_labeller(14))
     }
     p
   }
@@ -2891,10 +2908,10 @@ if (nrow(analysis_data) == 0 && nrow(control_data) == 0) {
       "Only 1 group is defined. Add a second group in the Intensity picker to enable cross-group comparison."
     mpfig_plot("channel_intensity_warning.png", width = 1400, height = 500, res = 300)
     print(ggplot() + theme_void() +
-          annotate("text", x = 0.5, y = 0.55, size = 5.5, color = "#b03030",
-                   label = "⚠ Only 1 group has data — comparison plots skipped") +
-          annotate("text", x = 0.5, y = 0.35, size = 3.8, color = "grey30",
-                   label = msg) +
+          annotate("text", x = 0.5, y = 0.62, size = 5.5, color = "#b03030",
+                   label = .mpfig_wrap("⚠ Only 1 group has data — comparison plots skipped", 44)) +
+          annotate("text", x = 0.5, y = 0.34, size = 3.8, color = "grey30",
+                   label = .mpfig_wrap(msg, 60)) +
           xlim(0, 1) + ylim(0, 1))
   }
 
@@ -3057,9 +3074,9 @@ suppressWarnings(suppressMessages({ library(ggplot2); library(ggprism) }))
 if (length(inputs) == 0 || is.null(inputs[[1]]) || nrow(inputs[[1]]) == 0) {
   mpfig_plot("wb_band_comparison.png", width = 1400, height = 900, res = 300)
   print(ggplot() + theme_void() +
-    annotate("text", x = 0.5, y = 0.55, size = 6, label = "No band table reached this node.") +
+    annotate("text", x = 0.5, y = 0.55, size = 6, label = .mpfig_wrap("No band table reached this node.", 44)) +
     annotate("text", x = 0.5, y = 0.40, size = 4, color = "grey40",
-             label = "Run Source -> Band picker -> Plot.") +
+             label = .mpfig_wrap("Run Source -> Band picker -> Plot.", 50)) +
     xlim(0, 1) + ylim(0, 1))
 } else {
 
@@ -3162,6 +3179,7 @@ render_one <- function(d_sub, s_sub, facet_var, w, h, fname, group_title = NULL)
                 color = "grey20", stroke = 0) +
     scale_y_continuous(expand = expansion(mult = c(0, 0.10)),
                        labels = y_fmt) +
+    scale_x_discrete(labels = function(z) .mpfig_wrap(z, 10)) +
     theme_prism(base_size = 12) +
     theme(legend.position = "none",
           plot.title    = element_text(face = "bold", size = 13,
@@ -3169,14 +3187,17 @@ render_one <- function(d_sub, s_sub, facet_var, w, h, fname, group_title = NULL)
           axis.title.y = element_text(margin = margin(r = 8)),
           axis.text.x  = element_text(angle = 30, hjust = 1, vjust = 1, size = 9),
           axis.text.y  = element_text(size = 9),
-          strip.text   = element_text(face = "bold", size = 11),
+          strip.text   = element_text(face = "bold", size = 10),
           plot.subtitle = element_text(size = 9, color = "grey35",
                                        margin = margin(b = 6)),
           plot.margin = margin(t = 18, r = 18, b = 22, l = 22)) +
-    labs(x = NULL, y = y_lab, title = ptitle, subtitle = plot_subtitle)
+    labs(x = NULL, y = .mpfig_wrap(y_lab, 36),
+         title = .mpfig_fit(ptitle, width_in = w / 300),
+         subtitle = .mpfig_fit(plot_subtitle, width_in = w / 300, cpi = 13))
   if (!is.null(facet_var)) p <- p + facet_wrap(as.formula(paste("~", facet_var)),
                                                 scales = "free_y",
-                                                ncol = min(3, n_facets))
+                                                ncol = min(3, n_facets),
+                                                labeller = .mpfig_labeller(12))
   if (val_col == "normalized") {
     p <- p + geom_hline(yintercept = 1, linetype = "dashed", color = "grey55", linewidth = 0.4)
   }
@@ -3393,10 +3414,10 @@ if (length(inputs) == 0 || is.null(inputs[[1]]) || nrow(inputs[[1]]) == 0) {
   message("No table inputs reached this node — did the Cellpose / shape-metrics node upstream succeed?")
   mpfig_plot("cell_characteristics.png", width = 900, height = 600, res = 150)
   ggplot() + theme_void() +
-    annotate("text", x = 0.5, y = 0.55, size = 6,
-             label = "No cell-shape table reached this node.") +
-    annotate("text", x = 0.5, y = 0.40, size = 4, color = "grey40",
-             label = "Wire an upstream Cellpose → 'Cell shape metrics' chain into this R node.") +
+    annotate("text", x = 0.5, y = 0.58, size = 6,
+             label = .mpfig_wrap("No cell-shape table reached this node.", 44)) +
+    annotate("text", x = 0.5, y = 0.38, size = 4, color = "grey40",
+             label = .mpfig_wrap("Wire an upstream Cellpose → 'Cell shape metrics' chain into this R node.", 50)) +
     xlim(0, 1) + ylim(0, 1)
 } else {
 
@@ -3495,7 +3516,9 @@ common_theme <- theme_prism(base_size = 10) +
   theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 8),
         plot.title  = element_text(size = 10, face = "bold", hjust = 0.5),
         legend.position = "none",
-        plot.margin = margin(6, 8, 6, 8))
+        # Roomy bottom/left margin so the angled, wrapped group labels
+        # (which sprawl down-left) are never clipped at the panel edge.
+        plot.margin = margin(8, 10, 16, 12))
 
 # Bar + scatter + SD error-bar + significance for one metric.
 # Returns NULL when the column is missing or empty so the layout
@@ -3514,7 +3537,8 @@ metric_plot <- function(yvar, ylab, ytitle = ylab) {
     }, geom = "errorbar", width = 0.25, linewidth = 0.4, color = "grey20") +
     geom_jitter(width = 0.16, size = 0.9, alpha = 0.55,
                 color = "grey20", show.legend = FALSE) +
-    labs(x = NULL, y = ylab, title = ytitle) +
+    scale_x_discrete(labels = function(z) .mpfig_wrap(z, 12)) +
+    labs(x = NULL, y = .mpfig_wrap(ylab, 22), title = .mpfig_wrap(ytitle, 24)) +
     common_theme
   add_brackets(g, yvar, pvals)
 }
@@ -3535,6 +3559,7 @@ p_list <- list(
 # Per-image cell count.
 p_count <- ggplot(counts, aes(x = source, y = n_cells, fill = group)) +
   geom_col(width = 0.7, color = "grey25", linewidth = 0.3) +
+  scale_x_discrete(labels = function(z) .mpfig_wrap(z, 14)) +
   labs(x = NULL, y = "Cells per image", title = "Cell count per image") +
   common_theme +
   theme(axis.text.x = element_text(angle = 35, hjust = 1, size = 7))
