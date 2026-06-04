@@ -4402,9 +4402,36 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // Load inset sources + MATLAB availability on open.
   useEffect(() => {
     if (!open) return;
-    api.listInsetAnalysisSources()
-      .then((r) => {
-        const list = r.sources || [];
+    // Per-MPF sources (Task #32 Part B): pull insets from the ACTIVE doc
+    // (keys unchanged for backward-compat with saved workflows) AND every
+    // OTHER open .mpf that has a saved path.  Non-active docs get their
+    // keys namespaced by doc id so two figures with the same panel coords
+    // (r0c0_i0) don't collide, and each source is tagged with mpfId / mpf
+    // so the Sources panel can fold them into per-figure folders and the
+    // run can extract each from its OWN project (buildSources →
+    // project_path → backend _project_context).
+    const _docs = openDocs;
+    const _active = activeDocId;
+    const _activeName = _docs.find((d) => d.id === _active)?.name || "This figure";
+    const tasks: Promise<InsetSource[]>[] = [
+      api.listInsetAnalysisSources()
+        .then((r) => (r.sources || []).map((s) => ({ ...(s as unknown as InsetSource), mpfId: _active || "__active__", mpf: _activeName })))
+        .catch(() => [] as InsetSource[]),
+    ];
+    for (const d of _docs) {
+      if (d.id === _active || !d.path) continue;
+      tasks.push(
+        api.listInsetAnalysisSourcesFor(d.path)
+          .then((r) => (r.sources || []).map((s) => {
+            const src = s as unknown as InsetSource;
+            return { ...src, key: `${d.id}__${src.key}`, mpfId: d.id, mpf: d.name };
+          }))
+          .catch(() => [] as InsetSource[]),
+      );
+    }
+    Promise.all(tasks)
+      .then((groups) => {
+        const list = groups.flat();
         // Preserve user-uploaded standalone sources (name-based) across the
         // refresh — they live in loaded_images for the session, not in the
         // builder inset list the backend returns here.
@@ -4458,7 +4485,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         });
       })
       .catch(() => { setCellposeKind(""); setCellposeVersions({ v3: { installed: false }, v4: { installed: false } }); });
-  }, [open, enginePaths]);
+  }, [open, enginePaths, openDocs, activeDocId]);
 
   // ── Graph handlers ─────────────────────────────────────────
 
@@ -5640,12 +5667,20 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
             }
           }
           if (!src) return null;
-          const base: { key: string; row: number; col: number; inset_index: number; label: string; name?: string } =
+          const base: { key: string; row: number; col: number; inset_index: number; label: string; name?: string; project_path?: string } =
             { key: insetKey, row: src.row, col: src.col, inset_index: src.inset_index, label: displayName(src, sourceNameOverrides) };
           if (src.name) base.name = src.name;  // standalone whole-image source
+          // Per-MPF (Task #32 Part B): a source from a NON-active figure
+          // carries its own project path so the backend extracts pixels from
+          // THAT .mpf, not the active doc.  Active-doc sources send nothing
+          // (backend uses the live figure — unchanged single-MPF behaviour).
+          if (src.mpfId && src.mpfId !== "__active__" && src.mpfId !== activeDocId) {
+            const p = openDocs.find((d) => d.id === src.mpfId)?.path;
+            if (p) base.project_path = p;
+          }
           return base;
         })
-        .filter((s): s is { key: string; row: number; col: number; inset_index: number; label: string; name?: string } => !!s);
+        .filter((s): s is { key: string; row: number; col: number; inset_index: number; label: string; name?: string; project_path?: string } => !!s);
 
       if (engine === "python") {
         const sources = buildSources();
@@ -6352,18 +6387,49 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
                     onDeleteSource={deleteUploadedSource}
                   />
                 ))}
-                {/* "Ungrouped" — anything not assigned to a group. */}
-                {(ungrouped.length > 0 || sourceGroups.length === 0) && (
-                  <UserSourceGroup
-                    key="__ungrouped__"
-                    group={{ id: "__ungrouped__", name: sourceGroups.length === 0 ? "All sources" : "Ungrouped", sourceKeys: [] }}
-                    items={ungrouped}
-                    onAssignKey={() => {/* drops on ungrouped are a no-op */}}
-                    onRemoveKey={() => {/* not in a group → nothing to remove */}}
-                    isUngrouped
-                    onDeleteSource={deleteUploadedSource}
-                  />
-                )}
+                {/* Per-MPF folders (Task #32 Part B): split the
+                    not-in-a-user-group sources into one read-only folder
+                    per source figure, so it's clear which .mpf each came
+                    from and sources from two figures can be combined in a
+                    workflow.  Active figure first, then others A→Z. */}
+                {(() => {
+                  const byMpf = new Map<string, { name: string; items: InsetSource[] }>();
+                  for (const s of ungrouped) {
+                    const id = s.mpfId || "__active__";
+                    if (!byMpf.has(id)) byMpf.set(id, { name: s.mpf || "This figure", items: [] });
+                    byMpf.get(id)!.items.push(s);
+                  }
+                  const activeKey = activeDocId || "__active__";
+                  const entries = Array.from(byMpf.entries()).sort((a, b) =>
+                    a[0] === activeKey ? -1 : b[0] === activeKey ? 1 : a[1].name.localeCompare(b[1].name));
+                  // Multi-figure → prefix names with 📄 so the folders read as
+                  // per-figure; single figure → keep the plain "All sources".
+                  const multi = entries.length > 1 || sourceGroups.length > 0;
+                  if (entries.length === 0 && sourceGroups.length === 0) {
+                    return (
+                      <UserSourceGroup
+                        key="__ungrouped__"
+                        group={{ id: "__ungrouped__", name: "All sources", sourceKeys: [] }}
+                        items={[]}
+                        onAssignKey={() => {}}
+                        onRemoveKey={() => {}}
+                        isUngrouped
+                        onDeleteSource={deleteUploadedSource}
+                      />
+                    );
+                  }
+                  return entries.map(([id, g]) => (
+                    <UserSourceGroup
+                      key={`mpf_${id}`}
+                      group={{ id: `mpf_${id}`, name: multi ? `📄 ${g.name}` : g.name, sourceKeys: [] }}
+                      items={g.items}
+                      onAssignKey={() => {/* per-MPF folders are read-only */}}
+                      onRemoveKey={() => {}}
+                      isUngrouped
+                      onDeleteSource={deleteUploadedSource}
+                    />
+                  ));
+                })()}
               </>
             );
           })()}

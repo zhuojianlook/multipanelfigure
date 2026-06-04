@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.347"
+SIDECAR_BUILD = "0.1.348"
 
 
 @app.get("/api/version")
@@ -6747,6 +6747,68 @@ def list_inset_sources_for(body: InsetSourcesForRequest):
     return {"sources": sources}
 
 
+import contextlib as _contextlib
+
+
+@_contextlib.contextmanager
+def _project_context(project_path):
+    """Temporarily make the global figure state point at a DIFFERENT .mpf so
+    inset extraction (`_extract_source_image` / `_extract_inset_image`, which
+    read the module globals) pulls pixels from that project instead of the
+    active builder doc.  Used by the analysis pipelines to run a workflow that
+    combines sources from MORE THAN ONE MPF — each source carries its own
+    `project_path`; sources with none use the active doc as before.
+
+    A no-op (yields immediately, no swap) when project_path is empty or the
+    file can't be found, so single-MPF workflows behave exactly as today.
+    Serialised by the same lock as inset-sources-for; the restore is in a
+    finally so the active state is always put back."""
+    global cfg, loaded_images, loaded_videos, video_frames, loaded_zstacks, channel_groups, min_dims
+    pp = os.path.expanduser((project_path or "").strip())
+    if pp and not os.path.dirname(pp):
+        pp = os.path.join(os.path.expanduser("~"), "Documents", pp)
+    if not pp or not os.path.isfile(pp):
+        yield
+        return
+    try:
+        loaded_cfg, local_images = _load_collage_mpf(pp)
+    except Exception as _e:
+        import sys as __s
+        print(f"[analysis] could not load source project {pp!r}: {_e}", file=__s.stderr, flush=True)
+        yield
+        return
+    with _source_swap_lock:
+        saved = (cfg, loaded_images, loaded_videos, video_frames, loaded_zstacks, channel_groups, min_dims)
+        try:
+            cfg = loaded_cfg
+            loaded_images = dict(local_images)
+            loaded_videos = {}
+            video_frames = {}
+            loaded_zstacks = {}
+            channel_groups = {}
+            _recalc_min_dims()
+            yield
+        finally:
+            (cfg, loaded_images, loaded_videos, video_frames,
+             loaded_zstacks, channel_groups, min_dims) = saved
+
+
+def _group_sources_by_project(sources):
+    """Stable partition of a source list by their `project_path` (missing /
+    empty = the active doc, grouped under '').  Returns an ordered list of
+    (project_path, [sources]) so the active group (key '') extracts with no
+    swap and each other MPF is loaded once for all its sources."""
+    order = []
+    buckets = {}
+    for s in (sources or []):
+        pp = str(s.get("project_path") or "").strip()
+        if pp not in buckets:
+            buckets[pp] = []
+            order.append(pp)
+        buckets[pp].append(s)
+    return [(pp, buckets[pp]) for pp in order]
+
+
 class WbPreviewRequest(BaseModel):
     """Build ONLY the contrast-stretched membrane preview — same gamma-sqrt
     percentile stretch wb_detect.contrast_scale() applies inside the
@@ -7785,45 +7847,54 @@ def run_python_pipeline(body: PyAnalysisRequest):
         # time and stash in a pickle the worker reads.
         inputs_pickle = os.path.join(tmpdir, "inputs.pkl")
         inputs_dict: Dict[str, Dict[str, object]] = {}
-        for s in sources_in:
+
+        def _materialise_py_source(s):
+            key = str(s.get("key", ""))
+            r = int(s.get("row", -1)); c = int(s.get("col", -1))
+            has_name = bool(s.get("name") or s.get("image_name"))
+            if not key or ((r < 0 or c < 0) and not has_name):
+                return
+            img = _extract_source_image(s)  # inset / panel / area / standalone
+            if img is None:
+                return
+            arr = _np.asarray(img.convert("RGB"))
+            entry = {
+                "image": arr,
+                "width": int(arr.shape[1]),
+                "height": int(arr.shape[0]),
+                "label": str(s.get("label") or key),
+                "row": r, "col": c, "inset_index": int(s.get("inset_index", -1)),
+            }
+            # Attach FULL-BIT-DEPTH pixels (geometry only, no leveling) so
+            # quantitative code (band integrated density) uses the real
+            # dynamic range instead of the 8-bit display image.
             try:
-                key = str(s.get("key", ""))
-                r = int(s.get("row", -1)); c = int(s.get("col", -1))
-                has_name = bool(s.get("name") or s.get("image_name"))
-                if not key or ((r < 0 or c < 0) and not has_name):
-                    continue
-                img = _extract_source_image(s)  # inset / panel / area / standalone
-                if img is None:
-                    continue
-                arr = _np.asarray(img.convert("RGB"))
-                entry = {
-                    "image": arr,
-                    "width": int(arr.shape[1]),
-                    "height": int(arr.shape[0]),
-                    "label": str(s.get("label") or key),
-                    "row": r, "col": c, "inset_index": int(s.get("inset_index", -1)),
-                }
-                # Attach FULL-BIT-DEPTH pixels (geometry only, no leveling) so
-                # quantitative code (band integrated density) uses the real
-                # dynamic range instead of the 8-bit display image.
+                raw = _extract_source_raw(s)
+            except Exception:
+                raw = None
+            if raw is not None:
+                raw = _np.asarray(raw)
+                entry["image_raw"] = raw
+                entry["raw_dtype"] = str(raw.dtype)
                 try:
-                    raw = _extract_source_raw(s)
+                    entry["raw_max"] = (float(_np.iinfo(raw.dtype).max)
+                                        if _np.issubdtype(raw.dtype, _np.integer)
+                                        else float(raw.max()))
                 except Exception:
-                    raw = None
-                if raw is not None:
-                    raw = _np.asarray(raw)
-                    entry["image_raw"] = raw
-                    entry["raw_dtype"] = str(raw.dtype)
+                    entry["raw_max"] = float(raw.max()) if raw.size else 255.0
+            inputs_dict[key] = entry
+
+        # Group by source MPF so a workflow mixing insets from TWO different
+        # .mpf files extracts each from ITS OWN project (sources with no
+        # project_path use the active doc — exactly as before).
+        for _proj, _grp in _group_sources_by_project(sources_in):
+            with _project_context(_proj):
+                for s in _grp:
                     try:
-                        entry["raw_max"] = (float(_np.iinfo(raw.dtype).max)
-                                            if _np.issubdtype(raw.dtype, _np.integer)
-                                            else float(raw.max()))
-                    except Exception:
-                        entry["raw_max"] = float(raw.max()) if raw.size else 255.0
-                inputs_dict[key] = entry
-            except Exception as _e:
-                import sys as __s
-                print(f"[run-python] extract failed for {s}: {_e}", file=__s.stderr, flush=True)
+                        _materialise_py_source(s)
+                    except Exception as _e:
+                        import sys as __s
+                        print(f"[run-python] extract failed for {s}: {_e}", file=__s.stderr, flush=True)
         # Pipe upstream-node outputs in as additional inputs[key]
         # entries — same shape as inset-sourced inputs so the user
         # code doesn't need to special-case them.
@@ -8314,13 +8385,17 @@ def run_cellpose_pipeline(body: CellposeAnalysisRequest):
     #    common [(label, np.ndarray)] list.  Source insets are
     #    re-extracted at full resolution; extras arrive base64 PNG.
     images_in: List[Tuple[str, _np.ndarray]] = []
-    for s in (body.sources or []):
-        try:
-            arr = _extract_source_image(s)  # dispatches: inset / panel / area
-            if arr is None: continue
-            images_in.append((str(s.get("label") or s.get("key") or f"src_{len(images_in)}"), _np.array(arr)))
-        except Exception as _e:
-            print(f"[run-cellpose] source extract failed: {_e}", file=_sys.stderr, flush=True)
+    # Group by source MPF so a workflow mixing insets from two different .mpf
+    # files extracts each from its own project (no project_path = active doc).
+    for _proj, _grp in _group_sources_by_project(body.sources or []):
+        with _project_context(_proj):
+            for s in _grp:
+                try:
+                    arr = _extract_source_image(s)  # dispatches: inset / panel / area
+                    if arr is None: continue
+                    images_in.append((str(s.get("label") or s.get("key") or f"src_{len(images_in)}"), _np.array(arr)))
+                except Exception as _e:
+                    print(f"[run-cellpose] source extract failed: {_e}", file=_sys.stderr, flush=True)
     for x in (body.extra_inputs or []):
         if x.get("kind") != "image": continue
         b64 = x.get("image_b64") or ""
