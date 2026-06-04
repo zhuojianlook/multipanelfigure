@@ -623,6 +623,7 @@ class ApiClient {
    *  figure) — lets the Analysis tab show a sources drawer per loaded MPF. */
   async listInsetAnalysisSourcesFor(projectPath: string): Promise<{
     sources: Array<Record<string, unknown>>;
+    measurements?: Array<Record<string, unknown>>;
   }> {
     return apiJson("/api/analysis/inset-sources-for", "POST", JSON.stringify({ project_path: projectPath }));
   }
@@ -633,6 +634,7 @@ class ApiClient {
    *  falls back to listInsetAnalysisSourcesFor(path) for saved-on-disk docs. */
   async listInsetAnalysisSourcesForDoc(docId: string): Promise<{
     sources: Array<Record<string, unknown>>;
+    measurements?: Array<Record<string, unknown>>;
   }> {
     return apiJson("/api/analysis/inset-sources-for-doc", "POST", JSON.stringify({ doc_id: docId }));
   }

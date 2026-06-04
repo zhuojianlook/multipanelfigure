@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.351"
+SIDECAR_BUILD = "0.1.352"
 
 
 @app.get("/api/version")
@@ -3439,9 +3439,10 @@ def magic_wand_select(r: int, c: int, body: MagicWandRequest):
 
 # ── Measurements Endpoint ──────────────────────────────────────────────────
 
-@app.get("/api/measurements")
-def get_measurements():
-    """Compute all line/area measurements across all panels.
+def _collect_measurements():
+    """Compute all line/area measurements across all panels of the LIVE
+    figure state (reads the module globals), so callers that briefly swap
+    the globals to another doc can collect that doc's measurements too.
 
     Each result carries the measurement BOTH as a display string (`value`,
     which honours a user `measure_text` override) AND as separate
@@ -3487,7 +3488,13 @@ def get_measurements():
                     results.append({"panel": label, "name": area.name, "type": "area",
                                     "value": text, "numeric": round(numeric, 4),
                                     "unit": unit_label(unit, squared=True)})
-    return {"measurements": results}
+    return results
+
+
+@app.get("/api/measurements")
+def get_measurements():
+    """All line/area measurements for the active figure."""
+    return {"measurements": _collect_measurements()}
 
 
 # ── Preview Endpoint ───────────────────────────────────────────────────────
@@ -6741,10 +6748,11 @@ def list_inset_sources_for(body: InsetSourcesForRequest):
             channel_groups = {}
             _recalc_min_dims()
             sources = _collect_analysis_insets(include_thumbnails=True)
+            measurements = _collect_measurements()
         finally:
             (cfg, loaded_images, loaded_videos, video_frames,
              loaded_zstacks, channel_groups, min_dims) = saved
-    return {"sources": sources}
+    return {"sources": sources, "measurements": measurements}
 
 
 @app.post("/api/analysis/inset-sources-for-doc")
@@ -6769,11 +6777,12 @@ def list_inset_sources_for_doc(body: DocStateRequest):
         try:
             _apply_doc_state(st)
             sources = _collect_analysis_insets(include_thumbnails=True)
+            measurements = _collect_measurements()
         finally:
             (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
              loaded_videos, video_frames, loaded_zstacks, zstack_frames,
              zstack_counts, channel_groups) = saved
-    return {"sources": sources}
+    return {"sources": sources, "measurements": measurements}
 
 
 import contextlib as _contextlib

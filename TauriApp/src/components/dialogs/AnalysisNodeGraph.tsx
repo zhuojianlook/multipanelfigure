@@ -829,11 +829,38 @@ function ConfirmDialogBody({ request, setRequest }: {
 // let those nodes call back into the parent (drop-to-attach, output
 // chip clicks, etc.) we use a React context that the canvas wraps
 // around its ReactFlow tree.
+/** A figure's measurements table attached to a SourceNode — carries the
+ *  source figure id/name (for the port label + per-MPF folder) and the
+ *  CSV the node feeds downstream when its 📋 port is wired. */
+interface MeasurementRef {
+  mpfId: string;
+  mpf: string;
+  label: string;
+  csv: string;
+}
+
+/** Convert a measurements array (from /api/measurements or the per-doc
+ *  source endpoints) into the same CSV the active figure uses, so a tile
+ *  for any figure feeds an identical table shape downstream. */
+function measArrToCsv(rows: Array<Record<string, unknown>>): string {
+  const header = "Panel,Name,Group,Value,Unit";
+  const q = (c: unknown) => `"${String(c ?? "").replace(/"/g, '""')}"`;
+  const body = (rows || []).map((m) => {
+    const value = m.numeric != null ? String(m.numeric) : String(m.value ?? "");
+    return [m.panel, m.name, m.panel, value, m.unit ?? ""].map(q).join(",");
+  }).join("\n");
+  return body ? `${header}\n${body}` : `${header}\n`;
+}
 interface GraphCallbacks {
   /** Attach an inset (by InsetSource.key) to a SourceNode's list. */
   addSourceToNode: (nodeId: string, sourceKey: string) => void;
   /** Detach an inset (by index) from a SourceNode's list. */
   removeSourceFromNode: (nodeId: string, idx: number) => void;
+  /** Attach a figure's measurements table to a SourceNode (drag the
+   *  📋 Measurements tile onto it). The node then exposes its 📋 port. */
+  attachMeasurements: (nodeId: string, ref: MeasurementRef) => void;
+  /** Detach the measurements table from a SourceNode (the 📋 row's ×). */
+  detachMeasurements: (nodeId: string) => void;
   /** Delete a connecting edge by id (used by the edge's hover × button). */
   removeEdge: (edgeId: string) => void;
   /** Open the output drawer focused on this output + briefly flash it. */
@@ -1017,6 +1044,10 @@ export interface NodeData {
   /** For source nodes only — list of inset sources to expose as
    *  output handles. */
   sources?: InsetSource[];
+  /** For source nodes — the figure's measurements table attached by
+   *  dragging the 📋 Measurements tile onto the node. When set, the node
+   *  exposes its 📋 (out_table_measurements) port carrying this CSV. */
+  measurementsRef?: MeasurementRef;
   /** When true, the user has explicitly removed the node from
    *  the canvas — used to no-op stale auto-edges. */
   deleted?: boolean;
@@ -1123,7 +1154,9 @@ function StatusPip({ status }: { status?: NodeData["status"] }) {
 function SourceNode({ data, id }: NodeCardProps) {
   const sources = data.sources || [];
   const cbs = useGraphCallbacks();
-  const showMeasurements = !!cbs?.hasMeasurements;
+  // The 📋 port shows once a figure's measurements are ATTACHED to this
+  // node (drag the Measurements tile onto it) — like any other source.
+  const measRef = data.measurementsRef;
   const isUpstreamHi = cbs?.highlightedUpstreamIds.has(id) ?? false;
   const [dragOver, setDragOver] = useState(false);
   // React Flow caches a node's handle set from the first render —
@@ -1167,10 +1200,11 @@ function SourceNode({ data, id }: NodeCardProps) {
       clearTimeout(t1); clearTimeout(t2); clearTimeout(t3);
       cancelAnimationFrame(raf1); if (raf2) cancelAnimationFrame(raf2);
     };
-  }, [id, sources.length, showMeasurements, updateNodeInternals]);
+  }, [id, sources.length, measRef, updateNodeInternals]);
 
   const onDragOver = (e: React.DragEvent) => {
-    if (e.dataTransfer.types.includes("application/x-mpfig-source")) {
+    const t = e.dataTransfer.types;
+    if (t.includes("application/x-mpfig-source") || t.includes("application/x-mpfig-measurements")) {
       e.preventDefault();
       e.dataTransfer.dropEffect = "copy";
       if (!dragOver) setDragOver(true);
@@ -1179,9 +1213,18 @@ function SourceNode({ data, id }: NodeCardProps) {
   const onDragLeave = () => setDragOver(false);
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
+    e.stopPropagation();
     setDragOver(false);
     const key = e.dataTransfer.getData("application/x-mpfig-source");
-    if (key && cbs) cbs.addSourceToNode(id, key);
+    if (key && cbs) { cbs.addSourceToNode(id, key); return; }
+    // 📋 Measurements tile dropped onto this source node → attach it.
+    const m = e.dataTransfer.getData("application/x-mpfig-measurements");
+    if (m && cbs) {
+      try {
+        const ref = JSON.parse(m) as MeasurementRef;
+        if (ref && typeof ref.csv === "string") cbs.attachMeasurements(id, ref);
+      } catch { /* malformed payload — ignore */ }
+    }
   };
 
   return (
@@ -1244,13 +1287,20 @@ function SourceNode({ data, id }: NodeCardProps) {
             </Box>
           ))
         )}
-        {/* Measurements port — every source node exposes it when the
-            host figure has measurement data, so any source can feed
-            an R node downstream. The runner dedups by sourceHandle
-            so multiple sources wiring measurements is harmless. */}
-        {showMeasurements && (
+        {/* Measurements port — shown only when a figure's measurements
+            were ATTACHED to this node (drag the 📋 Measurements tile onto
+            it), like any other source. The port carries THAT figure's
+            measurements CSV downstream; × detaches it. */}
+        {measRef && (
           <Box sx={{ position: "relative", display: "flex", alignItems: "center", gap: 0.4, py: 0.25, pr: 1.5, borderTop: "1px dashed", borderColor: "divider" }}>
-            <Typography variant="caption" sx={{ fontSize: "0.55rem", fontWeight: 600, flex: 1 }}>📋 measurements</Typography>
+            <Typography variant="caption" sx={{ fontSize: "0.55rem", fontWeight: 600, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              📋 {measRef.label || "measurements"}
+            </Typography>
+            <Box
+              component="span"
+              onClick={(e) => { e.stopPropagation(); cbs?.detachMeasurements(id); }}
+              sx={{ fontSize: "0.55rem", cursor: "pointer", color: "text.disabled", px: 0.25, "&:hover": { color: "error.main" } }}
+            >×</Box>
             <Handle
               type="source"
               position={Position.Right}
@@ -4295,6 +4345,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     const lines = (measurementsCsv || "").trim().split(/\r?\n/).filter((l) => l.trim().length > 0);
     return Math.max(0, lines.length - 1);
   }, [measurementsCsv]);
+  // Measurements for the OTHER open figures (the active one comes from the
+  // measurementsCsv prop). Populated from the per-doc source fetch below;
+  // keyed by doc id → { csv, rows }. Drives one Measurements tile per figure.
+  const [extraMeasurements, setExtraMeasurements] = useState<Record<string, { csv: string; rows: number }>>({});
 
   // ── Per-source name overrides ────────────────────────────────
   // `sourceNameOverrides[key]` is the user's chosen display name for
@@ -4429,6 +4483,15 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         const src = s as unknown as InsetSource;
         return { ...src, key: `${d.id}__${src.key}`, mpfId: d.id, mpf: d.name };
       });
+    // Per-figure measurements (one tile per figure). The per-doc endpoints
+    // return this figure's measurements too; record them so the Sources
+    // panel can offer a draggable Measurements tile for EACH open figure.
+    const _measAccum: Record<string, { csv: string; rows: number }> = {};
+    const _capMeas = (r: { sources?: Array<Record<string, unknown>>; measurements?: Array<Record<string, unknown>> }, d: { id: string; name: string }) => {
+      const m = r.measurements || [];
+      if (m.length) _measAccum[d.id] = { csv: measArrToCsv(m), rows: m.length };
+      return _tag(r.sources || [], d);
+    };
     const tasks: Promise<InsetSource[]>[] = [
       api.listInsetAnalysisSources()
         .then((r) => (r.sources || []).map((s) => ({ ...(s as unknown as InsetSource), mpfId: _active || "__active__", mpf: _activeName })))
@@ -4441,15 +4504,15 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
         // gone (sidecar restart) fall back to the on-disk .mpf when saved.
         tasks.push(
           api.listInsetAnalysisSourcesForDoc(d.id)
-            .then((r) => _tag(r.sources || [], d))
+            .then((r) => _capMeas(r, d))
             .catch(() => (d.path
-              ? api.listInsetAnalysisSourcesFor(d.path).then((r) => _tag(r.sources || [], d)).catch(() => [] as InsetSource[])
+              ? api.listInsetAnalysisSourcesFor(d.path).then((r) => _capMeas(r, d)).catch(() => [] as InsetSource[])
               : ([] as InsetSource[]))),
         );
       } else if (d.path) {
         tasks.push(
           api.listInsetAnalysisSourcesFor(d.path)
-            .then((r) => _tag(r.sources || [], d))
+            .then((r) => _capMeas(r, d))
             .catch(() => [] as InsetSource[]),
         );
       }
@@ -4465,6 +4528,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           const uploads = prev.filter((s) => s.name && !liveKeys.has(s.key));
           return [...uploads, ...list];
         });
+        setExtraMeasurements(_measAccum);
         // Do NOT auto-populate the Source node — the user picks
         // which insets to attach by dragging from the library
         // panel. We still refresh any sources that are already
@@ -4754,6 +4818,22 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // to partition insets across multiple parallel pipelines on the
   // same canvas.
 
+  /** Attach a figure's measurements table to a source node (drag the
+   *  📋 Measurements tile onto it). The node then exposes its 📋 port
+   *  carrying that figure's CSV. */
+  const attachMeasurements = useCallback((nodeId: string, ref: MeasurementRef) => {
+    setNodes((cur) => cur.map((n) =>
+      n.id === nodeId && n.data.kind === "source"
+        ? { ...n, data: { ...n.data, measurementsRef: ref } } : n));
+    setSelectedNodeId(nodeId);
+  }, [setNodes]);
+
+  /** Detach the measurements table from a source node (the 📋 row's ×). */
+  const detachMeasurements = useCallback((nodeId: string) => {
+    setNodes((cur) => cur.map((n) =>
+      n.id === nodeId ? { ...n, data: { ...n.data, measurementsRef: undefined } } : n));
+  }, [setNodes]);
+
   /** Attach an inset (looked up by InsetSource.key) to a source node. */
   const addSourceToNode = useCallback((nodeId: string, sourceKey: string) => {
     const inset = insetSources.find((s) => s.key === sourceKey);
@@ -4874,32 +4954,6 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     ]);
     setSelectedNodeId(id);
   }, [nodes, setNodes]);
-
-  // Drop target for the 📋 Measurements source tile — spawns a Source node
-  // (empty of insets) at the drop point.  A source node auto-exposes the
-  // measurements (📋) output port whenever the figure has measurements, so
-  // this gives the user a draggable "measurements source" they can wire into
-  // an R / Python node.  Falls back to a viewport-centred position.
-  const addMeasurementsSource = useCallback((screenX?: number, screenY?: number) => {
-    const id = newId("src");
-    let pos = { x: 30, y: 360 };
-    const inst = rfRef.current;
-    if (inst) {
-      try {
-        if (screenX != null && screenY != null) {
-          pos = inst.screenToFlowPosition({ x: screenX, y: screenY });
-        } else {
-          const container = document.querySelector(".react-flow") as HTMLElement | null;
-          if (container) {
-            const rect = container.getBoundingClientRect();
-            pos = inst.screenToFlowPosition({ x: rect.left + 80, y: rect.top + rect.height * 0.6 });
-          }
-        }
-      } catch { /* default pos */ }
-    }
-    setNodes((cur) => [...cur, newSourceNode([], { id, label: "Measurements", position: pos })]);
-    setSelectedNodeId(id);
-  }, [setNodes]);
 
   // Hidden file input — only the browser/dev FALLBACK for the upload button
   // (in the Tauri webview we use the native file dialog, which actually opens).
@@ -5289,8 +5343,12 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
             result.push({ key, kind: "image", label: displayName(src, sourceNameOverrides), image_b64: src.thumbnail });
           }
         } else if (e.sourceHandle === "out_table_measurements") {
-          const key = `measurements`;
-          result.push({ key, kind: "table", label: "measurements", csv: measurementsCsv });
+          // Emit the figure's measurements ATTACHED to this source node
+          // (its own CSV); fall back to the active figure for any legacy
+          // edge whose node has no attached ref.
+          result.push({ key: "measurements", kind: "table",
+            label: upstreamData.measurementsRef?.label || "measurements",
+            csv: upstreamData.measurementsRef?.csv ?? measurementsCsv });
         }
         continue;
       }
@@ -5475,8 +5533,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               result.push({ key, kind: "image", label: displayName(src, sourceNameOverrides), image_b64: src.thumbnail });
             }
           } else if (e.sourceHandle === "out_table_measurements") {
-            const key = `measurements`;
-            result.push({ key, kind: "table", label: "measurements", csv: measurementsCsv });
+            result.push({ key: "measurements", kind: "table",
+              label: upstreamData.measurementsRef?.label || "measurements",
+              csv: upstreamData.measurementsRef?.csv ?? measurementsCsv });
           }
           continue;
         }
@@ -6352,7 +6411,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
 
       {/* Canvas + side panel + drawer (flex row below the tabs) */}
       <GraphCallbacksContext.Provider value={{
-        addSourceToNode, removeSourceFromNode, removeEdge, navigateToOutput, openPreview,
+        addSourceToNode, removeSourceFromNode, attachMeasurements, detachMeasurements, removeEdge, navigateToOutput, openPreview,
         insetSources, sourceNameOverrides, renameSource: renameSourceHandler,
         hasMeasurements, highlightedUpstreamIds,
         inputCountsByNode, declaredByNode,
@@ -6414,37 +6473,53 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               ))}
             </Box>
           )}
-          {/* Measurements — a draggable source tile (parity with inset
-              tiles). The figure's panel/line/area measurements are a TABLE;
-              drag this onto the canvas to drop a Source node exposing the
-              📋 measurements port, then wire it to an R / Python node. */}
-          {measurementRowCount > 0 && (
-            <Tooltip placement="right" title="Panel / line / area measurements for this figure. Drag onto the canvas to add a Measurements source node, then wire its 📋 port to an R or Python node.">
-              <Box
-                draggable
-                onDragStart={(e) => {
-                  e.dataTransfer.setData("application/x-mpfig-measurements", "1");
-                  e.dataTransfer.effectAllowed = "copy";
-                }}
-                sx={{
-                  display: "flex", alignItems: "center", gap: 0.75, px: 0.75, py: 0.5, mb: 0.5,
-                  border: "1px dashed", borderColor: "divider", borderRadius: 0.5,
-                  cursor: "grab", bgcolor: "action.hover",
-                  "&:active": { cursor: "grabbing" },
-                  "&:hover": { borderColor: "primary.main" },
-                }}>
-                <Box component="span" sx={{ fontSize: 15, lineHeight: 1 }}>📋</Box>
-                <Box sx={{ minWidth: 0, flex: 1 }}>
-                  <Typography variant="caption" sx={{ fontSize: "0.62rem", fontWeight: 700, display: "block", lineHeight: 1.15 }}>
-                    Measurements
-                  </Typography>
-                  <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", display: "block", lineHeight: 1.15 }}>
-                    {measurementRowCount} row{measurementRowCount === 1 ? "" : "s"} · drag to canvas
-                  </Typography>
-                </Box>
-              </Box>
-            </Tooltip>
-          )}
+          {/* Measurements — one draggable tile PER open figure (parity with
+              inset tiles). Each carries that figure's panel/line/area
+              measurements CSV; drag onto a Source node to attach it (its 📋
+              port then wires to an R / Python node). */}
+          {(() => {
+            const tiles = openDocs
+              .map((d) => {
+                const active = d.id === (activeDocId || "");
+                const csv = active ? measurementsCsv : (extraMeasurements[d.id]?.csv || "");
+                const rows = active ? measurementRowCount : (extraMeasurements[d.id]?.rows || 0);
+                return { d, csv, rows };
+              })
+              .filter((t) => t.rows > 0);
+            if (tiles.length === 0) return null;
+            const multi = openDocs.length > 1;
+            return tiles.map(({ d, csv, rows }) => {
+              const label = multi ? `${d.name} — measurements` : "Measurements";
+              const ref: MeasurementRef = { mpfId: d.id, mpf: d.name, label, csv };
+              return (
+                <Tooltip key={`meas_${d.id}`} placement="right" title="Panel / line / area measurements for this figure. Drag onto a Source node to attach it, then wire that node's 📋 port to an R or Python node.">
+                  <Box
+                    draggable
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData("application/x-mpfig-measurements", JSON.stringify(ref));
+                      e.dataTransfer.effectAllowed = "copy";
+                    }}
+                    sx={{
+                      display: "flex", alignItems: "center", gap: 0.75, px: 0.75, py: 0.5, mb: 0.5,
+                      border: "1px dashed", borderColor: "divider", borderRadius: 0.5,
+                      cursor: "grab", bgcolor: "action.hover",
+                      "&:active": { cursor: "grabbing" },
+                      "&:hover": { borderColor: "primary.main" },
+                    }}>
+                    <Box component="span" sx={{ fontSize: 15, lineHeight: 1 }}>📋</Box>
+                    <Box sx={{ minWidth: 0, flex: 1 }}>
+                      <Typography variant="caption" sx={{ fontSize: "0.62rem", fontWeight: 700, display: "block", lineHeight: 1.15, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {multi ? `📄 ${d.name}` : "Measurements"}
+                      </Typography>
+                      <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", display: "block", lineHeight: 1.15 }}>
+                        {rows} measurement{rows === 1 ? "" : "s"} · drag to a Source node
+                      </Typography>
+                    </Box>
+                  </Box>
+                </Tooltip>
+              );
+            });
+          })()}
           {insetSources.length === 0 && uploading.length === 0 ? (
             <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.disabled", fontStyle: "italic", display: "block", px: 0.5, py: 1, lineHeight: 1.35 }}>
               No flagged insets yet. Open <strong>Edit Panel → Zoom Inset</strong> and tick <em>Include in Analysis</em>.
@@ -6523,7 +6598,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               edge directly. The hint below tells the user. */}
           {hasMeasurements && (
             <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", display: "block", mt: 1, px: 0.5, py: 0.5, borderTop: "1px dashed", borderColor: "divider", lineHeight: 1.3, fontStyle: "italic" }}>
-              📋 Measurements port is available on every source node — wire it to an R node downstream.
+              Drag a 📋 Measurements tile onto a Source node to attach it, then wire that node's 📋 port to an R node.
             </Typography>
           )}
         </Box>
@@ -6560,21 +6635,6 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           backgroundColor: "#2a3744",
           color: "#ffa726",
         },
-      }}
-      // Accept the 📋 Measurements source tile dropped onto the canvas →
-      // spawn a Source node (which exposes the measurements port) at the
-      // drop point. Inset tiles keep dropping onto Source nodes as before.
-      onDragOver={(e) => {
-        if (e.dataTransfer.types.includes("application/x-mpfig-measurements")) {
-          e.preventDefault();
-          e.dataTransfer.dropEffect = "copy";
-        }
-      }}
-      onDrop={(e) => {
-        if (e.dataTransfer.getData("application/x-mpfig-measurements")) {
-          e.preventDefault();
-          addMeasurementsSource(e.clientX, e.clientY);
-        }
       }}>
         <ReactFlow
           // FORCE REMOUNT on workflow change.  Despite multiple rounds
@@ -6947,7 +7007,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
             )}
             {hasMeasurements && (
               <Typography variant="caption" sx={{ fontSize: "0.6rem", color: "text.secondary", display: "block", mt: 1, fontStyle: "italic" }}>
-                The 📋 measurements port (on the node card) is available on every source — wire it to an R node to plot panel measurements.
+                Drag a 📋 Measurements tile onto a Source node, then wire that node's 📋 port to an R node to plot panel measurements.
               </Typography>
             )}
           </Box>
