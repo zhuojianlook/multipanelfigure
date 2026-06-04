@@ -6677,13 +6677,8 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               📊 R Plot
             </Button>
           </Tooltip>
-          <Tooltip placement="bottom" title="Add a western-blot Band picker — drop the whole blot on a Source, wire it here, then draw/auto-detect one ROI per lane">
-            <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
-              onClick={addBandPickerNode}
-              sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.python, "&:hover": { bgcolor: KIND_COLOR.python, filter: "brightness(0.9)" } }}>
-              🩻 Bands
-            </Button>
-          </Tooltip>
+          {/* Band picker lives in the Plugins menu (Picker tools) alongside
+              the Intensity picker — no separate toolbar button needed. */}
           <Tooltip placement="bottom" title={imagejKind
             ? `Add an ImageJ / Fiji macro node (detected: ${imagejKind})`
             : "ImageJ / Fiji not detected — install Fiji and ensure ImageJ-* is on PATH"}>
