@@ -4289,6 +4289,12 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // Measurements present? Falsy CSV (empty / null) hides the
   // measurements port on every source node + any related hints.
   const hasMeasurements = !!(measurementsCsv && measurementsCsv.trim().length > 0);
+  // Number of DATA rows (excluding the header) — drives the draggable
+  // Measurements source tile, which only shows when there's real data.
+  const measurementRowCount = useMemo(() => {
+    const lines = (measurementsCsv || "").trim().split(/\r?\n/).filter((l) => l.trim().length > 0);
+    return Math.max(0, lines.length - 1);
+  }, [measurementsCsv]);
 
   // ── Per-source name overrides ────────────────────────────────
   // `sourceNameOverrides[key]` is the user's chosen display name for
@@ -4868,6 +4874,32 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     ]);
     setSelectedNodeId(id);
   }, [nodes, setNodes]);
+
+  // Drop target for the 📋 Measurements source tile — spawns a Source node
+  // (empty of insets) at the drop point.  A source node auto-exposes the
+  // measurements (📋) output port whenever the figure has measurements, so
+  // this gives the user a draggable "measurements source" they can wire into
+  // an R / Python node.  Falls back to a viewport-centred position.
+  const addMeasurementsSource = useCallback((screenX?: number, screenY?: number) => {
+    const id = newId("src");
+    let pos = { x: 30, y: 360 };
+    const inst = rfRef.current;
+    if (inst) {
+      try {
+        if (screenX != null && screenY != null) {
+          pos = inst.screenToFlowPosition({ x: screenX, y: screenY });
+        } else {
+          const container = document.querySelector(".react-flow") as HTMLElement | null;
+          if (container) {
+            const rect = container.getBoundingClientRect();
+            pos = inst.screenToFlowPosition({ x: rect.left + 80, y: rect.top + rect.height * 0.6 });
+          }
+        }
+      } catch { /* default pos */ }
+    }
+    setNodes((cur) => [...cur, newSourceNode([], { id, label: "Measurements", position: pos })]);
+    setSelectedNodeId(id);
+  }, [setNodes]);
 
   // Hidden file input — only the browser/dev FALLBACK for the upload button
   // (in the Tauri webview we use the native file dialog, which actually opens).
@@ -6382,6 +6414,37 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               ))}
             </Box>
           )}
+          {/* Measurements — a draggable source tile (parity with inset
+              tiles). The figure's panel/line/area measurements are a TABLE;
+              drag this onto the canvas to drop a Source node exposing the
+              📋 measurements port, then wire it to an R / Python node. */}
+          {measurementRowCount > 0 && (
+            <Tooltip placement="right" title="Panel / line / area measurements for this figure. Drag onto the canvas to add a Measurements source node, then wire its 📋 port to an R or Python node.">
+              <Box
+                draggable
+                onDragStart={(e) => {
+                  e.dataTransfer.setData("application/x-mpfig-measurements", "1");
+                  e.dataTransfer.effectAllowed = "copy";
+                }}
+                sx={{
+                  display: "flex", alignItems: "center", gap: 0.75, px: 0.75, py: 0.5, mb: 0.5,
+                  border: "1px dashed", borderColor: "divider", borderRadius: 0.5,
+                  cursor: "grab", bgcolor: "action.hover",
+                  "&:active": { cursor: "grabbing" },
+                  "&:hover": { borderColor: "primary.main" },
+                }}>
+                <Box component="span" sx={{ fontSize: 15, lineHeight: 1 }}>📋</Box>
+                <Box sx={{ minWidth: 0, flex: 1 }}>
+                  <Typography variant="caption" sx={{ fontSize: "0.62rem", fontWeight: 700, display: "block", lineHeight: 1.15 }}>
+                    Measurements
+                  </Typography>
+                  <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", display: "block", lineHeight: 1.15 }}>
+                    {measurementRowCount} row{measurementRowCount === 1 ? "" : "s"} · drag to canvas
+                  </Typography>
+                </Box>
+              </Box>
+            </Tooltip>
+          )}
           {insetSources.length === 0 && uploading.length === 0 ? (
             <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.disabled", fontStyle: "italic", display: "block", px: 0.5, py: 1, lineHeight: 1.35 }}>
               No flagged insets yet. Open <strong>Edit Panel → Zoom Inset</strong> and tick <em>Include in Analysis</em>.
@@ -6497,6 +6560,21 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           backgroundColor: "#2a3744",
           color: "#ffa726",
         },
+      }}
+      // Accept the 📋 Measurements source tile dropped onto the canvas →
+      // spawn a Source node (which exposes the measurements port) at the
+      // drop point. Inset tiles keep dropping onto Source nodes as before.
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes("application/x-mpfig-measurements")) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "copy";
+        }
+      }}
+      onDrop={(e) => {
+        if (e.dataTransfer.getData("application/x-mpfig-measurements")) {
+          e.preventDefault();
+          addMeasurementsSource(e.clientX, e.clientY);
+        }
       }}>
         <ReactFlow
           // FORCE REMOUNT on workflow change.  Despite multiple rounds
