@@ -170,6 +170,14 @@ export interface FluorPickerImage {
 
 export interface FluorIntensityConfig {
   version: 1;
+  /** What this picker is FOR. "intensity" (default) = the full
+   *  fluorescence-intensity UI. "nuclei" = the nuclei-counting workflow's
+   *  detector: the picker hides cell-only controls (separate nuclei
+   *  channel, measure-compartments, capture-thin-processes, control
+   *  channel, simple strategy) and relabels the segmentation channel as
+   *  "Nuclei channel". The generated code is identical — only the UI and
+   *  defaults change. */
+  purpose?: "intensity" | "nuclei";
   channels: FluorChannels;
   /** "simple"   — per-channel rolling-ball BG + threshold; intensity =
    *               mean inside each channel's mask, one row per (image,
@@ -1397,6 +1405,10 @@ function renderBoundaryCanvas(
 export default function IntensityPickerDialog(props: IntensityPickerDialogProps) {
   const { open, images, initial, onClose, onSave } = props;
   const [cfg, setCfg] = useState<FluorIntensityConfig>(initial ? migrateConfig(initial) : emptyFluorConfig());
+  // Nuclei-counting detector mode: hide cell-only controls (separate nuclei
+  // channel, compartments, thin-process capture, control channel, simple
+  // strategy) and frame the segmentation channel as the NUCLEI channel.
+  const nucleiMode = cfg.purpose === "nuclei";
   const [activeIdx, setActiveIdx] = useState(0);
   // Per-image preview cache: maps imageLabel → the rendered layers from
   // the most recent successful Run. Switching back to a previously-
@@ -3603,7 +3615,9 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                 );
               })}
             </Box>
-            {/* Control-channel selector */}
+            {/* Control-channel selector — cell-intensity concept, hidden in
+                nuclei-counting mode. */}
+            {!nucleiMode && (
             <Box sx={{ mt: 0.8, display: "flex", alignItems: "center", gap: 0.75 }}>
               <Tooltip title="Pick the 'control' stain (typically DAPI / Hoechst). The downstream R plot adds a sanity-check panel comparing this channel across groups — if it's significantly different, the panel is flagged so you know the groups may not be biologically comparable.">
                 <Typography variant="caption" sx={{ fontWeight: 700, minWidth: 100 }}>Control channel</Typography>
@@ -3620,12 +3634,18 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                 <MenuItem value="b" sx={{ fontSize: "0.78rem" }}>{cfg.channels.b}</MenuItem>
               </TextField>
             </Box>
+            )}
           </Box>
 
           {/* Strategy ─────────────────────────────────────────── */}
           <Box sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, p: 1.1 }}>
             <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 0.6, flexWrap: "wrap" }}>
-              <Typography variant="caption" sx={{ fontWeight: 700 }}>Strategy</Typography>
+              <Typography variant="caption" sx={{ fontWeight: 700 }}>
+                {nucleiMode ? "Nuclei segmentation (Cellpose)" : "Strategy"}
+              </Typography>
+              {/* Simple vs Cellpose is meaningless for nuclei counting — it
+                  always needs per-object segmentation, so force Cellpose. */}
+              {!nucleiMode && (
               <ToggleButtonGroup size="small" exclusive value={cfg.mode}
                 onChange={(_, v) => { if (v) setCfg((c) => ({ ...c, mode: v })); }}
                 sx={{ ml: 1 }}>
@@ -3636,9 +3656,12 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                   Cellpose (per-cell)
                 </ToggleButton>
               </ToggleButtonGroup>
+              )}
             </Box>
             <Typography variant="caption" sx={{ color: "text.secondary", display: "block", mb: 0.75 }}>
-              {cfg.mode === "simple"
+              {nucleiMode
+                ? "Cellpose segments each nucleus in the nuclei channel below. Counts, size and per-channel intensity are measured per nucleus; the downstream plots compare them across conditions. n = images per group."
+                : cfg.mode === "simple"
                 ? "Detects the brightest pixels in each channel. Intensity sample = mean within that channel's detected pixels. n = images per group."
                 : "Cellpose 3+ segments individual cells in the chosen channel. Per-cell mean intensity per channel. n = cells per group."}
             </Typography>
@@ -3841,7 +3864,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                     ]}
                   </TextField>
                   <Box sx={{ display: "flex", alignItems: "center", gap: 0.4 }}>
-                    <TextField select size="small" label="Cell channel" value={cfg.cellpose.segChannel}
+                    <TextField select size="small" label={nucleiMode ? "Nuclei channel" : "Cell channel"} value={cfg.cellpose.segChannel}
                       onChange={(e) => setCellpose({ segChannel: e.target.value as "r" | "g" | "b" })}
                       inputProps={{ style: { fontSize: "0.78rem" } }}
                       InputLabelProps={{ style: { fontSize: "0.78rem" } }}
@@ -3864,7 +3887,11 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                     </Tooltip>
                   </Box>
                 </Box>
-                {/* Row 2 — nuclei channel + compartment toggle. */}
+                {/* Row 2 — nuclei channel + compartment toggle. Both are
+                    cell-body concepts (a separate nuclei channel for the
+                    cyto pass; compartment split needs a cell mask), so they
+                    are hidden in nuclei-counting mode. */}
+                {!nucleiMode && (
                 <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1, alignItems: "center" }}>
                   <Box sx={{ display: "flex", alignItems: "center", gap: 0.4 }}>
                     <TextField select size="small" label="Nuclei channel" value={cfg.cellpose.nucleiChannel ?? ""}
@@ -3929,6 +3956,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                     </Typography>
                   </Box>
                 </Box>
+                )}
                 {/* Diameter + min-size: AUTO by default (cellpose
                     estimates the diameter; min-size is derived from the
                     detected cells' size distribution at run time).  Each
@@ -3976,7 +4004,10 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                       </Box>
                       {/* Dendrite mode — bumps flow_threshold up + cellprob
                           down so cellpose extends masks down long thin
-                          processes instead of clipping at the soma. */}
+                          processes instead of clipping at the soma. A cell-
+                          shape concept (nuclei are round), hidden in nuclei
+                          mode. */}
+                      {!nucleiMode && (
                       <Box sx={{ display: "flex", alignItems: "center", gap: 0.6 }}>
                         <Box
                           onClick={() => setCellpose({ captureThinProcesses: !cfg.cellpose.captureThinProcesses })}
@@ -3993,6 +4024,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                           </Typography>
                         </Tooltip>
                       </Box>
+                      )}
                     </Box>
                   );
                 })()}
@@ -4003,7 +4035,9 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                     the common "why isn't my third channel being
                     segmented" confusion. */}
                 <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.65rem", display: "block", mt: 0.2 }}>
-                  Cellpose produces ONE cell mask per image (using the channels above). Intensities are then measured inside that mask in EVERY channel — not just the one used for segmentation.
+                  {nucleiMode
+                    ? "Cellpose segments each nucleus in the nuclei channel above. The count, nucleus size (area) and per-channel intensity inside each nucleus are all measured and compared across conditions downstream."
+                    : "Cellpose produces ONE cell mask per image (using the channels above). Intensities are then measured inside that mask in EVERY channel — not just the one used for segmentation."}
                 </Typography>
               </Box>
             )}

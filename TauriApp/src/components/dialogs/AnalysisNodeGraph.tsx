@@ -3127,12 +3127,14 @@ for r in rows:
 mpfig_data(rows, name="nuclei_counts")
 `;
 
-const NUCLEI_COUNT_PLOT_R = `# @name: Plot nuclei counts
-# Bar chart of nuclei per image.  With 2+ conditions: one bar per
-# CONDITION (mean +/- SD across that condition's images), a jittered
-# point per image, and ANOVA + Tukey HSD pairwise significance. With a
-# single condition (or none assigned): one bar per image, labelled with
-# its count.
+const NUCLEI_COUNT_PLOT_R = `# @name: Plot nuclei counts + size
+# Two figures from the per-image count table:
+#   nuclei_counts.png — nuclei per image
+#   nuclei_size.png   — mean nucleus area (px^2) per image
+# With 2+ conditions each shows one bar per CONDITION (mean +/- SD across
+# that condition's images, a jittered point per image, ANOVA + Tukey HSD
+# pairwise significance). With a single / unassigned condition, one bar
+# per image. (Per-channel intensity differences are a separate plot.)
 suppressWarnings(suppressMessages({ library(ggplot2); library(ggprism) }))
 
 if (length(inputs) == 0 || is.null(inputs[[1]]) || nrow(inputs[[1]]) == 0) {
@@ -3149,117 +3151,126 @@ df <- inputs[[1]]
 if (!"image" %in% names(df)) df$image <- as.character(seq_len(nrow(df)))
 if (!"group" %in% names(df)) df$group <- "(unassigned)"
 if (!"count" %in% names(df)) stop("Count table has no 'count' column — wire the 'Count nuclei' node in.")
+if (!"mean_area_px" %in% names(df)) df$mean_area_px <- NA_real_
 df$image <- as.character(df$image)
 df$group <- as.character(df$group)
 df$group[!nzchar(df$group)] <- "(unassigned)"
 df$count <- suppressWarnings(as.numeric(df$count))
-df <- df[is.finite(df$count), , drop = FALSE]
-if (nrow(df) == 0) stop("No finite counts to plot.")
+df$mean_area_px <- suppressWarnings(as.numeric(df$mean_area_px))
 
-groups <- unique(df$group)
-multi_group <- length(groups) > 1
-y_fmt <- scales::label_number(accuracy = 1, big.mark = ",")
+groups0 <- unique(df$group)
+multi_group <- length(groups0) > 1
 
-if (multi_group) {
-  df$group <- factor(df$group, levels = groups)
-  agg <- aggregate(count ~ group, data = df,
-                   FUN = function(v) c(m = mean(v), s = sd(v), n = length(v)))
-  summ <- data.frame(group = agg$group, mean = agg$count[, "m"],
-                     sd = agg$count[, "s"], n = as.integer(agg$count[, "n"]))
-  summ$sd[is.na(summ$sd)] <- 0
-  ymax_v <- max(summ$mean + summ$sd, na.rm = TRUE)
-
-  # ANOVA + Tukey HSD across conditions that have >= 2 images.
-  brackets <- NULL
-  usable <- levels(df$group)[vapply(levels(df$group),
-                                    function(gg) sum(df$group == gg) >= 2, logical(1))]
-  if (length(usable) >= 2) {
-    sub2 <- df[df$group %in% usable, , drop = FALSE]
-    sub2$group <- factor(sub2$group, levels = usable)
-    aov_res <- tryCatch(aov(count ~ group, data = sub2), error = function(e) NULL)
-    tk <- if (!is.null(aov_res)) tryCatch(TukeyHSD(aov_res), error = function(e) NULL) else NULL
-    tk_mat <- if (!is.null(tk)) tk[["group"]] else NULL
-    if (!is.null(tk_mat) && nrow(tk_mat) > 0) {
-      prs <- strsplit(rownames(tk_mat), "-", fixed = TRUE)
-      bk <- data.frame(group1 = vapply(prs, function(p) p[2], character(1)),
-                       group2 = vapply(prs, function(p) p[1], character(1)),
-                       p.adj  = tk_mat[, "p adj"], stringsAsFactors = FALSE)
-      bk <- bk[order(bk$p.adj), , drop = FALSE]
-      step <- 0.13 * ymax_v; k <- 0; out <- list()
-      for (i in seq_len(nrow(bk))) {
-        pv <- bk$p.adj[i]; if (is.na(pv)) next
-        lab <- if (pv < 0.001) "***" else if (pv < 0.01) "**" else if (pv < 0.05) "*" else "ns"
-        k <- k + 1
-        out[[length(out) + 1]] <- data.frame(
-          group1 = bk$group1[i], group2 = bk$group2[i],
-          p.label = lab, y.position = ymax_v + step * k, stringsAsFactors = FALSE)
+# Render one metric (count or nucleus size) as its own figure: bars per
+# condition (mean +/- SD, per-image points, Tukey HSD) when grouped, else
+# one bar per image.
+render_metric <- function(vcol, fname, ttl_grp, ttl_img, ylab, integer_labels) {
+  d <- df[is.finite(df[[vcol]]), , drop = FALSE]
+  if (nrow(d) == 0) return(invisible(NULL))
+  d$val <- d[[vcol]]
+  y_fmt <- if (integer_labels) scales::label_number(accuracy = 1, big.mark = ",")
+           else scales::label_number(accuracy = 1, big.mark = ",")
+  if (multi_group) {
+    d$group <- factor(d$group, levels = intersect(groups0, unique(d$group)))
+    agg <- aggregate(val ~ group, data = d,
+                     FUN = function(v) c(m = mean(v), s = sd(v), n = length(v)))
+    summ <- data.frame(group = agg$group, mean = agg$val[, "m"],
+                       sd = agg$val[, "s"], n = as.integer(agg$val[, "n"]))
+    summ$sd[is.na(summ$sd)] <- 0
+    ymax_v <- max(summ$mean + summ$sd, na.rm = TRUE)
+    brackets <- NULL
+    usable <- levels(d$group)[vapply(levels(d$group),
+                                     function(gg) sum(d$group == gg) >= 2, logical(1))]
+    if (length(usable) >= 2) {
+      sub2 <- d[d$group %in% usable, , drop = FALSE]
+      sub2$group <- factor(sub2$group, levels = usable)
+      aov_res <- tryCatch(aov(val ~ group, data = sub2), error = function(e) NULL)
+      tk <- if (!is.null(aov_res)) tryCatch(TukeyHSD(aov_res), error = function(e) NULL) else NULL
+      tk_mat <- if (!is.null(tk)) tk[["group"]] else NULL
+      if (!is.null(tk_mat) && nrow(tk_mat) > 0) {
+        prs <- strsplit(rownames(tk_mat), "-", fixed = TRUE)
+        bk <- data.frame(group1 = vapply(prs, function(p) p[2], character(1)),
+                         group2 = vapply(prs, function(p) p[1], character(1)),
+                         p.adj  = tk_mat[, "p adj"], stringsAsFactors = FALSE)
+        bk <- bk[order(bk$p.adj), , drop = FALSE]
+        step <- 0.13 * ymax_v; k <- 0; out <- list()
+        for (i in seq_len(nrow(bk))) {
+          pv <- bk$p.adj[i]; if (is.na(pv)) next
+          lab <- if (pv < 0.001) "***" else if (pv < 0.01) "**" else if (pv < 0.05) "*" else "ns"
+          k <- k + 1
+          out[[length(out) + 1]] <- data.frame(
+            group1 = bk$group1[i], group2 = bk$group2[i],
+            p.label = lab, y.position = ymax_v + step * k, stringsAsFactors = FALSE)
+        }
+        if (length(out) > 0) brackets <- do.call(rbind, out)
       }
-      if (length(out) > 0) brackets <- do.call(rbind, out)
     }
+    p <- ggplot() +
+      geom_col(data = summ, aes(x = group, y = mean, fill = group),
+               width = 0.7, color = "grey25", linewidth = 0.3) +
+      geom_errorbar(data = summ, aes(x = group, ymin = pmax(0, mean - sd), ymax = mean + sd),
+                    width = 0.2, linewidth = 0.4) +
+      geom_jitter(data = d, aes(x = group, y = val),
+                  width = 0.12, height = 0, size = 1.8, alpha = 0.85, color = "grey20", stroke = 0)
+    if (!is.null(brackets))
+      p <- p + ggprism::add_pvalue(brackets, label = "p.label", tip.length = 0.01, label.size = 3.2)
+    ttl <- ttl_grp; n_x <- nlevels(d$group)
+  } else {
+    d <- d[order(d$image), , drop = FALSE]
+    d$image <- factor(d$image, levels = unique(d$image))
+    p <- ggplot() +
+      geom_col(data = d, aes(x = image, y = val, fill = image),
+               width = 0.7, color = "grey25", linewidth = 0.3)
+    if (integer_labels)
+      p <- p + geom_text(data = d, aes(x = image, y = val, label = val),
+                         vjust = -0.4, size = 3.2, color = "grey20")
+    ttl <- ttl_img; n_x <- nlevels(d$image)
   }
-
-  p <- ggplot() +
-    geom_col(data = summ, aes(x = group, y = mean, fill = group),
-             width = 0.7, color = "grey25", linewidth = 0.3) +
-    geom_errorbar(data = summ, aes(x = group, ymin = pmax(0, mean - sd), ymax = mean + sd),
-                  width = 0.2, linewidth = 0.4) +
-    geom_jitter(data = df, aes(x = group, y = count),
-                width = 0.12, height = 0, size = 1.8, alpha = 0.85, color = "grey20", stroke = 0)
-  if (!is.null(brackets))
-    p <- p + ggprism::add_pvalue(brackets, label = "p.label", tip.length = 0.01, label.size = 3.2)
-  ttl <- "Nuclei count by condition"
-  ylab <- "Nuclei per image (mean +/- SD)"
-  n_x <- nlevels(df$group)
-} else {
-  df <- df[order(df$image), , drop = FALSE]
-  df$image <- factor(df$image, levels = unique(df$image))
-  ymax_v <- max(df$count, na.rm = TRUE)
-  p <- ggplot() +
-    geom_col(data = df, aes(x = image, y = count, fill = image),
-             width = 0.7, color = "grey25", linewidth = 0.3) +
-    geom_text(data = df, aes(x = image, y = count, label = count),
-              vjust = -0.4, size = 3.2, color = "grey20")
-  ttl <- "Nuclei count per image"
-  ylab <- "Nuclei count"
-  n_x <- nlevels(df$image)
+  w <- max(900, 150 * n_x + 360)
+  p <- p +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.16)), labels = y_fmt) +
+    scale_x_discrete(labels = function(z) .mpfig_wrap(z, 12)) +
+    theme_prism(base_size = 12) +
+    theme(legend.position = "none",
+          plot.title = element_text(face = "bold", size = 14, margin = margin(b = 6)),
+          axis.title.y = element_text(margin = margin(r = 8)),
+          axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1, size = 10),
+          axis.text.y = element_text(size = 9),
+          plot.margin = margin(t = 18, r = 18, b = 26, l = 22)) +
+    labs(x = NULL, y = .mpfig_wrap(ylab, 24), title = .mpfig_fit(ttl, width_in = w / 300))
+  mpfig_plot(fname, width = w, height = 1000, res = 300)
+  print(p)
 }
 
-w <- max(900, 150 * n_x + 360)
-p <- p +
-  scale_y_continuous(expand = expansion(mult = c(0, 0.16)), labels = y_fmt) +
-  scale_x_discrete(labels = function(z) .mpfig_wrap(z, 12)) +
-  theme_prism(base_size = 12) +
-  theme(legend.position = "none",
-        plot.title = element_text(face = "bold", size = 14, margin = margin(b = 6)),
-        axis.title.y = element_text(margin = margin(r = 8)),
-        axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1, size = 10),
-        axis.text.y = element_text(size = 9),
-        plot.margin = margin(t = 18, r = 18, b = 26, l = 22)) +
-  labs(x = NULL, y = .mpfig_wrap(ylab, 24),
-       title = .mpfig_fit(ttl, width_in = w / 300))
-
-mpfig_plot("nuclei_counts.png", width = w, height = 1000, res = 300)
-print(p)
+render_metric("count", "nuclei_counts.png",
+              "Nuclei count by condition", "Nuclei count per image",
+              "Nuclei per image", TRUE)
+render_metric("mean_area_px", "nuclei_size.png",
+              "Nucleus size by condition", "Nucleus size per image",
+              "Nucleus area (px^2)", FALSE)
 }
 `;
 
 function buildNucleiCountWorkflow(): SavedWorkflow {
-  const srcId = "source", segId = "nuclei_seg", countId = "nuclei_count", plotId = "nuclei_plot";
+  const srcId = "source", segId = "nuclei_seg", countId = "nuclei_count",
+        plotId = "nuclei_plot", intId = "nuclei_intensity";
   // Reuse the fluorescence segmentation picker, seeded for NUCLEI:
   // cellpose strategy, v3's purpose-built 'nuclei' model on the DAPI
   // (blue) channel, no compartment pass, no control channel. The user
   // can switch to v4/cpsam in the picker and re-assign the channel; they
   // assign images to conditions in the same picker as fluorescence.
   const segCfg = emptyFluorConfig();
+  segCfg.purpose = "nuclei";          // nuclei-focused picker UI (no cell channel etc.)
   segCfg.mode = "cellpose";
   segCfg.controlChannel = null;
   segCfg.cellpose = {
     ...segCfg.cellpose,
     cellposeVersion: "v3",
     model: "nuclei",
-    segChannel: "b",
+    segChannel: "b",                  // DAPI / Hoechst is conventionally blue
     nucleiChannel: null,
     measureCompartments: false,
+    captureThinProcesses: false,      // nuclei are round — no dendrite mode
     diameter: 0,
     minSize: 30,
   };
@@ -3287,7 +3298,15 @@ function buildNucleiCountWorkflow(): SavedWorkflow {
     },
     {
       id: plotId, type: "r", position: { x: 1020, y: 60 },
-      data: { label: "Plot nuclei counts", kind: "r", code: NUCLEI_COUNT_PLOT_R,
+      data: { label: "Plot counts + nucleus size", kind: "r", code: NUCLEI_COUNT_PLOT_R,
+              outputs: [], inputs: [], status: "idle", currentPreset: "custom" } as NodeData,
+    },
+    // Intensity branch — per-channel intensity WITHIN each nucleus, compared
+    // across conditions (reuses the fluorescence intensity plot; fed the
+    // detector's per-nucleus table directly).
+    {
+      id: intId, type: "r", position: { x: 700, y: 320 },
+      data: { label: "Plot nucleus intensity", kind: "r", code: INTENSITY_PLOT_R,
               outputs: [], inputs: [], status: "idle", currentPreset: "custom" } as NodeData,
     },
   ];
@@ -3303,6 +3322,7 @@ function buildNucleiCountWorkflow(): SavedWorkflow {
     edges: [
       mkEdge(segId, "out_table", countId, "in_table", "table"),
       mkEdge(countId, "out_table", plotId, "in_table", "table"),
+      mkEdge(segId, "out_table", intId, "in_table", "table"),
     ],
     createdAt: 0,
   };
