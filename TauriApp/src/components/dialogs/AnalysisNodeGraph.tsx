@@ -3058,6 +3058,256 @@ function buildIntensityWorkflow(): SavedWorkflow {
   };
 }
 
+// ── Nuclei counting ──────────────────────────────────────────
+// 4-stage pipeline that REUSES the fluorescence segmentation picker
+// (cellpose, multi-image cycler, group assignment) but seeded for
+// NUCLEI detection, then counts the segmented objects per image and
+// plots the count per condition:
+//   Source → Detect nuclei (cellpose 'nuclei' model on the DAPI
+//   channel) → Count nuclei (unique objects per image) → bar plot
+//   (one bar per condition, mean±SD across images, per-image points,
+//   Tukey HSD significance; or one bar per image when ungrouped).
+
+// Count the unique segmented objects (nuclei) per image from the
+// detector's per-cell table.  The detector emits one row per
+// (object × channel[, compartment]) so we dedupe on object_id.
+const NUCLEI_COUNT_PY = `# @name: Count nuclei per image
+# Counts the unique segmented objects (nuclei) per source image from the
+# upstream cellpose detector, grouped by the condition assigned in the
+# picker.  The detector emits one row per (object, channel) so the same
+# nucleus appears several times — we count each object_id once.
+# Output: one row per image — image, group, count, mean_area_px.
+table = None
+for v in inputs.values():
+    if isinstance(v, dict) and "table" in v:
+        table = v["table"]; break
+if not table:
+    raise SystemExit("No upstream table — wire the nuclei detector into the table input.")
+
+from collections import OrderedDict
+per_image = OrderedDict()   # image -> {group, ids:set, areas:dict}
+for r in table:
+    img = str(r.get("source") or r.get("image") or "")
+    if not img:
+        continue
+    grp = str(r.get("group") or "").strip() or "(unassigned)"
+    e = per_image.get(img)
+    if e is None:
+        e = {"group": grp, "ids": set(), "areas": {}}
+        per_image[img] = e
+    oid = r.get("object_id")
+    if oid is None:
+        continue
+    e["ids"].add(oid)
+    a = r.get("cell_area_px")
+    if a is None:
+        a = r.get("area_px")
+    if a is not None:
+        try: e["areas"][oid] = float(a)
+        except Exception: pass
+
+rows = []
+for img, e in per_image.items():
+    areas = list(e["areas"].values())
+    rows.append({
+        "image": img,
+        "group": e["group"],
+        "count": int(len(e["ids"])),
+        "mean_area_px": float(sum(areas) / len(areas)) if areas else 0.0,
+    })
+
+if not rows or sum(r["count"] for r in rows) == 0:
+    raise SystemExit("No nuclei counted — nuclei counting needs the Cellpose strategy "
+                     "(per-object segmentation). Open the detector, run the preview, then re-run.")
+
+_groups = sorted({r["group"] for r in rows})
+print(f"counted {sum(r['count'] for r in rows)} nuclei across {len(rows)} image(s), {len(_groups)} condition(s)")
+for r in rows:
+    print(f"  {r['image']}: {r['count']} nuclei (condition {r['group']!r})")
+mpfig_data(rows, name="nuclei_counts")
+`;
+
+const NUCLEI_COUNT_PLOT_R = `# @name: Plot nuclei counts
+# Bar chart of nuclei per image.  With 2+ conditions: one bar per
+# CONDITION (mean +/- SD across that condition's images), a jittered
+# point per image, and ANOVA + Tukey HSD pairwise significance. With a
+# single condition (or none assigned): one bar per image, labelled with
+# its count.
+suppressWarnings(suppressMessages({ library(ggplot2); library(ggprism) }))
+
+if (length(inputs) == 0 || is.null(inputs[[1]]) || nrow(inputs[[1]]) == 0) {
+  mpfig_plot("nuclei_counts.png", width = 1200, height = 900, res = 300)
+  print(ggplot() + theme_void() +
+    annotate("text", x = 0.5, y = 0.55, size = 6,
+             label = .mpfig_wrap("No count table reached this node.", 40)) +
+    annotate("text", x = 0.5, y = 0.40, size = 4, color = "grey40",
+             label = .mpfig_wrap("Run Source -> Detect nuclei -> Count nuclei.", 46)) +
+    xlim(0, 1) + ylim(0, 1))
+} else {
+
+df <- inputs[[1]]
+if (!"image" %in% names(df)) df$image <- as.character(seq_len(nrow(df)))
+if (!"group" %in% names(df)) df$group <- "(unassigned)"
+if (!"count" %in% names(df)) stop("Count table has no 'count' column — wire the 'Count nuclei' node in.")
+df$image <- as.character(df$image)
+df$group <- as.character(df$group)
+df$group[!nzchar(df$group)] <- "(unassigned)"
+df$count <- suppressWarnings(as.numeric(df$count))
+df <- df[is.finite(df$count), , drop = FALSE]
+if (nrow(df) == 0) stop("No finite counts to plot.")
+
+groups <- unique(df$group)
+multi_group <- length(groups) > 1
+y_fmt <- scales::label_number(accuracy = 1, big.mark = ",")
+
+if (multi_group) {
+  df$group <- factor(df$group, levels = groups)
+  agg <- aggregate(count ~ group, data = df,
+                   FUN = function(v) c(m = mean(v), s = sd(v), n = length(v)))
+  summ <- data.frame(group = agg$group, mean = agg$count[, "m"],
+                     sd = agg$count[, "s"], n = as.integer(agg$count[, "n"]))
+  summ$sd[is.na(summ$sd)] <- 0
+  ymax_v <- max(summ$mean + summ$sd, na.rm = TRUE)
+
+  # ANOVA + Tukey HSD across conditions that have >= 2 images.
+  brackets <- NULL
+  usable <- levels(df$group)[vapply(levels(df$group),
+                                    function(gg) sum(df$group == gg) >= 2, logical(1))]
+  if (length(usable) >= 2) {
+    sub2 <- df[df$group %in% usable, , drop = FALSE]
+    sub2$group <- factor(sub2$group, levels = usable)
+    aov_res <- tryCatch(aov(count ~ group, data = sub2), error = function(e) NULL)
+    tk <- if (!is.null(aov_res)) tryCatch(TukeyHSD(aov_res), error = function(e) NULL) else NULL
+    tk_mat <- if (!is.null(tk)) tk[["group"]] else NULL
+    if (!is.null(tk_mat) && nrow(tk_mat) > 0) {
+      prs <- strsplit(rownames(tk_mat), "-", fixed = TRUE)
+      bk <- data.frame(group1 = vapply(prs, function(p) p[2], character(1)),
+                       group2 = vapply(prs, function(p) p[1], character(1)),
+                       p.adj  = tk_mat[, "p adj"], stringsAsFactors = FALSE)
+      bk <- bk[order(bk$p.adj), , drop = FALSE]
+      step <- 0.13 * ymax_v; k <- 0; out <- list()
+      for (i in seq_len(nrow(bk))) {
+        pv <- bk$p.adj[i]; if (is.na(pv)) next
+        lab <- if (pv < 0.001) "***" else if (pv < 0.01) "**" else if (pv < 0.05) "*" else "ns"
+        k <- k + 1
+        out[[length(out) + 1]] <- data.frame(
+          group1 = bk$group1[i], group2 = bk$group2[i],
+          p.label = lab, y.position = ymax_v + step * k, stringsAsFactors = FALSE)
+      }
+      if (length(out) > 0) brackets <- do.call(rbind, out)
+    }
+  }
+
+  p <- ggplot() +
+    geom_col(data = summ, aes(x = group, y = mean, fill = group),
+             width = 0.7, color = "grey25", linewidth = 0.3) +
+    geom_errorbar(data = summ, aes(x = group, ymin = pmax(0, mean - sd), ymax = mean + sd),
+                  width = 0.2, linewidth = 0.4) +
+    geom_jitter(data = df, aes(x = group, y = count),
+                width = 0.12, height = 0, size = 1.8, alpha = 0.85, color = "grey20", stroke = 0)
+  if (!is.null(brackets))
+    p <- p + ggprism::add_pvalue(brackets, label = "p.label", tip.length = 0.01, label.size = 3.2)
+  ttl <- "Nuclei count by condition"
+  ylab <- "Nuclei per image (mean +/- SD)"
+  n_x <- nlevels(df$group)
+} else {
+  df <- df[order(df$image), , drop = FALSE]
+  df$image <- factor(df$image, levels = unique(df$image))
+  ymax_v <- max(df$count, na.rm = TRUE)
+  p <- ggplot() +
+    geom_col(data = df, aes(x = image, y = count, fill = image),
+             width = 0.7, color = "grey25", linewidth = 0.3) +
+    geom_text(data = df, aes(x = image, y = count, label = count),
+              vjust = -0.4, size = 3.2, color = "grey20")
+  ttl <- "Nuclei count per image"
+  ylab <- "Nuclei count"
+  n_x <- nlevels(df$image)
+}
+
+w <- max(900, 150 * n_x + 360)
+p <- p +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.16)), labels = y_fmt) +
+  scale_x_discrete(labels = function(z) .mpfig_wrap(z, 12)) +
+  theme_prism(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 14, margin = margin(b = 6)),
+        axis.title.y = element_text(margin = margin(r = 8)),
+        axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1, size = 10),
+        axis.text.y = element_text(size = 9),
+        plot.margin = margin(t = 18, r = 18, b = 26, l = 22)) +
+  labs(x = NULL, y = .mpfig_wrap(ylab, 24),
+       title = .mpfig_fit(ttl, width_in = w / 300))
+
+mpfig_plot("nuclei_counts.png", width = w, height = 1000, res = 300)
+print(p)
+}
+`;
+
+function buildNucleiCountWorkflow(): SavedWorkflow {
+  const srcId = "source", segId = "nuclei_seg", countId = "nuclei_count", plotId = "nuclei_plot";
+  // Reuse the fluorescence segmentation picker, seeded for NUCLEI:
+  // cellpose strategy, v3's purpose-built 'nuclei' model on the DAPI
+  // (blue) channel, no compartment pass, no control channel. The user
+  // can switch to v4/cpsam in the picker and re-assign the channel; they
+  // assign images to conditions in the same picker as fluorescence.
+  const segCfg = emptyFluorConfig();
+  segCfg.mode = "cellpose";
+  segCfg.controlChannel = null;
+  segCfg.cellpose = {
+    ...segCfg.cellpose,
+    cellposeVersion: "v3",
+    model: "nuclei",
+    segChannel: "b",
+    nucleiChannel: null,
+    measureCompartments: false,
+    diameter: 0,
+    minSize: 30,
+  };
+  const nodes: Node<NodeData>[] = [
+    {
+      id: srcId, type: "source", position: { x: 40, y: 60 },
+      data: {
+        label: "Source — drop your nuclei (DAPI) images here",
+        kind: "source", sources: [], status: "ok",
+      } as NodeData,
+      draggable: true, deletable: false,
+    },
+    {
+      id: segId, type: "python", position: { x: 360, y: 60 },
+      data: {
+        label: "Detect nuclei (cellpose)", kind: "python", interactive: "fluor_intensity",
+        intensity: segCfg, code: generateFluorCode(segCfg),
+        outputs: [], inputs: [], status: "idle", currentPreset: "custom",
+      } as NodeData,
+    },
+    {
+      id: countId, type: "python", position: { x: 700, y: 60 },
+      data: { label: "Count nuclei", kind: "python", code: NUCLEI_COUNT_PY,
+              outputs: [], inputs: [], status: "idle", currentPreset: "custom" } as NodeData,
+    },
+    {
+      id: plotId, type: "r", position: { x: 1020, y: 60 },
+      data: { label: "Plot nuclei counts", kind: "r", code: NUCLEI_COUNT_PLOT_R,
+              outputs: [], inputs: [], status: "idle", currentPreset: "custom" } as NodeData,
+    },
+  ];
+  const mkEdge = (s: string, sh: string, t: string, th: string, k: DataKind): Edge => ({
+    id: `e_${s}_${sh}__${t}_${th}`, source: s, sourceHandle: sh,
+    target: t, targetHandle: th, type: "deletable", animated: false,
+    style: { stroke: PORT_COLOR[k], strokeWidth: 2 },
+  });
+  return {
+    id: "builtin:nuclei_count",
+    name: "Nuclei counting (cellpose · multi-image + conditions)",
+    nodes,
+    edges: [
+      mkEdge(segId, "out_table", countId, "in_table", "table"),
+      mkEdge(countId, "out_table", plotId, "in_table", "table"),
+    ],
+    createdAt: 0,
+  };
+}
+
 // ── Western blot quantification ──────────────────────────────
 // 4-stage pipeline: interactive Band picker (per-band integrated
 // density, background-subtracted, tagged with LANE + LEVEL) →
@@ -3742,6 +3992,7 @@ function buildCellCharacteristicsWorkflow(): SavedWorkflow {
 const BUILTIN_WORKFLOWS: SavedWorkflow[] = [
   buildCornealHazeWorkflow(),
   buildIntensityWorkflow(),
+  buildNucleiCountWorkflow(),
   buildWesternBlotWorkflow(),
   buildCellCharacteristicsWorkflow(),
 ];
