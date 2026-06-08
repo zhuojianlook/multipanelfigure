@@ -152,7 +152,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.356"
+SIDECAR_BUILD = "0.1.357"
 
 
 @app.get("/api/version")
@@ -7270,6 +7270,11 @@ class FluorCellposePreview(BaseModel):
     # zoo; "v4" → cpsam (the only model v4 ships).  Routes to the
     # matching plugin venv.
     cellpose_version: str = "v4"
+    # Nuclei-counting workflow: strip the image to ONLY the seg_channel
+    # plane (grayscale) before segmentation so a generalist model segments
+    # the nuclei instead of cell-shaped cytoplasm signal.  Mirrors the
+    # generated run's client-side isolation so preview == run.
+    isolate_seg: bool = False
 
 
 class FluorPreviewRequest(BaseModel):
@@ -7397,11 +7402,18 @@ def fluor_preview_segment(body: FluorPreviewRequest):
         # form). When set, cyto3 produces noticeably better whole-cell
         # boundaries (it was trained on both inputs).
         nuc_ch = {"r": 1, "g": 2, "b": 3}.get((cp.nuclei_channel or "").lower(), 0)
+        # Nuclei-counting workflow: ISOLATE the seg channel to a clean
+        # grayscale plane so the model segments the nuclei (not cell-shaped
+        # signal in the other channels).  Mirrors the run's client-side
+        # isolation so the preview matches.  Keep `rgb` for the overlay
+        # composite; build a separate isolated array for the model input.
+        _iso = bool(getattr(cp, "isolate_seg", False))
+        seg_channels = [0, 0] if _iso else [seg_ch, nuc_ch]
         cfg = {
             "model": cp.model or "cyto3",
             "diameter": float(cp.diameter or 0) or None,
             "min_size": int(cp.min_size or 30),
-            "channels": [seg_ch, nuc_ch],
+            "channels": seg_channels,
             # Dendrite-capture levers: forwarded so the live preview
             # matches what the run will produce.
             "flow_threshold": float(getattr(cp, "flow_threshold", 0.4)),
@@ -7431,7 +7443,12 @@ def fluor_preview_segment(body: FluorPreviewRequest):
         # small image even when the source is 4000+ px wide.
         try:
             arr_u8 = _np.clip(rgb, 0, 255).astype(_np.uint8)
-            print(f"[fluor-preview] cellpose: starting model load + inference on {arr_u8.shape[1]}x{arr_u8.shape[0]} (model={cfg.get('model')}) — first run downloads ~100 MB",
+            # Strip to the isolated seg-channel plane (replicated to RGB)
+            # when requested, so the model sees only the nuclei stain.
+            if _iso and arr_u8.ndim == 3 and arr_u8.shape[2] >= seg_ch:
+                _plane = arr_u8[..., seg_ch - 1]
+                arr_u8 = _np.stack([_plane, _plane, _plane], axis=-1)
+            print(f"[fluor-preview] cellpose: starting model load + inference on {arr_u8.shape[1]}x{arr_u8.shape[0]} (model={cfg.get('model')}, isolate={_iso}) — first run downloads ~100 MB",
                   file=__s.stderr, flush=True)
             import time as _tm
             _t0 = _tm.monotonic()

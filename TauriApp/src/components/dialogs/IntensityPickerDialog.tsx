@@ -114,6 +114,14 @@ export interface FluorCellpose {
    *  compartments. Doubles cellpose cost but lets you compare e.g.
    *  nuclear-vs-cytoplasmic localisation of a target. */
   measureCompartments?: boolean;
+  /** ISOLATE the segmentation channel before running cellpose — strip the
+   *  image to ONLY the segChannel signal (replicated to grayscale RGB) so
+   *  the model sees a clean single-stain plane.  Used by the nuclei-
+   *  counting workflow: a generalist model (cpsam) fed full RGB latches
+   *  onto cell-shaped cytoplasm signal, but on the isolated DAPI plane it
+   *  segments the nuclei.  Same trick the compartment nuclei-pass uses.
+   *  Honoured in BOTH the run (generated Python) and the live preview. */
+  isolateSegChannel?: boolean;
 }
 
 /** Per-channel threshold knobs for the SIMPLE strategy. Each channel
@@ -766,10 +774,19 @@ if mode == "cellpose":
     print(f"[intensity] cellpose: starting batch run on {len(prepared)} image(s) — "
           f"the model loads once (first run on a machine downloads weights)")
     _cp_t0 = __import__("time").monotonic()
+    # Nuclei-counting workflow: ISOLATE the segmentation channel so the
+    # model sees ONLY the nuclei (DAPI) plane as clean grayscale — a
+    # generalist model fed full RGB latches onto cell-shaped cytoplasm
+    # signal, but on the isolated plane it segments the nuclei.  Same trick
+    # the compartment nuclei-pass uses.
+    _isolate_seg = bool(cp_cfg.get("isolateSegChannel"))
+    if _isolate_seg:
+        print(f"[intensity] cellpose: isolating channel {seg_idx} (single-stain segmentation)")
     labels_by_label, cp_errors = _cellpose_labels_batch(
         [(p[2], p[6]) for p in prepared],
         cp_cfg.get("model") or "cyto3",
-        [seg_idx, nuc_idx],
+        [0, 0] if _isolate_seg else [seg_idx, nuc_idx],
+        isolate_channel=(seg_idx if _isolate_seg else 0),
     )
     print(f"[intensity] cellpose cell-pass: {__import__('time').monotonic() - _cp_t0:.1f}s "
           f"({len(labels_by_label)} ok, {len(cp_errors)} failed)")
@@ -959,9 +976,11 @@ if mode == "cellpose":
             mpfig_image(overlay, name=f"{label}_overlay")
         except Exception as _e:
             print(f"[intensity] {label}: overlay/mask render failed: {_e}", file=_sys.stderr)
-        print(f"[intensity] {label}: {len(cell_ids)} cell(s) measured (cellpose)")
+        _obj_noun = "nucleus" if CFG.get("purpose") == "nuclei" else "cell"
+        _obj_plural = "nuclei" if _obj_noun == "nucleus" else "cells"
+        print(f"[intensity] {label}: {len(cell_ids)} {_obj_plural} measured (cellpose)")
     if not rows:
-        raise SystemExit("[intensity] cellpose produced no measurable cells across the inputs — "
+        raise SystemExit(f"[intensity] cellpose produced no measurable {('nuclei' if CFG.get('purpose') == 'nuclei' else 'cells')} across the inputs — "
                          "check the picker preview, then re-run.")
     # Gap 3: per-image control normalization. For each row, divide its
     # mean_intensity by the image's mean control-channel intensity (over
@@ -1774,6 +1793,9 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
           cellprob_threshold: dendrite ? -1.0 : (cfg.cellpose.cellprobThreshold ?? 0.0),
           expand_processes: dendrite,
           measure_compartments: !!cfg.cellpose.measureCompartments,
+          // Isolate the segmentation channel (nuclei mode) so the live
+          // preview matches the run: model sees only the DAPI plane.
+          isolate_seg: !!cfg.cellpose.isolateSegChannel,
         };
       }
       // Hard client-side timeout so the spinner can't get stuck forever
@@ -3073,9 +3095,9 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                       Edit:
                     </Typography>
                     {([
-                      { t: "cells" as const,  label: "Cells",  color: "#cdb336", enabled: !!activePreview?.cellLabels },
+                      { t: "cells" as const,  label: nucleiMode ? "Nuclei" : "Cells",  color: "#cdb336", enabled: !!activePreview?.cellLabels },
                       { t: "nuclei" as const, label: "Nuclei", color: "#5fbcdc", enabled: !!activePreview?.nucleusLabels },
-                    ]).map(({ t, label, color, enabled }) => {
+                    ]).filter((it) => !(nucleiMode && it.t === "nuclei")).map(({ t, label, color, enabled }) => {
                       const active = cellposeEditTarget === t;
                       return (
                         <Tooltip key={t} title={enabled
@@ -3458,7 +3480,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                 fontSize: "0.66rem", display: "flex", gap: 1, justifyContent: "center",
               }}>
                 {typeof activePreview.n_cells === "number" && (
-                  <span>cells: <b>{activePreview.n_cells}</b></span>
+                  <span>{nucleiMode ? "nuclei" : "cells"}: <b>{activePreview.n_cells}</b></span>
                 )}
                 {activePreview.per_channel && (["r", "g", "b"] as const).map((k) => {
                   const sw = k === "r" ? "#ff8080" : k === "g" ? "#88e088" : "#88a8ff";
@@ -3542,7 +3564,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
                     fontWeight: cpMaskVisible.cells ? 700 : 500,
                   }}>
                   <span style={{ fontSize: "0.85rem", lineHeight: 1 }}>{cpMaskVisible.cells ? "👁" : "·"}</span>
-                  <span>Cells{typeof activePreview.n_cells === "number" ? ` (${activePreview.n_cells})` : ""}</span>
+                  <span>{nucleiMode ? "Nuclei" : "Cells"}{typeof activePreview.n_cells === "number" ? ` (${activePreview.n_cells})` : ""}</span>
                 </Box>
               )}
               {activePreview.nucleusOverlaySrc && (

@@ -3255,19 +3255,23 @@ function buildNucleiCountWorkflow(): SavedWorkflow {
   const srcId = "source", segId = "nuclei_seg", countId = "nuclei_count",
         plotId = "nuclei_plot", intId = "nuclei_intensity";
   // Reuse the fluorescence segmentation picker, seeded for NUCLEI:
-  // cellpose strategy, v3's purpose-built 'nuclei' model on the DAPI
-  // (blue) channel, no compartment pass, no control channel. The user
-  // can switch to v4/cpsam in the picker and re-assign the channel; they
-  // assign images to conditions in the same picker as fluorescence.
+  // cellpose strategy with the strong cpsam (v4) model run on the ISOLATED
+  // DAPI (blue) channel — isolation strips the image to a clean nuclei
+  // plane so cpsam segments the nuclei rather than cell-shaped cytoplasm
+  // signal in other channels (which is what made the earlier v3-on-RGB
+  // default detect poorly). No compartment pass, no control channel. The
+  // user can switch model/channel in the picker; they assign images to
+  // conditions in the same picker as fluorescence.
   const segCfg = emptyFluorConfig();
   segCfg.purpose = "nuclei";          // nuclei-focused picker UI (no cell channel etc.)
   segCfg.mode = "cellpose";
   segCfg.controlChannel = null;
   segCfg.cellpose = {
     ...segCfg.cellpose,
-    cellposeVersion: "v3",
-    model: "nuclei",
+    cellposeVersion: "v4",
+    model: "cpsam",
     segChannel: "b",                  // DAPI / Hoechst is conventionally blue
+    isolateSegChannel: true,          // segment the clean DAPI plane → nuclei
     nucleiChannel: null,
     measureCompartments: false,
     captureThinProcesses: false,      // nuclei are round — no dendrite mode
