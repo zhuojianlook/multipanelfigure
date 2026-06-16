@@ -16,6 +16,7 @@ import { PreviewPane } from "../preview/PreviewPane";
 import { CollageView } from "../collage/CollageView";
 import { AnalysisView } from "../analysis/AnalysisView";
 import { hasUnsavedSnapshots } from "../../utils/projectNav";
+import { maybeRestoreSession, persistOpenDocs } from "../../utils/sessionRestore";
 import { Alert } from "@mui/material";
 
 function CenterPane({
@@ -89,10 +90,38 @@ export function AppShell() {
       await fetchConfig();
       await fetchImages();
       fetchFonts();
-      setTimeout(() => requestPreview(), 200);
+      // Reopen last session's .mpf tabs when the user has opted in. When it
+      // loads a project the builder already has a preview pending, so only
+      // kick our own preview when nothing was restored.
+      const restored = await maybeRestoreSession().catch(() => false);
+      if (!restored) setTimeout(() => requestPreview(), 200);
     };
     init();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Mirror the set of open .mpf tabs (paths + active doc) to localStorage on
+  // every change, so "Re-open tabs on relaunch" can rebuild them next launch.
+  // openDocs is session-only state, so we subscribe to the collage store and
+  // persist whenever the doc set / active doc / a tab name actually changes
+  // (collage canvas edits fire far more often — diff a compact key to skip
+  // those). Persisted regardless of the preference; only restore honours it.
+  useEffect(() => {
+    const docKey = () => {
+      const { openDocs, activeDocId } = useCollageStore.getState();
+      return openDocs.map((d) => `${d.path ?? ""}::${d.name}`).join("||")
+        + ">>" + (activeDocId ?? "");
+    };
+    // No initial write here — maybeRestoreSession reads a boot-time snapshot,
+    // and an eager persist would clobber the saved session before restore runs
+    // (and overwrite it with the pre-restore blank doc). We only persist once
+    // the doc set / active doc / a tab name actually changes.
+    let prevKey = docKey();
+    const unsub = useCollageStore.subscribe(() => {
+      const key = docKey();
+      if (key !== prevKey) { prevKey = key; persistOpenDocs(); }
+    });
+    return unsub;
   }, []);
 
   // Warn on app close if there are unsaved changes — the builder figure
@@ -132,24 +161,34 @@ export function AppShell() {
             const dirtyBuilder = useFigureStore.getState().unsaved;
             const collageItems = useCollageStore.getState().items.length > 0;
             const otherTabs = hasUnsavedSnapshots();
+            // How many .mpf documents (current + parked tabs) are dirty — drives
+            // singular/plural wording and whether there's anything to save.
+            const dirtyDocs = (dirtyBuilder ? 1 : 0)
+              + useCollageStore.getState().snapshotDirtyDocIds.length;
             const parts: string[] = [];
-            if (dirtyBuilder) parts.push("the current figure has unsaved changes");
-            if (otherTabs) parts.push("other open tabs have unsaved changes (switch to each to save)");
+            if (dirtyBuilder && otherTabs) parts.push(`${dirtyDocs} open figures have unsaved changes`);
+            else if (dirtyBuilder) parts.push("the current figure has unsaved changes");
+            else if (otherTabs) parts.push(
+              dirtyDocs > 1 ? `${dirtyDocs} open figures have unsaved changes`
+                : "an open figure has unsaved changes");
             if (collageItems) parts.push("your collage has unsaved content");
             const { confirmThree } = await import("../shared/ConfirmDialog");
-            const { ensureProjectSaved } = await import("../../utils/projectNav");
+            const { saveAllOpenDocs } = await import("../../utils/projectNav");
             const choice = await confirmThree({
               title: "Save before closing?",
               body: `Before you close, ${parts.join(" and ")}.\n\n`
-                + "Save the figure now? (The collage auto-saves to this app's "
+                + "Save all open figures now? Documents that were never saved will "
+                + "ask where to put the file. (The collage auto-saves to this app's "
                 + "local storage; export it via Save Collage if you need a file.)",
-              confirmLabel: "Save & close",
+              confirmLabel: "Save all & close",
               tertiaryLabel: "Close without saving",
               cancelLabel: "Cancel",
             });
             if (choice === "cancel") return;            // stay open
-            if (choice === "confirm" && dirtyBuilder) {
-              const saved = await ensureProjectSaved();
+            if (choice === "confirm") {
+              // Save every dirty .mpf (current + parked tabs). Any cancelled
+              // save-as aborts the close so nothing is lost.
+              const saved = await saveAllOpenDocs();
               if (!saved) return;                       // save cancelled → stay
             }
           }

@@ -21,6 +21,7 @@ import InfoIcon from "@mui/icons-material/Info";
 import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
 import { enterCollage, enterAnalysis, switchToDocument, newBlankDoc, closeDoc, saveDocument } from "../../utils/projectNav";
+import { getReopenPref, setReopenPref } from "../../utils/sessionRestore";
 import { RecordAppButton, DEV_OPTIONS_KEY } from "./Toolbar";
 
 /* Help menu — lives in the always-visible tab bar (same level as the Record
@@ -32,6 +33,9 @@ function HelpMenuButton() {
   const [devOn, setDevOn] = useState<boolean>(() => {
     try { return localStorage.getItem(DEV_OPTIONS_KEY) === "1"; } catch { return false; }
   });
+  // "Re-open tabs on relaunch" — opt-in persistence of the open .mpf tabs
+  // (handled by sessionRestore). Self-contained, like the dev-options toggle.
+  const [reopenOn, setReopenOn] = useState<boolean>(() => getReopenPref());
   return (
     <>
       <Tooltip title="Help">
@@ -56,6 +60,19 @@ function HelpMenuButton() {
             {devOn ? "☑" : "☐"}
           </Box>
           Enable developer options
+        </MenuItem>
+        <MenuItem
+          onClick={(e) => {
+            e.preventDefault();
+            const next = !reopenOn;
+            setReopenOn(next);
+            setReopenPref(next);
+          }}
+        >
+          <Box component="span" sx={{ mr: 1, width: 18, display: "inline-flex", justifyContent: "center" }}>
+            {reopenOn ? "☑" : "☐"}
+          </Box>
+          Re-open tabs on relaunch
         </MenuItem>
       </Menu>
     </>

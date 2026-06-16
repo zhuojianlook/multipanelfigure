@@ -172,6 +172,26 @@ export function defaultProjectName(): string {
   return `${ts}_project.mpf`;
 }
 
+/** Save EVERY open document that has unsaved changes — the live active doc
+ *  (when `unsaved`) and any tabs whose edits are parked in an in-memory
+ *  snapshot. Each is saved via saveDocument(), which switches to the tab,
+ *  overwrites its .mpf in place, and prompts for a location only for a
+ *  never-saved Untitled doc. Returns false as soon as the user cancels any
+ *  save-as (so an app-close can be aborted); true once all dirty docs are
+ *  saved. Used by the app-close guard so quitting never silently drops work. */
+export async function saveAllOpenDocs(): Promise<boolean> {
+  const cs = useCollageStore.getState();
+  const fs = useFigureStore.getState();
+  const dirtyIds = cs.openDocs
+    .filter((d) => (cs.activeDocId === d.id && fs.unsaved) || backendStashed.has(d.id))
+    .map((d) => d.id);
+  for (const id of dirtyIds) {
+    const ok = await saveDocument(id);
+    if (!ok) return false; // user cancelled a save-as → abort
+  }
+  return true;
+}
+
 /** If the builder has unsaved changes, prompt Save / Don't save /
  *  Cancel. Returns true to proceed, false to abort. */
 export async function maybeSaveBeforeLeavingBuilder(): Promise<boolean> {
