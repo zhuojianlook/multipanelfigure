@@ -860,14 +860,25 @@ function persist(s: Persisted) {
 let _docSeq = 1;
 const _newDocId = () => `doc_${Date.now()}_${_docSeq++}`;
 
+/** Next free "Untitled_N" name not already used by an open tab. Numbered so
+ *  multiple blank tabs are distinguishable in the tab strip and — crucially —
+ *  in the per-file "save before closing" prompts (otherwise every unsaved tab
+ *  reads "Untitled"). Reuses the smallest free number when tabs are closed. */
+function _nextUntitledName(existing: DocTab[]): string {
+  const used = new Set(existing.map((d) => d.name));
+  let n = 1;
+  while (used.has(`Untitled_${n}`)) n++;
+  return `Untitled_${n}`;
+}
+
 export const useCollageStore = create<CollageState>()(
   immer((set, get) => ({
     ...loadInitial(),
     selectedId: null,
     selectedIds: [],
     mode: "builder" as WorkspaceMode,
-    // Seed with a single Untitled working document.
-    openDocs: [{ id: "doc_initial", path: null, name: "Untitled" }],
+    // Seed with a single numbered Untitled working document.
+    openDocs: [{ id: "doc_initial", path: null, name: "Untitled_1" }],
     activeDocId: "doc_initial",
     snapshotDirtyDocIds: [],
     elemSyncItemId: null,
@@ -1243,9 +1254,18 @@ export const useCollageStore = create<CollageState>()(
     // ── Document tabs (session-only, not persisted) ──
     docAdd: (doc) => {
       const id = _newDocId();
-      const name = doc.name
-        ?? (doc.path ? (doc.path.split(/[\\/]/).pop()?.replace(/\.mpf$/i, "") || doc.path) : "Untitled");
-      set((s) => { s.openDocs.push({ id, path: doc.path ?? null, name }); });
+      set((s) => {
+        // Derive the display name: an explicit name wins; else a file path's
+        // basename; else the next free "Untitled_N" (numbered against the
+        // CURRENT tab set so it never collides).
+        let name = doc.name;
+        if (!name) {
+          name = doc.path
+            ? (doc.path.split(/[\\/]/).pop()?.replace(/\.mpf$/i, "") || doc.path)
+            : _nextUntitledName(s.openDocs);
+        }
+        s.openDocs.push({ id, path: doc.path ?? null, name });
+      });
       return id;
     },
 

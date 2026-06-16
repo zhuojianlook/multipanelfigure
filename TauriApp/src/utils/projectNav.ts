@@ -309,7 +309,8 @@ export async function switchToDocument(docId: string): Promise<void> {
 export async function newBlankDoc(): Promise<void> {
   await stashCurrentDoc();
   await useFigureStore.getState().newBlankFigure();
-  const id = useCollageStore.getState().docAdd({ path: null, name: "Untitled" });
+  // No name → the store assigns the next free "Untitled_N".
+  const id = useCollageStore.getState().docAdd({ path: null });
   useCollageStore.getState().docSetActive(id);
   useCollageStore.getState().setMode("builder");
 }
@@ -409,7 +410,7 @@ export async function closeDoc(docId: string): Promise<boolean> {
     } else {
       // No docs left — make a fresh blank one so the builder isn't empty.
       await useFigureStore.getState().newBlankFigure();
-      const id = useCollageStore.getState().docAdd({ path: null, name: "Untitled" });
+      const id = useCollageStore.getState().docAdd({ path: null });
       useCollageStore.getState().docSetActive(id);
     }
   }
