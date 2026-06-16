@@ -17,7 +17,7 @@ import { CollageView } from "../collage/CollageView";
 import { AnalysisView } from "../analysis/AnalysisView";
 import { hasUnsavedSnapshots } from "../../utils/projectNav";
 import { maybeRestoreSession, persistOpenDocs, getReopenPref, setReopenPref } from "../../utils/sessionRestore";
-import { Alert } from "@mui/material";
+import { Alert, CircularProgress } from "@mui/material";
 
 function CenterPane({
   splitPct, dragging, onSplitterDown,
@@ -84,6 +84,13 @@ export function AppShell() {
   const apiError = useFigureStore((s) => s.apiError);
   const mode = useCollageStore((s) => s.mode);
   // uploadImagesFromPaths used by Tauri native dialog; uploadImages for File objects
+
+  // True while the app is saving-and-quitting. Drives a blocking overlay so the
+  // user can't keep editing during the (potentially slow) per-file .mpf saves
+  // between clicking "Save all & close"/"Overwrite" and the window actually
+  // closing. Sits BELOW MUI dialogs (z 1300) so the per-file save prompts stay
+  // clickable above it.
+  const [closing, setClosing] = useState(false);
 
   useEffect(() => {
     const init = async () => {
@@ -193,13 +200,26 @@ export function AppShell() {
             });
             if (choice === "cancel") return;            // stay open
             if (choice === "confirm") {
-              // Save every dirty .mpf (current + parked tabs), prompting for a
-              // location per file. Any cancelled save aborts the close so
-              // nothing is lost.
-              const saved = await saveAllOpenDocs({ promptForLocation: true });
-              if (!saved) return;                       // save cancelled → stay
+              // Block the UI while we save — saving an .mpf re-encodes every
+              // image, which can take seconds, and we must not let the user keep
+              // editing (or lose those edits) in the gap before the window
+              // closes. The overlay sits below the per-file save prompts so
+              // those stay interactive.
+              setClosing(true);
+              let saved = false;
+              try {
+                // Save every dirty .mpf (current + parked tabs), prompting for a
+                // location per file. Any cancelled save aborts the close.
+                saved = await saveAllOpenDocs({ promptForLocation: true });
+              } catch (e) {
+                console.error("[close] save-all failed", e);
+              }
+              if (!saved) { setClosing(false); return; } // cancelled/failed → stay
             }
           }
+          // Keep (or show) the overlay through the quit so nothing is clickable
+          // in the final beat before the window tears down.
+          setClosing(true);
           await quit();
         });
         if (cancelled) off();
@@ -319,6 +339,24 @@ export function AppShell() {
       onDragLeave={handleGlobalDragLeave}
       onDrop={handleGlobalDrop}
     >
+      {/* ── Saving-and-closing overlay ──────────────────── */}
+      {/* Shown from the moment the user confirms "Save all & close" until the
+          window tears down. Blocks all interaction (so edits can't be made — or
+          lost — mid-save) at z 1250, BELOW MUI dialogs (z 1300) so the per-file
+          save prompts remain clickable above it. */}
+      {closing && (
+        <div
+          className="fixed inset-0 flex items-center justify-center"
+          style={{ zIndex: 1250, backgroundColor: "rgba(0,0,0,0.55)", cursor: "wait" }}
+        >
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 14 }}>
+            <CircularProgress size={40} sx={{ color: "#fff" }} />
+            <span style={{ fontSize: 14, fontWeight: 500, color: "#fff", letterSpacing: 0.3 }}>
+              Saving and closing…
+            </span>
+          </div>
+        </div>
+      )}
       {/* ── File Drop Overlay ──────────────────────────── */}
       {fileDragOver && (
         <div className="fixed inset-0 z-[10000] flex items-center justify-center pointer-events-none"
