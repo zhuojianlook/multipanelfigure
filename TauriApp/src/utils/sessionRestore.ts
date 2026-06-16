@@ -18,6 +18,7 @@ import { useFigureStore } from "../store/figureStore";
 import { useCollageStore } from "../store/collageStore";
 import { api } from "../api/client";
 import { confirm } from "../components/shared/ConfirmDialog";
+import { serializeDocOp } from "./projectNav";
 
 /** Preference flag: when "1", last session's .mpf tabs reopen on launch. */
 const REOPEN_PREF_KEY = "mpfig_reopen_tabs_v1";
@@ -129,33 +130,38 @@ export async function maybeRestoreSession(): Promise<boolean> {
   });
   if (!ok) return false;
 
-  const cs = useCollageStore.getState();
-  // Cold tabs for every surviving doc (docEnsure dedupes by path, so tabs
-  // already seeded from collage figures aren't duplicated).
-  for (const d of liveDocs) cs.docEnsure(d.path, d.name || undefined);
+  // Build the tabs + load the active doc as ONE serialized operation, so a tab
+  // click during the (slow) active load can't race the backend and leave the
+  // session half-restored.
+  return serializeDocOp(async () => {
+    const cs = useCollageStore.getState();
+    // Cold tabs for every surviving doc (docEnsure dedupes by path, so tabs
+    // already seeded from collage figures aren't duplicated).
+    for (const d of liveDocs) cs.docEnsure(d.path, d.name || undefined);
 
-  // Load the previously-active doc if it still exists, else the first surviving
-  // one — so the user lands back where they left off.
-  const activePath = (session.activePath && liveDocs.some((d) => d.path === session.activePath))
-    ? session.activePath
-    : liveDocs[0].path;
+    // Load the previously-active doc if it still exists, else the first
+    // surviving one — so the user lands back where they left off.
+    const activePath = (session.activePath && liveDocs.some((d) => d.path === session.activePath))
+      ? session.activePath
+      : liveDocs[0].path;
 
-  try {
-    await useFigureStore.getState().loadProject(activePath);
-  } catch {
-    // Raced deletion between the existence check and the load — bail to a clean
-    // blank rather than a half-restored state.
-    return false;
-  }
+    try {
+      await useFigureStore.getState().loadProject(activePath);
+    } catch {
+      // Raced deletion between the existence check and the load — bail to a
+      // clean blank rather than a half-restored state.
+      return false;
+    }
 
-  const activeId = useCollageStore.getState().docEnsure(activePath);
-  // Drop the auto-seeded blank "Untitled" tab(s). At startup these are always
-  // the untouched initial doc, now superseded by the restored session — left
-  // in place they'd read as a stray empty tab.
-  for (const d of useCollageStore.getState().openDocs) {
-    if (!d.path && d.id !== activeId) useCollageStore.getState().docRemove(d.id);
-  }
-  useCollageStore.getState().docSetActive(activeId);
-  useCollageStore.getState().setMode("builder");
-  return true;
+    const activeId = useCollageStore.getState().docEnsure(activePath);
+    // Drop the auto-seeded blank "Untitled" tab(s). At startup these are always
+    // the untouched initial doc, now superseded by the restored session — left
+    // in place they'd read as a stray empty tab.
+    for (const d of useCollageStore.getState().openDocs) {
+      if (!d.path && d.id !== activeId) useCollageStore.getState().docRemove(d.id);
+    }
+    useCollageStore.getState().docSetActive(activeId);
+    useCollageStore.getState().setMode("builder");
+    return true;
+  });
 }

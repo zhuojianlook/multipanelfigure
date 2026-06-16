@@ -148,7 +148,7 @@ interface FigureState {
   requestPreview: () => void;
   syncToBackend: () => Promise<void>;
 
-  saveProject: (path: string) => Promise<void>;
+  saveProject: (path: string) => Promise<boolean>;
   loadProject: (path: string) => Promise<void>;
   /** Restore an in-session document snapshot (a base64 .mpf blob captured
    *  by api.snapshotProject) into the builder. Used by the document-tab
@@ -1775,8 +1775,14 @@ export const useFigureStore = create<FigureState>()(
         // and so the collage's Multi-Panel Builder button can offer
         // to reload it.
         set((s) => { s.currentProjectPath = path; s.configDirty = false; s.unsaved = false; });
+        return true;
       } catch (err) {
+        // Return false (rather than swallowing silently) so callers — e.g. the
+        // app-close save-all flow — can surface the failure and NOT treat the
+        // doc as saved (which would leave it dirty and re-prompt, or worse,
+        // drop the work on quit).
         console.error("Save project failed", err);
+        return false;
       }
     },
 
