@@ -172,13 +172,15 @@ export function defaultProjectName(): string {
   return `${ts}_project.mpf`;
 }
 
-/** Save one document tab, ALWAYS prompting for a save location first — the
- *  dialog is pre-filled with the doc's current .mpf path (so the user can just
- *  confirm to overwrite, or pick a new file/folder). Used by the app-close
- *  "Save all & close" flow, where the user wants to choose where each figure
- *  goes rather than have saved docs silently overwritten in place. Switches to
- *  the tab first when it isn't active. Returns false if the user cancels the
- *  dialog (so the close can be aborted). */
+/** Save one document tab for the app-close "Save all & close" flow.
+ *
+ *  - A MODIFIED file that already lives on disk → first confirms the overwrite,
+ *    offering "Overwrite" / "Save to a different location…" / "Cancel" so the
+ *    user never clobbers a file without intent (and can redirect it).
+ *  - A never-saved Untitled doc → just prompts for a location.
+ *
+ *  Switches to the tab first when it isn't active. Returns false if the user
+ *  cancels (so the close can be aborted). */
 async function saveDocumentAs(docId: string): Promise<boolean> {
   const cs = useCollageStore.getState();
   const doc = cs.openDocs.find((d) => d.id === docId);
@@ -193,11 +195,38 @@ async function saveDocumentAs(docId: string): Promise<boolean> {
   }
   const fs = useFigureStore.getState();
   const existingPath = doc.path || fs.currentProjectPath;
-  const path = await saveProjectDialog({
-    title: `Save "${doc.name}"`,
-    defaultPath: existingPath || defaultProjectName(),
-  });
-  if (!path) return false; // user cancelled → abort
+
+  let path: string | null;
+  if (existingPath) {
+    // Modified existing .mpf — confirm overwrite, or let the user redirect it.
+    const fileName = existingPath.split(/[\\/]/).pop() || existingPath;
+    const choice = await confirmThree({
+      title: `Save "${doc.name}"?`,
+      body: `Your changes will overwrite:\n${existingPath}\n\n`
+        + `Overwrite "${fileName}", or save to a different location?`,
+      confirmLabel: "Overwrite",
+      tertiaryLabel: "Save to different location…",
+      cancelLabel: "Cancel",
+    });
+    if (choice === "cancel") return false;
+    if (choice === "confirm") {
+      path = existingPath;
+    } else {
+      path = await saveProjectDialog({
+        title: `Save "${doc.name}" as…`,
+        defaultPath: existingPath,
+      });
+      if (!path) return false; // user cancelled the location picker → abort
+    }
+  } else {
+    // Never-saved Untitled — just pick a location.
+    path = await saveProjectDialog({
+      title: `Save "${doc.name}"`,
+      defaultPath: defaultProjectName(),
+    });
+    if (!path) return false; // user cancelled → abort
+  }
+
   await fs.saveProject(path);
   // Reflect a new location on the tab (leave the name alone when overwriting
   // the same path, so a custom rename sticks).
