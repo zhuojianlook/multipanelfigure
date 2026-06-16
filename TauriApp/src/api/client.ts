@@ -260,6 +260,24 @@ class ApiClient {
     return apiJson<ProjectLoadResponse>("/api/project/load", "POST", JSON.stringify({ path }));
   }
 
+  /** Cheaply check which of the given .mpf paths still exist on disk (used by
+   *  session restore so files deleted since last launch don't reopen as phantom
+   *  tabs). Returns a map path→exists. Degrades to "all exist" if the endpoint
+   *  is unavailable (e.g. an older sidecar) so restore still works. */
+  async pathsExist(paths: string[]): Promise<Record<string, boolean>> {
+    if (paths.length === 0) return {};
+    try {
+      const data = await apiJson<{ exists: Record<string, boolean> }>(
+        "/api/fs/exists", "POST", JSON.stringify({ paths }),
+      );
+      return data.exists ?? {};
+    } catch {
+      const all: Record<string, boolean> = {};
+      for (const p of paths) all[p] = true;
+      return all;
+    }
+  }
+
   // ── In-session document snapshots (for seamless tab switching) ──
   // snapshotProject serializes the CURRENT backend builder state to a
   // base64 .mpf blob without writing to disk; restoreProject loads such a

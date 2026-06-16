@@ -16,6 +16,8 @@
 
 import { useFigureStore } from "../store/figureStore";
 import { useCollageStore } from "../store/collageStore";
+import { api } from "../api/client";
+import { confirm } from "../components/shared/ConfirmDialog";
 
 /** Preference flag: when "1", last session's .mpf tabs reopen on launch. */
 const REOPEN_PREF_KEY = "mpfig_reopen_tabs_v1";
@@ -81,37 +83,68 @@ function readSession(): PersistedSession | null {
  *  collage figures, mutating openDocs before restore gets to read). */
 const _bootSession: PersistedSession | null = readSession();
 
-/** On launch, when the preference is on, rebuild the document tabs from the
- *  last session: a "cold" tab (path only — not loaded into the backend) for
- *  every saved doc, plus loading the previously-active doc into the builder.
- *  Cold tabs load lazily when the user clicks them (the existing switch-to-doc
- *  flow surfaces a friendly error if a file has since moved/been deleted).
+/** One-shot guard so the launch restore (and its prompt) runs at most once,
+ *  even if an effect double-invokes (React StrictMode in dev). */
+let _restoreAttempted = false;
+
+/** On launch, when the preference is on, offer to rebuild the document tabs
+ *  from the last session.
+ *
+ *  - Files deleted/moved since last launch are filtered out FIRST (via a cheap
+ *    existence check) so they never reopen as phantom tabs. If none survive,
+ *    we silently start clean.
+ *  - The user is then ASKED whether to reopen the surviving tabs or start with
+ *    a blank document (the preference enables the offer; it doesn't force it).
+ *
+ *  On "reopen": a "cold" tab (path only — not loaded into the backend) is made
+ *  for every surviving doc, and the previously-active one (or the first if it's
+ *  gone) is loaded into the builder. Cold tabs load lazily when clicked.
  *
  *  Returns true if a project was loaded into the builder (so the caller can
  *  skip its own preview kick — loadProject already requests one). Returns false
- *  when the pref is off, nothing was saved, or the active doc failed to load. */
+ *  when the pref is off, nothing survives, the user declines, or the load
+ *  fails. */
 export async function maybeRestoreSession(): Promise<boolean> {
+  if (_restoreAttempted) return false; // one shot per launch (guards StrictMode double-invoke)
+  _restoreAttempted = true;
   if (!getReopenPref()) return false;
   const session = _bootSession;
   if (!session || session.docs.length === 0) return false;
 
-  const cs = useCollageStore.getState();
-  // Cold tabs for every saved doc (docEnsure dedupes by path, so tabs already
-  // seeded from collage figures aren't duplicated).
-  for (const d of session.docs) cs.docEnsure(d.path, d.name || undefined);
+  // Drop docs whose .mpf no longer exists so deleted files don't reopen as
+  // empty phantom tabs.
+  const existMap = await api.pathsExist(session.docs.map((d) => d.path));
+  const liveDocs = session.docs.filter((d) => existMap[d.path]);
+  if (liveDocs.length === 0) return false; // nothing left → start clean
 
-  // Load the previously-active doc if it's among the restored set, else the
-  // first one — so the user lands back where they left off.
-  const activePath = (session.activePath && session.docs.some((d) => d.path === session.activePath))
+  // Even with the preference on, confirm before reopening so the user can
+  // choose a clean start.
+  const n = liveDocs.length;
+  const ok = await confirm({
+    title: "Reopen last session?",
+    body: `You have ${n} saved figure ${n === 1 ? "tab" : "tabs"} from your last session.\n\n`
+      + "Reopen them, or start with a blank document?",
+    confirmLabel: n === 1 ? "Reopen tab" : `Reopen ${n} tabs`,
+    cancelLabel: "Start fresh",
+  });
+  if (!ok) return false;
+
+  const cs = useCollageStore.getState();
+  // Cold tabs for every surviving doc (docEnsure dedupes by path, so tabs
+  // already seeded from collage figures aren't duplicated).
+  for (const d of liveDocs) cs.docEnsure(d.path, d.name || undefined);
+
+  // Load the previously-active doc if it still exists, else the first surviving
+  // one — so the user lands back where they left off.
+  const activePath = (session.activePath && liveDocs.some((d) => d.path === session.activePath))
     ? session.activePath
-    : session.docs[0]?.path ?? null;
-  if (!activePath) return false;
+    : liveDocs[0].path;
 
   try {
     await useFigureStore.getState().loadProject(activePath);
   } catch {
-    // File moved/deleted — leave the blank Untitled active; its cold tab
-    // remains and surfaces a load error if the user clicks it later.
+    // Raced deletion between the existence check and the load — bail to a clean
+    // blank rather than a half-restored state.
     return false;
   }
 

@@ -4306,6 +4306,28 @@ def load_proj(body: ProjectLoadRequest):
     }
 
 
+class PathsExistRequest(BaseModel):
+    paths: List[str]
+
+
+@app.post("/api/fs/exists")
+def fs_exists(body: PathsExistRequest):
+    """Cheap batch check of which .mpf paths still exist on disk. Used by the
+    frontend's session restore so files deleted since last launch don't reopen
+    as phantom tabs. Mirrors load_proj's path normalisation (~ expansion +
+    bare-name -> Documents) so the answer matches what an actual load resolves."""
+    out: Dict[str, bool] = {}
+    for raw in body.paths:
+        try:
+            p = os.path.expanduser((raw or "").strip())
+            if p and not os.path.dirname(p):
+                p = os.path.join(os.path.expanduser("~"), "Documents", p)
+            out[raw] = bool(p) and os.path.isfile(p)
+        except Exception:
+            out[raw] = False
+    return {"exists": out}
+
+
 @app.get("/api/project/snapshot")
 def snapshot_proj():
     """Serialize the CURRENT builder state to an in-memory .mpf blob
