@@ -16,7 +16,7 @@ import { PreviewPane } from "../preview/PreviewPane";
 import { CollageView } from "../collage/CollageView";
 import { AnalysisView } from "../analysis/AnalysisView";
 import { hasUnsavedSnapshots } from "../../utils/projectNav";
-import { maybeRestoreSession, persistOpenDocs } from "../../utils/sessionRestore";
+import { maybeRestoreSession, persistOpenDocs, getReopenPref, setReopenPref } from "../../utils/sessionRestore";
 import { Alert } from "@mui/material";
 
 function CenterPane({
@@ -177,18 +177,26 @@ export function AppShell() {
             const choice = await confirmThree({
               title: "Save before closing?",
               body: `Before you close, ${parts.join(" and ")}.\n\n`
-                + "Save all open figures now? Documents that were never saved will "
-                + "ask where to put the file. (The collage auto-saves to this app's "
-                + "local storage; export it via Save Collage if you need a file.)",
+                + "Save all open figures now? You'll be asked where to save each "
+                + "one. (The collage auto-saves to this app's local storage; export "
+                + "it via Save Collage if you need a file.)",
               confirmLabel: "Save all & close",
               tertiaryLabel: "Close without saving",
               cancelLabel: "Cancel",
+              // Inline toggle so the session-restore preference is discoverable
+              // right where the user is thinking about their open tabs.
+              checkbox: {
+                label: "Re-open my open tabs next time I launch",
+                checked: getReopenPref(),
+                onChange: (v) => setReopenPref(v),
+              },
             });
             if (choice === "cancel") return;            // stay open
             if (choice === "confirm") {
-              // Save every dirty .mpf (current + parked tabs). Any cancelled
-              // save-as aborts the close so nothing is lost.
-              const saved = await saveAllOpenDocs();
+              // Save every dirty .mpf (current + parked tabs), prompting for a
+              // location per file. Any cancelled save aborts the close so
+              // nothing is lost.
+              const saved = await saveAllOpenDocs({ promptForLocation: true });
               if (!saved) return;                       // save cancelled → stay
             }
           }

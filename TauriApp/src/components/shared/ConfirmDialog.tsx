@@ -34,6 +34,8 @@ import {
   DialogTitle,
   Typography,
   Button,
+  Checkbox,
+  FormControlLabel,
 } from "@mui/material";
 
 /** Result of a (possibly 3-way) dialog. */
@@ -54,6 +56,15 @@ interface ConfirmRequest {
   /** When true, the confirm button uses color="error" (red).
    *  Use for destructive actions — delete, overwrite, etc. */
   destructive?: boolean;
+  /** Optional checkbox rendered below the body — for an inline preference
+   *  toggle (e.g. "Re-open tabs on relaunch" on the close prompt). It is
+   *  self-managing: `checked` seeds it and `onChange` fires (and should
+   *  persist) on every toggle, independently of which button the user picks. */
+  checkbox?: {
+    label: string;
+    checked: boolean;
+    onChange: (checked: boolean) => void;
+  };
   /** Resolver attached by the caller; receives the chosen action. */
   resolve: (result: DialogResult) => void;
 }
@@ -134,6 +145,12 @@ export function ConfirmHost() {
     return () => { listeners.delete(onRequest); };
   }, []);
 
+  // Local state for an optional inline checkbox; re-seeded from each request's
+  // `checked` whenever a new request becomes current. Toggling it doesn't touch
+  // the queue, so the effect won't reset it mid-dialog.
+  const [cbChecked, setCbChecked] = useState(false);
+  useEffect(() => { setCbChecked(queue[0]?.checkbox?.checked ?? false); }, [queue]);
+
   const current = queue[0];
   if (!current) return null;
 
@@ -157,6 +174,23 @@ export function ConfirmHost() {
       <DialogTitle>{current.title}</DialogTitle>
       <DialogContent>
         <Typography sx={{ whiteSpace: "pre-wrap" }}>{current.body}</Typography>
+        {current.checkbox && (
+          <FormControlLabel
+            sx={{ mt: 1.5, ml: 0 }}
+            control={
+              <Checkbox
+                size="small"
+                checked={cbChecked}
+                onChange={(e) => {
+                  setCbChecked(e.target.checked);
+                  current.checkbox!.onChange(e.target.checked);
+                }}
+                sx={{ py: 0.25, pl: 0 }}
+              />
+            }
+            label={<Typography variant="body2">{current.checkbox.label}</Typography>}
+          />
+        )}
       </DialogContent>
       <DialogActions>
         {cancelLabel !== null && (

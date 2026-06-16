@@ -172,22 +172,64 @@ export function defaultProjectName(): string {
   return `${ts}_project.mpf`;
 }
 
+/** Save one document tab, ALWAYS prompting for a save location first — the
+ *  dialog is pre-filled with the doc's current .mpf path (so the user can just
+ *  confirm to overwrite, or pick a new file/folder). Used by the app-close
+ *  "Save all & close" flow, where the user wants to choose where each figure
+ *  goes rather than have saved docs silently overwritten in place. Switches to
+ *  the tab first when it isn't active. Returns false if the user cancels the
+ *  dialog (so the close can be aborted). */
+async function saveDocumentAs(docId: string): Promise<boolean> {
+  const cs = useCollageStore.getState();
+  const doc = cs.openDocs.find((d) => d.id === docId);
+  if (!doc) return false;
+  if (cs.activeDocId !== docId) {
+    try {
+      await switchToDocument(docId);
+    } catch (e) {
+      console.error("[projectNav] saveDocumentAs: switch failed", e);
+      return false;
+    }
+  }
+  const fs = useFigureStore.getState();
+  const existingPath = doc.path || fs.currentProjectPath;
+  const path = await saveProjectDialog({
+    title: `Save "${doc.name}"`,
+    defaultPath: existingPath || defaultProjectName(),
+  });
+  if (!path) return false; // user cancelled → abort
+  await fs.saveProject(path);
+  // Reflect a new location on the tab (leave the name alone when overwriting
+  // the same path, so a custom rename sticks).
+  if (path !== doc.path) useCollageStore.getState().docSetPath(docId, path);
+  if (backendStashed.has(docId)) { void api.dropState(docId).catch(() => {}); backendStashed.delete(docId); }
+  syncSnapshotDirty();
+  return true;
+}
+
 /** Save EVERY open document that has unsaved changes — the live active doc
  *  (when `unsaved`) and any tabs whose edits are parked in an in-memory
- *  snapshot. Each is saved via saveDocument(), which switches to the tab,
- *  overwrites its .mpf in place, and prompts for a location only for a
- *  never-saved Untitled doc. Returns false as soon as the user cancels any
- *  save-as (so an app-close can be aborted); true once all dirty docs are
- *  saved. Used by the app-close guard so quitting never silently drops work. */
-export async function saveAllOpenDocs(): Promise<boolean> {
+ *  snapshot. Returns false as soon as the user cancels any save (so an
+ *  app-close can be aborted); true once all dirty docs are saved. Used by the
+ *  app-close guard so quitting never silently drops work.
+ *
+ *  When `promptForLocation` is set, each dirty doc shows the Save Project
+ *  dialog pre-filled with its current path (the app-close behaviour: the user
+ *  picks a location for every figure). Otherwise saved docs overwrite in place
+ *  and only never-saved Untitled docs prompt (the in-tab Save behaviour). */
+export async function saveAllOpenDocs(
+  opts: { promptForLocation?: boolean } = {},
+): Promise<boolean> {
   const cs = useCollageStore.getState();
   const fs = useFigureStore.getState();
   const dirtyIds = cs.openDocs
     .filter((d) => (cs.activeDocId === d.id && fs.unsaved) || backendStashed.has(d.id))
     .map((d) => d.id);
   for (const id of dirtyIds) {
-    const ok = await saveDocument(id);
-    if (!ok) return false; // user cancelled a save-as → abort
+    const ok = opts.promptForLocation
+      ? await saveDocumentAs(id)
+      : await saveDocument(id);
+    if (!ok) return false; // user cancelled a save → abort
   }
   return true;
 }
