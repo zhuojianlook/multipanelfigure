@@ -135,33 +135,38 @@ export async function maybeRestoreSession(): Promise<boolean> {
   // session half-restored.
   return serializeDocOp(async () => {
     const cs = useCollageStore.getState();
-    // Cold tabs for every surviving doc (docEnsure dedupes by path, so tabs
-    // already seeded from collage figures aren't duplicated).
-    for (const d of liveDocs) cs.docEnsure(d.path, d.name || undefined);
-
-    // Load the previously-active doc if it still exists, else the first
-    // surviving one — so the user lands back where they left off.
+    // Pick which doc lands in the builder: the previously-active one if it still
+    // exists, else the first surviving one.
     const activePath = (session.activePath && liveDocs.some((d) => d.path === session.activePath))
       ? session.activePath
       : liveDocs[0].path;
 
-    try {
-      await useFigureStore.getState().loadProject(activePath);
-    } catch {
-      // Raced deletion between the existence check and the load — bail to a
-      // clean blank rather than a half-restored state.
-      return false;
-    }
-
+    // Shape the tab strip to its FINAL form in one synchronous batch — add the
+    // restored cold tabs, drop the auto-seeded blank "Untitled" tab, and set the
+    // active tab — BEFORE the (slow) load. Doing the removal after the await let
+    // React paint a transient state with the stray Untitled_1 sitting next to
+    // the restored tabs (the "3 tabs for a moment" glitch). No awaits here, so
+    // the strip renders its final shape directly.
+    for (const d of liveDocs) cs.docEnsure(d.path, d.name || undefined);
     const activeId = useCollageStore.getState().docEnsure(activePath);
-    // Drop the auto-seeded blank "Untitled" tab(s). At startup these are always
-    // the untouched initial doc, now superseded by the restored session — left
-    // in place they'd read as a stray empty tab.
     for (const d of useCollageStore.getState().openDocs) {
       if (!d.path && d.id !== activeId) useCollageStore.getState().docRemove(d.id);
     }
     useCollageStore.getState().docSetActive(activeId);
     useCollageStore.getState().setMode("builder");
+
+    // Now fill the builder with the active doc's content.
+    try {
+      await useFigureStore.getState().loadProject(activePath);
+    } catch {
+      // Rare: the file vanished between the existence check and the load. Reset
+      // to a clean blank working doc so the active tab and backend stay
+      // consistent (the other restored tabs remain and load on click).
+      await useFigureStore.getState().newBlankFigure().catch(() => {});
+      const blankId = useCollageStore.getState().docAdd({ path: null });
+      useCollageStore.getState().docSetActive(blankId);
+      return false;
+    }
     return true;
   });
 }
