@@ -23,7 +23,14 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install Python deps
-        run: pip install pillow numpy scipy matplotlib opencv-python-headless fastapi uvicorn python-multipart nibabel tifffile pyinstaller
+        # PIN the image-render stack. These were installed unpinned, so a fresh
+        # CI run silently pulled the newest release of each — which is how
+        # matplotlib 3.11.0 slipped in and broke generate_preview() (it removed
+        # APIs the figure builder uses), surfacing as a permanent "No Preview
+        # Yet" while per-panel (PIL) renders still worked. Pin to the last
+        # known-good set (the versions that shipped in v0.1.357). Bump these
+        # deliberately, not by accident. Server/build tools stay unpinned.
+        run: pip install 'pillow==12.2.0' 'numpy==2.4.6' 'scipy==1.17.1' 'matplotlib==3.10.9' 'opencv-python-headless==4.13.0.92' fastapi uvicorn python-multipart nibabel tifffile pyinstaller
       - name: Build sidecar
         working-directory: TauriApp/python-sidecar
         run: |
