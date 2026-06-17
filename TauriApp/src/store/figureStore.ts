@@ -436,6 +436,13 @@ let headerEditsPending = false;
 // response can't overwrite a newer one (race condition seen as a
 // "ghost" of the previous header state appearing in the preview).
 let previewSeq = 0;
+// Consecutive failed preview fetches while NO preview has rendered yet. A
+// getPreview() can transiently fail when it races other sidecar calls (e.g. the
+// panel-thumbnail refreshes loadProject fires) — without a retry that leaves a
+// permanent "No Preview Yet". We retry a few times, then give up (the manual
+// "Generate Preview" button remains). Reset to 0 on any success.
+let previewFailRetries = 0;
+const PREVIEW_MAX_RETRIES = 4;
 // True while a background "wait for the sidecar to come up" poll is running,
 // so we never spawn more than one. Set when the initial connect window
 // elapses without the sidecar answering (it can still be extracting — a
@@ -1733,15 +1740,27 @@ export const useFigureStore = create<FigureState>()(
             return;
           }
           console.log(`[mpf] preview fetch seq=${mySeq} APPLIED (imgBytes=${resp.image?.length ?? 0})`);
+          previewFailRetries = 0;
           set((s) => {
             s.previewImageB64 = resp.image;
             s.previewLoading = false;
             s.configDirty = false;
           });
-        } catch {
+        } catch (err) {
           set((s) => {
             s.previewLoading = false;
           });
+          // Only the latest request retries (older ones were superseded). If the
+          // preview has never rendered, this was likely a transient race with
+          // another sidecar call — retry a few times so we don't get stuck on
+          // "No Preview Yet".
+          if (mySeq === previewSeq
+            && get().previewImageB64 == null
+            && previewFailRetries < PREVIEW_MAX_RETRIES) {
+            previewFailRetries++;
+            console.log(`[mpf] preview fetch failed; retry ${previewFailRetries}/${PREVIEW_MAX_RETRIES}`, err);
+            setTimeout(() => { try { get().requestPreview(); } catch { /* noop */ } }, 350);
+          }
         }
       }, 100);
     },

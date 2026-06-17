@@ -97,11 +97,16 @@ export function AppShell() {
       await fetchConfig();
       await fetchImages();
       fetchFonts();
-      // Reopen last session's .mpf tabs when the user has opted in. When it
-      // loads a project the builder already has a preview pending, so only
-      // kick our own preview when nothing was restored.
-      const restored = await maybeRestoreSession().catch(() => false);
-      if (!restored) setTimeout(() => requestPreview(), 200);
+      // Reopen last session's .mpf tabs when the user has opted in (waits for
+      // the user's prompt + the active doc's load to settle).
+      await maybeRestoreSession().catch(() => false);
+      // ALWAYS kick a preview once everything has settled — even after a
+      // restore. Restore's own loadProject preview can lose a race with the
+      // panel-thumbnail refreshes it fires (single-threaded sidecar) and fail
+      // with nothing to retry it, leaving a permanent "No Preview Yet". This
+      // unconditional kick is the safety net; a duplicate render is harmless
+      // (requestPreview de-dupes via its sequence guard).
+      setTimeout(() => requestPreview(), 200);
     };
     init();
     // eslint-disable-next-line react-hooks/exhaustive-deps
