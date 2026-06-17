@@ -30,8 +30,44 @@ import { saveProjectDialog } from "../components/shared/SaveProjectDialog";
    button / save guards). `backendStashed` tracks which doc ids have a stash. */
 const backendStashed = new Set<string>();
 
+/* ── Clean-document perf cache ───────────────────────────────────────────
+   Switching to a CLEAN saved tab used to reload+decode its whole .mpf from
+   disk every time (slow). To make repeat-switching fast we ALSO cache clean
+   docs' live state in the backend on switch-away and restore them via the fast
+   in-memory activate path. This is a SEPARATE layer from `backendStashed` on
+   purpose: backendStashed (and every save/close guard built on it) tracks only
+   DIRTY docs and is left completely untouched, so this optimisation can never
+   mis-count unsaved work or drop edits. `cleanCached` is purely a speed cache —
+   never counted as unsaved, evicted LRU to bound memory. Caveat: a clean cached
+   doc whose .mpf is modified by an EXTERNAL process won't refresh until its tab
+   is closed/reopened (the app itself never writes a non-active doc's file). */
+const cleanCached = new Set<string>();
+/** Max clean docs cached in the backend at once (bounds memory — each holds a
+ *  full decoded image set). Dirty stashes are NOT capped (never dropped). */
+const CLEAN_CACHE_MAX = 5;
+
+/** Drop a doc's backend stash (dirty or clean) and forget it in both sets. */
+function dropStash(id: string): void {
+  if (backendStashed.has(id) || cleanCached.has(id)) {
+    void api.dropState(id).catch(() => {});
+    backendStashed.delete(id);
+    cleanCached.delete(id);
+  }
+}
+
+/** Evict oldest clean caches (Set keeps insertion order) past the cap. */
+function evictCleanCache(): void {
+  while (cleanCached.size > CLEAN_CACHE_MAX) {
+    const oldest = cleanCached.values().next().value as string | undefined;
+    if (oldest === undefined) break;
+    cleanCached.delete(oldest);
+    void api.dropState(oldest).catch(() => {});
+  }
+}
+
 /** Push the stashed doc-id set into the collage store so the tab strip can
- *  show the unsaved/save indicator on tabs whose edits aren't live. */
+ *  show the unsaved/save indicator on tabs whose edits aren't live. Only DIRTY
+ *  stashes drive the indicator — clean perf caches are invisible to the user. */
 function syncSnapshotDirty() {
   useCollageStore.getState().setSnapshotDirtyDocIds(Array.from(backendStashed));
 }
@@ -64,24 +100,30 @@ export function hasUnsavedSnapshots(): boolean {
   return backendStashed.size > 0;
 }
 
-/** Stash the currently-active builder doc in the backend IF it has unsaved
- *  edits, so switching away doesn't lose work. No-op for clean docs (they
- *  reload from disk / reset to blank on return) and for an active doc that
- *  was already removed (e.g. mid-close). */
+/** Stash the currently-active builder doc's live state in the backend so
+ *  switching away and back is fast. Dirty docs go in `backendStashed` (their
+ *  edits must survive — drives the save guards); clean docs go in the
+ *  `cleanCached` perf layer (a fast reload, never counted as unsaved). No-op
+ *  for an active doc that was already removed (e.g. mid-close). */
 async function stashCurrentDoc(): Promise<void> {
   const cs = useCollageStore.getState();
   const fs = useFigureStore.getState();
   const activeId = cs.activeDocId;
   if (!activeId) return;
   if (!cs.openDocs.some((d) => d.id === activeId)) return; // already removed
-  if (!fs.unsaved) {
-    if (backendStashed.has(activeId)) { void api.dropState(activeId).catch(() => {}); backendStashed.delete(activeId); }
-    syncSnapshotDirty();
-    return;
-  }
   try {
     await api.stashState(activeId);
-    backendStashed.add(activeId);
+    if (fs.unsaved) {
+      backendStashed.add(activeId);
+      cleanCached.delete(activeId);
+    } else {
+      // Clean: cache for fast return. Refresh its LRU position, then evict
+      // the oldest clean caches past the cap.
+      backendStashed.delete(activeId);
+      cleanCached.delete(activeId);
+      cleanCached.add(activeId);
+      evictCleanCache();
+    }
   } catch (e) {
     console.error("[projectNav] stash failed for", activeId, e);
   }
@@ -89,18 +131,24 @@ async function stashCurrentDoc(): Promise<void> {
 }
 
 /** Load a document's state into the backend builder: prefer its in-memory
- *  stash (preserves unsaved edits, fast), else the on-disk .mpf, else blank. */
+ *  cache — a dirty stash (preserves unsaved edits) or a clean perf cache (fast
+ *  reload) — else the on-disk .mpf, else blank. */
 async function activateDoc(doc: { id: string; path: string | null }): Promise<void> {
-  if (backendStashed.has(doc.id)) {
+  const wasDirty = backendStashed.has(doc.id);
+  if (wasDirty || cleanCached.has(doc.id)) {
     try {
-      await useFigureStore.getState().restoreDocState(doc.id, { path: doc.path });
+      // Restore with the cached dirty state: a dirty stash stays unsaved; a
+      // clean cache stays clean (so no false "unsaved" indicator on return).
+      await useFigureStore.getState().restoreDocState(doc.id, { path: doc.path, dirty: wasDirty });
       backendStashed.delete(doc.id); // now live in the backend
+      cleanCached.delete(doc.id);
       syncSnapshotDirty();
       return;
     } catch (e) {
       // Cache miss (e.g. sidecar restarted) — drop it and fall back to disk.
       console.error("[projectNav] activate-state failed; falling back to disk/blank", e);
       backendStashed.delete(doc.id);
+      cleanCached.delete(doc.id);
       syncSnapshotDirty();
     }
   }
@@ -175,7 +223,7 @@ async function saveDocumentImpl(docId: string): Promise<boolean> {
   // sticks. saveProject already cleared `unsaved`, so the dirty dot/active
   // marker disappears; also drop any parked snapshot.
   if (!doc.path) useCollageStore.getState().docSetPath(docId, path);
-  if (backendStashed.has(docId)) { void api.dropState(docId).catch(() => {}); backendStashed.delete(docId); }
+  dropStash(docId);
   syncSnapshotDirty();
   return true;
 }
@@ -270,7 +318,7 @@ async function saveDocumentAs(docId: string): Promise<boolean> {
   // Reflect a new location on the tab (leave the name alone when overwriting
   // the same path, so a custom rename sticks).
   if (path !== doc.path) useCollageStore.getState().docSetPath(docId, path);
-  if (backendStashed.has(docId)) { void api.dropState(docId).catch(() => {}); backendStashed.delete(docId); }
+  dropStash(docId);
   syncSnapshotDirty();
   return true;
 }
@@ -419,7 +467,7 @@ export function openProjectIntoTab(path: string): Promise<void> {
     }
     const id = useCollageStore.getState().docEnsure(path);
     // Freshly loaded from disk — drop any stale in-memory stash for it.
-    if (backendStashed.has(id)) { void api.dropState(id).catch(() => {}); backendStashed.delete(id); }
+    dropStash(id);
     syncSnapshotDirty();
     useCollageStore.getState().docSetActive(id);
     useCollageStore.getState().setMode("builder");
@@ -479,7 +527,7 @@ async function closeDocImpl(docId: string): Promise<boolean> {
   }
 
   // Drop any in-memory stash for the closed doc.
-  if (backendStashed.has(docId)) { void api.dropState(docId).catch(() => {}); backendStashed.delete(docId); }
+  dropStash(docId);
   syncSnapshotDirty();
 
   const remaining = useCollageStore.getState().openDocs.filter((d) => d.id !== docId);

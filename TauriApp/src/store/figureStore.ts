@@ -160,7 +160,7 @@ interface FigureState {
   /** Fast restore via the backend's in-memory doc-state cache (no blob /
    *  image decode). Mirrors restoreDoc's apply. Rejects if the cache entry is
    *  gone (e.g. the sidecar restarted) so the caller can fall back to disk. */
-  restoreDocState: (docId: string, opts: { path: string | null }) => Promise<void>;
+  restoreDocState: (docId: string, opts: { path: string | null; dirty?: boolean }) => Promise<void>;
   /** Reset the builder to a fresh blank 2×2 figure (new document) WITHOUT
    *  a page reload and without touching the collage. Deletes loaded
    *  images on the backend, resets cfg, clears the project path. */
@@ -1949,7 +1949,9 @@ export const useFigureStore = create<FigureState>()(
         }));
         s.currentProjectPath = opts.path;
         s.configDirty = false;
-        s.unsaved = true;
+        // A dirty stash carried unsaved edits → keep it dirty. A clean perf
+        // cache was identical to disk → keep it clean (no false unsaved dot).
+        s.unsaved = opts.dirty ?? true;
       });
       get().requestPreview();
       const cfg = resp.config;
