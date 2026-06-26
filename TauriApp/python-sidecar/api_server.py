@@ -6,6 +6,8 @@ Launched as a Tauri sidecar — communicates via HTTP on a random port.
 from __future__ import annotations
 import argparse
 import base64
+import hashlib
+import datetime as _dt
 import io
 import os
 import tempfile
@@ -152,12 +154,97 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.357"
+SIDECAR_BUILD = "0.1.369"  # keep in sync with package.json / tauri.conf.json on each release
 
 
 @app.get("/api/version")
 async def version():
     return {"build": SIDECAR_BUILD}
+
+
+# ── Export provenance / watermark ───────────────────────────────────────────
+# Every figure/collage the user exports gets identifying metadata embedded in
+# the file's standard metadata fields: the app name + version, the project's
+# GitHub URL, an MD5 fingerprint of the rendered pixels, and a UTC timestamp.
+# Acts as a lightweight digital watermark proving the file came from this app.
+APP_NAME = "Multi-Panel Figure Builder"
+REPO_URL = "https://github.com/zhuojianlook/multipanelfigure"
+
+
+def _provenance_fields(img: "Image.Image") -> dict:
+    """Build provenance metadata for a rendered export image. `md5` is over the
+    image's raw pixel bytes — a content fingerprint that anyone can re-verify by
+    re-opening the file and re-hashing its pixels (exact for lossless PNG/TIFF).
+    ASCII-only text so it's safe in every format's metadata field."""
+    try:
+        md5 = hashlib.md5(img.tobytes()).hexdigest()
+    except Exception:
+        md5 = ""
+    created = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    software = "{} v{}".format(APP_NAME, SIDECAR_BUILD)
+    text = ("Created with {} - {} | content-md5: {} | created: {}"
+            .format(software, REPO_URL, md5, created))
+    return {"md5": md5, "created": created, "software": software, "text": text}
+
+
+def _provenance_save_kwargs(img: "Image.Image", fmt: str) -> dict:
+    """Return per-format PIL `Image.save()` kwargs that embed the provenance
+    watermark in the format's standard metadata fields. Returns {} on ANY error
+    so the caller's save still succeeds without metadata (the watermark is a
+    nice-to-have; never let it break an export)."""
+    try:
+        f = (fmt or "").upper()
+        prov = _provenance_fields(img)
+        text, md5, software = prov["text"], prov["md5"], prov["software"]
+        if f == "PNG":
+            from PIL import PngImagePlugin
+            info = PngImagePlugin.PngInfo()
+            info.add_text("Software", software)
+            info.add_text("Source", REPO_URL)
+            info.add_text("Comment", text)
+            info.add_text("content-md5", md5)
+            return {"pnginfo": info}
+        if f in ("TIFF", "TIF"):
+            from PIL.TiffImagePlugin import ImageFileDirectory_v2
+            ifd = ImageFileDirectory_v2()
+            ifd[270] = text       # ImageDescription
+            ifd[305] = software   # Software
+            return {"tiffinfo": ifd}
+        if f in ("JPEG", "JPG"):
+            return {"comment": text.encode("ascii", "replace")}
+        if f == "PDF":
+            return {
+                "title": "{} export".format(APP_NAME),
+                "creator": software,
+                "producer": REPO_URL,
+                "subject": text,
+                "keywords": "content-md5:{}".format(md5),
+            }
+    except Exception as _e:
+        import sys
+        print("[provenance] kwargs build failed ({}): {}".format(fmt, _e), file=sys.stderr, flush=True)
+    return {}
+
+
+def _save_image(img: "Image.Image", out, fmt: str, **base_kwargs) -> None:
+    """Save `img` to `out` (path or buffer) as `fmt` with the provenance
+    watermark embedded. If embedding the metadata makes PIL choke, retry once
+    WITHOUT it — an export must never fail over a watermark."""
+    pkw = _provenance_save_kwargs(img, fmt)
+    try:
+        img.save(out, format=fmt, **base_kwargs, **pkw)
+    except Exception as _e:
+        if not pkw:
+            raise  # nothing to do with metadata — a genuine save error
+        import sys
+        print("[provenance] save with metadata failed ({}): {}; retrying plain"
+              .format(fmt, _e), file=sys.stderr, flush=True)
+        try:
+            if hasattr(out, "seek") and hasattr(out, "truncate"):
+                out.seek(0); out.truncate(0)
+        except Exception:
+            pass
+        img.save(out, format=fmt, **base_kwargs)
 
 
 @app.post("/api/analysis/warmup")
@@ -3650,6 +3737,24 @@ def save_figure(body: SaveFigureRequest):
                 # outgoing inset → 1000-px canvas convention.
                 full_res_sizes2[(r, c)] = (1000, 1000)
     fig_bytes = assemble_figure(cfg, processed, dpi=body.dpi, full_res_sizes=full_res_sizes2)
+
+    # Embed the provenance watermark (app/version/repo/md5). Best-effort: re-open
+    # the rendered bytes, re-save the SAME pixels with metadata. Lossless for the
+    # TIFF/PNG figure formats, and any failure leaves fig_bytes untouched so the
+    # save still succeeds.
+    try:
+        _pfmt = "TIFF" if cfg.output_format == "TIFF" else "PNG"
+        _pimg = Image.open(io.BytesIO(fig_bytes))
+        _pkw = _provenance_save_kwargs(_pimg, _pfmt)
+        if _pkw:
+            _pbuf = io.BytesIO()
+            _pextra = {"compression": "tiff_lzw"} if _pfmt == "TIFF" else {}
+            _pimg.save(_pbuf, format=_pfmt, dpi=(body.dpi, body.dpi), **_pextra, **_pkw)
+            fig_bytes = _pbuf.getvalue()
+    except Exception as _e:
+        import sys
+        print("[save_figure] provenance embed skipped: {}".format(_e), file=sys.stderr, flush=True)
+
     save_path = os.path.expanduser(body.path.strip())
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
@@ -5347,12 +5452,12 @@ def convert_collage(body: CollageConvertRequest):
         out = io.BytesIO()
         first, rest = pages_img[0], pages_img[1:]
         if fmt == "tiff":
-            first.save(out, format="TIFF", dpi=(dpi, dpi),
-                       compression="tiff_lzw", save_all=True, append_images=rest)
+            _save_image(first, out, "TIFF", dpi=(dpi, dpi),
+                        compression="tiff_lzw", save_all=True, append_images=rest)
             ext = "tiff"
         else:  # pdf
-            first.save(out, format="PDF", resolution=float(dpi),
-                       save_all=True, append_images=rest)
+            _save_image(first, out, "PDF", resolution=float(dpi),
+                        save_all=True, append_images=rest)
             ext = "pdf"
         return {"images": [base64.b64encode(out.getvalue()).decode("ascii")], "ext": ext, "multi_page": True}
 
@@ -5361,13 +5466,13 @@ def convert_collage(body: CollageConvertRequest):
     for img in pages_img:
         out = io.BytesIO()
         if fmt == "jpeg":
-            img.save(out, format="JPEG", quality=95, dpi=(dpi, dpi)); ext = "jpg"
+            _save_image(img, out, "JPEG", quality=95, dpi=(dpi, dpi)); ext = "jpg"
         elif fmt == "tiff":
-            img.save(out, format="TIFF", dpi=(dpi, dpi), compression="tiff_lzw"); ext = "tiff"
+            _save_image(img, out, "TIFF", dpi=(dpi, dpi), compression="tiff_lzw"); ext = "tiff"
         elif fmt == "pdf":
-            img.save(out, format="PDF", resolution=float(dpi)); ext = "pdf"
+            _save_image(img, out, "PDF", resolution=float(dpi)); ext = "pdf"
         else:
-            img.save(out, format="PNG", dpi=(dpi, dpi)); ext = "png"
+            _save_image(img, out, "PNG", dpi=(dpi, dpi)); ext = "png"
         results.append(base64.b64encode(out.getvalue()).decode("ascii"))
     # Back-compat: single-input requests get the legacy `image` field too.
     response = {"images": results, "ext": ext, "multi_page": False}
