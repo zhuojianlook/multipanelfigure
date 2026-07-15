@@ -694,38 +694,52 @@ export function StyledTextField({
             );
           })()}
 
-          {/* Colour swatch — IconButton triggers the hidden native
-              color input via .click().  The native picker opens in
-              a separate OS window so it can't be embedded inline;
-              we route through a ref instead of a label so the
-              mousedown can preventDefault and keep our selection. */}
-          <IconButton
-            title="Colour (selection)"
-            size="small"
-            sx={{ p: 0.25, ml: 0.5 }}
-            onMouseDown={swallowMouseDown}
-            onClick={() => colorInputRef.current?.click()}
-          >
-            <Box sx={{
-              width: 14, height: 14, borderRadius: 0.25,
-              border: "1px solid",
-              borderColor: "divider",
-              bgcolor: selStyle?.color || defaultColor,
-            }} />
-          </IconButton>
-          <input
-            ref={colorInputRef}
-            type="color"
-            value={selStyle?.color || defaultColor}
-            onChange={(e) => applyPatch({ color: e.target.value })}
-            // Keep the input mounted but invisible — clicking the
-            // swatch button calls .click() programmatically, which
-            // opens the native picker without moving keyboard focus.
-            // tabIndex=-1 keeps it out of tab order so Tab still
-            // moves between meaningful UI.
-            tabIndex={-1}
-            style={{ position: "absolute", width: 0, height: 0, opacity: 0, pointerEvents: "none" }}
-          />
+          {/* Colour swatch — the IconButton opens the native colour
+              picker for the hidden <input type="color"> next to it.
+              We trigger via showPicker() rather than a synthetic
+              .click(): in WKWebView (this app's macOS webview) a
+              programmatic .click() on a zero-size / pointer-events:none
+              colour input is a silent no-op — the picker never opens,
+              so the icon looked dead.  showPicker() is purpose-built to
+              open the picker programmatically regardless of the input's
+              size or visibility; .click() stays as a fallback for
+              engines that predate it. */}
+          <Box sx={{ position: "relative", display: "inline-flex", ml: 0.5 }}>
+            <IconButton
+              title="Colour (selection)"
+              size="small"
+              sx={{ p: 0.25 }}
+              onMouseDown={swallowMouseDown}
+              onClick={() => {
+                const el = colorInputRef.current as
+                  (HTMLInputElement & { showPicker?: () => void }) | null;
+                if (!el) return;
+                try {
+                  if (typeof el.showPicker === "function") { el.showPicker(); return; }
+                } catch { /* fall through to .click() below */ }
+                el.click();
+              }}
+            >
+              <Box sx={{
+                width: 14, height: 14, borderRadius: 0.25,
+                border: "1px solid",
+                borderColor: "divider",
+                bgcolor: selStyle?.color || defaultColor,
+              }} />
+            </IconButton>
+            <input
+              ref={colorInputRef}
+              type="color"
+              value={selStyle?.color || defaultColor}
+              onChange={(e) => applyPatch({ color: e.target.value })}
+              // Kept mounted but visually hidden (the swatch above shows
+              // the colour).  A 1×1 footprint anchored under the swatch
+              // gives the native picker a sane position to open next to.
+              // tabIndex=-1 keeps it out of tab order.
+              tabIndex={-1}
+              style={{ position: "absolute", left: 4, bottom: 0, width: 1, height: 1, opacity: 0, border: "none", padding: 0, pointerEvents: "none" }}
+            />
+          </Box>
 
           <IconButton title="Clear formatting on selection" size="small" sx={{ p: 0.25, ml: 0.5 }}
             onMouseDown={swallowMouseDown}

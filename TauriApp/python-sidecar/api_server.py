@@ -3601,8 +3601,16 @@ def generate_preview():
     # `panel.image_name in loaded_images` silently dropped video panels and
     # they showed as blank placeholders in the preview.
     processed = []
+    # Scale bars are calibrated in process_panel-output pixels. When we
+    # shrink a panel below max_preview_px for speed, record its PRE-shrink
+    # size so assemble_figure keeps the bar's image-fraction correct —
+    # otherwise the bar renders too long here even though the Edit Panel
+    # dialog preview (which never shrinks) and the exported figure are
+    # right. See assemble_figure(scalebar_ref_sizes=...).
+    scalebar_ref_sizes = []
     for r in range(rows):
         row_imgs = []
+        row_refs = []
         for c in range(cols):
             panel = cfg.panels[r][c]
             src_img = _get_panel_image(panel) if panel.image_name else None
@@ -3610,14 +3618,18 @@ def generate_preview():
                 img = process_panel(
                     src_img, panel,
                     min_dims, loaded_images, skip_labels=True, skip_symbols=True)
+                # Record the calibrated (pre-shrink) size for the scale bar.
+                row_refs.append(img.size if img else None)
                 # Downscale for preview if image is large
                 if img and max(img.size) > max_preview_px:
                     scale = max_preview_px / max(img.size)
                     img = img.resize((int(img.size[0] * scale), int(img.size[1] * scale)), Image.LANCZOS)
                 row_imgs.append(img)
             else:
+                row_refs.append(None)
                 row_imgs.append(None)
         processed.append(row_imgs)
+        scalebar_ref_sizes.append(row_refs)
 
     # Compute per-column max width and per-row max height from actual images
     col_max_w = [max((processed[r][c].size[0] for r in range(rows)
@@ -3659,7 +3671,8 @@ def generate_preview():
                 # scales zi.x/y correctly when drawing the rect.
                 full_res_sizes[(r, c)] = (1000, 1000)
 
-    fig_bytes = assemble_figure(cfg, processed, full_res_sizes=full_res_sizes)
+    fig_bytes = assemble_figure(cfg, processed, full_res_sizes=full_res_sizes,
+                                scalebar_ref_sizes=scalebar_ref_sizes)
     fig_img = Image.open(io.BytesIO(fig_bytes))
     # Always convert to PNG for browser display (TIFF isn't supported by browsers)
     png_buf = io.BytesIO()

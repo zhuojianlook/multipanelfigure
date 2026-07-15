@@ -1774,6 +1774,7 @@ def assemble_figure(cfg: FigureConfig,
                     full_res_sizes: Optional[Dict] = None,
                     draw_headers: bool = True,
                     header_collect: Optional[list] = None,
+                    scalebar_ref_sizes: Optional[List[List]] = None,
                     ) -> bytes:
     """
     Assemble the final figure.  *processed_images* is a rows×cols list of
@@ -1788,6 +1789,16 @@ def assemble_figure(cfg: FigureConfig,
     *header_collect* — when a list, each header's geometry (figure
     fractions) + text/style is appended for the collage overlay
     renderer.
+    *scalebar_ref_sizes* — rows×cols of the process_panel-output image
+    sizes (w, h) that each panel's scale bar was CALIBRATED against, i.e.
+    the size at which `bar_length_microns / micron_per_pixel` equals the
+    bar's pixel length. Normally the images passed in ARE that size, so
+    this is captured internally. But a caller that shrinks the images for
+    speed BEFORE assembling (e.g. the live preview capping panels at
+    max_preview_px) must supply the pre-shrink sizes here — otherwise the
+    scale bar's reference size becomes the shrunken width and the bar
+    renders too long (dialog preview vs applied preview mismatch). Cells
+    left None fall back to the received image size.
     """
     rows, cols = cfg.rows, cfg.cols
 
@@ -2009,8 +2020,26 @@ def assemble_figure(cfg: FigureConfig,
                       original_images, col_widths, row_heights)
     _add_panel_symbols(fig, axes, cfg, rows, cols, processed_images,
                        original_images=original_images)
+    # When a caller shrank the panel images before assembling (live
+    # preview), use the supplied pre-shrink sizes as the scale bar's
+    # reference so the bar's image-fraction matches the dialog preview
+    # and the exported figure. Per-cell fallback keeps zoom-target /
+    # placeholder cells (which the caller doesn't shrink) unchanged.
+    sb_pre_norm = pre_norm_sizes
+    if scalebar_ref_sizes:
+        sb_pre_norm = [
+            [
+                (scalebar_ref_sizes[r][c]
+                 if (r < len(scalebar_ref_sizes)
+                     and c < len(scalebar_ref_sizes[r])
+                     and scalebar_ref_sizes[r][c])
+                 else pre_norm_sizes[r][c])
+                for c in range(cols)
+            ]
+            for r in range(rows)
+        ]
     _add_panel_scale_bars(fig, axes, cfg, rows, cols, original_images,
-                          pre_norm_sizes=pre_norm_sizes,
+                          pre_norm_sizes=sb_pre_norm,
                           col_widths=col_widths, row_heights=row_heights)
 
     # Column/Row labels & headers (respect visibility toggles)
