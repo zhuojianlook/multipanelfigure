@@ -844,15 +844,134 @@ interface MeasurementRef {
 /** Convert a measurements array (from /api/measurements or the per-doc
  *  source endpoints) into the same CSV the active figure uses, so a tile
  *  for any figure feeds an identical table shape downstream. */
-function measArrToCsv(rows: Array<Record<string, unknown>>): string {
-  const header = "Panel,Name,Group,Value,Unit";
+/* Figure goes LAST, deliberately. The seeded R templates pick their axes by
+   column POSITION-and-type, not by name:
+     xcol <- names(data)[!sapply(data, is.numeric)][1]   # first non-numeric
+   That has always resolved to Panel. Prepending Figure would silently switch
+   every bar / box / violin plot's x-axis from Panel to Figure. Appending keeps
+   the existing contract intact while still attributing every row. */
+export const MEAS_CSV_HEADER = "Panel,Name,Group,Value,Unit,Figure";
+
+/** Rows -> CSV. `figure` is the document the rows came from.
+ *
+ *  Without it, two figures both emit rows keyed "R1C1" (panel labels are bare
+ *  grid coordinates), so wiring two figures' tables into one script yields rows
+ *  that cannot be told apart and a naive group-by silently merges unrelated
+ *  panels across figures. */
+function measArrToCsv(rows: Array<Record<string, unknown>>, figure = ""): string {
+  const header = MEAS_CSV_HEADER;
   const q = (c: unknown) => `"${String(c ?? "").replace(/"/g, '""')}"`;
   const body = (rows || []).map((m) => {
     const value = m.numeric != null ? String(m.numeric) : String(m.value ?? "");
-    return [m.panel, m.name, m.panel, value, m.unit ?? ""].map(q).join(",");
+    return [m.panel, m.name, m.panel, value, m.unit ?? "", figure].map(q).join(",");
   }).join("\n");
   return body ? `${header}\n${body}` : `${header}\n`;
 }
+/* ── MeasurementFigureFolder ─────────────────────────────────────
+   A figure's measurements as a per-panel tree, not an opaque chip.
+
+   These used to render as one tile per figure showing only a name and a row
+   count ("5 measurements"), which made it impossible to tell what the numbers
+   referred to. Now each figure is a collapsible folder of panels, and each
+   panel lists its readings with values.
+
+   Both levels are draggable: the figure drags its whole table, a panel drags
+   just its own rows — so you can wire one panel into a script without
+   filtering it back out downstream.
+   ────────────────────────────────────────────────────────────── */
+function MeasurementFigureFolder({
+  docId, docName, rows, csv, defaultOpen,
+}: {
+  docId: string;
+  docName: string;
+  rows: Array<Record<string, unknown>>;
+  csv: string;
+  defaultOpen: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const byPanel = useMemo(() => {
+    const m = new Map<string, Array<Record<string, unknown>>>();
+    for (const r of rows || []) {
+      const k = String(r.panel ?? "—");
+      if (!m.has(k)) m.set(k, []);
+      m.get(k)!.push(r);
+    }
+    return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  }, [rows]);
+
+  const dragFigure = (e: React.DragEvent) => {
+    const ref: MeasurementRef = { mpfId: docId, mpf: docName, label: `${docName} — measurements`, csv };
+    e.dataTransfer.setData("application/x-mpfig-measurements", JSON.stringify(ref));
+    e.dataTransfer.effectAllowed = "copy";
+  };
+
+  return (
+    <Box sx={{ mb: 0.5, border: "1px dashed", borderColor: "divider", borderRadius: 0.5, bgcolor: "action.hover" }}>
+      <Tooltip placement="right" title="All measurements for this figure. Drag onto a Source node, then wire its 📋 port to an R or Python node.">
+        <Box
+          draggable onDragStart={dragFigure}
+          onClick={() => setOpen((v) => !v)}
+          sx={{ display: "flex", alignItems: "center", gap: 0.5, px: 0.75, py: 0.5, cursor: "grab", "&:active": { cursor: "grabbing" }, "&:hover": { bgcolor: "action.selected" } }}
+        >
+          <Box component="span" sx={{ fontSize: 11, lineHeight: 1, width: 10 }}>{open ? "▾" : "▸"}</Box>
+          <Box component="span" sx={{ fontSize: 13, lineHeight: 1 }}>📋</Box>
+          <Box sx={{ minWidth: 0, flex: 1 }}>
+            <Typography variant="caption" sx={{ fontSize: "0.62rem", fontWeight: 700, display: "block", lineHeight: 1.15, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              📄 {docName}
+            </Typography>
+            <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", display: "block", lineHeight: 1.15 }}>
+              {rows.length} measurement{rows.length === 1 ? "" : "s"} · {byPanel.length} panel{byPanel.length === 1 ? "" : "s"} · drag to a Source node
+            </Typography>
+          </Box>
+        </Box>
+      </Tooltip>
+      {open && (
+        <Box sx={{ px: 0.5, pb: 0.5 }}>
+          {byPanel.map(([panel, items]) => {
+            const panelCsv = measArrToCsv(items, docName);
+            return (
+              <Box key={`${docId}_${panel}`} sx={{ ml: 1, mb: 0.25, borderLeft: "1px solid", borderColor: "divider", pl: 0.75 }}>
+                <Tooltip placement="right" title={`Just ${panel}'s measurements. Drag onto a Source node to wire this panel alone.`}>
+                  <Box
+                    draggable
+                    onDragStart={(e) => {
+                      const ref: MeasurementRef = {
+                        mpfId: docId, mpf: docName,
+                        label: `${docName} · ${panel}`, csv: panelCsv,
+                      };
+                      e.dataTransfer.setData("application/x-mpfig-measurements", JSON.stringify(ref));
+                      e.dataTransfer.effectAllowed = "copy";
+                    }}
+                    sx={{ display: "flex", alignItems: "center", gap: 0.5, cursor: "grab", py: 0.15, "&:active": { cursor: "grabbing" }, "&:hover": { bgcolor: "action.selected" } }}
+                  >
+                    <Box component="span" sx={{ fontSize: 10, lineHeight: 1 }}>🗂</Box>
+                    <Typography variant="caption" sx={{ fontSize: "0.56rem", fontWeight: 700 }}>
+                      {panel}
+                    </Typography>
+                    <Typography variant="caption" sx={{ fontSize: "0.48rem", color: "text.disabled" }}>
+                      ({items.length})
+                    </Typography>
+                  </Box>
+                </Tooltip>
+                {items.map((m, k) => (
+                  <Box key={`${docId}_${panel}_${k}`} sx={{ display: "flex", gap: 0.5, ml: 1.25, alignItems: "baseline" }}>
+                    <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {String(m.name ?? "")}
+                    </Typography>
+                    <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.primary", fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>
+                      {String(m.value ?? "")}
+                    </Typography>
+                  </Box>
+                ))}
+              </Box>
+            );
+          })}
+        </Box>
+      )}
+    </Box>
+  );
+}
+
 interface GraphCallbacks {
   /** Attach an inset (by InsetSource.key) to a SourceNode's list. */
   addSourceToNode: (nodeId: string, sourceKey: string) => void;
@@ -4152,6 +4271,9 @@ interface Props {
   open: boolean;
   /** Built-in measurement CSV (same content the R tab used). */
   measurementsCsv: string;
+  /** Structured rows for the ACTIVE figure, so the Sources panel can group
+   *  them per panel rather than showing an opaque count. */
+  measurements?: Array<Record<string, unknown>>;
   /** Pinned-only filter for the drawer (toggled by the user). */
   pinnedFilter?: boolean;
   /** Pushed by the runner whenever a node finishes — the parent
@@ -4180,7 +4302,7 @@ export interface AggregatedOutput {
   versionLabel?: string;
 }
 
-export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: Props) {
+export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutputsChanged }: Props) {
   // Inset sources from the backend (image ports for the source node). On
   // mount we restore any analysis-tab uploads that were persisted before the
   // last tab switch — they live in component-local state, so without this
@@ -4626,7 +4748,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
   // Measurements for the OTHER open figures (the active one comes from the
   // measurementsCsv prop). Populated from the per-doc source fetch below;
   // keyed by doc id → { csv, rows }. Drives one Measurements tile per figure.
-  const [extraMeasurements, setExtraMeasurements] = useState<Record<string, { csv: string; rows: number }>>({});
+  const [extraMeasurements, setExtraMeasurements] = useState<Record<string, { csv: string; rows: number; items: Array<Record<string, unknown>> }>>({});
 
   // ── Per-source name overrides ────────────────────────────────
   // `sourceNameOverrides[key]` is the user's chosen display name for
@@ -4764,10 +4886,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
     // Per-figure measurements (one tile per figure). The per-doc endpoints
     // return this figure's measurements too; record them so the Sources
     // panel can offer a draggable Measurements tile for EACH open figure.
-    const _measAccum: Record<string, { csv: string; rows: number }> = {};
+    const _measAccum: Record<string, { csv: string; rows: number; items: Array<Record<string, unknown>> }> = {};
     const _capMeas = (r: { sources?: Array<Record<string, unknown>>; measurements?: Array<Record<string, unknown>> }, d: { id: string; name: string }) => {
       const m = r.measurements || [];
-      if (m.length) _measAccum[d.id] = { csv: measArrToCsv(m), rows: m.length };
+      if (m.length) _measAccum[d.id] = { csv: measArrToCsv(m, d.name), rows: m.length, items: m };
       return _tag(r.sources || [], d);
     };
     const tasks: Promise<InsetSource[]>[] = [
@@ -6198,7 +6320,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             code: fullCode,
-            measurements_csv: "Panel,Name,Group,Value,Unit\n",
+            measurements_csv: `${MEAS_CSV_HEADER}\n`,
             interpreter_path: enginePaths.r || undefined,
           }),
         });
@@ -6600,7 +6722,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
           analysisSource: { nodeId: o.nodeId, outputId: o.outputId },
           ...(o.rCode ? {
             rCode: o.rCode,
-            rDataCsv: "Panel,Name,Group,Value,Unit\n",
+            rDataCsv: `${MEAS_CSV_HEADER}\n`,
             rInterpreter: o.rInterpreter ?? null,
             rPlotIndex: o.rPlotIndex ?? 0,
           } : {}),
@@ -6771,52 +6893,35 @@ export function AnalysisNodeGraph({ open, measurementsCsv, onOutputsChanged }: P
               ))}
             </Box>
           )}
-          {/* Measurements — one draggable tile PER open figure (parity with
-              inset tiles). Each carries that figure's panel/line/area
-              measurements CSV; drag onto a Source node to attach it (its 📋
-              port then wires to an R / Python node). */}
+          {/* Measurements — one collapsible FOLDER per open figure, each
+              holding its panels and their readings. These were flat chips
+              showing only a row count, so there was no way to tell what the
+              numbers referred to. Figure and panel are both draggable onto a
+              Source node (its 📋 port then wires to an R / Python node). */}
           {(() => {
-            const tiles = openDocs
+            const folders = openDocs
               .map((d) => {
                 const active = d.id === (activeDocId || "");
                 const csv = active ? measurementsCsv : (extraMeasurements[d.id]?.csv || "");
-                const rows = active ? measurementRowCount : (extraMeasurements[d.id]?.rows || 0);
+                const rows = active
+                  ? ((measurements || []) as Array<Record<string, unknown>>)
+                  : (extraMeasurements[d.id]?.items || []);
                 return { d, csv, rows };
               })
-              .filter((t) => t.rows > 0);
-            if (tiles.length === 0) return null;
-            const multi = openDocs.length > 1;
-            return tiles.map(({ d, csv, rows }) => {
-              const label = multi ? `${d.name} — measurements` : "Measurements";
-              const ref: MeasurementRef = { mpfId: d.id, mpf: d.name, label, csv };
-              return (
-                <Tooltip key={`meas_${d.id}`} placement="right" title="Panel / line / area measurements for this figure. Drag onto a Source node to attach it, then wire that node's 📋 port to an R or Python node.">
-                  <Box
-                    draggable
-                    onDragStart={(e) => {
-                      e.dataTransfer.setData("application/x-mpfig-measurements", JSON.stringify(ref));
-                      e.dataTransfer.effectAllowed = "copy";
-                    }}
-                    sx={{
-                      display: "flex", alignItems: "center", gap: 0.75, px: 0.75, py: 0.5, mb: 0.5,
-                      border: "1px dashed", borderColor: "divider", borderRadius: 0.5,
-                      cursor: "grab", bgcolor: "action.hover",
-                      "&:active": { cursor: "grabbing" },
-                      "&:hover": { borderColor: "primary.main" },
-                    }}>
-                    <Box component="span" sx={{ fontSize: 15, lineHeight: 1 }}>📋</Box>
-                    <Box sx={{ minWidth: 0, flex: 1 }}>
-                      <Typography variant="caption" sx={{ fontSize: "0.62rem", fontWeight: 700, display: "block", lineHeight: 1.15, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {multi ? `📄 ${d.name}` : "Measurements"}
-                      </Typography>
-                      <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", display: "block", lineHeight: 1.15 }}>
-                        {rows} measurement{rows === 1 ? "" : "s"} · drag to a Source node
-                      </Typography>
-                    </Box>
-                  </Box>
-                </Tooltip>
-              );
-            });
+              .filter((t) => t.rows.length > 0);
+            if (folders.length === 0) return null;
+            return folders.map(({ d, csv, rows }) => (
+              <MeasurementFigureFolder
+                key={`meas_${d.id}`}
+                docId={d.id}
+                docName={d.name}
+                rows={rows}
+                csv={csv}
+                // Expand the figure you're working on; leave the others folded
+                // so a many-tab session doesn't bury the inset sources below.
+                defaultOpen={d.id === (activeDocId || "") || folders.length === 1}
+              />
+            ));
           })()}
           {insetSources.length === 0 && uploading.length === 0 ? (
             <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.disabled", fontStyle: "italic", display: "block", px: 0.5, py: 1, lineHeight: 1.35 }}>

@@ -11,35 +11,48 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { Box } from "@mui/material";
-import { AnalysisNodeGraph } from "../dialogs/AnalysisNodeGraph";
+import { AnalysisNodeGraph, MEAS_CSV_HEADER } from "../dialogs/AnalysisNodeGraph";
 import { useFigureStore } from "../../store/figureStore";
+import { useCollageStore } from "../../store/collageStore";
 import { api } from "../../api/client";
 
 export function AnalysisView() {
   // Re-fetch measurements whenever the active config changes so the
   // analysis source reflects the current figure.
   const config = useFigureStore((s) => s.config);
-  const [measurementsCsv, setMeasurementsCsv] = useState<string>("Panel,Name,Group,Value,Unit\n");
+  // The active figure's name — /api/measurements only ever serves the active
+  // doc and its rows carry no figure identifier, so attribute here, where the
+  // doc IS in hand. Panel labels are bare grid coords ("R1C1"), so without this
+  // two figures' rows are indistinguishable downstream.
+  const openDocs = useCollageStore((s) => s.openDocs);
+  const activeDocId = useCollageStore((s) => s.activeDocId);
+  const activeDocName = (openDocs || []).find((d) => d.id === activeDocId)?.name || "";
+
+  const [measurementsCsv, setMeasurementsCsv] = useState<string>(`${MEAS_CSV_HEADER}\n`);
+  const [measurements, setMeasurements] = useState<Array<Record<string, unknown>>>([]);
 
   const refresh = useCallback(async () => {
     try {
-      const { measurements } = await api.getMeasurements();
-      const header = "Panel,Name,Group,Value,Unit";
-      const body = (measurements || [])
+      const { measurements: rows } = await api.getMeasurements();
+      const body = (rows || [])
         .map((m) => {
           const value = m.numeric != null ? String(m.numeric) : (m.value ?? "");
           // Group defaults to the panel so the stats blocks have something
           // to split on; the user re-assigns groups in their code.
-          return [m.panel, m.name, m.panel, value, m.unit ?? ""]
+          // Figure LAST — see MEAS_CSV_HEADER: the seeded R templates pick
+          // their x-axis as the first non-numeric column, which must stay Panel.
+          return [m.panel, m.name, m.panel, value, m.unit ?? "", activeDocName]
             .map((c) => `"${String(c).replace(/"/g, '""')}"`)
             .join(",");
         })
         .join("\n");
-      setMeasurementsCsv(body ? `${header}\n${body}` : `${header}\n`);
+      setMeasurementsCsv(body ? `${MEAS_CSV_HEADER}\n${body}` : `${MEAS_CSV_HEADER}\n`);
+      setMeasurements((rows || []) as unknown as Array<Record<string, unknown>>);
     } catch {
-      setMeasurementsCsv("Panel,Name,Group,Value,Unit\n");
+      setMeasurementsCsv(`${MEAS_CSV_HEADER}\n`);
+      setMeasurements([]);
     }
-  }, []);
+  }, [activeDocName]);
 
   useEffect(() => { void refresh(); }, [refresh, config]);
 
@@ -61,7 +74,7 @@ export function AnalysisView() {
       onDragOver={blockFileDrop}
       onDrop={blockFileDrop}
     >
-      <AnalysisNodeGraph open measurementsCsv={measurementsCsv} />
+      <AnalysisNodeGraph open measurementsCsv={measurementsCsv} measurements={measurements} />
     </Box>
   );
 }
