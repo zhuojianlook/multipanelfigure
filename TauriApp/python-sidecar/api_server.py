@@ -3381,6 +3381,11 @@ def get_panel_rendered_preview(r: int, c: int, include_zoom: bool = False):
                        original_images=[[orig_img]])
 
     buf = io.BytesIO()
+    # See assemble_figure: glyphs are rasterised at save time, so the symbol
+    # charmaps must be re-selected right now or an LRU eviction since the
+    # artists were built will have dropped them.
+    from figure_builder import reapply_symbol_charmaps
+    reapply_symbol_charmaps()
     fig.savefig(buf, format='png', dpi=preview_dpi, pad_inches=0)
     plt.close(fig)
 
@@ -4435,6 +4440,12 @@ def _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict, channel
     # composite) so per-channel LUT editing + the saved display window survive.
     _restore_channel_groups(channel_data)
     custom_fonts = font_bytes_dict or {}
+    # A project can BUNDLE fonts that were never uploaded on this machine. Both
+    # renderers only ever scan the filesystem, so spill the blobs to disk and
+    # drop the stale verdicts — otherwise the WebView preview shows the real
+    # font (served from memory via @font-face) while the render falls back.
+    _materialize_custom_fonts()
+    _invalidate_font_caches()
     _recalc_min_dims()
     return {n: _thumb_b64(img) for n, img in loaded_images.items()}
 
@@ -4605,6 +4616,9 @@ def _apply_doc_state(st: dict):
     hidden_images = st["hidden_images"]
     min_dims = st["min_dims"]
     custom_fonts = st["custom_fonts"]
+    # Undo/redo swaps the whole font dict — same reasoning as the load path.
+    _materialize_custom_fonts()
+    _invalidate_font_caches()
     loaded_videos = st["loaded_videos"]
     video_frames = st["video_frames"]
     loaded_zstacks = st["loaded_zstacks"]
@@ -4670,6 +4684,58 @@ def list_fonts():
 
 _CUSTOM_FONTS_DIR = Path.home() / ".multipanelfigure" / "fonts"
 
+def _materialize_custom_fonts() -> None:
+    """Write the in-memory `custom_fonts` blobs out to the persistent fonts dir.
+
+    BOTH renderers resolve fonts by scanning the FILESYSTEM (figure_builder's
+    _resolve_font_path and image_processing's _load_font) and neither ever
+    consults `custom_fonts`. So a font that only exists in memory — e.g. one
+    bundled inside a loaded .mpfig that was never uploaded on this machine —
+    is invisible to them and silently falls back, even though the WebView
+    preview still shows it correctly (it fetches the blob over
+    /api/fonts/file-b64 and renders it via @font-face). That asymmetry is why
+    the preview and the render disagreed about custom fonts."""
+    try:
+        _CUSTOM_FONTS_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+    for name, data in list(custom_fonts.items()):
+        try:
+            dest = _CUSTOM_FONTS_DIR / name
+            # Only write when missing or actually different — avoids churning
+            # mtimes (and therefore the caches keyed on them) every load.
+            if not dest.exists() or dest.read_bytes() != data:
+                dest.write_bytes(data)
+        except Exception as e:
+            print(f"Warning: Could not materialize font {name}: {e}")
+
+
+def _invalidate_font_caches() -> None:
+    """Drop every cached font verdict.
+
+    There are FOUR module-level caches and they are all keyed by path or name,
+    with no notion of the bytes behind them. Uploading a font writes to
+    ~/.multipanelfigure/fonts/<filename>, OVERWRITING any existing file of that
+    name — so the path stays identical while the font changes, and a stale
+    'this path is a symbol font' verdict then makes the renderer shift ordinary
+    text into the private-use area, where every glyph is .notdef. Clearing only
+    _font_path_cache (as upload used to) left the symbol verdicts poisoned."""
+    try:
+        from figure_builder import (_font_path_cache, _symbol_font_cache,
+                                    _symbol_charmap_idx_cache, _symbol_fonts_in_use)
+        _font_path_cache.clear()
+        _symbol_font_cache.clear()
+        _symbol_charmap_idx_cache.clear()
+        _symbol_fonts_in_use.clear()
+    except Exception:
+        pass
+    try:
+        from image_processing import _pil_symbol_font_cache
+        _pil_symbol_font_cache.clear()
+    except Exception:
+        pass
+
+
 def _load_persistent_fonts():
     """Load custom fonts from persistent storage on startup."""
     if _CUSTOM_FONTS_DIR.is_dir():
@@ -4680,8 +4746,10 @@ def _load_persistent_fonts():
                 except Exception:
                     pass
 
-# Load persistent fonts on startup
+# Load persistent fonts on startup. Clear any verdicts cached during import —
+# the files on disk may have changed since the last run.
 _load_persistent_fonts()
+_invalidate_font_caches()
 
 
 @app.get("/api/fonts/file-b64/{name}")
@@ -4810,13 +4878,9 @@ async def upload_fonts(files: List[UploadFile] = File(...)):
         except Exception as e:
             print(f"Warning: Could not save font {f.filename}: {e}")
         names.append(f.filename)
-    # Invalidate the cached font-path lookups so newly uploaded fonts
-    # are resolvable on the very next render.
-    try:
-        from figure_builder import _font_path_cache
-        _font_path_cache.clear()
-    except Exception:
-        pass
+    # Invalidate EVERY cached font verdict — not just the path lookups — so a
+    # re-uploaded file under an existing name can't keep an old symbol verdict.
+    _invalidate_font_caches()
     return {"names": names, "total": len(find_fonts())}
 
 

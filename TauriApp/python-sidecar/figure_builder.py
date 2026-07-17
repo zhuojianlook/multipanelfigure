@@ -651,60 +651,76 @@ def _is_symbol_font(font_path: Optional[str]) -> bool:
         return False
 
 
-def _prepare_symbol_font_for_matplotlib(font_path: str) -> None:
-    """Select the Microsoft Symbol (3, 0) charmap on the matplotlib-
-    cached FT2Font for `font_path`.  Must be called before every
-    matplotlib text-render that uses this symbol font; the charmap
-    selection sticks on the cached FT2Font instance but matplotlib
-    can clear/reset it between renders so we re-apply defensively.
+# FreeType's tag for the legacy Microsoft Symbol cmap ('symb', big-endian).
+# Selecting BY ENCODING is deterministic and — critically — fails cleanly on a
+# font that hasn't got one, with no side effects.
+_FT_ENCODING_MS_SYMBOL = 0x73796D62
 
-    Walks each charmap looking for one that contains PUA codepoint
-    U+F041 ("A" in Wingdings' (3, 0) subtable) and selects it.  This
-    is more robust than hard-coding `set_charmap(1)` because the
-    subtable order varies by font / OS."""
+# Symbol fonts whose charmap we have selected this process.
+# matplotlib rasterises glyphs LAZILY at savefig() time, and its FT2Font cache
+# is an LRU capped at 64 entries — so a selection made while building the text
+# artists can be silently thrown away by an eviction before it is ever used.
+# `reapply_symbol_charmaps()` re-applies these immediately before each savefig.
+_symbol_fonts_in_use: set = set()
+
+
+def _prepare_symbol_font_for_matplotlib(font_path: str) -> bool:
+    """Select the Microsoft Symbol charmap on the matplotlib-cached FT2Font for
+    `font_path`. Returns True only when the font genuinely has one.
+
+    Selects by ENCODING instead of probing charmap indices. The old probe loop
+    called set_charmap(i) for every index hunting a PUA codepoint, which:
+      • mutates PROCESS-GLOBAL shared state — font_manager.get_font(p) hands
+        back the same FT2Font instance to every caller, and the Agg backend's
+        font.clear() between renders does NOT reset the charmap; and
+      • on failure left the font on whatever index it happened to probe last
+        and then cached index 0, so every later render of that font went
+        through an arbitrary (often legacy Mac) subtable.
+    That corrupted ORDINARY text, not just symbols: through a legacy subtable
+    '°' resolves to a different glyph and '’' to .notdef — the reported "weird
+    characters" — and 'µm' is exactly what a scale bar draws.
+
+    select_charmap() raises on a font without the symbol cmap, and that
+    rejection is precisely the signal that its text must NOT be remapped."""
     try:
         from matplotlib.font_manager import get_font
-        font = get_font(font_path)
-        cached_idx = _symbol_charmap_idx_cache.get(font_path)
-        if cached_idx is not None:
-            font.set_charmap(cached_idx)
-            return
-        # Find the symbol charmap by probing each for the well-known
-        # PUA codepoint U+F041 (Wingdings 'A' / equivalent in other
-        # symbol fonts). If no charmap has it, we just leave the font
-        # alone — rendering will still be tofu but no worse than
-        # before.
-        for i in range(font.num_charmaps):
-            try:
-                font.set_charmap(i)
-                # get_charmap() returns {codepoint: glyph_index}
-                m = font.get_charmap()
-                if 0xF041 in m or 0xF020 in m:
-                    _symbol_charmap_idx_cache[font_path] = i
-                    return
-            except Exception:
-                continue
-        # No symbol charmap found — clear so we don't retry every
-        # call (other lookups may have side effects).
-        _symbol_charmap_idx_cache[font_path] = 0
+        get_font(font_path).select_charmap(_FT_ENCODING_MS_SYMBOL)
+        _symbol_fonts_in_use.add(font_path)
+        return True
     except Exception:
-        pass
+        return False
+
+
+def reapply_symbol_charmaps() -> None:
+    """Re-select the symbol charmap for every symbol font used so far.
+
+    MUST be called immediately before fig.savefig(). matplotlib only turns text
+    artists into glyphs at save time, so a charmap selected while the artists
+    were being built can be dropped by an FT2Font LRU eviction in between —
+    which is why symbol fonts rendered fine at first and degraded once enough
+    distinct fonts had been touched (the cache holds only 64)."""
+    for p in list(_symbol_fonts_in_use):
+        try:
+            from matplotlib.font_manager import get_font
+            get_font(p).select_charmap(_FT_ENCODING_MS_SYMBOL)
+        except Exception:
+            pass
 
 
 def _remap_text_for_font(text: str, fp: FontProperties) -> str:
-    """If `fp` points at a symbol-encoded font, ALSO ensure the
-    underlying FT2Font has the Symbol charmap selected, AND return
-    the text with ASCII codepoints shifted to the PUA U+F000 block.
-    Both steps are required for matplotlib to render correctly —
-    see the module-level note above."""
+    """If `fp` points at a symbol-encoded font, ensure the underlying FT2Font
+    has the Symbol charmap selected AND shift ASCII into the PUA U+F000 block.
+    Both steps are required together — see the module-level note above."""
     if not text:
         return text
     fp_path = getattr(fp, "_fname", None) or (fp.get_file() if hasattr(fp, "get_file") else None)
     if not _is_symbol_font(fp_path):
         return text
-    # Make the cached FT2Font use the symbol charmap before matplotlib
-    # picks it up for the next render.
-    _prepare_symbol_font_for_matplotlib(fp_path)
+    # Only shift into the PUA if the symbol charmap was ACTUALLY selected.
+    # Remapping without it guarantees .notdef for every character — the old
+    # code remapped unconditionally and trusted the selection to have worked.
+    if not _prepare_symbol_font_for_matplotlib(fp_path):
+        return text
     return "".join(chr(ord(c) + 0xF000) if 0x20 <= ord(c) <= 0x7F else c for c in text)
 
 
@@ -2111,6 +2127,11 @@ def assemble_figure(cfg: FigureConfig,
 
     buf = io.BytesIO()
     fmt = "tiff" if cfg.output_format == "TIFF" else "png"
+    # matplotlib turns text artists into glyphs HERE, not when they were added.
+    # Re-select the symbol charmaps now: an FT2Font LRU eviction (cache holds
+    # 64) between building the artists and this call would otherwise have
+    # silently dropped the selection, rendering PUA-remapped text as garbage.
+    reapply_symbol_charmaps()
     fig.savefig(buf, format=fmt, dpi=dpi,
                 facecolor=fig.get_facecolor(), edgecolor="none")
     plt.close(fig)
