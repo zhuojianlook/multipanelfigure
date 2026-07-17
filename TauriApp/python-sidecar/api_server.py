@@ -3582,9 +3582,14 @@ def _collect_measurements():
                 if getattr(line, 'measure_in_analysis', True) and len(line.points) >= 2:
                     unit = getattr(line, 'measure_unit', 'um')
                     lt = effective_line_type(line)
-                    numeric = compute_line_measurement_value(line.points, iw, ih, mpp, unit, lt)
+                    # Honour a per-line custom scale (see LineAnnotation.effective_mpp).
+                    try:
+                        lmpp = line.effective_mpp(mpp)
+                    except Exception:
+                        lmpp = mpp
+                    numeric = compute_line_measurement_value(line.points, iw, ih, lmpp, unit, lt)
                     text = line.measure_text or compute_line_measurement(
-                        line.points, iw, ih, mpp, unit, lt)
+                        line.points, iw, ih, lmpp, unit, lt)
                     results.append({"panel": label, "name": line.name, "type": "line",
                                     "value": text, "numeric": round(numeric, 4),
                                     "unit": unit_label(unit, squared=False)})
@@ -3592,10 +3597,15 @@ def _collect_measurements():
             for area in (panel.areas or []):
                 if getattr(area, 'measure_in_analysis', True) and len(area.points) >= 2:
                     unit = getattr(area, 'measure_unit', 'um')
+                    # Honour a per-area custom scale (see AreaAnnotation.effective_mpp).
+                    try:
+                        ampp = area.effective_mpp(mpp)
+                    except Exception:
+                        ampp = mpp
                     numeric = compute_area_measurement_value(
-                        area.points, area.shape, iw, ih, mpp, unit)
+                        area.points, area.shape, iw, ih, ampp, unit)
                     text = area.measure_text or compute_area_measurement(
-                        area.points, area.shape, iw, ih, mpp, unit)
+                        area.points, area.shape, iw, ih, ampp, unit)
                     results.append({"panel": label, "name": area.name, "type": "area",
                                     "value": text, "numeric": round(numeric, 4),
                                     "unit": unit_label(unit, squared=True)})

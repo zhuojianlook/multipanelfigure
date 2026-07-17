@@ -808,7 +808,13 @@ def draw_lines(image: Image.Image, lines: List[LineAnnotation],
                                     effective_line_type)
                 px_len = compute_line_length_pixels(line.points, iw, ih,
                                                     effective_line_type(line))
-                len_um = px_len * micron_per_pixel
+                # A line pinned to a custom scale measures with its own mpp —
+                # deliberately independent of the panel's bar.
+                try:
+                    _mpp = line.effective_mpp(micron_per_pixel)
+                except Exception:
+                    _mpp = micron_per_pixel
+                len_um = px_len * _mpp
                 len_in_unit = len_um / UNIT_TO_MICRONS.get(unit, 1.0)
                 unit_labels = {"km": "km", "m": "m", "cm": "cm", "mm": "mm", "um": "\u03bcm", "nm": "nm", "pm": "pm"}
                 text = _format_measurement(len_in_unit, unit_labels.get(unit, unit))
@@ -1098,7 +1104,12 @@ def draw_areas(image: Image.Image, areas: List[AreaAnnotation],
                 # Use adaptive precision formatting
                 from models import compute_area_pixels, UNIT_TO_MICRONS
                 px_area = compute_area_pixels(area.points, area.shape, iw, ih)
-                area_um2 = px_area * (micron_per_pixel ** 2)
+                # An area pinned to a custom scale measures with its own mpp.
+                try:
+                    _ampp = area.effective_mpp(micron_per_pixel)
+                except Exception:
+                    _ampp = micron_per_pixel
+                area_um2 = px_area * (_ampp ** 2)
                 um_per_unit = UNIT_TO_MICRONS.get(unit, 1.0)
                 area_in_unit = area_um2 / (um_per_unit ** 2)
                 unit_labels = {"km": "km\u00B2", "m": "m\u00B2", "cm": "cm\u00B2", "mm": "mm\u00B2",

@@ -51,7 +51,7 @@ class ScaleBarSettings:
     #   "Segmented" — alternating filled blocks, a ruler-style bar
     bar_style: str = "Solid"
     label: str = "100 \u03bcm"
-    font_size: int = 20
+    font_size: int = 5          # pt at the 216pt (3-inch) panel reference
     font_name: str = "arial.ttf"
     font_path: Optional[str] = None
     label_x_offset: int = 0
@@ -142,7 +142,7 @@ class LineAnnotation:
     measure_in_analysis: bool = True
     measure_text: str = ""              # computed measurement text
     measure_unit: str = "um"            # "cm", "mm", "um", "nm"
-    measure_font_size: int = 12
+    measure_font_size: int = 5   # pt at the 216pt (3-inch) panel reference
     measure_color: str = "#FFFF00"
     measure_font_name: str = "arial.ttf"
     measure_font_path: Optional[str] = None
@@ -150,6 +150,23 @@ class LineAnnotation:
     measure_styled_segments: List[StyledSegment] = field(default_factory=list)
     measure_position_x: float = -1.0   # absolute text position (% 0-100), -1 = auto
     measure_position_y: float = -1.0   # absolute text position (% 0-100), -1 = auto
+    # Scale source, mirroring ThicknessMeasurement. "image" (default) follows
+    # the panel's scale bar; "custom" pins this annotation to its OWN
+    # micron_per_pixel, independent of the image bar and of every other
+    # annotation. Before this existed, the line editor's "Scale:" control wrote
+    # straight to the PANEL scale bar — so changing "the line's scale" silently
+    # re-scaled every other annotation that follows the image bar.
+    scale_mode: str = "image"      # "image" | "custom"
+    micron_per_pixel: float = 1.0  # only consulted when scale_mode == "custom"
+    scale_name: str = ""           # predefined scale picked for custom mode ("" = manual)
+
+    def effective_mpp(self, panel_mpp: float) -> float:
+        """Microns-per-pixel this annotation measures with: its own when the
+        user pinned a custom scale, else the panel's image scale bar."""
+        if (self.scale_mode or "image") == "custom":
+            return self.micron_per_pixel
+        return panel_mpp
+
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +188,7 @@ class AreaAnnotation:
     measure_in_analysis: bool = True
     measure_text: str = ""              # computed measurement text
     measure_unit: str = "um"            # "cm", "mm", "um", "nm"
-    measure_font_size: int = 12
+    measure_font_size: int = 5   # pt at the 216pt (3-inch) panel reference
     measure_color: str = "#FFFF00"
     measure_font_name: str = "arial.ttf"
     measure_font_path: Optional[str] = None
@@ -189,6 +206,23 @@ class AreaAnnotation:
     # dialog's library so the user can run pipelines over just the
     # masked region's pixels (not the whole panel).
     include_in_analysis: bool = False
+    # Scale source, mirroring ThicknessMeasurement. "image" (default) follows
+    # the panel's scale bar; "custom" pins this annotation to its OWN
+    # micron_per_pixel, independent of the image bar and of every other
+    # annotation. Before this existed, the line editor's "Scale:" control wrote
+    # straight to the PANEL scale bar — so changing "the line's scale" silently
+    # re-scaled every other annotation that follows the image bar.
+    scale_mode: str = "image"      # "image" | "custom"
+    micron_per_pixel: float = 1.0  # only consulted when scale_mode == "custom"
+    scale_name: str = ""           # predefined scale picked for custom mode ("" = manual)
+
+    def effective_mpp(self, panel_mpp: float) -> float:
+        """Microns-per-pixel this annotation measures with: its own when the
+        user pinned a custom scale, else the panel's image scale bar."""
+        if (self.scale_mode or "image") == "custom":
+            return self.micron_per_pixel
+        return panel_mpp
+
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +290,7 @@ class ThicknessMeasurement:
     measure_in_analysis: bool = True
     label_offset: float = 14.0     # px (at 216pt ref) to push the value off its line
     measure_unit: str = "um"
-    measure_font_size: int = 12
+    measure_font_size: int = 5   # pt at the 216pt (3-inch) panel reference
     measure_color: str = "#00E5FF"
     measure_font_name: str = "arial.ttf"
     measure_font_path: Optional[str] = None

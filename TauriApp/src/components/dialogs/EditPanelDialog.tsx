@@ -117,6 +117,143 @@ function TabPanel({ children, value, index }: { children: React.ReactNode; value
  *  aren't currently editing keeps the tab short instead of letting it
  *  grow into one long scroll. Header shows the live count and hosts the
  *  "Add" action so it stays reachable even when the section is folded. */
+/* ── AnnotationScaleControl ──────────────────────────────────────
+   One scale control shared by every measuring annotation (line, area, curved
+   surface).
+
+   It exists because the line and area editors used to show a "Scale:" picker
+   that wrote to `local.scale_bar` — the PANEL's bar. It read as belonging to
+   the annotation you had selected, but it re-scaled every other annotation
+   that follows the image bar, and force-enabled add_scale_bar as a side
+   effect. That is why "change the line's scale" moved the curved surface's
+   readings: not a focus bug — the control simply didn't own what it claimed.
+
+   "Image scale bar" (default) follows the panel. "Custom" pins this annotation
+   to its own µm/px, independent of the image bar AND of every other
+   annotation, with the same saved-scale dropdown used elsewhere.
+   ────────────────────────────────────────────────────────────── */
+/** Anything carrying a per-annotation scale (line / area / curved surface). */
+interface AnyScaled { scale_mode?: string; micron_per_pixel?: number }
+
+interface AnnotationScalePatch {
+  scale_mode?: "image" | "custom";
+  micron_per_pixel?: number;
+  scale_name?: string;
+  measure_unit?: string;
+}
+
+function AnnotationScaleControl({
+  scaleMode, mpp, scaleName, unit, panelMpp, hasPanelBar, resolutionEntries, onChange,
+}: {
+  scaleMode: "image" | "custom";
+  mpp: number;
+  scaleName: string;
+  unit: string;
+  panelMpp: number;
+  hasPanelBar: boolean;
+  resolutionEntries: Record<string, number>;
+  onChange: (patch: AnnotationScalePatch) => void;
+}) {
+  const uLab: Record<string, string> = { km: "km", m: "m", cm: "cm", mm: "mm", um: "\u00B5m", nm: "nm", pm: "pm" };
+  const u = uLab[unit] || unit;
+  const discordant = scaleMode === "custom" && hasPanelBar && Math.abs(mpp - panelMpp) > 1e-9;
+
+  return (
+    <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5, mb: 0.5 }}>
+      <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+        <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.68rem", flex: 1 }}>Scale</Typography>
+        {discordant && (
+          <WarningAmberIcon
+            sx={{ fontSize: 14, color: "warning.main" }}
+            titleAccess={`Measures at ${mpp} ${u}/px, which differs from the image scale bar (${panelMpp} ${u}/px)`}
+          />
+        )}
+      </Box>
+      <ToggleButtonGroup
+        size="small" exclusive value={scaleMode}
+        onChange={async (_, v) => {
+          if (!v || v === scaleMode) return;
+          if (v === "image") { onChange({ scale_mode: "image" }); return; }
+          // Switching to Custom matters even when the numbers agree right now —
+          // the annotation STOPS following the image bar. The previous guard
+          // only warned when the values already differed, which on a fresh
+          // annotation is never true (it is seeded from the panel), so the
+          // dialog was unreachable.
+          const r = await confirmThree({
+            title: "Use a custom scale for this annotation?",
+            body: hasPanelBar
+              ? `This annotation will stop following the image scale bar (${panelMpp} ${u}/px) and measure at its own ${mpp} ${u}/px. Other annotations and the image scale bar are unaffected.`
+              : `This annotation will measure at its own ${mpp} ${u}/px, independent of the image.`,
+            confirmLabel: "Use custom scale",
+            tertiaryLabel: "Keep image scale bar",
+            cancelLabel: "Cancel",
+          });
+          if (r === "cancel") return;
+          if (r === "tertiary") { onChange({ scale_mode: "image" }); return; }
+          onChange({ scale_mode: "custom", micron_per_pixel: mpp });
+        }}
+      >
+        <ToggleButton value="image" sx={{ px: 1, py: 0.25, fontSize: "0.62rem", textTransform: "none" }}>
+          Image scale bar
+        </ToggleButton>
+        <ToggleButton value="custom" sx={{ px: 1, py: 0.25, fontSize: "0.62rem", textTransform: "none" }}>
+          Custom
+        </ToggleButton>
+      </ToggleButtonGroup>
+      {scaleMode === "custom" ? (
+        <>
+          <FormControl size="small" fullWidth>
+            <InputLabel sx={{ fontSize: "0.72rem" }}>Saved scale</InputLabel>
+            <Select
+              label="Saved scale" value={scaleName}
+              onChange={(e) => {
+                const name = e.target.value as string;
+                if (name && resolutionEntries?.[name]) {
+                  // Saved-scale keys are "label|unit" — decode the unit too.
+                  // The old line/area pickers set micron_per_pixel but NOT the
+                  // unit, so the label kept a stale one.
+                  const predUnit = name.split("|")[1] || "um";
+                  onChange({ scale_name: name, micron_per_pixel: resolutionEntries[name], measure_unit: predUnit });
+                } else {
+                  onChange({ scale_name: "" });
+                }
+              }}
+              sx={{ fontSize: "0.72rem" }}
+            >
+              <MenuItem value="" sx={{ fontSize: "0.72rem" }}>Manual entry</MenuItem>
+              {Object.entries(resolutionEntries || {}).map(([name, val]) => {
+                const parts = name.split("|");
+                const pu = parts[1] || "um";
+                return (
+                  <MenuItem key={name} value={name} sx={{ fontSize: "0.72rem" }}>
+                    {parts[0]} ({val} {uLab[pu] || pu}/px)
+                  </MenuItem>
+                );
+              })}
+            </Select>
+          </FormControl>
+          <TextField
+            label={`${u}/pixel (this annotation only)`}
+            type="number"
+            value={Number((mpp || 1).toPrecision(6))}
+            onChange={(e) => onChange({ micron_per_pixel: Number(e.target.value), scale_name: "" })}
+            inputProps={{ step: 0.001, min: 0.0001 }}
+            disabled={!!scaleName}
+            size="small" fullWidth
+            sx={{ "& input": { fontSize: "0.72rem" } }}
+          />
+        </>
+      ) : (
+        <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.62rem", fontStyle: "italic" }}>
+          {hasPanelBar
+            ? `Following the image scale bar (${panelMpp} ${u}/px).`
+            : "No image scale bar set \u2014 measurements are in pixels until you add one."}
+        </Typography>
+      )}
+    </Box>
+  );
+}
+
 function AnnotationSection({ title, count, open, onToggle, onAdd, addLabel, children }: {
   title: string;
   count: number;
@@ -223,7 +360,7 @@ function defaultScaleBar(): ScaleBarSettings {
     bar_height: 5,
     bar_color: "#FFFFFF",
     label: "",
-    font_size: 10,
+    font_size: 5,
     font_name: "arial.ttf",
     font_path: null,
     label_x_offset: 0,
@@ -3623,7 +3760,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     show_curves: false, show_measure: true, measure_in_analysis: true,
     label_offset: 14,
     measure_unit: local?.scale_bar?.unit || "um",
-    measure_font_size: 12,
+    measure_font_size: 5,
     measure_color: "#00E5FF",
     measure_font_name: config?.column_labels?.[0]?.font_name || "arial.ttf",
     measure_font_style: [],
@@ -3655,14 +3792,29 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     const nowMpp = cur?.scale_bar?.micron_per_pixel;
     if (!cur || nowMpp === undefined || prevMpp === undefined) return;
     if (Math.abs(nowMpp - prevMpp) < 1e-9) return;   // nothing actually changed
-    const pinned = ((cur.thickness_measurements ?? []) as ThicknessMeasurement[])
-      .filter((t) => t.scale_mode === "custom");
-    if (pinned.length === 0) return;                 // nothing to reconcile
+    // Count BOTH populations. The gate here used to filter to
+    // scale_mode === "custom" and bail — but those are precisely the
+    // annotations that DON'T move. The ones that silently re-measure are the
+    // image-mode ones (the default), so the warning stayed silent in exactly
+    // the case it was written for.
+    const all = [
+      ...((cur.lines ?? []) as unknown as AnyScaled[]),
+      ...((cur.areas ?? []) as unknown as AnyScaled[]),
+      ...((cur.thickness_measurements ?? []) as unknown as AnyScaled[]),
+    ];
+    const following = all.filter((a) => (a.scale_mode ?? "image") === "image");
+    const pinned = all.filter((a) => a.scale_mode === "custom");
+    if (following.length === 0 && pinned.length === 0) return;   // nothing measures
+
+    const bits: string[] = [];
+    if (following.length) bits.push(`${following.length} annotation${following.length > 1 ? "s" : ""} follow${following.length > 1 ? "" : "s"} the image scale bar and will re-measure at ${nowMpp} µm/px`);
+    if (pinned.length) bits.push(`${pinned.length} ${pinned.length > 1 ? "are" : "is"} pinned to a custom scale and will keep measuring at the old value`);
+
     const r = await confirmThree({
-      title: "Update annotation scales?",
-      body: `${pinned.length} annotation${pinned.length > 1 ? "s are" : " is"} pinned to a custom scale and will keep measuring at the old value. Point ${pinned.length > 1 ? "them" : "it"} at the new image scale bar (${nowMpp} µm/px), or leave ${pinned.length > 1 ? "them" : "it"} on the allocated scale?`,
-      confirmLabel: "Update to image scale",
-      tertiaryLabel: "Keep their scales",
+      title: "Scale bar changed — update annotations?",
+      body: `${bits.join(". ")}.${pinned.length ? " Point the pinned ones at the new image scale too, keep their own, or undo the change?" : " Undo the change if that wasn't intended."}`,
+      confirmLabel: pinned.length ? "Update pinned to image scale" : "OK",
+      tertiaryLabel: pinned.length ? "Keep their scales" : undefined,
       cancelLabel: "Undo scale change",
     });
     if (r === "cancel") {
@@ -3671,10 +3823,14 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       if (sbNow) updateLocal({ scale_bar: { ...sbNow, micron_per_pixel: prevMpp } });
       return;
     }
-    if (r === "confirm") {
-      const arr = ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[])
-        .map((t) => (t.scale_mode === "custom" ? { ...t, scale_mode: "image" as const } : t));
-      updateLocal({ thickness_measurements: arr } as unknown as Partial<PanelInfo>);
+    if (r === "confirm" && pinned.length) {
+      const unpin = <T extends { scale_mode?: string }>(xs: T[] | undefined) =>
+        (xs ?? []).map((x) => (x.scale_mode === "custom" ? { ...x, scale_mode: "image" } : x));
+      updateLocal({
+        lines: unpin(localRef.current?.lines as never),
+        areas: unpin(localRef.current?.areas as never),
+        thickness_measurements: unpin(localRef.current?.thickness_measurements as never),
+      } as unknown as Partial<PanelInfo>);
     }
     // "tertiary" → keep their allocated scales: nothing to do.
   };
@@ -4737,8 +4893,13 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   <Select
                     value={sb.scale_name ?? ""}
                     label="Source"
-                    onChange={(e) => {
+                    onChange={async (e) => {
                       const name = e.target.value;
+                      // Capture BEFORE the write so the reconcile prompt can
+                      // offer an undo. This picker was entirely unguarded — it
+                      // can change µm/px by orders of magnitude, and it also
+                      // disables the only field that WAS instrumented.
+                      const prevMpp = sb.micron_per_pixel;
                       if (name && config && config.resolution_entries[name]) {
                         // Extract unit from predefined name (format: "name|unit")
                         const predUnit = name.split("|")[1] || "um";
@@ -4749,6 +4910,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       } else {
                         updateLocal({ scale_bar: { ...sb, scale_name: "" } });
                       }
+                      await maybeReconcileAnnotationScales(prevMpp);
                     }}
                     sx={{ fontSize: "0.75rem" }}
                   >
@@ -5131,7 +5293,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   points: [], color: "#FFFF00", width: 2, dash_style: "solid",
                   line_type: "straight", is_curved: false, show_measure: false,
                   measure_in_analysis: true, measure_text: "",
-                  measure_unit: "um", measure_font_size: 12, measure_color: "#FFFF00",
+                  measure_unit: "um", measure_font_size: 5, measure_color: "#FFFF00",
                   measure_font_name: config?.column_labels?.[0]?.font_name || "arial.ttf", measure_font_style: [],
                   measure_styled_segments: [], measure_position_x: -1, measure_position_y: -1,
                 }];
@@ -5220,90 +5382,47 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       Smoothed
                     </ToggleButton>
                   </ToggleButtonGroup>
-                  {/* Two separate concerns: whether the value is DRAWN on the
-                      figure, and whether it's reported as data. */}
+                </Box>
+                {/* Own row. Crammed in beside the dash Select and the 3-way
+                    line-type toggle these overran, and "Add to analysis" was
+                    pushed clean out of sight. */}
+                <Box sx={{ display: "flex", flexWrap: "wrap", columnGap: 1, alignItems: "center", mb: 0.5 }}>
                   <FormControlLabel
-                    control={<Checkbox size="small" checked={line.show_measure} onChange={(e) => {
+                    sx={{ ml: 0, mr: 0 }}
+                    control={<Checkbox size="small" sx={{ p: 0.5 }} checked={line.show_measure} onChange={(e) => {
                       const lines = [...(local.lines ?? [])];
                       lines[i] = { ...lines[i], show_measure: e.target.checked };
                       updateLocal({ lines } as unknown as Partial<PanelInfo>);
                     }} />}
-                    label={<Typography variant="caption">Show measurement</Typography>}
+                    label={<Typography variant="caption" sx={{ fontSize: "0.68rem", whiteSpace: "nowrap" }}>Show measurement</Typography>}
                   />
                   <FormControlLabel
-                    control={<Checkbox size="small" checked={line.measure_in_analysis !== false} onChange={(e) => {
+                    sx={{ ml: 0, mr: 0 }}
+                    control={<Checkbox size="small" sx={{ p: 0.5 }} checked={line.measure_in_analysis !== false} onChange={(e) => {
                       const lines = [...(local.lines ?? [])];
                       lines[i] = { ...lines[i], measure_in_analysis: e.target.checked };
                       updateLocal({ lines } as unknown as Partial<PanelInfo>);
                     }} />}
-                    label={<Typography variant="caption" title="Report this measurement in the Analysis list / CSV, whether or not it's drawn">Add to analysis</Typography>}
+                    label={<Typography variant="caption" title="Report this measurement in the Analysis list / CSV, whether or not it's drawn" sx={{ fontSize: "0.68rem", whiteSpace: "nowrap" }}>Add to analysis</Typography>}
                   />
                 </Box>
                 {/* Scale selection for measurement */}
+                {/* Scale — PER LINE. Same story as the area editor above. */}
                 {(line.show_measure || line.measure_in_analysis !== false) && (
-                  <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5, mb: 0.5 }}>
-                    <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
-                      <Typography variant="caption" sx={{ flexShrink: 0, fontSize: "0.6rem" }}>Scale:</Typography>
-                      <FormControl size="small" sx={{ flex: 1 }}>
-                        <Select
-                          value={local.scale_bar?.scale_name ?? ""}
-                          onChange={(e) => {
-                            const name = e.target.value as string;
-                            if (name && config && config.resolution_entries[name]) {
-                              updateLocal({
-                                scale_bar: {
-                                  ...(local.scale_bar || { micron_per_pixel: 1, bar_length_microns: 100, bar_height: 5, bar_color: "#FFFFFF", bar_position: [0.9, 0.9] as [number, number], label: "", font_size: 10, font_name: "arial.ttf", font_path: "", label_x_offset: 0, label_font_style: [] as string[], position_preset: "Bottom-Right", position_x: 90, position_y: 90, edge_distance: 5, unit: "um", scale_name: "", styled_segments: [] as any[], draggable: false, label_color: "#FFFFFF" }),
-                                  scale_name: name,
-                                  micron_per_pixel: config.resolution_entries[name],
-                                },
-                                add_scale_bar: true,
-                              });
-                            } else {
-                              // Custom selected
-                              updateLocal({
-                                scale_bar: {
-                                  ...(local.scale_bar || { micron_per_pixel: 1, bar_length_microns: 100, bar_height: 5, bar_color: "#FFFFFF", bar_position: [0.9, 0.9] as [number, number], label: "", font_size: 10, font_name: "arial.ttf", font_path: "", label_x_offset: 0, label_font_style: [] as string[], position_preset: "Bottom-Right", position_x: 90, position_y: 90, edge_distance: 5, unit: "um", scale_name: "", styled_segments: [] as any[], draggable: false, label_color: "#FFFFFF" }),
-                                  scale_name: "",
-                                },
-                              });
-                            }
-                          }}
-                          sx={{ fontSize: "0.6rem" }}
-                          displayEmpty
-                        >
-                          <MenuItem value="" sx={{ fontSize: "0.6rem" }}>Custom</MenuItem>
-                          {config && Object.entries(config.resolution_entries).map(([name, val]) => (
-                            <MenuItem key={name} value={name} sx={{ fontSize: "0.6rem" }}>{name} ({val} {"\u00B5m/px"})</MenuItem>
-                          ))}
-                        </Select>
-                      </FormControl>
-                    </Box>
-                    {/* Custom scale value input when no predefined scale selected */}
-                    {!(local.scale_bar?.scale_name) && (
-                      <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
-                        <TextField
-                          label={`${local.scale_bar?.unit === "nm" ? "nm" : local.scale_bar?.unit === "mm" ? "mm" : "\u00B5m"}/px`}
-                          type="number"
-                          value={local.scale_bar?.micron_per_pixel ?? 1}
-                          onChange={(e) => {
-                            const val = Number(e.target.value);
-                            if (val > 0) {
-                              updateLocal({
-                                scale_bar: {
-                                  ...(local.scale_bar || { micron_per_pixel: 1, bar_length_microns: 100, bar_height: 5, bar_color: "#FFFFFF", bar_position: [0.9, 0.9] as [number, number], label: "", font_size: 10, font_name: "arial.ttf", font_path: "", label_x_offset: 0, label_font_style: [] as string[], position_preset: "Bottom-Right", position_x: 90, position_y: 90, edge_distance: 5, unit: "um", scale_name: "", styled_segments: [] as any[], draggable: false, label_color: "#FFFFFF" }),
-                                  micron_per_pixel: val,
-                                  scale_name: "",
-                                },
-                              });
-                            }
-                          }}
-                          size="small"
-                          inputProps={{ step: 0.001, min: 0.0001 }}
-                          sx={{ flex: 1, "& input": { fontSize: "0.75rem", px: 1, py: 0.75 } }}
-                        />
-                      </Box>
-                    )}
-                  </Box>
+                  <AnnotationScaleControl
+                    scaleMode={(line.scale_mode as "image" | "custom") ?? "image"}
+                    mpp={line.micron_per_pixel ?? panelMpp}
+                    scaleName={line.scale_name ?? ""}
+                    unit={line.measure_unit || local.scale_bar?.unit || "um"}
+                    panelMpp={panelMpp}
+                    hasPanelBar={!!local.add_scale_bar}
+                    resolutionEntries={config?.resolution_entries ?? {}}
+                    onChange={(patch) => {
+                      const lines = [...(local.lines ?? [])];
+                      lines[i] = { ...lines[i], ...patch };
+                      updateLocal({ lines } as unknown as Partial<PanelInfo>);
+                    }}
+                  />
                 )}
                 {/* Measurement text — styling via StyledTextField hover-
                     menu only.  Per-element font / size / colour pickers
@@ -5392,7 +5511,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   shape: "Custom", points: [], color: "#FF000040", border_color: "#FF0000",
                   border_width: 1, show_measure: true, measure_in_analysis: true, measure_text: "",
                   measure_unit: local.scale_bar?.unit || "um",
-                  measure_font_size: 12, measure_color: "#FF0000",
+                  measure_font_size: 5, measure_color: "#FF0000",
                   measure_font_name: config?.column_labels?.[0]?.font_name || "arial.ttf",
                   measure_styled_segments: [],
                 }];
@@ -5575,53 +5694,26 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 />
                 {(area.show_measure || area.measure_in_analysis !== false) && (
                   <Box sx={{ display: "flex", flexDirection: "column", gap: 1, mt: 0.5 }}>
-                    {/* Scale source */}
-                    <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5 }}>
-                      <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
-                        <Typography variant="caption" sx={{ flexShrink: 0, fontSize: "0.7rem" }}>Scale:</Typography>
-                        <FormControl size="small" sx={{ flex: 1 }}>
-                          <Select
-                            value={local.scale_bar?.scale_name ?? ""}
-                            onChange={(e) => {
-                              const name = e.target.value as string;
-                              const defaultSb = { micron_per_pixel: 1, bar_length_microns: 100, bar_height: 5, bar_color: "#FFFFFF", bar_position: [0.9, 0.9] as [number, number], label: "", font_size: 10, font_name: "arial.ttf", font_path: "", label_x_offset: 0, label_font_style: [] as string[], position_preset: "Bottom-Right", position_x: 90, position_y: 90, edge_distance: 5, unit: "um", scale_name: "", styled_segments: [] as any[], draggable: false, label_color: "#FFFFFF" };
-                              if (name && config && config.resolution_entries[name]) {
-                                updateLocal({
-                                  scale_bar: { ...(local.scale_bar || defaultSb), scale_name: name, micron_per_pixel: config.resolution_entries[name] },
-                                  add_scale_bar: true,
-                                });
-                              } else {
-                                updateLocal({ scale_bar: { ...(local.scale_bar || defaultSb), scale_name: "" } });
-                              }
-                            }}
-                            sx={{ fontSize: "0.7rem" }}
-                            displayEmpty
-                          >
-                            <MenuItem value="" sx={{ fontSize: "0.7rem" }}>Custom</MenuItem>
-                            {config && Object.entries(config.resolution_entries).map(([name, val]) => (
-                              <MenuItem key={name} value={name} sx={{ fontSize: "0.7rem" }}>{name} ({val} µm/px)</MenuItem>
-                            ))}
-                          </Select>
-                        </FormControl>
-                      </Box>
-                      {!(local.scale_bar?.scale_name) && (
-                        <TextField
-                          label={`${local.scale_bar?.unit === "nm" ? "nm" : local.scale_bar?.unit === "mm" ? "mm" : "\u00B5m"}/px`}
-                          type="number"
-                          value={local.scale_bar?.micron_per_pixel ?? 1}
-                          onChange={(e) => {
-                            const val = Number(e.target.value);
-                            if (val > 0) {
-                              const defaultSb = { micron_per_pixel: 1, bar_length_microns: 100, bar_height: 5, bar_color: "#FFFFFF", bar_position: [0.9, 0.9] as [number, number], label: "", font_size: 10, font_name: "arial.ttf", font_path: "", label_x_offset: 0, label_font_style: [] as string[], position_preset: "Bottom-Right", position_x: 90, position_y: 90, edge_distance: 5, unit: "um", scale_name: "", styled_segments: [] as any[], draggable: false, label_color: "#FFFFFF" };
-                              updateLocal({ scale_bar: { ...(local.scale_bar || defaultSb), micron_per_pixel: val, scale_name: "" } });
-                            }
-                          }}
-                          size="small"
-                          inputProps={{ step: 0.001, min: 0.0001 }}
-                          sx={{ "& input": { fontSize: "0.75rem", px: 1, py: 0.75 } }}
-                        />
-                      )}
-                    </Box>
+                    {/* Scale — PER AREA. This was a "Scale:" picker bound to
+                        local.scale_bar, i.e. the PANEL's bar: it read as
+                        area-scoped but silently re-scaled every other
+                        annotation following the image bar (and force-enabled
+                        add_scale_bar as a side effect). Now it touches this
+                        area only. */}
+                    <AnnotationScaleControl
+                      scaleMode={(area.scale_mode as "image" | "custom") ?? "image"}
+                      mpp={area.micron_per_pixel ?? panelMpp}
+                      scaleName={area.scale_name ?? ""}
+                      unit={area.measure_unit || local.scale_bar?.unit || "um"}
+                      panelMpp={panelMpp}
+                      hasPanelBar={!!local.add_scale_bar}
+                      resolutionEntries={config?.resolution_entries ?? {}}
+                      onChange={(patch) => {
+                        const areas = [...(local.areas ?? [])];
+                        areas[i] = { ...areas[i], ...patch };
+                        updateLocal({ areas } as unknown as Partial<PanelInfo>);
+                      }}
+                    />
                     {/* Unit selection */}
                     <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
                       <Typography variant="caption" sx={{ flexShrink: 0, fontSize: "0.7rem" }}>Unit:</Typography>

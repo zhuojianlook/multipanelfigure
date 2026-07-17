@@ -107,6 +107,13 @@ export interface LineAnnotation {
   measure_styled_segments: StyledSegment[];
   measure_position_x: number;  // absolute text position (% 0-100), -1 = auto
   measure_position_y: number;  // absolute text position (% 0-100), -1 = auto
+  /** Scale source, mirroring ThicknessMeasurement. "image" (default) follows
+   *  the panel's scale bar; "custom" pins this annotation to its OWN
+   *  micron_per_pixel, independent of the image bar and of every other
+   *  annotation. Undefined = "image" for projects saved before this existed. */
+  scale_mode?: "image" | "custom";
+  micron_per_pixel?: number;   // only used when scale_mode === "custom"
+  scale_name?: string;         // predefined scale for custom mode ("" = manual)
 }
 
 export interface AreaAnnotation {
@@ -132,6 +139,13 @@ export interface AreaAnnotation {
    *  pipelines on just the region of interest.  Backend mirror:
    *  AreaAnnotation.include_in_analysis. */
   include_in_analysis?: boolean;
+  /** Scale source, mirroring ThicknessMeasurement. "image" (default) follows
+   *  the panel's scale bar; "custom" pins this annotation to its OWN
+   *  micron_per_pixel, independent of the image bar and of every other
+   *  annotation. Undefined = "image" for projects saved before this existed. */
+  scale_mode?: "image" | "custom";
+  micron_per_pixel?: number;   // only used when scale_mode === "custom"
+  scale_name?: string;         // predefined scale for custom mode ("" = manual)
 }
 
 /** One perpendicular thickness reading between the top and bottom arcs.
