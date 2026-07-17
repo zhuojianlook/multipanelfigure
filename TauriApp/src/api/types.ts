@@ -166,6 +166,8 @@ export interface ThicknessMeasurement {
    *  every other annotation. */
   scale_mode: "image" | "custom";
   micron_per_pixel: number;   // only used when scale_mode === "custom"
+  /** Predefined scale chosen for custom mode ("" = manual entry). */
+  scale_name?: string;
   color: string;
   width: number;
   show_curves: boolean;       // guide arcs in the RENDERED figure (dialog always shows them)

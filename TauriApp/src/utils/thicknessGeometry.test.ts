@@ -24,11 +24,40 @@ describe("counts and spacing", () => {
     expect(normalizeCount(0)).toBe(1);
   });
 
-  it("caps spacing so the group always fits inside the arc", () => {
+  it("caps spacing so the group always fits inside the arc (centred)", () => {
     expect(maxSpacingFor(1)).toBe(1);
     expect(maxSpacingFor(3)).toBeCloseTo(0.5, 6);   // 2 gaps
     expect(maxSpacingFor(5)).toBeCloseTo(0.25, 6);  // 4 gaps
     expect(maxSpacingFor(4)).toBeCloseTo(0.25, 6);  // rounded up to 5
+  });
+
+  it("shrinks the cap when the centre node moves off-middle", () => {
+    // Readings spread symmetrically, so the SHORTER side binds:
+    // s_max = 2*min(c, 1-c)/(n-1).
+    expect(maxSpacingFor(5, 0.5)).toBeCloseTo(0.25, 6);
+    expect(maxSpacingFor(5, 0.34)).toBeCloseTo(0.17, 6);  // the user's example
+    expect(maxSpacingFor(5, 0.25)).toBeCloseTo(0.125, 6);
+    // Mirrored either side of the middle.
+    expect(maxSpacingFor(5, 0.2)).toBeCloseTo(maxSpacingFor(5, 0.8), 9);
+    // Hard against an end → floored, not zero (keeps the slider usable).
+    expect(maxSpacingFor(5, 0)).toBeGreaterThan(0);
+  });
+
+  it("readings stay inside the arc when the centre is off-middle", () => {
+    const top: Pt[] = [[20, 30], [50, 30], [80, 30]];
+    const bot: Pt[] = [[20, 50], [50, 50], [80, 50]];
+    const centre = 0.25;
+    const cap = maxSpacingFor(5, centre);
+    const { readings } = computeThicknessReadings(top, bot, 5, centre, cap, IW, IH);
+    // The arc spans x 20..80; every anchor must land within it (no pile-up at
+    // an end, which is what an uncapped spacing would cause).
+    const xs = readings.map((r) => r.top[0]);
+    for (const x of xs) {
+      expect(x).toBeGreaterThanOrEqual(20 - 0.5);
+      expect(x).toBeLessThanOrEqual(80 + 0.5);
+    }
+    // and they're all distinct (nothing clamped on top of anything else)
+    expect(new Set(xs.map((x) => x.toFixed(2))).size).toBe(5);
   });
 
   it("an even count still yields an odd number of readings", () => {

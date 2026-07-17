@@ -1,0 +1,45 @@
+import { describe, it, expect } from "vitest";
+import { formatMeasurement, lineAutoLabel, areaAutoLabel, lineLengthPx } from "./lineMeasure";
+
+/* formatMeasurement is a port of the backend's _format_measurement
+   (image_processing.py). The auto-populated field must equal what the figure
+   draws character-for-character — otherwise the label visibly changes format
+   the moment the user styles it (which pins the string). */
+describe("formatMeasurement — parity with python _format_measurement", () => {
+  it("matches across every precision band", () => {
+    expect(formatMeasurement(100, "µm")).toBe("100.00 µm");         // %.2f
+    expect(formatMeasurement(1.5, "µm")).toBe("1.50 µm");           // %.2f
+    expect(formatMeasurement(999.999, "µm")).toBe("1000.00 µm");    // still %.2f band
+    expect(formatMeasurement(0.5, "µm")).toBe("0.5 µm");            // %.4g
+    expect(formatMeasurement(0.123456, "µm")).toBe("0.1235 µm");    // %.4g
+    expect(formatMeasurement(12345.678, "µm")).toBe("12345.7 µm");  // %.6g
+    expect(formatMeasurement(0.001234, "µm")).toBe("1.234e-03 µm"); // %.3e
+  });
+});
+
+describe("auto labels", () => {
+  it("straight line: 20% of 1000px at 0.5 µm/px = 100 µm", () => {
+    expect(lineAutoLabel([[40, 50], [60, 50]], 1000, 1000, "straight", 0.5, "um"))
+      .toBe("100.00 µm");
+  });
+
+  it("returns empty for an incomplete line (nothing to measure yet)", () => {
+    expect(lineAutoLabel([[40, 50]], 1000, 1000, "straight", 1, "um")).toBe("");
+    expect(lineAutoLabel([], 1000, 1000, "straight", 1, "um")).toBe("");
+  });
+
+  it("a curved line is LONGER than its control polygon", () => {
+    // The renderer draws a spline; measuring the chords would under-report.
+    const pts: [number, number][] = [[20, 50], [50, 20], [80, 50]];
+    const curved = lineLengthPx(pts, 1000, 1000, "curved");
+    const chords = lineLengthPx(pts, 1000, 1000, "straight");
+    expect(curved).toBeGreaterThan(chords);
+  });
+
+  it("rectangle area: 20%x10% of 1000px at 1 µm/px = 20000 µm²", () => {
+    // %.6g strips trailing zeros → "20000", matching python's
+    // _format_measurement(20000) exactly (verified against the interpreter).
+    expect(areaAutoLabel([[50, 50], [20, 10]], "Rectangle", 1000, 1000, 1, "um"))
+      .toBe("20000 µm²");
+  });
+});

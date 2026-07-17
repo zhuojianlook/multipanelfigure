@@ -67,6 +67,7 @@ import { useFigureStore } from "../../store/figureStore";
 import { api } from "../../api/client";
 import { niceScaleBarUm } from "../../utils/scaleBarRounding";
 import { computeScaleBarRect } from "../../utils/scaleBarGeometry";
+import { lineAutoLabel, areaAutoLabel } from "../../utils/lineMeasure";
 import {
   computeThicknessReadings, readingValue, normalizeCount, maxSpacingFor,
   snapToCurve, paramOnCurve, pointOnCurve,
@@ -3579,9 +3580,11 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     if (!cur) return;
     const next = { ...cur, ...patch };
     // Counts are forced ODD so a reading always lands on the centre node, and
-    // spacing can't exceed what the arc can hold for that count.
+    // spacing can't exceed what the arc can hold for that count AT THAT CENTRE
+    // — dragging the node off-middle shrinks the room on the shorter side, so
+    // the cap (and the current value) have to follow it down.
     next.num_readings = normalizeCount(next.num_readings);
-    next.spacing = Math.min(Math.max(next.spacing, 0.005), maxSpacingFor(next.num_readings));
+    next.spacing = Math.min(Math.max(next.spacing, 0.005), maxSpacingFor(next.num_readings, next.center));
     const res = computeThicknessReadings(
       (next.top_points ?? []) as ThickPt[],
       (next.bottom_points ?? []) as ThickPt[],
@@ -3614,6 +3617,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     // so switching to Custom starts from something sensible.
     scale_mode: "image",
     micron_per_pixel: local?.scale_bar?.micron_per_pixel || 1,
+    scale_name: local?.scale_bar?.scale_name || "",
     color: "#00E5FF", width: 1,
     show_curves: false, show_measure: true, measure_in_analysis: true,
     label_offset: 14,
@@ -5271,24 +5275,62 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     removed; drag-select the text to apply formats. */}
                 {(line.show_measure || line.measure_in_analysis !== false) && (
                   <Box sx={{ mt: 1, display: "flex", flexDirection: "column", gap: 1 }}>
-                    <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.7rem" }}>Measurement Label</Typography>
-                    <StyledTextField
-                      label="Text (auto if empty)"
-                      text={line.measure_text || ""}
-                      segments={line.measure_styled_segments}
-                      defaultColor={line.measure_color || "#FFFF00"}
-                      fontStyle={line.measure_font_style}
-                      baseFontSize={line.measure_font_size}
-                      fonts={fonts}
-                      onChange={(text, measure_styled_segments) => {
-                        const lines2 = [...(local.lines ?? [])];
-                        lines2[i] = { ...lines2[i], measure_text: text, measure_styled_segments };
-                        updateLocal({ lines: lines2 } as unknown as Partial<PanelInfo>);
-                      }}
-                    />
-                    <Typography variant="caption" sx={{ color: "text.secondary", fontSize: "0.65rem", fontStyle: "italic" }}>
-                      Drag measurement text on preview to reposition
-                    </Typography>
+                    {(() => {
+                      // Show the measured value as real TEXT, not a placeholder:
+                      // an empty field has nothing to drag-select, which is why
+                      // the hover toolbar (font / size / colour) was unreachable.
+                      // Nothing is STORED until the user actually edits, so the
+                      // backend keeps auto-computing and the label can't go
+                      // stale on its own. Once edited it's pinned — hence Reset.
+                      const auto = lineAutoLabel(
+                        (line.points ?? []) as [number, number][],
+                        svgDims.w || 1000, svgDims.h || 1000,
+                        line.line_type || (line.is_curved ? "curved" : "straight"),
+                        local.scale_bar?.micron_per_pixel || 1,
+                        local.scale_bar?.unit || "um",
+                      );
+                      const pinned = !!line.measure_text;
+                      return (
+                        <>
+                          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                            <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.7rem", flex: 1 }}>
+                              Measurement Label
+                            </Typography>
+                            <Button
+                              size="small" variant="outlined" disabled={!pinned}
+                              title="Re-apply the measured value and drop any custom text / styling"
+                              onClick={() => {
+                                const lines2 = [...(local.lines ?? [])];
+                                lines2[i] = { ...lines2[i], measure_text: "", measure_styled_segments: [] };
+                                updateLocal({ lines: lines2 } as unknown as Partial<PanelInfo>);
+                              }}
+                              sx={{ fontSize: "0.58rem", py: 0, px: 0.6, minWidth: 0, textTransform: "none" }}
+                            >
+                              Reset to auto
+                            </Button>
+                          </Box>
+                          <StyledTextField
+                            label={pinned ? "Text (custom)" : "Text (auto — edit to pin)"}
+                            text={line.measure_text || auto}
+                            segments={line.measure_styled_segments}
+                            defaultColor={line.measure_color || "#FFFF00"}
+                            fontStyle={line.measure_font_style}
+                            baseFontSize={line.measure_font_size}
+                            fonts={fonts}
+                            onChange={(text, measure_styled_segments) => {
+                              const lines2 = [...(local.lines ?? [])];
+                              lines2[i] = { ...lines2[i], measure_text: text, measure_styled_segments };
+                              updateLocal({ lines: lines2 } as unknown as Partial<PanelInfo>);
+                            }}
+                          />
+                          <Typography variant="caption" sx={{ color: "text.secondary", fontSize: "0.65rem", fontStyle: "italic" }}>
+                            {pinned
+                              ? "Pinned — it won't follow the line's length any more. Drag on preview to reposition."
+                              : "Drag-select the text for font / size / colour. Drag on preview to reposition."}
+                          </Typography>
+                        </>
+                      );
+                    })()}
                   </Box>
                 )}
                 <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5 }}>
@@ -5563,23 +5605,58 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         hovermenu only.  Per-element font / size / colour
                         pickers removed; drag-select the text to apply
                         formats. */}
-                    <Typography variant="caption" sx={{ fontWeight: 600, mt: 1, mb: 0.5, display: "block", fontSize: "0.7rem" }}>Measurement Label</Typography>
-                    <StyledTextField
-                      label="Text (auto if empty)"
-                      text={area.measure_text || ""}
-                      segments={area.measure_styled_segments}
-                      defaultColor={area.measure_color || "#FFFF00"}
-                      baseFontSize={area.measure_font_size}
-                      fonts={fonts}
-                      onChange={(text, measure_styled_segments) => {
-                        const areas = [...(local.areas ?? [])];
-                        areas[i] = { ...areas[i], measure_text: text, measure_styled_segments };
-                        updateLocal({ areas } as unknown as Partial<PanelInfo>);
-                      }}
-                    />
-                    <Typography variant="caption" sx={{ color: "text.secondary", fontSize: "0.65rem", fontStyle: "italic" }}>
-                      Drag measurement text on preview to reposition
-                    </Typography>
+                    {(() => {
+                      // Same pattern as lines: real text (selectable → styleable),
+                      // nothing stored until edited, Reset to unpin. See the note
+                      // in the line editor.
+                      const auto = areaAutoLabel(
+                        (area.points ?? []) as [number, number][],
+                        area.shape,
+                        svgDims.w || 1000, svgDims.h || 1000,
+                        local.scale_bar?.micron_per_pixel || 1,
+                        area.measure_unit || local.scale_bar?.unit || "um",
+                      );
+                      const pinned = !!area.measure_text;
+                      return (
+                        <>
+                          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, mt: 1, mb: 0.5 }}>
+                            <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.7rem", flex: 1 }}>
+                              Measurement Label
+                            </Typography>
+                            <Button
+                              size="small" variant="outlined" disabled={!pinned}
+                              title="Re-apply the measured value and drop any custom text / styling"
+                              onClick={() => {
+                                const areas = [...(local.areas ?? [])];
+                                areas[i] = { ...areas[i], measure_text: "", measure_styled_segments: [] };
+                                updateLocal({ areas } as unknown as Partial<PanelInfo>);
+                              }}
+                              sx={{ fontSize: "0.58rem", py: 0, px: 0.6, minWidth: 0, textTransform: "none" }}
+                            >
+                              Reset to auto
+                            </Button>
+                          </Box>
+                          <StyledTextField
+                            label={pinned ? "Text (custom)" : "Text (auto — edit to pin)"}
+                            text={area.measure_text || auto}
+                            segments={area.measure_styled_segments}
+                            defaultColor={area.measure_color || "#FFFF00"}
+                            baseFontSize={area.measure_font_size}
+                            fonts={fonts}
+                            onChange={(text, measure_styled_segments) => {
+                              const areas = [...(local.areas ?? [])];
+                              areas[i] = { ...areas[i], measure_text: text, measure_styled_segments };
+                              updateLocal({ areas } as unknown as Partial<PanelInfo>);
+                            }}
+                          />
+                          <Typography variant="caption" sx={{ color: "text.secondary", fontSize: "0.65rem", fontStyle: "italic" }}>
+                            {pinned
+                              ? "Pinned — it won't follow the area any more. Drag on preview to reposition."
+                              : "Drag-select the text for font / size / colour. Drag on preview to reposition."}
+                          </Typography>
+                        </>
+                      );
+                    })()}
                   </Box>
                 )}
 
@@ -5621,7 +5698,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 const discordant = thicknessDiscordant(tm);
                 const uLab: Record<string, string> = { km: "km", m: "m", cm: "cm", mm: "mm", um: "µm", nm: "nm", pm: "pm" };
                 const uT = tm.measure_unit || "um";
-                const maxSpace = maxSpacingFor(tm.num_readings);
+                const maxSpace = maxSpacingFor(tm.num_readings, tm.center);
                 return (
                   <Box
                     key={`thick-${i}`}
@@ -5738,15 +5815,55 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         </ToggleButton>
                       </ToggleButtonGroup>
                       {tm.scale_mode === "custom" ? (
-                        <TextField
-                          label={`${uLab[uT] || uT}/pixel (this annotation only)`}
-                          type="number"
-                          value={Number((tm.micron_per_pixel || 1).toPrecision(6))}
-                          onChange={(e) => applyThickness(i, { micron_per_pixel: Number(e.target.value) })}
-                          inputProps={{ step: 0.01 }}
-                          size="small" fullWidth
-                          sx={{ "& input": { fontSize: "0.72rem" } }}
-                        />
+                        <>
+                          {/* Pick a saved scale rather than retyping µm/px —
+                              same source of truth as the line / scale-bar
+                              pickers (config.resolution_entries). Unlike those,
+                              this writes to THIS annotation only and never
+                              touches the image's scale bar. */}
+                          <FormControl size="small" fullWidth>
+                            <InputLabel sx={{ fontSize: "0.72rem" }}>Saved scale</InputLabel>
+                            <Select
+                              label="Saved scale"
+                              value={tm.scale_name ?? ""}
+                              onChange={(e) => {
+                                const name = e.target.value as string;
+                                if (name && config?.resolution_entries?.[name]) {
+                                  const predUnit = name.split("|")[1] || "um";
+                                  applyThickness(i, {
+                                    scale_name: name,
+                                    micron_per_pixel: config.resolution_entries[name],
+                                    measure_unit: predUnit,
+                                  });
+                                } else {
+                                  applyThickness(i, { scale_name: "" });
+                                }
+                              }}
+                              sx={{ fontSize: "0.72rem" }}
+                            >
+                              <MenuItem value="" sx={{ fontSize: "0.72rem" }}>Manual entry</MenuItem>
+                              {config && Object.entries(config.resolution_entries).map(([name, val]) => {
+                                const parts = name.split("|");
+                                const u = parts[1] || "um";
+                                return (
+                                  <MenuItem key={name} value={name} sx={{ fontSize: "0.72rem" }}>
+                                    {parts[0]} ({val} {uLab[u] || u}/px)
+                                  </MenuItem>
+                                );
+                              })}
+                            </Select>
+                          </FormControl>
+                          <TextField
+                            label={`${uLab[uT] || uT}/pixel (this annotation only)`}
+                            type="number"
+                            value={Number((tm.micron_per_pixel || 1).toPrecision(6))}
+                            onChange={(e) => applyThickness(i, { micron_per_pixel: Number(e.target.value), scale_name: "" })}
+                            inputProps={{ step: 0.01 }}
+                            disabled={!!tm.scale_name}
+                            size="small" fullWidth
+                            sx={{ "& input": { fontSize: "0.72rem" } }}
+                          />
+                        </>
                       ) : (
                         <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.62rem", fontStyle: "italic" }}>
                           {local.add_scale_bar
@@ -5775,7 +5892,8 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         onChange={(v) => applyThickness(i, { spacing: v / 100 })}
                       />
                       <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.6rem", fontStyle: "italic", mt: -0.5 }}>
-                        Max {(maxSpace * 100).toFixed(1)}% at {tm.num_readings} readings — the set spans the whole arc.
+                        Max {(maxSpace * 100).toFixed(1)}% at {tm.num_readings} readings, centre {Math.round(tm.center * 100)}%
+                        {Math.abs(tm.center - 0.5) > 0.01 ? " — off-centre leaves less room on the short side" : " — the set spans the whole arc"}.
                       </Typography>
                       <AdjustSlider
                         label="Width" value={tm.width} defaultValue={1}
@@ -5847,9 +5965,15 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                                       {ri + 1}
                                     </Typography>
                                     <Box sx={{ flex: 1, minWidth: 0 }}>
+                                      {/* Real text, not a placeholder — an empty
+                                          field has nothing to drag-select, so the
+                                          hover toolbar (font / size / colour)
+                                          couldn't be reached. Nothing is stored
+                                          until edited, so the value keeps
+                                          tracking the geometry until pinned. */}
                                       <StyledTextField
-                                        placeholder={auto}
-                                        text={rd.text || ""}
+                                        label={rd.text ? "custom" : undefined}
+                                        text={rd.text || auto}
                                         segments={rd.styled_segments as StyledSegment[] | undefined}
                                         defaultColor={tm.measure_color || tm.color}
                                         baseFontSize={tm.measure_font_size}
@@ -5867,6 +5991,19 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                                         edited
                                       </Typography>
                                     )}
+                                    <IconButton
+                                      size="small" sx={{ p: 0.25, flexShrink: 0 }}
+                                      title="Reset this reading's label to the measured value"
+                                      disabled={!rd.text && !(rd.styled_segments ?? []).length}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        const rds = [...(tm.readings ?? [])];
+                                        rds[ri] = { ...rds[ri], text: "", styled_segments: [] };
+                                        applyThickness(i, { readings: rds });
+                                      }}
+                                    >
+                                      <RestartAltIcon sx={{ fontSize: 13 }} />
+                                    </IconButton>
                                     <IconButton
                                       size="small" sx={{ p: 0.25, flexShrink: 0 }}
                                       title={rd.hidden ? "Show reading" : "Hide reading"}
@@ -8290,23 +8427,38 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
 
                             {/* Centre node — drag along the top surface to move
                                 where the reading set is centred. A reading always
-                                sits exactly here (counts are forced odd). */}
-                            {isActive && centreNode && (
-                              <circle
-                                cx={toVb(centreNode)[0]} cy={toVb(centreNode)[1]}
-                                r={handleR * 1.7}
-                                fill="none" stroke="#fff" strokeWidth={strokeW * 1.6}
-                                style={{ pointerEvents: "auto", cursor: "ew-resize" }}
-                                onMouseDown={startDrag((px, py) => {
-                                  const cur = ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[])[ti];
-                                  if (!cur) return;
-                                  // Constrain to the top surface: take the arc
-                                  // parameter nearest the cursor.
-                                  const t = paramOnCurve([px, py], (cur.top_points ?? []) as ThickPt[], vbW, vbH);
-                                  applyThickness(ti, { center: t });
-                                })}
-                              />
-                            )}
+                                sits exactly here (counts are forced odd).
+                                Deliberately loud: a haloed double ring with a
+                                stalk, so it reads as THE control among the six
+                                surface handles rather than another dot. */}
+                            {isActive && centreNode && (() => {
+                              const [cx, cy] = toVb(centreNode);
+                              const R = handleR * 2.6;
+                              const drag = startDrag((px, py) => {
+                                const cur = ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[])[ti];
+                                if (!cur) return;
+                                // Constrain to the top surface: take the arc
+                                // parameter nearest the cursor.
+                                const t = paramOnCurve([px, py], (cur.top_points ?? []) as ThickPt[], vbW, vbH);
+                                applyThickness(ti, { center: t });
+                              });
+                              return (
+                                <g style={{ pointerEvents: "auto", cursor: "ew-resize" }} onMouseDown={drag}>
+                                  {/* dark halo so it survives on light images */}
+                                  <circle cx={cx} cy={cy} r={R} fill="none" stroke="rgba(0,0,0,0.65)" strokeWidth={strokeW * 5} />
+                                  <circle cx={cx} cy={cy} r={R} fill="none" stroke="#fff" strokeWidth={strokeW * 2.6} />
+                                  <circle cx={cx} cy={cy} r={R * 0.42} fill="#fff" stroke="rgba(0,0,0,0.65)" strokeWidth={strokeW} />
+                                  {/* stalk marking the exact anchor on the surface */}
+                                  <line
+                                    x1={cx} y1={cy - R * 1.9} x2={cx} y2={cy - R}
+                                    stroke="#fff" strokeWidth={strokeW * 2.2}
+                                    style={{ paintOrder: "stroke" }}
+                                  />
+                                  {/* generous invisible grab area */}
+                                  <circle cx={cx} cy={cy} r={R * 1.8} fill="transparent" />
+                                </g>
+                              );
+                            })()}
                           </g>
                         );
                       })}

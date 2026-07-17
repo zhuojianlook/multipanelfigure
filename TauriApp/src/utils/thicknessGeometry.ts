@@ -51,11 +51,23 @@ export function normalizeCount(n: number): number {
   return v % 2 === 1 ? v : v + 1;
 }
 
-/** Largest spacing (fraction of arc length) that still fits `count`
- *  readings inside the arc: the group spans (count-1)*spacing. */
-export function maxSpacingFor(count: number): number {
+/** Largest spacing (fraction of arc length) that still fits `count` readings
+ *  inside the arc, given where the centre node sits.
+ *
+ *  Readings spread SYMMETRICALLY either side of `center`, so the group spans
+ *  (count-1)*spacing and the binding constraint is the SHORTER side:
+ *      center - (n-1)/2*s >= 0   and   center + (n-1)/2*s <= 1
+ *  ⇒  s <= 2*min(center, 1-center) / (n-1)
+ *
+ *  So moving the centre off-middle genuinely shrinks the maximum — at
+ *  center=0.5 this reduces to the familiar 1/(n-1). A small floor keeps the
+ *  slider usable when the node is dragged hard against an end. */
+export function maxSpacingFor(count: number, center = 0.5): number {
   const n = normalizeCount(count);
-  return n <= 1 ? 1 : 1 / (n - 1);
+  if (n <= 1) return 1;
+  const c = Math.min(1, Math.max(0, center));
+  const half = Math.min(c, 1 - c);
+  return Math.max(0.005, (2 * half) / (n - 1));
 }
 
 interface Curve {
@@ -175,7 +187,8 @@ export function computeThicknessReadings(
   const bottomSamplesPx = bottom.sample(ARC_SAMPLES);
 
   const L = top.length;
-  const step = Math.max(0, Math.min(spacing, maxSpacingFor(n))) * L;
+  // Cap against the centre's actual room, not just the count.
+  const step = Math.max(0, Math.min(spacing, maxSpacingFor(n, center))) * L;
   const centerS = Math.min(1, Math.max(0, center)) * L;
   const mid = (n - 1) / 2;   // integer, since n is odd → a reading sits on centre
 

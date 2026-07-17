@@ -238,6 +238,7 @@ class ThicknessMeasurement:
     # micron_per_pixel, independent of the image bar and of other annotations.
     scale_mode: str = "image"      # "image" | "custom"
     micron_per_pixel: float = 1.0  # only consulted when scale_mode == "custom"
+    scale_name: str = ""           # predefined scale picked for the custom mode ("" = manual)
     # Appearance
     color: str = "#00E5FF"
     width: float = 1.0             # thin by default — these are measurement ticks
