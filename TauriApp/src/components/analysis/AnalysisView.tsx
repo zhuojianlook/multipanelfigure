@@ -11,7 +11,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { Box } from "@mui/material";
-import { AnalysisNodeGraph, MEAS_CSV_HEADER } from "../dialogs/AnalysisNodeGraph";
+import { AnalysisNodeGraph, MEAS_CSV_HEADER, measArrToCsv, figureLabels } from "../dialogs/AnalysisNodeGraph";
 import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
 import { api } from "../../api/client";
@@ -20,13 +20,17 @@ export function AnalysisView() {
   // Re-fetch measurements whenever the active config changes so the
   // analysis source reflects the current figure.
   const config = useFigureStore((s) => s.config);
-  // The active figure's name — /api/measurements only ever serves the active
+  // The active figure's label — /api/measurements only ever serves the active
   // doc and its rows carry no figure identifier, so attribute here, where the
   // doc IS in hand. Panel labels are bare grid coords ("R1C1"), so without this
-  // two figures' rows are indistinguishable downstream.
+  // two figures' rows are indistinguishable downstream. (The node graph fetches
+  // every OTHER open doc itself and labels those the same way.)
+  //
+  // Label, not name: DocTab.name has no uniqueness constraint, so two tabs can
+  // both be "fig1" and a group-by would merge unrelated experiments.
   const openDocs = useCollageStore((s) => s.openDocs);
   const activeDocId = useCollageStore((s) => s.activeDocId);
-  const activeDocName = (openDocs || []).find((d) => d.id === activeDocId)?.name || "";
+  const activeDocLabel = figureLabels(openDocs || [])[activeDocId || ""] || "";
 
   const [measurementsCsv, setMeasurementsCsv] = useState<string>(`${MEAS_CSV_HEADER}\n`);
   const [measurements, setMeasurements] = useState<Array<Record<string, unknown>>>([]);
@@ -34,25 +38,19 @@ export function AnalysisView() {
   const refresh = useCallback(async () => {
     try {
       const { measurements: rows } = await api.getMeasurements();
-      const body = (rows || [])
-        .map((m) => {
-          const value = m.numeric != null ? String(m.numeric) : (m.value ?? "");
-          // Group defaults to the panel so the stats blocks have something
-          // to split on; the user re-assigns groups in their code.
-          // Figure LAST — see MEAS_CSV_HEADER: the seeded R templates pick
-          // their x-axis as the first non-numeric column, which must stay Panel.
-          return [m.panel, m.name, m.panel, value, m.unit ?? "", activeDocName]
-            .map((c) => `"${String(c).replace(/"/g, '""')}"`)
-            .join(",");
-        })
-        .join("\n");
-      setMeasurementsCsv(body ? `${MEAS_CSV_HEADER}\n${body}` : `${MEAS_CSV_HEADER}\n`);
+      // Shared with the node graph's per-figure folders, so the active figure's
+      // table and every other figure's are built by the same code and can't
+      // drift apart in column order or quoting.
+      setMeasurementsCsv(measArrToCsv(
+        (rows || []) as unknown as Array<Record<string, unknown>>,
+        activeDocLabel,
+      ));
       setMeasurements((rows || []) as unknown as Array<Record<string, unknown>>);
     } catch {
       setMeasurementsCsv(`${MEAS_CSV_HEADER}\n`);
       setMeasurements([]);
     }
-  }, [activeDocName]);
+  }, [activeDocLabel]);
 
   useEffect(() => { void refresh(); }, [refresh, config]);
 

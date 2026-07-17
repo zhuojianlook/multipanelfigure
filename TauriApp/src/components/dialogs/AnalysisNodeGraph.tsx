@@ -841,6 +841,127 @@ interface MeasurementRef {
   csv: string;
 }
 
+/** The parts of a collageStore DocTab this module binds against. */
+type DocTabLike = { id: string; name: string; path?: string | null };
+
+/** Stable identity for the figure a source or measurement belongs to.
+ *
+ *  A doc id is only meaningful within one session: saved workflows persist to
+ *  localStorage but `openDocs` does not (collageStore's `Persisted` omits it),
+ *  so ids are re-minted on every launch. A path survives a restart; an Untitled
+ *  figure has no durable identity at all, and a binding to one is deliberately
+ *  allowed to go stale rather than silently resolve to a different figure.
+ *
+ *  Paths are compared as the raw strings the store holds. Two strings can name
+ *  one file (bare "x.mpf" vs "~/Documents/x.mpf" — see docEnsure), which splits
+ *  one figure into two identities. That over-separates, which is the safe way to
+ *  be wrong here: it can strand a binding, never cross-bind it. */
+export function figKey(d: { id: string; path?: string | null }): string {
+  const p = (d.path || "").trim();
+  return p ? `p:${p}` : `d:${d.id}`;
+}
+
+/** The backend's own key for an inset — bare grid coords, e.g. "r0c0_i0".
+ *  Unique within a figure and identical ACROSS figures, which is why every
+ *  key that leaves this module is namespaced by figKey. */
+export function rawKeyOf(s: { key: string; rawKey?: string; name?: string }): string {
+  if (s.rawKey) return s.rawKey;
+  // Standalone uploads ("img:<filename>") belong to no figure, are never
+  // namespaced, and their key is already raw. Check this FIRST: a filename can
+  // contain "__", which the legacy split below would chop.
+  if (s.name) return s.key;
+  const ns = s.key.lastIndexOf("::");
+  if (ns >= 0) return s.key.slice(ns + 2);
+  // Legacy: either bare ("r0c0_i0") or doc-id-namespaced ("doc_x__r0c0_i0").
+  // Doc ids contain underscores, so split on the LAST "__" — no backend key
+  // contains one (r{r}c{c}_i{n} / _panel / _area{n}).
+  const i = s.key.lastIndexOf("__");
+  return i >= 0 ? s.key.slice(i + 2) : s.key;
+}
+
+/** Globally unique source key: which figure, then which inset inside it.
+ *  FRONTEND ONLY — it embeds a path, so it must never reach the sidecar
+ *  (see runtimeKeyFor). */
+export function nsKey(fig: string, raw: string): string {
+  return `${fig}::${raw}`;
+}
+
+/** The key the sidecar exposes a source under in the user's `inputs` dict.
+ *
+ *  Deliberately NOT the frontend's binding key, which embeds a file path.
+ *  Three constraints rule that out:
+ *    - filesystem safety — the ImageJ runner writes `<key>.png`, so a "/" in
+ *      the key writes to a directory that doesn't exist;
+ *    - suffix routing — _extract_source_image dispatches on "_panel" /
+ *      "_area<N>" suffixes;
+ *    - user code — single-figure scripts already say inputs["r0c0_i0"], and
+ *      renaming that out from under them would break every saved pipeline.
+ *
+ *  So the ACTIVE figure keeps the bare backend key (unchanged for the
+ *  single-figure case) and other figures are namespaced by session doc id.
+ *  That only has to be unique within one run, which a doc id is. */
+export function runtimeKeyFor(
+  src: { key: string; rawKey?: string; name?: string },
+  ownerId: string | undefined,
+  activeDocId: string | null,
+): string {
+  if (src.name) return src.key;                       // upload — backend resolves by name
+  const raw = rawKeyOf(src);
+  if (!ownerId || ownerId === activeDocId) return raw;
+  return `${ownerId}__${raw}`;
+}
+
+/** Bind a source saved before keys carried a figure identity.
+ *
+ *  Legacy keys are either bare ("r0c0_i0", written when the source's figure was
+ *  active) or doc-id-namespaced ("doc_x__r0c0_i0"). Neither survives a restart:
+ *  doc ids are re-minted, and a bare key matches whatever is active now. So we
+ *  re-bind by the strongest evidence the saved source carries:
+ *
+ *    1. mpfId still names an open doc  → that figure (same session).
+ *    2. mpf (the label) matches EXACTLY one open doc → that figure.
+ *    3. otherwise → the active doc, which is what the old code did implicitly.
+ *
+ *  Step 3 can be wrong for a legacy multi-figure workflow, but those were
+ *  already resolving to the active figure — silently. Now the binding is at
+ *  least explicit and visible, and re-dragging the source fixes it for good. */
+export function migrateLegacySource(s: InsetSource, docs: DocTabLike[], activeId: string | null): InsetSource {
+  const raw = rawKeyOf(s);
+  const byId = s.mpfId ? docs.find((d) => d.id === s.mpfId) : undefined;
+  const named = s.mpf ? docs.filter((d) => d.name === s.mpf) : [];
+  const owner = byId
+    ?? (named.length === 1 ? named[0] : undefined)
+    ?? docs.find((d) => d.id === activeId);
+  if (!owner) return s;
+  const fk = figKey(owner);
+  return {
+    ...s, key: nsKey(fk, raw), rawKey: raw, figKey: fk,
+    runKey: runtimeKeyFor({ ...s, rawKey: raw }, owner.id, activeId),
+    mpfId: owner.id, mpf: s.mpf || owner.name,
+  };
+}
+
+/** Unique, human-readable label per open figure, keyed by doc id.
+ *
+ *  DocTab.name has NO uniqueness constraint. Two tabs share a name when the
+ *  same basename is opened from two directories (docEnsure dedupes on the exact
+ *  path string), when a tab is renamed (no collision check), or when an Untitled
+ *  tab is saved over a path another tab holds. Rows tagged with a bare name then
+ *  merge unrelated experiments in a downstream group-by, so collisions take a
+ *  positional suffix: "fig1", "fig1 (2)".
+ *
+ *  This is a DISPLAY label, never an identity — use figKey to bind. */
+export function figureLabels(docs: Array<{ id: string; name: string }>): Record<string, string> {
+  const seen = new Map<string, number>();
+  const out: Record<string, string> = {};
+  for (const d of docs || []) {
+    const n = (seen.get(d.name) || 0) + 1;
+    seen.set(d.name, n);
+    out[d.id] = n === 1 ? d.name : `${d.name} (${n})`;
+  }
+  return out;
+}
+
 /** Convert a measurements array (from /api/measurements or the per-doc
  *  source endpoints) into the same CSV the active figure uses, so a tile
  *  for any figure feeds an identical table shape downstream. */
@@ -858,7 +979,7 @@ export const MEAS_CSV_HEADER = "Panel,Name,Group,Value,Unit,Figure";
  *  grid coordinates), so wiring two figures' tables into one script yields rows
  *  that cannot be told apart and a naive group-by silently merges unrelated
  *  panels across figures. */
-function measArrToCsv(rows: Array<Record<string, unknown>>, figure = ""): string {
+export function measArrToCsv(rows: Array<Record<string, unknown>>, figure = ""): string {
   const header = MEAS_CSV_HEADER;
   const q = (c: unknown) => `"${String(c ?? "").replace(/"/g, '""')}"`;
   const body = (rows || []).map((m) => {
@@ -1019,10 +1140,26 @@ export type DataKind = "image" | "table" | "plot";
 export type EngineKind = "python" | "matlab" | "r" | "imagej" | "cellpose";
 
 export interface InsetSource {
+  /** Globally unique: `${figKey}::${rawKey}`. The backend's own key is bare
+   *  grid coords and is IDENTICAL across figures, so an un-namespaced key
+   *  silently matches another figure's inset — see the refresh in the
+   *  sources effect, which rebinds attached sources by key equality. */
   key: string;
+  /** The backend's key for this inset, as the run payload needs it. */
+  rawKey?: string;
+  /** The key the sidecar exposes this source under in `inputs` — see
+   *  runtimeKeyFor. Filesystem-safe and bare for the active figure, so
+   *  existing single-figure scripts keep working. Recomputed whenever the
+   *  active doc changes, which is why it is carried rather than derived at
+   *  each use site. */
+  runKey?: string;
+  /** Stable identity of the owning figure (figKey) — survives a restart for
+   *  saved docs. This, not mpfId, is what binds a source to its figure. */
+  figKey?: string;
   /** Which MPF this source comes from (doc id) + its display name, so the
    *  Sources panel can group sources into a drawer per loaded MPF and the
-   *  project save can tell which MPF a workflow's data belongs to. */
+   *  project save can tell which MPF a workflow's data belongs to.
+   *  mpfId is SESSION-SCOPED (openDocs is not persisted) — never bind on it. */
   mpfId?: string;
   mpf?: string;
   /** Set for STANDALONE analysis images uploaded directly into the Analysis
@@ -2274,9 +2411,12 @@ function placeholderForEngine(engine: keyof EnginePaths): string {
 // ── Per-source display-name overrides (localStorage) ────────
 // The library auto-generates labels like "R1C1·1"; users rename
 // them in-place to things like "Control_1" / "Drug_2" so the
-// downstream group-inference reads what they wrote.  Overrides
-// are keyed by the inset's stable `.key` (panel coords + index)
-// so renames survive figure changes that don't move the inset.
+// downstream group-inference reads what they wrote.  Overrides are
+// keyed by the inset's `.key` so renames survive figure changes that
+// don't move the inset.  That key is now namespaced per figure: it used
+// to be bare panel coords, which two figures share, so renaming a source
+// in one figure silently renamed the same-coords source in every other
+// open figure.
 const SOURCE_NAMES_KEY = "mpfig.source_names";
 function loadSourceNames(): Record<string, string> {
   try {
@@ -2288,9 +2428,15 @@ function saveSourceNames(m: Record<string, string>) {
   try { localStorage.setItem(SOURCE_NAMES_KEY, JSON.stringify(m)); } catch { /* ignore */ }
 }
 /** Display name for an inset — user override if present, else the
- *  backend-supplied label (`R{r}C{c}·{idx}`). */
+ *  backend-supplied label (`R{r}C{c}·{idx}`).
+ *
+ *  Falls back to the bare-key override so renames made before keys were
+ *  namespaced still resolve. That fallback is shared across figures — the
+ *  ambiguity it carries is exactly what namespacing removes — so a
+ *  figure-specific override always wins over it. */
 function displayName(s: InsetSource, overrides: Record<string, string>): string {
-  return (overrides[s.key] || s.label || s.key).trim();
+  const legacy = overrides[rawKeyOf(s)];
+  return (overrides[s.key] || legacy || s.label || s.key).trim();
 }
 
 // ── User-defined source-library groups (localStorage) ─────────
@@ -4862,39 +5008,58 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   // Load inset sources + MATLAB availability on open.
   useEffect(() => {
     if (!open) return;
-    // Per-MPF sources (Task #32 Part B): pull insets from the ACTIVE doc
-    // (keys unchanged for backward-compat with saved workflows) AND every
-    // OTHER open .mpf that has a saved path.  Non-active docs get their
-    // keys namespaced by doc id so two figures with the same panel coords
-    // (r0c0_i0) don't collide, and each source is tagged with mpfId / mpf
-    // so the Sources panel can fold them into per-figure folders and the
-    // run can extract each from its OWN project (buildSources →
-    // project_path → backend _project_context).
+    // Per-MPF sources: pull insets from the ACTIVE doc AND every OTHER open
+    // .mpf. EVERY source's key is namespaced by its figure's stable figKey —
+    // the active doc included.
+    //
+    // The active doc used to keep the backend's bare key for saved-workflow
+    // compatibility while other docs got namespaced. Backend keys are pure grid
+    // coords, so two figures both emit "r0c0_i0": a node holding the bare key
+    // matched whichever figure was active, and the refresh below silently
+    // rebound it on every tab switch. The run then saw mpfId === activeDocId,
+    // sent no project_path, and analysed the WRONG figure's pixels with no
+    // error. Namespacing uniformly is what makes that unrepresentable.
+    //
+    // Each source is also tagged with mpfId / mpf so the Sources panel can fold
+    // them into per-figure folders and the run can extract each from its OWN
+    // project (buildSources → project_path → backend _project_context).
     const _docs = openDocs;
     const _active = activeDocId;
-    const _activeName = _docs.find((d) => d.id === _active)?.name || "This figure";
+    const _labels = figureLabels(_docs);
     // Docs whose live edits are parked as an in-memory stash (switched away
     // from while dirty). For those we read the STASH — so unsaved
     // "add to analysis" flags and Untitled (never-saved) docs still
     // contribute — instead of the (stale or missing) .mpf on disk.
     const _dirty = new Set(useCollageStore.getState().snapshotDirtyDocIds || []);
-    const _tag = (arr: Array<Record<string, unknown>>, d: { id: string; name: string }) =>
-      arr.map((s) => {
+    const _tag = (arr: Array<Record<string, unknown>>, d: DocTabLike) => {
+      const fk = figKey(d);
+      return arr.map((s) => {
         const src = s as unknown as InsetSource;
-        return { ...src, key: `${d.id}__${src.key}`, mpfId: d.id, mpf: d.name };
+        const raw = rawKeyOf(src);
+        return {
+          ...src, key: nsKey(fk, raw), rawKey: raw, figKey: fk,
+          runKey: runtimeKeyFor({ ...src, rawKey: raw }, d.id, _active),
+          mpfId: d.id, mpf: _labels[d.id] || d.name,
+        };
       });
+    };
     // Per-figure measurements (one tile per figure). The per-doc endpoints
     // return this figure's measurements too; record them so the Sources
     // panel can offer a draggable Measurements tile for EACH open figure.
     const _measAccum: Record<string, { csv: string; rows: number; items: Array<Record<string, unknown>> }> = {};
-    const _capMeas = (r: { sources?: Array<Record<string, unknown>>; measurements?: Array<Record<string, unknown>> }, d: { id: string; name: string }) => {
+    const _capMeas = (r: { sources?: Array<Record<string, unknown>>; measurements?: Array<Record<string, unknown>> }, d: DocTabLike) => {
       const m = r.measurements || [];
-      if (m.length) _measAccum[d.id] = { csv: measArrToCsv(m, d.name), rows: m.length, items: m };
+      // Tag with the DISAMBIGUATED label, not d.name — two tabs can share a
+      // name, and the Figure column is the only thing separating their rows.
+      if (m.length) _measAccum[d.id] = { csv: measArrToCsv(m, _labels[d.id] || d.name), rows: m.length, items: m };
       return _tag(r.sources || [], d);
     };
+    const _activeDoc = _docs.find((d) => d.id === _active);
     const tasks: Promise<InsetSource[]>[] = [
       api.listInsetAnalysisSources()
-        .then((r) => (r.sources || []).map((s) => ({ ...(s as unknown as InsetSource), mpfId: _active || "__active__", mpf: _activeName })))
+        .then((r) => (_activeDoc
+          ? _tag((r.sources || []) as Array<Record<string, unknown>>, _activeDoc)
+          : ([] as InsetSource[])))
         .catch(() => [] as InsetSource[]),
     ];
     for (const d of _docs) {
@@ -4934,13 +5099,25 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         // panel. We still refresh any sources that are already
         // attached so saved workflows pick up the latest thumbnail
         // / pixel data when the figure changed underneath them.
+        //
+        // Matching is by the figure-namespaced key, so a refresh can only ever
+        // re-resolve a source to the SAME figure it was attached from. Matching
+        // on the bare key is what let a tab switch silently swap an attached
+        // inset for a different figure's inset at the same grid coords.
         setWorkflowTabs((tabs) => tabs.map((t) => ({
           ...t,
           nodes: t.nodes.map((n) => {
             if (n.data.kind !== "source") return n;
             const refreshed = (n.data.sources || []).map((s) => {
-              const live = list.find((l) => l.key === s.key);
-              return live ?? s;
+              // Standalone uploads aren't figure-bound; leave them alone.
+              if (s.name) return s;
+              const bound = s.figKey ? s : migrateLegacySource(s, _docs, _active);
+              const live = list.find((l) => l.key === bound.key);
+              // No match → the owning figure is closed, or is an Untitled whose
+              // session ended. Keep the stale entry: it still carries figKey, so
+              // buildSources reports it as unresolved instead of quietly
+              // reading the active figure.
+              return live ?? bound;
             });
             return { ...n, data: { ...n.data, sources: refreshed } };
           }),
@@ -5802,11 +5979,16 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     // detection + the wb-preview contrast stretch. Standalone uploads resolve
     // by name; builder insets by row/col/inset_index.
     const srcByKey = new Map<string, { key: string; name?: string; row?: number; col?: number; inset_index?: number }>();
+    // Binding key → the sidecar's `inputs` key. They are NOT the same string:
+    // the binding key namespaces by figure (and embeds a path), the runtime key
+    // stays bare for the active figure. See runtimeKeyFor.
+    const runByKey = new Map<string, string>();
     const addSrc = (s: InsetSource) => {
       if (srcByKey.has(s.key)) return;
+      if (s.runKey) runByKey.set(s.key, s.runKey);
       srcByKey.set(s.key, s.name
         ? { key: s.key, name: s.name }
-        : { key: s.key, row: s.row, col: s.col, inset_index: s.inset_index });
+        : { key: rawKeyOf(s), row: s.row, col: s.col, inset_index: s.inset_index });
     };
     for (const s of insetSources) addSrc(s);
     for (const n of nodes) {
@@ -5824,7 +6006,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       const baseLbl = (x.label || "").split("/").pop() || x.label || "image";
       labelCounts.set(baseLbl, (labelCounts.get(baseLbl) || 0) + 1);
       const skey = x.key.startsWith("inset_") ? x.key.split("_").slice(2).join("_") : "";
-      const idKey = skey || x.key;
+      const idKey = (skey && runByKey.get(skey)) || skey || x.key;
       built.push({ id: idKey, label: baseLbl, image_b64: x.image_b64 || "", source: skey ? srcByKey.get(skey) : undefined });
     }
     const counters = new Map<string, number>();
@@ -5985,14 +6167,21 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     // CONNECTED sources directly (not edges) so newly-auto-wired insets
     // also resolve correctly even before React rerenders.
     const srcByKey = new Map<string, FluorImageSource>();
+    // Binding key → the sidecar's `inputs` key; see runtimeKeyFor for why the
+    // two differ.
+    const runByKey = new Map<string, string>();
     for (const srcId of connectedSourceIds) {
       const srcNode = nm.get(srcId);
       if (!srcNode || srcNode.data.kind !== "source") continue;
       for (const src of (srcNode.data.sources || [])) {
         // The descriptor mirrors the wb-preview / wb-detect-bands shape so
-        // the backend's _extract_source_image can re-extract full-res.
+        // the backend's _extract_source_image can re-extract full-res. It gets
+        // the RAW key: _extract_source_image routes on the "_panel"/"_area<N>"
+        // suffix, which the raw key carries and the binding key's path prefix
+        // would only get in the way of.
+        if (src.runKey) runByKey.set(src.key, src.runKey);
         srcByKey.set(src.key, {
-          key: src.key,
+          key: rawKeyOf(src),
           row: (src as { row?: number }).row,
           col: (src as { col?: number }).col,
           inset_index: (src as { inset_index?: number }).inset_index,
@@ -6026,7 +6215,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       // of the round-trip.  Get this wrong and `img2group.get(key)`
       // misses every assignment at runtime — exactly the bug
       // 0.1.330's first cut hit.
-      const idKey = skey || x.key;
+      // The strip alone is no longer enough: the binding key namespaces by
+      // figure, while the runner keys `inputs` by the runtime key (bare for the
+      // active figure). Prefer the source's recorded runKey.
+      const idKey = (skey && runByKey.get(skey)) || skey || x.key;
       pickerImages.push({ id: idKey, label: baseLbl, image_b64: x.image_b64 || "", source });
     }
     // Second pass: when a label is shared by 2+ entries, suffix every
@@ -6197,18 +6389,37 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
             }
           }
           if (!src) return null;
+          if (src.name) {
+            // Standalone upload — belongs to no figure; the backend resolves
+            // the whole image by name.
+            return { key: src.key, row: src.row, col: src.col, inset_index: src.inset_index,
+                     label: displayName(src, sourceNameOverrides), name: src.name };
+          }
+          // Resolve the source to the figure it was ATTACHED from, by stable
+          // identity. A source from a non-active figure carries that figure's
+          // doc id + project path so the backend extracts pixels from THAT
+          // figure (the stashed live state by doc id, or the .mpf on disk).
+          // Active-figure sources send nothing → backend uses the live figure
+          // (single-MPF behaviour unchanged).
+          const owner = src.figKey
+            ? openDocs.find((d) => figKey(d) === src.figKey)
+            : openDocs.find((d) => d.id === src.mpfId);
           const base: { key: string; row: number; col: number; inset_index: number; label: string; name?: string; project_path?: string; mpf_doc_id?: string } =
-            { key: insetKey, row: src.row, col: src.col, inset_index: src.inset_index, label: displayName(src, sourceNameOverrides) };
-          if (src.name) base.name = src.name;  // standalone whole-image source
-          // Per-MPF (Task #32 Part B): a source from a NON-active figure
-          // carries its own doc id + project path so the backend extracts
-          // pixels from THAT figure (the stashed live state by doc id, or
-          // the .mpf on disk), not the active doc.  Active-doc sources send
-          // nothing → backend uses the live figure (single-MPF unchanged).
-          if (src.mpfId && src.mpfId !== "__active__" && src.mpfId !== activeDocId) {
-            base.mpf_doc_id = src.mpfId;
-            const p = openDocs.find((d) => d.id === src.mpfId)?.path;
-            if (p) base.project_path = p;
+            { key: runtimeKeyFor(src, owner?.id, activeDocId), row: src.row, col: src.col,
+              inset_index: src.inset_index, label: displayName(src, sourceNameOverrides) };
+          if (!owner) {
+            // The figure this source came from is closed (or was an Untitled
+            // whose session ended). Refuse the run: every fallback from here
+            // reads the ACTIVE figure's pixels under the original figure's
+            // label, which is silently wrong output rather than an error.
+            throw new Error(
+              `"${displayName(src, sourceNameOverrides)}" comes from ${src.mpf || "a figure"}, which is not open. `
+              + `Re-open that figure, or drag the source in again from a figure that is open.`,
+            );
+          }
+          if (owner.id !== activeDocId) {
+            base.mpf_doc_id = owner.id;
+            if (owner.path) base.project_path = owner.path;
           }
           return base;
         })
@@ -6899,6 +7110,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
               numbers referred to. Figure and panel are both draggable onto a
               Source node (its 📋 port then wires to an R / Python node). */}
           {(() => {
+            // Labels, not names: two tabs can share a name, and the folder
+            // header is the only thing telling their measurements apart.
+            const labels = figureLabels(openDocs);
             const folders = openDocs
               .map((d) => {
                 const active = d.id === (activeDocId || "");
@@ -6914,7 +7128,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
               <MeasurementFigureFolder
                 key={`meas_${d.id}`}
                 docId={d.id}
-                docName={d.name}
+                docName={labels[d.id] || d.name}
                 rows={rows}
                 csv={csv}
                 // Expand the figure you're working on; leave the others folded
