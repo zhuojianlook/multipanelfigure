@@ -32,8 +32,18 @@ const mockApi = vi.hoisted(() => ({
   updateResolutions: vi.fn(),
 }));
 
+// `figureStore` imports `checkHealth` / `lastHealthError` as NAMED exports
+// alongside `api` (see figureStore.ts). The mock must expose them at the top
+// level too — otherwise fetchConfig() throws "No checkHealth export is
+// defined on the mock" the moment it hits its sidecar-readiness gate.
+// Default: healthy, so fetchConfig connects on the first attempt instead of
+// grinding through its 45× retry loop.
+const mockCheckHealth = vi.hoisted(() => vi.fn(async () => true));
+
 vi.mock("../api/client", () => ({
   api: mockApi,
+  checkHealth: mockCheckHealth,
+  lastHealthError: "",
   default: vi.fn(),
 }));
 
@@ -246,7 +256,9 @@ describe("API endpoint integration", () => {
 
     await useFigureStore.getState().saveProject("/tmp/test.mpfig");
 
-    expect(mockApi.saveProject).toHaveBeenCalledWith("/tmp/test.mpfig");
+    // saveProject also forwards the Analysis snapshot as a second argument —
+    // null when the Analysis dialog hasn't published one.
+    expect(mockApi.saveProject).toHaveBeenCalledWith("/tmp/test.mpfig", null);
   });
 
   it("loadProject restores config and images", async () => {
