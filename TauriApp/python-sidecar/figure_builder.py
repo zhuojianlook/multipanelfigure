@@ -1538,10 +1538,43 @@ def _add_panel_scale_bars(fig, axes, cfg, rows: int, cols: int,
             bx += pad_ox
             by += pad_oy
 
-            # Draw bar as a filled rectangle
-            bar_rect = Rectangle((bx, by), bar_length_px, bar_height,
-                                 facecolor=sb.bar_color, edgecolor='none')
-            ax.add_patch(bar_rect)
+            # Draw the bar in the chosen style. Every style occupies the SAME
+            # (bx, by, bar_length_px, bar_height) box, so switching style never
+            # moves the bar or changes what it measures.
+            bar_style = getattr(sb, 'bar_style', 'Solid') or 'Solid'
+            if bar_style == 'Outline':
+                # Hollow — reads on bright / busy images without masking pixels.
+                lw = max(0.5, bar_height * 0.22)
+                ax.add_patch(Rectangle((bx, by), bar_length_px, bar_height,
+                                       facecolor='none', edgecolor=sb.bar_color,
+                                       linewidth=lw))
+            elif bar_style == 'I-beam':
+                # Thin rule with end serifs — the extent is unambiguous even
+                # when the bar is only a couple of px thick.
+                rule_h = max(1.0, bar_height * 0.34)
+                ax.add_patch(Rectangle((bx, by + (bar_height - rule_h) / 2.0),
+                                       bar_length_px, rule_h,
+                                       facecolor=sb.bar_color, edgecolor='none'))
+                serif_w = max(1.0, bar_height * 0.34)
+                for sx in (bx, bx + bar_length_px - serif_w):
+                    ax.add_patch(Rectangle((sx, by), serif_w, bar_height,
+                                           facecolor=sb.bar_color, edgecolor='none'))
+            elif bar_style == 'Segmented':
+                # Ruler-style alternating blocks. An even count keeps both ends
+                # filled, so the bar's extent still reads exactly.
+                n_seg = 5
+                seg_w = bar_length_px / float(n_seg)
+                for k in range(n_seg):
+                    if k % 2 == 0:
+                        ax.add_patch(Rectangle((bx + k * seg_w, by), seg_w, bar_height,
+                                               facecolor=sb.bar_color, edgecolor='none'))
+                # A hairline outline keeps the unfilled gaps legible.
+                ax.add_patch(Rectangle((bx, by), bar_length_px, bar_height,
+                                       facecolor='none', edgecolor=sb.bar_color,
+                                       linewidth=max(0.4, bar_height * 0.10)))
+            else:  # "Solid" — the classic filled rectangle
+                ax.add_patch(Rectangle((bx, by), bar_length_px, bar_height,
+                                       facecolor=sb.bar_color, edgecolor='none'))
 
             # Label text — auto-generate if empty, using the selected unit
             label_text = sb.label

@@ -26,8 +26,11 @@ export interface ScaleBarSettings {
   micron_per_pixel: number;
   bar_length_microns: number;
   bar_position: [number, number];
-  bar_height: number;
+  bar_height: number;          // bar THICKNESS in px (UI calls it that)
   bar_color: string;
+  /** How the bar is drawn: "Solid" | "Outline" | "I-beam" | "Segmented".
+   *  Optional for projects saved before it existed — undefined = "Solid". */
+  bar_style?: string;
   label: string;
   font_size: number;
   font_name: string;

@@ -61,6 +61,14 @@ export interface StyledTextEditorProps {
   fontStyle?: string[];
   className?: string;
   style?: CSSProperties;
+  /** Ignore each segment's absolute `font_size` when rendering the editable.
+   *  A FORM field wants one steady, readable size — the number you pick is a
+   *  property of the FIGURE, not of the input box, and letting it drive the
+   *  box makes the field lurch about as you tune the size. In-place canvas
+   *  editors (headers) leave this off so they stay WYSIWYG.
+   *  Super/subscript still render relatively (0.7em) — that's a formatting
+   *  cue, not a size. */
+  ignoreSegmentFontSize?: boolean;
 
   onTextChange: (text: string) => void;
   /** Fired on mousedown BEFORE focus moves. Lets a parent toolbar
@@ -79,6 +87,7 @@ export interface StyledTextEditorProps {
 function segSpanStyle(
   seg: StyledTextSegment,
   fallbackColor?: string,
+  ignoreFontSize = false,
 ): CSSProperties {
   const st = seg.font_style ?? [];
   const bold = st.includes("Bold");
@@ -92,8 +101,10 @@ function segSpanStyle(
   if (strike) deco.push("line-through");
   return {
     color: seg.color || fallbackColor || "inherit",
-    fontSize:
-      sup || sub
+    fontSize: ignoreFontSize
+      // Keep sup/sub RELATIVE to whatever the field's own size is.
+      ? (sup || sub ? "0.7em" : undefined)
+      : sup || sub
         ? seg.font_size
           ? `${seg.font_size * 0.7}px`
           : "0.7em"
@@ -132,6 +143,7 @@ function buildHtml(
   text: string,
   segs: StyledTextSegment[] | undefined,
   defaultColor?: string,
+  ignoreFontSize = false,
 ): string {
   if (text === "") return "";
   const renderPlain = (t: string): string => {
@@ -166,7 +178,7 @@ function buildHtml(
       html += "<br>".repeat(seg.text.length);
       continue;
     }
-    const style = cssObjectToString(segSpanStyle(seg, defaultColor));
+    const style = cssObjectToString(segSpanStyle(seg, defaultColor, ignoreFontSize));
     const parts = seg.text.split("\n").map(escapeHtml).join("<br>");
     html += `<span style="${style}">${parts}</span>`;
   }
@@ -322,6 +334,7 @@ export const StyledTextEditor = forwardRef<
     fontStyle = [],
     className,
     style,
+    ignoreSegmentFontSize = false,
     onTextChange,
     onBeforeAction,
     onSelectionChange,
@@ -339,8 +352,8 @@ export const StyledTextEditor = forwardRef<
   const skipNextSync = useRef(false);
 
   const html = useMemo(
-    () => buildHtml(text, styledSegments, defaultColor),
-    [text, styledSegments, defaultColor],
+    () => buildHtml(text, styledSegments, defaultColor, ignoreSegmentFontSize),
+    [text, styledSegments, defaultColor, ignoreSegmentFontSize],
   );
 
   useLayoutEffect(() => {

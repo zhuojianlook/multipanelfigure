@@ -75,6 +75,7 @@ import {
 import type { Pt as ThickPt, ThicknessReadingData } from "../../utils/thicknessGeometry";
 import { alert as alertDialog, confirmThree } from "../shared/ConfirmDialog";
 import { StyledTextField } from "../shared/StyledTextField";
+import { ColorPickerButton } from "../shared/ColorPickerButton";
 import type {
   PanelInfo,
   LabelSettings,
@@ -4823,15 +4824,41 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 {/* ── Appearance ── */}
                 <Divider />
                 <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary" }}>Appearance</Typography>
+                {/* Thickness (was "Bar height", which read as the bar's
+                    vertical extent on the page rather than how thick the rule
+                    is). A slider beats a number field for something you tune
+                    by eye against the image. */}
+                <AdjustSlider
+                  label="Thickness" value={sb.bar_height} defaultValue={5}
+                  min={1} max={40} step={1} suffix="px"
+                  onChange={(v) => updateLocal({ scale_bar: { ...sb, bar_height: Math.round(v) } })}
+                />
                 <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
-                  <TextField label="Bar height (px)" type="number" value={sb.bar_height}
-                    onChange={(e) => updateLocal({ scale_bar: { ...sb, bar_height: Number(e.target.value) } })}
-                    size="small" sx={{ flex: 1, "& input": { fontSize: "0.75rem" } }} />
+                  <FormControl size="small" sx={{ flex: 1 }}>
+                    <InputLabel sx={{ fontSize: "0.75rem" }}>Style</InputLabel>
+                    <Select
+                      label="Style"
+                      value={sb.bar_style || "Solid"}
+                      onChange={(e) => updateLocal({ scale_bar: { ...sb, bar_style: e.target.value as string } })}
+                      sx={{ fontSize: "0.75rem" }}
+                    >
+                      <MenuItem value="Solid" sx={{ fontSize: "0.75rem" }}>Solid</MenuItem>
+                      <MenuItem value="Outline" sx={{ fontSize: "0.75rem" }}>Outline</MenuItem>
+                      <MenuItem value="I-beam" sx={{ fontSize: "0.75rem" }}>I-beam</MenuItem>
+                      <MenuItem value="Segmented" sx={{ fontSize: "0.75rem" }}>Segmented</MenuItem>
+                    </Select>
+                  </FormControl>
                   <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-                    <Typography variant="caption" sx={{ fontSize: "0.7rem" }}>Bar color</Typography>
-                    <input type="color" value={sb.bar_color}
-                      onChange={(e) => updateLocal({ scale_bar: { ...sb, bar_color: e.target.value } })}
-                      style={{ width: 32, height: 32, border: "none", padding: 0, cursor: "pointer", borderRadius: 4 }} />
+                    <Typography variant="caption" sx={{ fontSize: "0.7rem" }}>Bar colour</Typography>
+                    {/* The SAME control as the label's colour swatch in the
+                        text hover toolbar — these were visibly different
+                        widgets (native OS panel vs inline palette). */}
+                    <ColorPickerButton
+                      title="Bar colour"
+                      value={sb.bar_color}
+                      align="right"
+                      onChange={(c) => updateLocal({ scale_bar: { ...sb, bar_color: c } })}
+                    />
                   </Box>
                 </Box>
 
@@ -4976,13 +5003,14 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     <ToggleButton value="Cross" title="Cross"><CloseIcon sx={{ fontSize: 16 }} /></ToggleButton>
                     <ToggleButton value="Triangle" title="Triangle">{"\u25B2"}</ToggleButton>
                   </ToggleButtonGroup>
-                  <input
-                    type="color"
-                    value={sym.color}
-                    onChange={(e) => updateSymbol(i, { color: e.target.value })}
-                    title={["Triangle","Star","Rectangle","Ellipse","Cross"].includes(sym.shape) ? "Border / outline color" : "Symbol color"}
-                    style={{ width: 28, height: 28, border: "none", padding: 0, cursor: "pointer", borderRadius: 4, marginLeft: 8, verticalAlign: "middle" }}
-                  />
+                  <Box sx={{ ml: 1, display: "inline-flex", alignItems: "center" }}>
+                    <ColorPickerButton
+                      value={sym.color}
+                      size={28}
+                      onChange={(c) => updateSymbol(i, { color: c })}
+                      title={["Triangle","Star","Rectangle","Ellipse","Cross"].includes(sym.shape) ? "Border / outline colour" : "Symbol colour"}
+                    />
+                  </Box>
                 </Box>
 
                 {/* Width — Arrow / NarrowTriangle only. Scales the symbol's
@@ -5022,11 +5050,13 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                           control={<Checkbox size="small" checked={!!sym.fill_color}
                             onChange={(e) => updateSymbol(i, { fill_color: e.target.checked ? (sym.fill_color || sym.color || "#FF0000") : "" })} />}
                           label={<Typography variant="caption" sx={{ fontSize: "0.72rem" }}>Centre fill</Typography>} />
-                        <input type="color" value={sym.fill_color || sym.color || "#FF0000"}
+                        <ColorPickerButton
+                          value={sym.fill_color || sym.color || "#FF0000"}
+                          size={28}
                           disabled={!sym.fill_color}
-                          onChange={(e) => updateSymbol(i, { fill_color: e.target.value })}
-                          title="Centre fill color"
-                          style={{ width: 28, height: 28, border: "none", padding: 0, cursor: sym.fill_color ? "pointer" : "default", borderRadius: 4, opacity: sym.fill_color ? 1 : 0.4 }} />
+                          onChange={(c) => updateSymbol(i, { fill_color: c })}
+                          title="Centre fill colour"
+                        />
                       </Box>
                     )}
                     {sym.shape !== "Cross" && !!sym.fill_color && (
@@ -5133,11 +5163,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     lines[i] = { ...lines[i], name: e.target.value };
                     updateLocal({ lines } as unknown as Partial<PanelInfo>);
                   }} size="small" sx={{ flex: 1, mr: 1, "& input": { fontSize: "0.7rem", py: 0.5 } }} />
-                  <input type="color" value={line.color} onChange={(e) => {
-                    const lines = [...(local.lines ?? [])];
-                    lines[i] = { ...lines[i], color: e.target.value };
-                    updateLocal({ lines } as unknown as Partial<PanelInfo>);
-                  }} style={{ width: 24, height: 24, border: "none", padding: 0, cursor: "pointer", borderRadius: 4 }} />
+                  <ColorPickerButton
+                    title="Line colour"
+                    value={line.color}
+                    size={24}
+                    onChange={(c) => {
+                      const lines = [...(local.lines ?? [])];
+                      lines[i] = { ...lines[i], color: c };
+                      updateLocal({ lines } as unknown as Partial<PanelInfo>);
+                    }}
+                  />
                   <IconButton size="small" onClick={() => {
                     const lines = (local.lines ?? []).filter((_, idx) => idx !== i);
                     updateLocal({ lines } as unknown as Partial<PanelInfo>);
@@ -5411,11 +5446,17 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     <ToggleButton value="Custom">Custom</ToggleButton>
                     <ToggleButton value="Magic">{"\u2728"} Magic</ToggleButton>
                   </ToggleButtonGroup>
-                  <input type="color" value={area.color?.slice(0, 7) ?? "#FF0000"} onChange={(e) => {
-                    const areas = [...(local.areas ?? [])];
-                    areas[i] = { ...areas[i], color: e.target.value + "40", border_color: e.target.value };
-                    updateLocal({ areas } as unknown as Partial<PanelInfo>);
-                  }} title="Fill color" style={{ width: 28, height: 28, border: "none", padding: 0, cursor: "pointer", borderRadius: 4, flexShrink: 0 }} />
+                  <ColorPickerButton
+                    title="Fill colour"
+                    value={area.color?.slice(0, 7) ?? "#FF0000"}
+                    size={28}
+                    onChange={(c) => {
+                      const areas = [...(local.areas ?? [])];
+                      // Fill keeps its 40 alpha suffix; the border takes the solid hue.
+                      areas[i] = { ...areas[i], color: c + "40", border_color: c };
+                      updateLocal({ areas } as unknown as Partial<PanelInfo>);
+                    }}
+                  />
                 </Box>
 
                 {/* Magic wand: tolerance slider with live re-selection */}
@@ -5743,10 +5784,12 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                           onChange={(e) => applyThickness(i, { name: e.target.value })}
                           sx={{ flex: 1, "& input": { fontSize: "0.75rem" } }}
                         />
-                        <input
-                          type="color" value={tm.color}
-                          onChange={(e) => applyThickness(i, { color: e.target.value, measure_color: e.target.value })}
-                          style={{ width: 32, height: 32, border: "none", padding: 0, cursor: "pointer", borderRadius: 4 }}
+                        <ColorPickerButton
+                          title="Measurement colour"
+                          value={tm.color}
+                          size={28}
+                          align="right"
+                          onChange={(c) => applyThickness(i, { color: c, measure_color: c })}
                         />
                       </Box>
 
@@ -6749,30 +6792,26 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 <Typography variant="caption" sx={{ fontWeight: 600, mt: 2 }}>Styling</Typography>
                 <Divider />
                 <Box sx={{ display: "flex", gap: 1 }}>
-                  <TextField
-                    label="Rect color"
-                    type="color"
-                    value={local.zoom_inset.rectangle_color}
-                    onChange={(e) =>
-                      updateLocal({
-                        zoom_inset: { ...local.zoom_inset!, rectangle_color: e.target.value },
-                      })
-                    }
-                    size="small"
-                    sx={{ width: 80, "& input": { cursor: "pointer", p: 0.5 } }}
-                  />
-                  <TextField
-                    label="Line color"
-                    type="color"
-                    value={local.zoom_inset.line_color}
-                    onChange={(e) =>
-                      updateLocal({
-                        zoom_inset: { ...local.zoom_inset!, line_color: e.target.value },
-                      })
-                    }
-                    size="small"
-                    sx={{ width: 80, "& input": { cursor: "pointer", p: 0.5 } }}
-                  />
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                    <Typography variant="caption" sx={{ fontSize: "0.7rem" }}>Rect</Typography>
+                    <ColorPickerButton
+                      title="Rectangle colour"
+                      value={local.zoom_inset.rectangle_color}
+                      onChange={(c) =>
+                        updateLocal({ zoom_inset: { ...local.zoom_inset!, rectangle_color: c } })
+                      }
+                    />
+                  </Box>
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                    <Typography variant="caption" sx={{ fontSize: "0.7rem" }}>Line</Typography>
+                    <ColorPickerButton
+                      title="Line colour"
+                      value={local.zoom_inset.line_color}
+                      onChange={(c) =>
+                        updateLocal({ zoom_inset: { ...local.zoom_inset!, line_color: c } })
+                      }
+                    />
+                  </Box>
                 </Box>
 
                 <Box sx={{ display: "flex", gap: 1 }}>
@@ -7527,11 +7566,36 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         top: `${(by / ih) * 100}%`,
                         width: `${(barLen / iw) * 100}%`,
                         height: `${(barH / ih) * 100}%`,
-                        bgcolor: sb.bar_color,
                         borderRadius: 0.25,
                         userSelect: "none",
                         pointerEvents: "none",
                         zIndex: 5,
+                        // Mirror the renderers' bar_style so the live overlay
+                        // can't contradict the figure. Same box in every case,
+                        // so switching style never moves the bar.
+                        ...(() => {
+                          const style = sb.bar_style || "Solid";
+                          const c = sb.bar_color;
+                          if (style === "Outline") {
+                            return { border: `${Math.max(1, barH * 0.22)}px solid ${c}`, boxSizing: "border-box" as const };
+                          }
+                          if (style === "I-beam") {
+                            return {
+                              // serifs at both ends + a centred rule
+                              background: `linear-gradient(${c}, ${c}) left / ${Math.max(1, barH * 0.34)}px 100% no-repeat,`
+                                + `linear-gradient(${c}, ${c}) right / ${Math.max(1, barH * 0.34)}px 100% no-repeat,`
+                                + `linear-gradient(${c}, ${c}) center / 100% ${Math.max(1, barH * 0.34)}px no-repeat`,
+                            };
+                          }
+                          if (style === "Segmented") {
+                            return {
+                              background: `repeating-linear-gradient(to right, ${c} 0 20%, transparent 20% 40%)`,
+                              outline: `${Math.max(1, barH * 0.1)}px solid ${c}`,
+                              outlineOffset: "-1px",
+                            };
+                          }
+                          return { backgroundColor: c };
+                        })(),
                       }}
                     >
                       {/* Label — absolutely positioned OFF the bar, so an

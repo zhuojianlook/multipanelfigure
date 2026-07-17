@@ -485,7 +485,34 @@ def draw_scale_bar(image: Image.Image, sb: ScaleBarSettings,
     x = max(0, min(x, iw - bar_length_px - 1))
     y = max(0, min(y, ih - sb.bar_height - 1))
 
-    draw.rectangle([x, y, x + bar_length_px, y + sb.bar_height], fill=sb.bar_color)
+    # Draw the bar in the chosen style. Mirrors figure_builder's matplotlib
+    # branch exactly — same box, same proportions — so the PIL preview and the
+    # rendered figure can't disagree about how the bar looks.
+    _bar_style = getattr(sb, 'bar_style', 'Solid') or 'Solid'
+    _bh = sb.bar_height
+    if _bar_style == 'Outline':
+        _lw = max(1, int(round(_bh * 0.22)))
+        draw.rectangle([x, y, x + bar_length_px, y + _bh],
+                       outline=sb.bar_color, width=_lw)
+    elif _bar_style == 'I-beam':
+        _rule = max(1, int(round(_bh * 0.34)))
+        draw.rectangle([x, y + (_bh - _rule) // 2, x + bar_length_px,
+                        y + (_bh - _rule) // 2 + _rule], fill=sb.bar_color)
+        _serif = max(1, int(round(_bh * 0.34)))
+        draw.rectangle([x, y, x + _serif, y + _bh], fill=sb.bar_color)
+        draw.rectangle([x + bar_length_px - _serif, y, x + bar_length_px, y + _bh],
+                       fill=sb.bar_color)
+    elif _bar_style == 'Segmented':
+        _n = 5
+        _seg = bar_length_px / float(_n)
+        for _k in range(_n):
+            if _k % 2 == 0:
+                draw.rectangle([x + _k * _seg, y, x + (_k + 1) * _seg, y + _bh],
+                               fill=sb.bar_color)
+        draw.rectangle([x, y, x + bar_length_px, y + _bh],
+                       outline=sb.bar_color, width=max(1, int(round(_bh * 0.10))))
+    else:  # "Solid"
+        draw.rectangle([x, y, x + bar_length_px, y + _bh], fill=sb.bar_color)
     # font_size pts on a 3-inch (216pt) panel = font_size * iw / 216 pixels
     scaled_font_size = max(8, int(sb.font_size * iw / 216))
     # Try font_path first, then font_name for lookup

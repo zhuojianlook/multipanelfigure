@@ -42,8 +42,14 @@ class ScaleBarSettings:
     micron_per_pixel: float = 1.0
     bar_length_microns: float = 100.0
     bar_position: Tuple[int, int] = (0, 0)   # (x, y) in pixels
-    bar_height: int = 5
+    bar_height: int = 5                      # bar THICKNESS in px (UI calls it that)
     bar_color: str = "#FFFFFF"
+    # How the bar is drawn:
+    #   "Solid"     — filled rectangle (the classic)
+    #   "Outline"   — hollow rectangle, for busy / bright images
+    #   "I-beam"    — thin rule with end serifs, so the exact extent is unambiguous
+    #   "Segmented" — alternating filled blocks, a ruler-style bar
+    bar_style: str = "Solid"
     label: str = "100 \u03bcm"
     font_size: int = 20
     font_name: str = "arial.ttf"

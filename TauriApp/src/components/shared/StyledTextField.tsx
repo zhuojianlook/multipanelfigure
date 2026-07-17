@@ -52,6 +52,7 @@ import {
   type StyledTextEditorHandle,
   type StyledTextSegment,
 } from "../grid/StyledTextEditor";
+import { ColorPickerButton } from "./ColorPickerButton";
 
 /* ── segment helpers ──────────────────────────────────────────
    The segments array is a string of runs whose concatenated text
@@ -65,15 +66,6 @@ import {
  *  segments aligned.  If segments is empty / null / out-of-sync,
  *  rebuilds a single "default style" segment covering the whole
  *  text. */
-/** Palette for the inline colour picker — figure-annotation staples: a
- *  greyscale ramp plus high-contrast primaries that read well over both
- *  bright-field and fluorescence panels. Anything outside this set is still
- *  reachable via "Custom…" (the OS picker). */
-const COLOR_SWATCHES = [
-  "#FFFFFF", "#C0C0C0", "#808080", "#404040", "#000000", "#FF0000", "#FF6D00", "#FFD600",
-  "#FFFF00", "#00E676", "#00C853", "#00E5FF", "#2979FF", "#0000FF", "#D500F9", "#FF00FF",
-];
-
 export function reconcileSegments(
   text: string,
   segments: StyledTextSegment[] | null | undefined,
@@ -253,7 +245,6 @@ export function StyledTextField({
   // when the ref later attached.
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [containerEl, setContainerEl] = useState<HTMLDivElement | null>(null);
-  const colorInputRef = useRef<HTMLInputElement | null>(null);
   const fieldId = useId();
   const [focused, setFocused] = useState(false);
   // Cached selection range — the toolbar's button mousedown steals
@@ -267,8 +258,6 @@ export function StyledTextField({
   // no MUI Menu / Popover, because their portal-based positioning
   // misbehaves when nested inside our parent <Popper>.
   const [fontMenuOpen, setFontMenuOpen] = useState(false);
-  // Same for the inline colour palette (see COLOR_SWATCHES).
-  const [colorMenuOpen, setColorMenuOpen] = useState(false);
 
   // Keep segments coherent with text — if the parent passes
   // inconsistent data (e.g. only updates text without segments),
@@ -291,7 +280,6 @@ export function StyledTextField({
   useEffect(() => {
     if (!toolbarOpen) {
       setFontMenuOpen(false);
-      setColorMenuOpen(false);
     }
   }, [toolbarOpen]);
 
@@ -412,7 +400,6 @@ export function StyledTextField({
       // it land here as "not outside" (the Paper is inside the
       // toolbar's Popper, which contains the click target).
       setFontMenuOpen(false);
-      setColorMenuOpen(false);
       setHasSel(false);
       cachedSelRef.current = null;
     };
@@ -460,6 +447,12 @@ export function StyledTextField({
           styledSegments={safeSegments}
           defaultColor={defaultColor}
           fontStyle={fontStyle}
+          // The size you pick belongs to the FIGURE, not to this input box —
+          // letting it drive the box made the field lurch about while tuning
+          // the size (and a large size could push the text out of view).
+          // Colour / bold / italic / font still preview here; only the
+          // absolute px size is ignored.
+          ignoreSegmentFontSize
           style={{
             outline: "none",
             fontSize: size === "small" ? "0.8rem" : "0.9rem",
@@ -725,95 +718,16 @@ export function StyledTextField({
             );
           })()}
 
-          {/* Colour — an INLINE palette, not the native <input type="color">.
-              WKWebView (this app's macOS webview) hands a native colour input
-              to the OS NSColorPanel: a free-floating window that opens wherever
-              macOS last left it — frequently nowhere near the app, which is
-              exactly what the user hit. A <Paper> positioned by CSS under the
-              swatch (same trick as the Font dropdown above — MUI's portal
-              widgets mis-position inside our parent <Popper>) opens right where
-              you clicked, every time. "Custom…" still reaches the OS picker for
-              colours outside the palette. */}
-          <Box sx={{ position: "relative", display: "inline-flex", ml: 0.5 }}>
-            <IconButton
+          {/* Colour — the shared ColorPickerButton, the SAME control used for
+              the scale bar / annotation colours, so one concept looks like one
+              thing everywhere. swallowMouseDown keeps our text selection. */}
+          <Box sx={{ ml: 0.5, display: "inline-flex", alignItems: "center" }}>
+            <ColorPickerButton
               title="Colour (selection)"
-              size="small"
-              sx={{ p: 0.25 }}
-              onMouseDown={swallowMouseDown}
-              onClick={() => setColorMenuOpen((v) => !v)}
-            >
-              <Box sx={{
-                width: 14, height: 14, borderRadius: 0.25,
-                border: "1px solid",
-                borderColor: "divider",
-                bgcolor: selStyle?.color || defaultColor,
-              }} />
-            </IconButton>
-            {colorMenuOpen && (
-              <Paper
-                elevation={6}
-                sx={{
-                  position: "absolute", top: "100%", left: 0, mt: 0.25,
-                  p: 0.75, zIndex: 1600,
-                  border: "1px solid", borderColor: "divider",
-                }}
-                onMouseDown={(e) => e.preventDefault()}
-              >
-                <Box sx={{ display: "grid", gridTemplateColumns: "repeat(8, 16px)", gap: 0.375 }}>
-                  {COLOR_SWATCHES.map((c) => {
-                    const selected = (selStyle?.color || "").toLowerCase() === c.toLowerCase();
-                    return (
-                      <Box
-                        key={c}
-                        title={c}
-                        onMouseDown={swallowMouseDown}
-                        onClick={() => { applyPatch({ color: c }); setColorMenuOpen(false); }}
-                        sx={{
-                          width: 16, height: 16, borderRadius: 0.25,
-                          bgcolor: c, cursor: "pointer",
-                          border: "1px solid",
-                          borderColor: selected ? "primary.main" : "divider",
-                          boxShadow: selected ? 2 : 0,
-                          "&:hover": { transform: "scale(1.15)" },
-                          transition: "transform 80ms",
-                        }}
-                      />
-                    );
-                  })}
-                </Box>
-                <Box
-                  onMouseDown={swallowMouseDown}
-                  onClick={() => {
-                    const el = colorInputRef.current as
-                      (HTMLInputElement & { showPicker?: () => void }) | null;
-                    if (!el) return;
-                    setColorMenuOpen(false);
-                    try {
-                      if (typeof el.showPicker === "function") { el.showPicker(); return; }
-                    } catch { /* fall through to .click() below */ }
-                    el.click();
-                  }}
-                  sx={{
-                    mt: 0.75, px: 0.5, py: 0.25, borderRadius: 0.5,
-                    fontSize: "0.65rem", textAlign: "center", cursor: "pointer",
-                    color: "text.secondary",
-                    border: "1px dashed", borderColor: "divider",
-                    "&:hover": { bgcolor: "action.hover" },
-                  }}
-                >
-                  Custom…
-                </Box>
-              </Paper>
-            )}
-            <input
-              ref={colorInputRef}
-              type="color"
               value={selStyle?.color || defaultColor}
-              onChange={(e) => applyPatch({ color: e.target.value })}
-              // Only reachable via "Custom…" now. Kept mounted + 1×1 so
-              // showPicker() has a live, rendered element to open from.
-              tabIndex={-1}
-              style={{ position: "absolute", left: 4, bottom: 0, width: 1, height: 1, opacity: 0, border: "none", padding: 0, pointerEvents: "none" }}
+              size={18}
+              onBeforeOpen={swallowMouseDown}
+              onChange={(c: string) => applyPatch({ color: c })}
             />
           </Box>
 
