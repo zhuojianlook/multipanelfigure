@@ -178,6 +178,59 @@ class AreaAnnotation:
 
 
 # ---------------------------------------------------------------------------
+# Thickness measurement (perpendicular readings between two curved surfaces)
+# ---------------------------------------------------------------------------
+@dataclass
+class ThicknessReading:
+    """One perpendicular thickness reading between the top and bottom
+    surface arcs. Stored RESOLVED (endpoints in %) so the backend can
+    render + measure without re-running the arc geometry (which lives in
+    the frontend). `edited` freezes this reading against regeneration when
+    the user has dragged it manually."""
+    top: Tuple[float, float] = (0.0, 0.0)      # (x%, y%) on the top arc
+    bottom: Tuple[float, float] = (0.0, 0.0)   # (x%, y%) on the bottom arc
+    hidden: bool = False
+    text: str = ""                              # per-reading measure override ("" = auto)
+    edited: bool = False                        # user moved it → keep across regen
+
+
+@dataclass
+class ThicknessMeasurement:
+    """Perpendicular thickness readings between two circular-arc surfaces.
+
+    Each surface is a 3-point circular arc (`top_points` / `bottom_points`,
+    each three (x%, y%) points). `num_readings` samples are placed along the
+    top arc, centred at `center` (0..1 of arc length) and spaced `spacing`
+    (fraction of the top arc's length) apart; each reading runs
+    perpendicular (radial) to the top arc down to the bottom arc.
+
+    The geometry is computed in the frontend and the resolved reading
+    endpoints stored in `readings`; `top_samples` / `bottom_samples` are
+    polyline samples of the two arcs (also frontend-computed) so the backend
+    can draw the guide curves without duplicating the arc math."""
+    name: str = ""
+    top_points: List[Tuple[float, float]] = field(default_factory=list)     # 3 x (x%, y%)
+    bottom_points: List[Tuple[float, float]] = field(default_factory=list)  # 3 x (x%, y%)
+    num_readings: int = 5
+    center: float = 0.5            # 0..1 along the top arc
+    spacing: float = 0.12          # step between readings, fraction of top arc length
+    readings: List[ThicknessReading] = field(default_factory=list)
+    top_samples: List[Tuple[float, float]] = field(default_factory=list)    # arc polyline (x%, y%)
+    bottom_samples: List[Tuple[float, float]] = field(default_factory=list)
+    # Appearance
+    color: str = "#00E5FF"
+    width: float = 2.0
+    show_curves: bool = True       # draw the two guide arcs
+    show_measure: bool = True
+    measure_unit: str = "um"
+    measure_font_size: int = 12
+    measure_color: str = "#00E5FF"
+    measure_font_name: str = "arial.ttf"
+    measure_font_path: Optional[str] = None
+    measure_font_style: List[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # Zoom-inset settings  (3 modes: Standard, Separate Image, Adjacent Panel)
 # ---------------------------------------------------------------------------
 @dataclass
@@ -287,6 +340,7 @@ class PanelInfo:
     symbols: List[SymbolSettings] = field(default_factory=list)
     lines: List[LineAnnotation] = field(default_factory=list)
     areas: List[AreaAnnotation] = field(default_factory=list)
+    thickness_measurements: List[ThicknessMeasurement] = field(default_factory=list)
 
     zoom_inset: Optional[ZoomInsetSettings] = None  # legacy single inset
     add_zoom_inset: bool = False                    # legacy flag
@@ -414,6 +468,7 @@ class PanelSettingsClipboard:
     symbols: List[SymbolSettings] = field(default_factory=list)
     lines: List[LineAnnotation] = field(default_factory=list)
     areas: List[AreaAnnotation] = field(default_factory=list)
+    thickness_measurements: List[ThicknessMeasurement] = field(default_factory=list)
     rotation: float = 0.0
     flip_horizontal: bool = False
     flip_vertical: bool = False
@@ -720,6 +775,11 @@ _FIELD_TYPE_MAP = {
     'measure_styled_segments': ('list', StyledSegment),
     'lines': ('list', LineAnnotation),
     'areas': ('list', AreaAnnotation),
+    'thickness_measurements': ('list', ThicknessMeasurement),
+    # Resolved per-reading endpoints inside a ThicknessMeasurement — without
+    # this the readings load back as plain dicts and the renderer (which does
+    # reading.top / reading.hidden) breaks.
+    'readings': ('list', ThicknessReading),
     'label_font_style': ('plain', None),
     'scale_definitions': ('list', ScaleDefinition),
     'parked_panels': ('list', ParkedPanel),
@@ -802,6 +862,7 @@ def copy_panel_settings(panel: PanelInfo) -> PanelSettingsClipboard:
         symbols=copy.deepcopy(panel.symbols),
         lines=copy.deepcopy(panel.lines),
         areas=copy.deepcopy(panel.areas),
+        thickness_measurements=copy.deepcopy(panel.thickness_measurements),
         rotation=panel.rotation,
         flip_horizontal=panel.flip_horizontal,
         flip_vertical=panel.flip_vertical,
@@ -882,6 +943,7 @@ def paste_panel_settings(panel: PanelInfo, clipboard: PanelSettingsClipboard,
     panel.symbols = copy.deepcopy(clipboard.symbols)
     panel.lines = copy.deepcopy(clipboard.lines)
     panel.areas = copy.deepcopy(clipboard.areas)
+    panel.thickness_measurements = copy.deepcopy(getattr(clipboard, "thickness_measurements", []) or [])
     messages.append("annotations...ok")
 
     return messages

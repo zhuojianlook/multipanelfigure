@@ -821,6 +821,81 @@ def draw_lines(image: Image.Image, lines: List[LineAnnotation],
     return img
 
 
+def draw_thickness_measurements(image: Image.Image, items,
+                                micron_per_pixel: float = 1.0) -> Image.Image:
+    """Draw perpendicular thickness readings between two curved surfaces.
+
+    Each item carries two arc polylines (`top_samples` / `bottom_samples`,
+    in (x%, y%)) drawn as guide curves, and a list of resolved `readings`
+    each running from a point on the top arc to a point on the bottom arc.
+    Geometry is computed in the frontend; here we only draw the stored
+    primitives + the per-reading measurement value (reusing the same
+    pixel-length → physical-unit formula the line annotations use)."""
+    if not items:
+        return image
+    from models import compute_line_length_pixels, UNIT_TO_MICRONS, unit_label
+    img = image.copy()
+    draw = ImageDraw.Draw(img)
+    iw, ih = img.size
+
+    for tm in items:
+        color = getattr(tm, 'color', "#00E5FF")
+        width_scale = max(1.0, iw / 1000.0)
+        font_scale = iw / 216.0
+        width = max(1, int(getattr(tm, 'width', 2.0) * width_scale))
+
+        # 1) Guide arcs (the two surfaces) — drawn from frontend-sampled polylines
+        if getattr(tm, 'show_curves', True):
+            for samples in (getattr(tm, 'top_samples', None), getattr(tm, 'bottom_samples', None)):
+                if samples and len(samples) >= 2:
+                    pts = [(p[0] / 100.0 * iw, p[1] / 100.0 * ih) for p in samples]
+                    draw.line(pts, fill=color, width=width)
+
+        # 2) Per-reading perpendicular segments + measurement labels
+        unit = getattr(tm, 'measure_unit', 'um')
+        show_measure = getattr(tm, 'show_measure', True)
+        m_color = getattr(tm, 'measure_color', color) or color
+        m_font_size = getattr(tm, 'measure_font_size', 12)
+        m_font_name = getattr(tm, 'measure_font_name', 'arial.ttf')
+        m_font_style = getattr(tm, 'measure_font_style', []) or []
+        m_font_path = getattr(tm, 'measure_font_path', None)
+        scaled_font_size = max(8, int(m_font_size * font_scale))
+        font = _load_font(m_font_path, scaled_font_size,
+                          font_name=m_font_name, font_style=m_font_style)
+        cap = max(3.0, 4.0 * width_scale)
+
+        for rd in (getattr(tm, 'readings', None) or []):
+            if getattr(rd, 'hidden', False):
+                continue
+            top = getattr(rd, 'top', None)
+            bottom = getattr(rd, 'bottom', None)
+            if not top or not bottom:
+                continue
+            tx0 = top[0] / 100.0 * iw; ty0 = top[1] / 100.0 * ih
+            bx0 = bottom[0] / 100.0 * iw; by0 = bottom[1] / 100.0 * ih
+            # The perpendicular reading segment.
+            draw.line([(tx0, ty0), (bx0, by0)], fill=color, width=width)
+            # Small end-caps (caliper look) perpendicular to the reading.
+            dx = bx0 - tx0; dy = by0 - ty0
+            seg = math.hypot(dx, dy)
+            if seg > 1e-6:
+                nx = -dy / seg; ny = dx / seg
+                draw.line([(tx0 - nx * cap, ty0 - ny * cap), (tx0 + nx * cap, ty0 + ny * cap)], fill=color, width=width)
+                draw.line([(bx0 - nx * cap, by0 - ny * cap), (bx0 + nx * cap, by0 + ny * cap)], fill=color, width=width)
+            # Measurement value label.
+            if show_measure:
+                text = getattr(rd, 'text', '') or ''
+                if not text:
+                    px_len = compute_line_length_pixels([top, bottom], iw, ih)
+                    len_um = px_len * micron_per_pixel
+                    len_in_unit = len_um / UNIT_TO_MICRONS.get(unit, 1.0)
+                    text = _format_measurement(len_in_unit, unit_label(unit))
+                mx = (tx0 + bx0) / 2; my = (ty0 + by0) / 2
+                draw.text((mx + 4 * font_scale, my - 6 * font_scale), text, fill=m_color, font=font)
+
+    return img
+
+
 def _draw_dashed_line(draw, p1, p2, color, width, pattern):
     """Draw a dashed line between two points."""
     dx = p2[0] - p1[0]; dy = p2[1] - p1[1]
@@ -1797,6 +1872,10 @@ def process_panel(image: Image.Image, panel: PanelInfo,
     # 11) Areas
     if panel.areas and not skip_annotations:
         img = draw_areas(img, panel.areas, micron_per_pixel)
+
+    # 11b) Thickness measurements (perpendicular readings between two arcs)
+    if getattr(panel, 'thickness_measurements', None) and not skip_annotations:
+        img = draw_thickness_measurements(img, panel.thickness_measurements, micron_per_pixel)
 
     # 12) Labels
     if panel.labels and not skip_labels:

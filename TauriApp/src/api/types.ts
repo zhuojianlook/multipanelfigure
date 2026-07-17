@@ -123,6 +123,42 @@ export interface AreaAnnotation {
   include_in_analysis?: boolean;
 }
 
+/** One perpendicular thickness reading between the top and bottom arcs.
+ *  Endpoints are stored RESOLVED (in %) so the backend renders + measures
+ *  without re-running the arc geometry. `edited` freezes the reading against
+ *  regeneration once the user has dragged it. Backend mirror:
+ *  models.ThicknessReading. */
+export interface ThicknessReading {
+  top: [number, number];      // (x%, y%) on the top arc
+  bottom: [number, number];   // (x%, y%) on the bottom arc
+  hidden: boolean;
+  text: string;               // per-reading measure override ("" = auto)
+  edited: boolean;            // user moved it → keep across regen
+}
+
+/** Perpendicular thickness readings between two 3-point circular-arc
+ *  surfaces. Backend mirror: models.ThicknessMeasurement. */
+export interface ThicknessMeasurement {
+  name: string;
+  top_points: [number, number][];     // 3 x (x%, y%) defining the top arc
+  bottom_points: [number, number][];  // 3 x (x%, y%) defining the bottom arc
+  num_readings: number;
+  center: number;             // 0..1 along the top arc
+  spacing: number;            // step between readings, fraction of top arc length
+  readings: ThicknessReading[];
+  top_samples: [number, number][];    // top-arc polyline (x%, y%) for rendering
+  bottom_samples: [number, number][]; // bottom-arc polyline
+  color: string;
+  width: number;
+  show_curves: boolean;       // draw the two guide arcs
+  show_measure: boolean;
+  measure_unit: string;
+  measure_font_size: number;
+  measure_color: string;
+  measure_font_name: string;
+  measure_font_style: string[];
+}
+
 export interface ZoomInsetSettings {
   inset_type: string;
   zoom_factor: number;
@@ -215,6 +251,7 @@ export interface PanelInfo {
   symbols: SymbolSettings[];
   lines: LineAnnotation[];
   areas: AreaAnnotation[];
+  thickness_measurements: ThicknessMeasurement[];
   zoom_inset: ZoomInsetSettings | null;   // legacy single inset (backward compat)
   add_zoom_inset: boolean;                // legacy flag
   zoom_insets: ZoomInsetSettings[];       // NEW: array of zoom insets

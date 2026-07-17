@@ -346,6 +346,7 @@ function defaultPanel(): PanelInfo {
     symbols: [],
     lines: [],
     areas: [],
+    thickness_measurements: [],
     zoom_inset: null,
     add_zoom_inset: false,
     zoom_insets: [],
@@ -738,6 +739,7 @@ export const useFigureStore = create<FigureState>()(
           symbols: [],
           lines: [],
           areas: [],
+          thickness_measurements: [],
           // Both legacy + new zoom-inset shapes.
           zoom_inset: null,
           add_zoom_inset: false,

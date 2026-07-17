@@ -63,6 +63,7 @@ function makeConfig(rows = 2, cols = 3): FigureConfig {
       symbols: [],
       lines: [],
       areas: [],
+      thickness_measurements: [],
       zoom_inset: null,
       add_zoom_inset: false,
       zoom_insets: [],
@@ -716,6 +717,7 @@ describe("New feature: panel lines and areas", () => {
     const cfg = makeConfig(2, 2);
     expect(cfg.panels[0][0].lines).toEqual([]);
     expect(cfg.panels[0][0].areas).toEqual([]);
+    expect(cfg.panels[0][0].thickness_measurements).toEqual([]);
   });
 
   it("updatePanel can add lines", () => {

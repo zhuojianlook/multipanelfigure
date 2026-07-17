@@ -858,7 +858,7 @@ def _apply_zoom_target_self_overlays(cfg, processed, rows, cols):
     already work for zoom targets because they iterate cfg.panels
     directly.
     """
-    from image_processing import draw_zoom_inset, draw_scale_bar, draw_lines, draw_areas
+    from image_processing import draw_zoom_inset, draw_scale_bar, draw_lines, draw_areas, draw_thickness_measurements
     for r in range(rows):
         for c in range(cols):
             panel = cfg.panels[r][c]
@@ -898,6 +898,12 @@ def _apply_zoom_target_self_overlays(cfg, processed, rows, cols):
                     synth = draw_areas(synth, panel.areas, mpp)
                 except Exception as e:
                     import sys; print(f"[zoom-target-overlay] draw_areas failed at ({r},{c}): {e}", file=sys.stderr)
+            # 5. Thickness measurements
+            if getattr(panel, "thickness_measurements", None):
+                try:
+                    synth = draw_thickness_measurements(synth, panel.thickness_measurements, mpp)
+                except Exception as e:
+                    import sys; print(f"[zoom-target-overlay] draw_thickness failed at ({r},{c}): {e}", file=sys.stderr)
             processed[r][c] = synth
 
 
@@ -3078,6 +3084,7 @@ def get_panel_preview(r: int, c: int):
         panel_copy.symbols = []
         panel_copy.lines = []
         panel_copy.areas = []
+        panel_copy.thickness_measurements = []
         processed = process_panel(src_img, panel_copy, min_dims, loaded_images, skip_labels=True, skip_symbols=True)
     elif not panel.image_name:
         # Adjacent-zoom target: synthesise via the cascade path so the
@@ -3146,6 +3153,7 @@ def patch_panel_and_preview(r: int, c: int, body: PanelPatchAndPreview):
         panel_copy.symbols = []
         panel_copy.lines = []
         panel_copy.areas = []
+        panel_copy.thickness_measurements = []
         processed = process_panel(src_img, panel_copy, min_dims, loaded_images, skip_labels=True, skip_symbols=True)
     elif not panel.image_name:
         rows, cols = cfg.rows, cfg.cols
@@ -3575,6 +3583,26 @@ def _collect_measurements():
                     results.append({"panel": label, "name": area.name, "type": "area",
                                     "value": text, "numeric": round(numeric, 4),
                                     "unit": unit_label(unit, squared=True)})
+            # Thickness measurements — one row per visible reading
+            for tm in (getattr(panel, 'thickness_measurements', None) or []):
+                if not getattr(tm, 'show_measure', True):
+                    continue
+                unit = getattr(tm, 'measure_unit', 'um')
+                ulabel = unit_label(unit, squared=False)
+                for ri, rd in enumerate(getattr(tm, 'readings', None) or []):
+                    if getattr(rd, 'hidden', False):
+                        continue
+                    top = getattr(rd, 'top', None); bottom = getattr(rd, 'bottom', None)
+                    if not top or not bottom:
+                        continue
+                    numeric = compute_line_measurement_value([top, bottom], iw, ih, mpp, unit)
+                    text = getattr(rd, 'text', '') or compute_line_measurement(
+                        [top, bottom], iw, ih, mpp, unit)
+                    results.append({"panel": label,
+                                    "name": f"{tm.name or 'Thickness'} #{ri + 1}",
+                                    "type": "thickness",
+                                    "value": text, "numeric": round(numeric, 4),
+                                    "unit": ulabel})
     return results
 
 
@@ -6265,6 +6293,7 @@ def _collect_analysis_insets(include_thumbnails: bool = True):
                 pc.symbols = []
                 pc.lines = []
                 pc.areas = []
+                pc.thickness_measurements = []
                 processed = process_panel(src_img, pc, min_dims, loaded_images,
                                           skip_labels=True, skip_symbols=True)
                 pw, ph = int(processed.size[0]), int(processed.size[1])
@@ -6409,6 +6438,7 @@ def _collect_analysis_insets(include_thumbnails: bool = True):
                                 panel_copy.symbols = []
                                 panel_copy.lines = []
                                 panel_copy.areas = []
+                                panel_copy.thickness_measurements = []
                                 processed = process_panel(src_img, panel_copy, min_dims, loaded_images,
                                                            skip_labels=True, skip_symbols=True)
                                 pw, ph = int(processed.size[0]), int(processed.size[1])
@@ -6460,6 +6490,7 @@ def _collect_analysis_insets(include_thumbnails: bool = True):
                     pc.symbols = []
                     pc.lines = []
                     pc.areas = []
+                    pc.thickness_measurements = []
                     proc = process_panel(src_img, pc, min_dims, loaded_images,
                                          skip_labels=True, skip_symbols=True)
                     panel_processed[(rr, cc)] = proc
@@ -6563,6 +6594,7 @@ def _extract_area_image(row: int, col: int, area_index: int) -> Tuple[Optional[I
     pc.symbols = []
     pc.lines = []
     pc.areas = []
+    pc.thickness_measurements = []
     processed = process_panel(src_img, pc, min_dims, loaded_images,
                               skip_labels=True, skip_symbols=True)
     W, H = processed.size
@@ -6639,7 +6671,7 @@ def _extract_source_image(s: Dict[str, object]) -> Optional[Image.Image]:
         pc = _from_dict(PanelInfo, _to_dict(panel))
         pc.add_zoom_inset = False
         pc.add_scale_bar = False
-        pc.labels = []; pc.symbols = []; pc.lines = []; pc.areas = []
+        pc.labels = []; pc.symbols = []; pc.lines = []; pc.areas = []; pc.thickness_measurements = []
         return process_panel(src_img, pc, min_dims, loaded_images,
                              skip_labels=True, skip_symbols=True)
     if "_area" in key or s.get("inset_type") == "Area":
@@ -6824,6 +6856,7 @@ def _extract_inset_image(row: int, col: int, inset_index: int) -> Optional[Image
     panel_copy.symbols = []
     panel_copy.lines = []
     panel_copy.areas = []
+    panel_copy.thickness_measurements = []
     img = process_panel(src_img, panel_copy, min_dims, loaded_images, skip_labels=True, skip_symbols=True)
     iw, ih = img.size
     x = max(0, min(int(zi.x), iw - 1))
