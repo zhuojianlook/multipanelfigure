@@ -640,10 +640,63 @@ def convert_scale_units(value: float, from_unit: str, to_unit: str) -> float:
     return microns / UNIT_TO_MICRONS.get(to_unit, 1.0)
 
 
-def compute_line_length_pixels(points: List[Tuple[float, float]],
-                                image_width: int, image_height: int) -> float:
-    """Compute the total pixel length of a polyline from percentage coordinates."""
+def effective_line_type(line) -> str:
+    """A line's type, honouring the legacy `is_curved` flag."""
+    lt = getattr(line, 'line_type', None)
+    if lt:
+        return lt
+    return "curved" if getattr(line, 'is_curved', False) else "straight"
+
+
+def _catmull_rom_length_pixels(points: List[Tuple[float, float]],
+                               image_width: int, image_height: int,
+                               samples_per_seg: int = 20) -> float:
+    """Arc length of the Catmull-Rom spline that `_draw_spline` ACTUALLY
+    renders for a curved line.
+
+    Mirrors src/utils/lineMeasure.ts `lineLengthPx` exactly — same basis, same
+    20 samples/segment, same carry of `prev` across segment boundaries (where
+    s=0 of the next segment coincides with s=SAMPLES of the previous, adding a
+    zero-length step rather than double counting)."""
     import math
+    pts = [(p[0] / 100.0 * image_width, p[1] / 100.0 * image_height) for p in points]
+    total = 0.0
+    prev = None
+    for i in range(len(pts) - 1):
+        p0 = pts[max(0, i - 1)]
+        p1 = pts[i]
+        p2 = pts[i + 1]
+        p3 = pts[min(len(pts) - 1, i + 2)]
+        for s in range(samples_per_seg + 1):
+            t = s / float(samples_per_seg)
+            t2 = t * t
+            t3 = t2 * t
+            x = 0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t
+                       + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2
+                       + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3)
+            y = 0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t
+                       + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2
+                       + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3)
+            if prev is not None:
+                total += math.hypot(x - prev[0], y - prev[1])
+            prev = (x, y)
+    return total
+
+
+def compute_line_length_pixels(points: List[Tuple[float, float]],
+                                image_width: int, image_height: int,
+                                line_type: str = "straight") -> float:
+    """Total pixel length of a line from percentage coordinates.
+
+    A "curved" line is DRAWN as a Catmull-Rom spline, so measuring the chords
+    between its control points under-reports it — the figure's label disagreed
+    with the value the dialog showed. Curved lines are now measured along the
+    spline that's actually rendered. Straight / multijointed lines are the
+    chord sum, exactly as before (and `line_type` defaults to "straight", so
+    2-point callers — e.g. the curved-surface readings — are unaffected)."""
+    import math
+    if line_type == "curved" and len(points) >= 3:
+        return _catmull_rom_length_pixels(points, image_width, image_height)
     total = 0.0
     for i in range(len(points) - 1):
         x1 = points[i][0] / 100.0 * image_width
@@ -656,9 +709,10 @@ def compute_line_length_pixels(points: List[Tuple[float, float]],
 
 def compute_line_measurement(points: List[Tuple[float, float]],
                               image_width: int, image_height: int,
-                              micron_per_pixel: float, unit: str) -> str:
+                              micron_per_pixel: float, unit: str,
+                              line_type: str = "straight") -> str:
     """Compute a human-readable measurement string for a line."""
-    px_length = compute_line_length_pixels(points, image_width, image_height)
+    px_length = compute_line_length_pixels(points, image_width, image_height, line_type)
     length_um = px_length * micron_per_pixel
     length_in_unit = length_um / UNIT_TO_MICRONS.get(unit, 1.0)
     unit_labels = {"km": "km", "m": "m", "cm": "cm", "mm": "mm", "um": "\u03bcm", "nm": "nm", "pm": "pm"}
@@ -724,11 +778,12 @@ def unit_label(unit: str, squared: bool = False) -> str:
 
 def compute_line_measurement_value(points: List[Tuple[float, float]],
                                    image_width: int, image_height: int,
-                                   micron_per_pixel: float, unit: str) -> float:
+                                   micron_per_pixel: float, unit: str,
+                                   line_type: str = "straight") -> float:
     """Numeric line length in `unit` (NO label). Companion to
     compute_line_measurement() for callers \u2014 e.g. the Analysis section \u2014
     that need the value and its unit as SEPARATE structured fields."""
-    px_length = compute_line_length_pixels(points, image_width, image_height)
+    px_length = compute_line_length_pixels(points, image_width, image_height, line_type)
     length_um = px_length * micron_per_pixel
     return length_um / UNIT_TO_MICRONS.get(unit, 1.0)
 

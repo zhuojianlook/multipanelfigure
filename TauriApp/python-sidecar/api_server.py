@@ -3554,7 +3554,8 @@ def _collect_measurements():
     embedded inside the display string."""
     from models import (compute_line_measurement, compute_area_measurement,
                          compute_line_measurement_value,
-                         compute_area_measurement_value, unit_label)
+                         compute_area_measurement_value, unit_label,
+                         effective_line_type)
     results = []
     for r in range(cfg.rows):
         for c in range(cfg.cols):
@@ -3575,9 +3576,10 @@ def _collect_measurements():
             for line in (panel.lines or []):
                 if getattr(line, 'measure_in_analysis', True) and len(line.points) >= 2:
                     unit = getattr(line, 'measure_unit', 'um')
-                    numeric = compute_line_measurement_value(line.points, iw, ih, mpp, unit)
+                    lt = effective_line_type(line)
+                    numeric = compute_line_measurement_value(line.points, iw, ih, mpp, unit, lt)
                     text = line.measure_text or compute_line_measurement(
-                        line.points, iw, ih, mpp, unit)
+                        line.points, iw, ih, mpp, unit, lt)
                     results.append({"panel": label, "name": line.name, "type": "line",
                                     "value": text, "numeric": round(numeric, 4),
                                     "unit": unit_label(unit, squared=False)})

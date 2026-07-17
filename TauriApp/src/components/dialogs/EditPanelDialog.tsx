@@ -8402,16 +8402,30 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                               const [bx, by] = toVb(rd.bottom);
                               const val = readingValue(rd as ThicknessReadingData, vbW, vbH, mppT, uT);
                               const label = rd.text || `${val.toFixed(1)} ${uLab[uT] || uT}`;
-                              // Label: dragged position, else pushed off the
-                              // line along its own perpendicular (mirrors the
-                              // backend's placement).
-                              const dx = bx - tx, dy = by - ty;
+                              // Label: dragged position, else pushed out along
+                              // the reading's OWN axis, past its top end.
+                              // Offsetting perpendicular (the obvious choice)
+                              // collides badly: readings are near-parallel and
+                              // side-by-side, so "perpendicular" shoves every
+                              // label into its neighbour. Along-axis fans them
+                              // out over the arc and keeps each label sitting
+                              // on its own tick. Mirrors the backend.
+                              const dx = tx - bx, dy = ty - by;       // bottom → top
                               const seg = Math.hypot(dx, dy) || 1;
-                              const nx = -dy / seg, ny = dx / seg;
-                              const off = (tm.label_offset ?? 14) * (vbW / 216) / 12 * Math.max(1, vbW / 216);
+                              const ux = dx / seg, uy = dy / seg;
+                              // Stagger alternate labels one LINE further out.
+                              // Readings are usually closer together than a
+                              // label is wide (5 readings at 12% spacing is the
+                              // DEFAULT and collided), so two rows let
+                              // neighbours pass each other. The step is a line
+                              // height, not a magic multiplier: anything
+                              // smaller than the text just merges the rows back
+                              // together. Mirrors the backend.
+                              const off = (tm.label_offset ?? 14) * (vbW / 216) / 12 * Math.max(1, vbW / 216)
+                                + (ri % 2) * fs * 1.25;
                               const hasPos = (rd.measure_position_x ?? -1) >= 0 && (rd.measure_position_y ?? -1) >= 0;
-                              const lx = hasPos ? (rd.measure_position_x! / 100) * vbW : (tx + bx) / 2 + nx * off;
-                              const ly = hasPos ? (rd.measure_position_y! / 100) * vbH : (ty + by) / 2 + ny * off;
+                              const lx = hasPos ? (rd.measure_position_x! / 100) * vbW : tx + ux * off;
+                              const ly = hasPos ? (rd.measure_position_y! / 100) * vbH : ty + uy * off;
                               return (
                                 <g key={`rd-ov-${ri}`}>
                                   <line x1={tx} y1={ty} x2={bx} y2={by} stroke={tm.color} strokeWidth={strokeW} />

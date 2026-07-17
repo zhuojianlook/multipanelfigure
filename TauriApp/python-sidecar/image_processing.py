@@ -804,8 +804,10 @@ def draw_lines(image: Image.Image, lines: List[LineAnnotation],
             if not text:
                 unit = getattr(line, 'measure_unit', 'um')
                 # Use adaptive precision formatting
-                from models import compute_line_length_pixels, UNIT_TO_MICRONS
-                px_len = compute_line_length_pixels(line.points, iw, ih)
+                from models import (compute_line_length_pixels, UNIT_TO_MICRONS,
+                                    effective_line_type)
+                px_len = compute_line_length_pixels(line.points, iw, ih,
+                                                    effective_line_type(line))
                 len_um = px_len * micron_per_pixel
                 len_in_unit = len_um / UNIT_TO_MICRONS.get(unit, 1.0)
                 unit_labels = {"km": "km", "m": "m", "cm": "cm", "mm": "mm", "um": "\u03bcm", "nm": "nm", "pm": "pm"}
@@ -906,7 +908,7 @@ def draw_thickness_measurements(image: Image.Image, items,
                           font_name=m_font_name, font_style=m_font_style)
         cap = max(3.0, 4.0 * width_scale)
 
-        for rd in (getattr(tm, 'readings', None) or []):
+        for _ri, rd in enumerate(getattr(tm, 'readings', None) or []):
             if getattr(rd, 'hidden', False):
                 continue
             top = getattr(rd, 'top', None)
@@ -936,18 +938,32 @@ def draw_thickness_measurements(image: Image.Image, items,
                 text = _format_measurement(len_in_unit, unit_label(unit))
 
             # Label placement: honour a dragged position, else push the value
-            # clear of the line it measures — along the reading's own
-            # perpendicular, so ticks stay legible even when densely packed.
+            # out along the reading's OWN axis, past its top end.
+            # Offsetting perpendicular (the obvious choice) collides badly:
+            # readings are near-parallel and side-by-side, so "perpendicular"
+            # shoves every label into its neighbour — at 5 readings they
+            # rendered as one illegible pile. Along-axis fans them out over the
+            # arc and keeps each label on its own tick. Mirrors the overlay.
             lpos_x = getattr(rd, 'measure_position_x', -1)
             lpos_y = getattr(rd, 'measure_position_y', -1)
             if lpos_x is not None and lpos_y is not None and lpos_x >= 0 and lpos_y >= 0:
                 tx = int(lpos_x / 100.0 * iw)
                 ty = int(lpos_y / 100.0 * ih)
             else:
-                mx = (tx0 + bx0) / 2; my = (ty0 + by0) / 2
-                off = label_offset * font_scale / 12.0 * max(1.0, font_scale)
-                tx = int(mx + nx * off)
-                ty = int(my + ny * off)
+                # Stagger alternate labels one LINE further out — readings are
+                # usually closer together than a label is wide (5 readings at
+                # 12% spacing is the DEFAULT and collided), so two rows let
+                # neighbours pass each other. The step is a line height, not a
+                # magic multiplier: anything smaller than the text just merges
+                # the rows back together. Mirrors the overlay.
+                off = (label_offset * font_scale / 12.0 * max(1.0, font_scale)
+                       + (_ri % 2) * scaled_font_size * 1.25)
+                if seg > 1e-6:
+                    ux = (tx0 - bx0) / seg; uy = (ty0 - by0) / seg   # bottom → top
+                else:
+                    ux, uy = 0.0, -1.0
+                tx = int(tx0 + ux * off)
+                ty = int(ty0 + uy * off)
             # Centre the text on its anchor so the offset reads symmetrically.
             try:
                 bbox = draw.textbbox((0, 0), text, font=font)
