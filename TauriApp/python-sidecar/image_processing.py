@@ -146,6 +146,55 @@ def _truetype_with_symbol_fallback(path: str, size: int) -> ImageFont.FreeTypeFo
     return ImageFont.truetype(path, size)
 
 
+def _text_size(draw, text: str, font) -> tuple:
+    """(width, height) of `text` in `font`, 0x0 if it can't be measured."""
+    try:
+        b = draw.textbbox((0, 0), text, font=font)
+        return (b[2] - b[0], b[3] - b[1])
+    except Exception:
+        return (0, 0)
+
+
+def _clamp_text_pos(draw, text: str, font, tx: float, ty: float,
+                    iw: int, ih: int, pad: int = 2) -> tuple:
+    """Clamp a draw.text() anchor so the rendered glyphs stay on the image.
+
+    Measurement labels are positioned by offsetting off the thing they measure
+    — perpendicular to a line, or out along a reading's axis, with alternate
+    readings staggered a further line out. Near an edge those offsets push the
+    text off the panel, where it is cropped or spills into the neighbouring
+    cell.
+
+    NOTE the anchor is NOT the ink's top-left: textbbox((0,0)) reports offsets
+    (x0, y0) that are routinely non-zero (side bearing / ascent), so text drawn
+    at `tx` actually inks from `tx + x0`. Clamping on width alone leaves the
+    label hanging off by exactly that offset — measured, not assumed."""
+    try:
+        x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=font)
+    except Exception:
+        return (int(tx), int(ty))
+    lo_x, hi_x = pad - x0, iw - pad - x1
+    lo_y, hi_y = pad - y0, ih - pad - y1
+    # If the text is wider/taller than the panel, prefer pinning to the
+    # left/top edge over centring it off-screen.
+    if hi_x < lo_x:
+        hi_x = lo_x
+    if hi_y < lo_y:
+        hi_y = lo_y
+    return (int(max(lo_x, min(tx, hi_x))), int(max(lo_y, min(ty, hi_y))))
+
+
+def _clamp_label_xy(tx: float, ty: float, tw: int, th: int,
+                    iw: int, ih: int, pad: int = 2) -> tuple:
+    """Box-based clamp for callers that already know the run's size (styled
+    text, whose width comes from _measure_styled_pil_text rather than a bbox)."""
+    if tw <= 0 or th <= 0:
+        return (int(tx), int(ty))
+    max_x = max(pad, iw - tw - pad)
+    max_y = max(pad, ih - th - pad)
+    return (int(max(pad, min(tx, max_x))), int(max(pad, min(ty, max_y))))
+
+
 def _load_font(font_path: Optional[str], size: int, font_name: Optional[str] = None,
                font_style: Optional[List[str]] = None) -> ImageFont.FreeTypeFont:
     """Load a font with optional bold/italic variant resolution."""
@@ -839,6 +888,9 @@ def draw_lines(image: Image.Image, lines: List[LineAnnotation],
             else:
                 tx = int(mx) + int(5 * font_scale)
                 ty = int(my) - int(15 * font_scale)
+            # Keep the label on the image (a line near the top edge would
+            # otherwise push its value off the panel).
+            tx, ty = _clamp_text_pos(draw, text, font, tx, ty, iw, ih)
             line_segments = getattr(line, 'measure_styled_segments', None) or []
             if line_segments:
                 _draw_styled_pil_text(
@@ -970,13 +1022,13 @@ def draw_thickness_measurements(image: Image.Image, items,
                     ux, uy = 0.0, -1.0
                 tx = int(tx0 + ux * off)
                 ty = int(ty0 + uy * off)
-            # Centre the text on its anchor so the offset reads symmetrically.
-            try:
-                bbox = draw.textbbox((0, 0), text, font=font)
-                tw = bbox[2] - bbox[0]; th = bbox[3] - bbox[1]
-            except Exception:
-                tw = th = 0
+            # Centre the text on its anchor so the offset reads symmetrically,
+            # then keep the whole box on the image — the along-axis offset plus
+            # the alternate-row stagger will otherwise throw a label for a
+            # reading near the edge clean off the panel.
+            tw, th = _text_size(draw, text, font)
             tx -= tw // 2; ty -= th // 2
+            tx, ty = _clamp_text_pos(draw, text, font, tx, ty, iw, ih)
 
             segs = getattr(rd, 'styled_segments', None) or []
             if segs:
@@ -1157,8 +1209,14 @@ def draw_areas(image: Image.Image, areas: List[AreaAnnotation],
                     cy -= th / 2
                 except Exception:
                     pass
+                # Keep the whole run on the image.
+                try:
+                    _th = font.getbbox("Ay")[3] - font.getbbox("Ay")[1]
+                except Exception:
+                    _th = scaled_font_size
+                _cx, _cy = _clamp_label_xy(cx, cy, int(tw), int(_th), iw, ih)
                 _draw_styled_pil_text(
-                    draw, (int(cx), int(cy)), area_segments,
+                    draw, (_cx, _cy), area_segments,
                     base_font_name=area_font_name,
                     base_font_path=getattr(area, 'measure_font_path', None),
                     base_size_px=scaled_font_size,
@@ -1167,12 +1225,11 @@ def draw_areas(image: Image.Image, areas: List[AreaAnnotation],
                     base_style=area_font_style,
                 )
             else:
-                try:
-                    bbox = font.getbbox(text)
-                    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                    cx -= tw / 2; cy -= th / 2
-                except Exception:
-                    pass
+                tw, th = _text_size(draw, text, font)
+                cx -= tw / 2; cy -= th / 2
+                # Keep the label on the image — an area whose centroid sits near
+                # an edge would otherwise push its value off the panel.
+                cx, cy = _clamp_text_pos(draw, text, font, cx, cy, iw, ih)
                 draw.text((int(cx), int(cy)), text, fill=area.measure_color, font=font)
 
     return img.convert("RGB")

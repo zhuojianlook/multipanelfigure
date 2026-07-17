@@ -8516,8 +8516,26 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                               const off = (tm.label_offset ?? 14) * (vbW / 216) / 12 * Math.max(1, vbW / 216)
                                 + (ri % 2) * fs * 1.25;
                               const hasPos = (rd.measure_position_x ?? -1) >= 0 && (rd.measure_position_y ?? -1) >= 0;
-                              const lx = hasPos ? (rd.measure_position_x! / 100) * vbW : tx + ux * off;
-                              const ly = hasPos ? (rd.measure_position_y! / 100) * vbH : ty + uy * off;
+                              // Keep the value on the image, matching the
+                              // backend's clamp — the along-axis offset plus the
+                              // alternate-row stagger throws a label for a
+                              // reading near the edge clean off the panel.
+                              // textAnchor is middle / baseline middle, so the
+                              // half-extents are what must stay inside.
+                              const halfW = Math.max(1, label.length * fs * 0.3);
+                              const halfH = fs * 0.6;
+                              const clamp = (v: number, half: number, max: number) =>
+                                Math.max(half, Math.min(v, max - half));
+                              // Clamp the DRAGGED position too, not just the
+                              // auto one — the backend clamps both, so leaving
+                              // this unclamped would show a label hanging off
+                              // the panel here and snapped back in the figure.
+                              const lx = clamp(
+                                hasPos ? (rd.measure_position_x! / 100) * vbW : tx + ux * off,
+                                halfW, vbW);
+                              const ly = clamp(
+                                hasPos ? (rd.measure_position_y! / 100) * vbH : ty + uy * off,
+                                halfH, vbH);
                               return (
                                 <g key={`rd-ov-${ri}`}>
                                   <line x1={tx} y1={ty} x2={bx} y2={by} stroke={tm.color} strokeWidth={strokeW} />
