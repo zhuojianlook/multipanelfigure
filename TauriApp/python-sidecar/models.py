@@ -182,27 +182,35 @@ class AreaAnnotation:
 # ---------------------------------------------------------------------------
 @dataclass
 class ThicknessReading:
-    """One perpendicular thickness reading between the top and bottom
-    surface arcs. Stored RESOLVED (endpoints in %) so the backend can
-    render + measure without re-running the arc geometry (which lives in
-    the frontend). `edited` freezes this reading against regeneration when
-    the user has dragged it manually."""
+    """One thickness reading between the top and bottom surface arcs.
+    Stored RESOLVED (endpoints in %) so the backend can render + measure
+    without re-running the arc geometry (which lives in the frontend).
+    `edited` freezes this reading against regeneration when the user has
+    dragged it manually."""
     top: Tuple[float, float] = (0.0, 0.0)      # (x%, y%) on the top arc
     bottom: Tuple[float, float] = (0.0, 0.0)   # (x%, y%) on the bottom arc
     hidden: bool = False
     text: str = ""                              # per-reading measure override ("" = auto)
     edited: bool = False                        # user moved it → keep across regen
+    # Value label placement + rich text, mirroring LineAnnotation's measure_*
+    # fields so readings behave like line measurements (draggable, styleable).
+    measure_position_x: float = -1.0            # absolute label pos (% 0-100), -1 = auto
+    measure_position_y: float = -1.0
+    styled_segments: List[StyledSegment] = field(default_factory=list)
 
 
 @dataclass
 class ThicknessMeasurement:
-    """Perpendicular thickness readings between two circular-arc surfaces.
+    """Curved Surface Measurement — thickness readings between two
+    circular-arc surfaces.
 
     Each surface is a 3-point circular arc (`top_points` / `bottom_points`,
-    each three (x%, y%) points). `num_readings` samples are placed along the
-    top arc, centred at `center` (0..1 of arc length) and spaced `spacing`
-    (fraction of the top arc's length) apart; each reading runs
-    perpendicular (radial) to the top arc down to the bottom arc.
+    each three (x%, y%) points). An ODD `num_readings` is placed along the
+    top arc — one exactly on the user's `center` node (0..1 of arc length),
+    the rest spread symmetrically either side, `spacing` apart as a fraction
+    of the top arc's length. Each reading runs from its anchor to the
+    NEAREST point on the bottom arc (minimal distance, perpendicular to the
+    bottom surface at its foot).
 
     The geometry is computed in the frontend and the resolved reading
     endpoints stored in `readings`; `top_samples` / `bottom_samples` are
@@ -211,23 +219,38 @@ class ThicknessMeasurement:
     name: str = ""
     top_points: List[Tuple[float, float]] = field(default_factory=list)     # 3 x (x%, y%)
     bottom_points: List[Tuple[float, float]] = field(default_factory=list)  # 3 x (x%, y%)
-    num_readings: int = 5
-    center: float = 0.5            # 0..1 along the top arc
+    num_readings: int = 5          # always odd — a reading sits on `center`
+    center: float = 0.5            # 0..1 along the top arc (draggable node)
     spacing: float = 0.12          # step between readings, fraction of top arc length
     readings: List[ThicknessReading] = field(default_factory=list)
     top_samples: List[Tuple[float, float]] = field(default_factory=list)    # arc polyline (x%, y%)
     bottom_samples: List[Tuple[float, float]] = field(default_factory=list)
+    # Scale source. "image" → inherit the panel's scale bar (the default, kept
+    # in sync automatically). "custom" → this annotation measures with its OWN
+    # micron_per_pixel, independent of the image bar and of other annotations.
+    scale_mode: str = "image"      # "image" | "custom"
+    micron_per_pixel: float = 1.0  # only consulted when scale_mode == "custom"
     # Appearance
     color: str = "#00E5FF"
-    width: float = 2.0
-    show_curves: bool = True       # draw the two guide arcs
+    width: float = 1.0             # thin by default — these are measurement ticks
+    # Guide arcs are an EDITING aid: the dialog always draws them, but they are
+    # off in the rendered/exported figure unless the user opts in.
+    show_curves: bool = False
     show_measure: bool = True
+    label_offset: float = 14.0     # px (at 216pt ref) to push the value off its line
     measure_unit: str = "um"
     measure_font_size: int = 12
     measure_color: str = "#00E5FF"
     measure_font_name: str = "arial.ttf"
     measure_font_path: Optional[str] = None
     measure_font_style: List[str] = field(default_factory=list)
+
+    def effective_mpp(self, panel_mpp: float) -> float:
+        """Microns-per-pixel this annotation measures with: its own when the
+        user pinned a custom scale, else the panel's image scale bar."""
+        if (self.scale_mode or "image") == "custom":
+            return self.micron_per_pixel
+        return panel_mpp
 
 
 # ---------------------------------------------------------------------------

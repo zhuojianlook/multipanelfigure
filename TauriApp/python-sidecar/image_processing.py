@@ -823,14 +823,19 @@ def draw_lines(image: Image.Image, lines: List[LineAnnotation],
 
 def draw_thickness_measurements(image: Image.Image, items,
                                 micron_per_pixel: float = 1.0) -> Image.Image:
-    """Draw perpendicular thickness readings between two curved surfaces.
+    """Draw Curved Surface Measurement readings between two curved surfaces.
 
-    Each item carries two arc polylines (`top_samples` / `bottom_samples`,
-    in (x%, y%)) drawn as guide curves, and a list of resolved `readings`
-    each running from a point on the top arc to a point on the bottom arc.
-    Geometry is computed in the frontend; here we only draw the stored
-    primitives + the per-reading measurement value (reusing the same
-    pixel-length → physical-unit formula the line annotations use)."""
+    Each item carries two arc polylines (`top_samples` / `bottom_samples`, in
+    (x%, y%)) drawn as optional guide curves, and a list of resolved `readings`
+    each running from an anchor on the top arc to the nearest point on the
+    bottom arc. Geometry is computed in the frontend; here we only draw the
+    stored primitives + each reading's value (reusing the same pixel-length →
+    physical-unit formula the line annotations use).
+
+    `micron_per_pixel` is the PANEL's scale; an item pinned to a custom scale
+    (scale_mode == "custom") measures with its own instead — see
+    ThicknessMeasurement.effective_mpp.
+    """
     if not items:
         return image
     from models import compute_line_length_pixels, UNIT_TO_MICRONS, unit_label
@@ -842,16 +847,25 @@ def draw_thickness_measurements(image: Image.Image, items,
         color = getattr(tm, 'color', "#00E5FF")
         width_scale = max(1.0, iw / 1000.0)
         font_scale = iw / 216.0
-        width = max(1, int(getattr(tm, 'width', 2.0) * width_scale))
+        width = max(1, int(round(getattr(tm, 'width', 1.0) * width_scale)))
 
-        # 1) Guide arcs (the two surfaces) — drawn from frontend-sampled polylines
-        if getattr(tm, 'show_curves', True):
+        # Scale: the annotation's own when pinned custom, else the panel's.
+        eff_mpp = micron_per_pixel
+        try:
+            eff_mpp = tm.effective_mpp(micron_per_pixel)
+        except Exception:
+            if (getattr(tm, 'scale_mode', 'image') or 'image') == 'custom':
+                eff_mpp = getattr(tm, 'micron_per_pixel', micron_per_pixel)
+
+        # 1) Guide arcs — OFF by default in the rendered figure. They exist to
+        #    trace the surfaces while editing; the dialog always shows them.
+        if getattr(tm, 'show_curves', False):
             for samples in (getattr(tm, 'top_samples', None), getattr(tm, 'bottom_samples', None)):
                 if samples and len(samples) >= 2:
                     pts = [(p[0] / 100.0 * iw, p[1] / 100.0 * ih) for p in samples]
                     draw.line(pts, fill=color, width=width)
 
-        # 2) Per-reading perpendicular segments + measurement labels
+        # 2) Per-reading segments + value labels
         unit = getattr(tm, 'measure_unit', 'um')
         show_measure = getattr(tm, 'show_measure', True)
         m_color = getattr(tm, 'measure_color', color) or color
@@ -859,6 +873,7 @@ def draw_thickness_measurements(image: Image.Image, items,
         m_font_name = getattr(tm, 'measure_font_name', 'arial.ttf')
         m_font_style = getattr(tm, 'measure_font_style', []) or []
         m_font_path = getattr(tm, 'measure_font_path', None)
+        label_offset = getattr(tm, 'label_offset', 14.0)
         scaled_font_size = max(8, int(m_font_size * font_scale))
         font = _load_font(m_font_path, scaled_font_size,
                           font_name=m_font_name, font_style=m_font_style)
@@ -873,25 +888,60 @@ def draw_thickness_measurements(image: Image.Image, items,
                 continue
             tx0 = top[0] / 100.0 * iw; ty0 = top[1] / 100.0 * ih
             bx0 = bottom[0] / 100.0 * iw; by0 = bottom[1] / 100.0 * ih
-            # The perpendicular reading segment.
             draw.line([(tx0, ty0), (bx0, by0)], fill=color, width=width)
             # Small end-caps (caliper look) perpendicular to the reading.
             dx = bx0 - tx0; dy = by0 - ty0
             seg = math.hypot(dx, dy)
+            nx = ny = 0.0
             if seg > 1e-6:
                 nx = -dy / seg; ny = dx / seg
                 draw.line([(tx0 - nx * cap, ty0 - ny * cap), (tx0 + nx * cap, ty0 + ny * cap)], fill=color, width=width)
                 draw.line([(bx0 - nx * cap, by0 - ny * cap), (bx0 + nx * cap, by0 + ny * cap)], fill=color, width=width)
-            # Measurement value label.
-            if show_measure:
-                text = getattr(rd, 'text', '') or ''
-                if not text:
-                    px_len = compute_line_length_pixels([top, bottom], iw, ih)
-                    len_um = px_len * micron_per_pixel
-                    len_in_unit = len_um / UNIT_TO_MICRONS.get(unit, 1.0)
-                    text = _format_measurement(len_in_unit, unit_label(unit))
+
+            if not show_measure:
+                continue
+
+            text = getattr(rd, 'text', '') or ''
+            if not text:
+                px_len = compute_line_length_pixels([top, bottom], iw, ih)
+                len_um = px_len * eff_mpp
+                len_in_unit = len_um / UNIT_TO_MICRONS.get(unit, 1.0)
+                text = _format_measurement(len_in_unit, unit_label(unit))
+
+            # Label placement: honour a dragged position, else push the value
+            # clear of the line it measures — along the reading's own
+            # perpendicular, so ticks stay legible even when densely packed.
+            lpos_x = getattr(rd, 'measure_position_x', -1)
+            lpos_y = getattr(rd, 'measure_position_y', -1)
+            if lpos_x is not None and lpos_y is not None and lpos_x >= 0 and lpos_y >= 0:
+                tx = int(lpos_x / 100.0 * iw)
+                ty = int(lpos_y / 100.0 * ih)
+            else:
                 mx = (tx0 + bx0) / 2; my = (ty0 + by0) / 2
-                draw.text((mx + 4 * font_scale, my - 6 * font_scale), text, fill=m_color, font=font)
+                off = label_offset * font_scale / 12.0 * max(1.0, font_scale)
+                tx = int(mx + nx * off)
+                ty = int(my + ny * off)
+            # Centre the text on its anchor so the offset reads symmetrically.
+            try:
+                bbox = draw.textbbox((0, 0), text, font=font)
+                tw = bbox[2] - bbox[0]; th = bbox[3] - bbox[1]
+            except Exception:
+                tw = th = 0
+            tx -= tw // 2; ty -= th // 2
+
+            segs = getattr(rd, 'styled_segments', None) or []
+            if segs:
+                _draw_styled_pil_text(
+                    draw, (tx, ty), segs,
+                    base_font_name=m_font_name,
+                    base_font_path=m_font_path,
+                    base_size_px=scaled_font_size,
+                    base_size_pt=m_font_size,
+                    base_color=m_color,
+                    base_style=m_font_style,
+                )
+            else:
+                draw.text((tx, ty), text, fill=m_color, font=font)
 
     return img
 

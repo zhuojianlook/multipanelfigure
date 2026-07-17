@@ -134,24 +134,35 @@ export interface ThicknessReading {
   hidden: boolean;
   text: string;               // per-reading measure override ("" = auto)
   edited: boolean;            // user moved it → keep across regen
+  /** Absolute label position (% 0-100), -1 = auto. Mirrors LineAnnotation. */
+  measure_position_x?: number;
+  measure_position_y?: number;
+  /** Per-reading rich text from the hover toolbar. */
+  styled_segments?: StyledSegment[];
 }
 
-/** Perpendicular thickness readings between two 3-point circular-arc
- *  surfaces. Backend mirror: models.ThicknessMeasurement. */
+/** Curved Surface Measurement — thickness readings between two 3-point
+ *  circular-arc surfaces. Backend mirror: models.ThicknessMeasurement. */
 export interface ThicknessMeasurement {
   name: string;
   top_points: [number, number][];     // 3 x (x%, y%) defining the top arc
   bottom_points: [number, number][];  // 3 x (x%, y%) defining the bottom arc
-  num_readings: number;
-  center: number;             // 0..1 along the top arc
+  num_readings: number;       // always odd — a reading sits on `center`
+  center: number;             // 0..1 along the top arc (draggable node)
   spacing: number;            // step between readings, fraction of top arc length
   readings: ThicknessReading[];
   top_samples: [number, number][];    // top-arc polyline (x%, y%) for rendering
   bottom_samples: [number, number][]; // bottom-arc polyline
+  /** "image" → follow the panel's scale bar. "custom" → measure with this
+   *  annotation's own micron_per_pixel, independent of the image bar and of
+   *  every other annotation. */
+  scale_mode: "image" | "custom";
+  micron_per_pixel: number;   // only used when scale_mode === "custom"
   color: string;
   width: number;
-  show_curves: boolean;       // draw the two guide arcs
+  show_curves: boolean;       // guide arcs in the RENDERED figure (dialog always shows them)
   show_measure: boolean;
+  label_offset: number;       // px (at 216pt ref) pushing the value off its line
   measure_unit: string;
   measure_font_size: number;
   measure_color: string;

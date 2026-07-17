@@ -1,11 +1,19 @@
 /* ──────────────────────────────────────────────────────────
-   thicknessGeometry — geometry for the Thickness Measurement
-   annotation (perpendicular readings between two curved surfaces).
+   thicknessGeometry — geometry for the Curved Surface Measurement
+   annotation (thickness readings between two curved surfaces).
 
-   Each surface is a circular arc through 3 user-clicked points. N
-   readings are placed along the TOP arc (centred at `center`, spaced
-   `spacing` apart by arc length) and each runs perpendicular (radial)
-   to the top arc down to the bottom arc.
+   Each surface is a circular arc through 3 user-clicked points. An odd
+   number of readings is placed along the TOP arc: one exactly on the
+   user's centre node, the rest spread symmetrically either side, spaced
+   `spacing` apart as a fraction of the top arc's length.
+
+   Each reading runs from its anchor on the top arc to the NEAREST point
+   on the bottom arc — the minimal distance, which meets the bottom
+   surface perpendicularly (and meets the top perpendicularly too when
+   the surfaces are roughly parallel, the usual case for a thickness
+   measurement). Anchoring on the top arc is what guarantees a reading
+   sits exactly on the centre node; a true common normal (perpendicular
+   to both by construction) could not honour a user-specified anchor.
 
    IMPORTANT: all geometry runs in PIXEL space (using the panel's actual
    image width/height), because a circle in the anisotropic %-coordinate
@@ -24,6 +32,11 @@ export interface ThicknessReadingData {
   hidden: boolean;
   text: string;
   edited: boolean;
+  /** Absolute label position (x%, y%); -1 = auto (offset off the line). */
+  measure_position_x?: number;
+  measure_position_y?: number;
+  /** Per-reading rich-text runs from the hover toolbar. */
+  styled_segments?: unknown[];
 }
 
 const EPS = 1e-9;
@@ -31,28 +44,27 @@ const EPS = 1e-9;
 const sub = (a: Pt, b: Pt): Pt => [a[0] - b[0], a[1] - b[1]];
 const dot = (a: Pt, b: Pt) => a[0] * b[0] + a[1] * b[1];
 const norm = (a: Pt) => Math.hypot(a[0], a[1]);
-const unit = (a: Pt): Pt => {
-  const n = norm(a);
-  return n < EPS ? [0, 0] : [a[0] / n, a[1] / n];
-};
 
-/** A parametric curve through 3 points, t ∈ [0,1] from p1 → p3.
- *  Circular arc when the points aren't collinear, else a straight
- *  segment. All coordinates are pixels. */
-interface Curve {
-  length: number;
-  centroid: Pt;
-  pointAt(t: number): Pt;
-  /** Outward unit normal at parameter t (for an arc: radial from the
-   *  circle centre; for a line: a fixed perpendicular). */
-  normalAt(t: number): Pt;
-  sample(n: number): Pt[];
-  /** Intersections of the INFINITE line through `o` with direction `d`
-   *  (need not be unit) and this curve, clamped to the curve's span. */
-  intersectLine(o: Pt, d: Pt): Pt[];
+/** Readings must be ODD so one always lands on the centre node. */
+export function normalizeCount(n: number): number {
+  const v = Math.max(1, Math.round(n || 1));
+  return v % 2 === 1 ? v : v + 1;
 }
 
-/** Circumcircle of 3 points, or null if (near-)collinear. */
+/** Largest spacing (fraction of arc length) that still fits `count`
+ *  readings inside the arc: the group spans (count-1)*spacing. */
+export function maxSpacingFor(count: number): number {
+  const n = normalizeCount(count);
+  return n <= 1 ? 1 : 1 / (n - 1);
+}
+
+interface Curve {
+  length: number;
+  pointAt(t: number): Pt;
+  normalAt(t: number): Pt;
+  sample(n: number): Pt[];
+}
+
 function circleFrom3(p1: Pt, p2: Pt, p3: Pt): { c: Pt; r: number } | null {
   const [ax, ay] = p1, [bx, by] = p2, [cx, cy] = p3;
   const d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
@@ -69,31 +81,18 @@ const wrap = (a: number) => ((a % TWO_PI) + TWO_PI) % TWO_PI;
 
 function buildCurve(p1: Pt, p2: Pt, p3: Pt): Curve {
   const circle = circleFrom3(p1, p2, p3);
-  const centroid: Pt = [(p1[0] + p2[0] + p3[0]) / 3, (p1[1] + p2[1] + p3[1]) / 3];
 
   if (!circle) {
     // Straight-segment fallback (collinear points).
-    const d = unit(sub(p3, p1));
+    const len = norm(sub(p3, p1));
+    const d: Pt = len < EPS ? [1, 0] : [(p3[0] - p1[0]) / len, (p3[1] - p1[1]) / len];
     const nrm: Pt = [-d[1], d[0]];
-    const length = norm(sub(p3, p1));
+    const at = (t: number): Pt => [p1[0] + (p3[0] - p1[0]) * t, p1[1] + (p3[1] - p1[1]) * t];
     return {
-      length,
-      centroid,
-      pointAt: (t) => [p1[0] + (p3[0] - p1[0]) * t, p1[1] + (p3[1] - p1[1]) * t],
+      length: len,
+      pointAt: at,
       normalAt: () => nrm,
-      sample: (n) => Array.from({ length: n }, (_, i) => {
-        const t = n <= 1 ? 0 : i / (n - 1);
-        return [p1[0] + (p3[0] - p1[0]) * t, p1[1] + (p3[1] - p1[1]) * t] as Pt;
-      }),
-      intersectLine: (o, dd) => {
-        // line o+u*dd  vs  segment-line p1 + v*(p3-p1)
-        const e: Pt = [p3[0] - p1[0], p3[1] - p1[1]];
-        const denom = dd[0] * (-e[1]) - dd[1] * (-e[0]);
-        if (Math.abs(denom) < EPS) return [];
-        const diff = sub(p1, o);
-        const u = (diff[0] * (-e[1]) - diff[1] * (-e[0])) / denom;
-        return [[o[0] + dd[0] * u, o[1] + dd[1] * u]];
-      },
+      sample: (n) => Array.from({ length: n }, (_, i) => at(n <= 1 ? 0 : i / (n - 1))),
     };
   }
 
@@ -101,64 +100,31 @@ function buildCurve(p1: Pt, p2: Pt, p3: Pt): Curve {
   const a1 = Math.atan2(p1[1] - c[1], p1[0] - c[0]);
   const a2 = Math.atan2(p2[1] - c[1], p2[0] - c[0]);
   const a3 = Math.atan2(p3[1] - c[1], p3[0] - c[0]);
-  // Sweep from a1 → a3 in the direction that passes through a2.
-  const ccwSweep = wrap(a3 - a1);          // [0, 2π)
+  const ccwSweep = wrap(a3 - a1);
   const a2rel = wrap(a2 - a1);
   let dir = 1, span = ccwSweep;
   if (a2rel > ccwSweep) { dir = -1; span = TWO_PI - ccwSweep; }
-  const length = r * span;
   const angleAt = (t: number) => a1 + dir * span * t;
-
-  const inSpan = (ang: number) => {
-    const rel = wrap((ang - a1) * dir);      // [0, 2π); rel along the chosen dir
-    return rel <= span + 1e-6;
-  };
-
   return {
-    length,
-    centroid: c,   // circle centre is a better "toward" reference than the 3-pt mean
+    length: r * span,
     pointAt: (t) => {
       const ang = angleAt(t);
       return [c[0] + r * Math.cos(ang), c[1] + r * Math.sin(ang)];
     },
     normalAt: (t) => {
       const ang = angleAt(t);
-      return [Math.cos(ang), Math.sin(ang)];   // outward radial (unit)
+      return [Math.cos(ang), Math.sin(ang)];
     },
     sample: (n) => Array.from({ length: n }, (_, i) => {
-      const t = n <= 1 ? 0 : i / (n - 1);
-      const ang = angleAt(t);
+      const ang = angleAt(n <= 1 ? 0 : i / (n - 1));
       return [c[0] + r * Math.cos(ang), c[1] + r * Math.sin(ang)] as Pt;
     }),
-    intersectLine: (o, dd) => {
-      // (o + u*dd) on circle |·−c| = r
-      const f = sub(o, c);
-      const A = dot(dd, dd);
-      const B = 2 * dot(f, dd);
-      const C = dot(f, f) - r * r;
-      const disc = B * B - 4 * A * C;
-      if (disc < 0 || A < EPS) return [];
-      const sq = Math.sqrt(disc);
-      const us = [(-B - sq) / (2 * A), (-B + sq) / (2 * A)];
-      const out: Pt[] = [];
-      for (const u of us) {
-        const pt: Pt = [o[0] + dd[0] * u, o[1] + dd[1] * u];
-        const ang = Math.atan2(pt[1] - c[1], pt[0] - c[0]);
-        if (inSpan(ang)) out.push(pt);
-      }
-      // If neither intersection lands on the drawn arc span, still return
-      // them (better a perpendicular to the full circle than nothing).
-      if (out.length === 0) {
-        for (const u of us) out.push([o[0] + dd[0] * u, o[1] + dd[1] * u]);
-      }
-      return out;
-    },
   };
 }
 
-/** Nearest point on a sampled polyline to `q` (pixel space). */
-function nearestOnPolyline(pts: Pt[], q: Pt): Pt {
-  let best: Pt = pts[0], bestD = Infinity;
+/** Nearest point on a sampled polyline to `q`, plus that distance. */
+function nearestOnPolyline(pts: Pt[], q: Pt): { pt: Pt; dist: number } {
+  let best: Pt = pts[0] ?? q, bestD = Infinity;
   for (let i = 0; i < pts.length - 1; i++) {
     const a = pts[i], b = pts[i + 1];
     const ab = sub(b, a);
@@ -169,27 +135,25 @@ function nearestOnPolyline(pts: Pt[], q: Pt): Pt {
     const d = norm(sub(q, proj));
     if (d < bestD) { bestD = d; best = proj; }
   }
-  return best;
+  return { pt: best, dist: bestD };
 }
 
 export interface ComputeResult {
   readings: ThicknessReadingData[];
-  topSamples: Pt[];      // (x%, y%)
+  topSamples: Pt[];
   bottomSamples: Pt[];
 }
 
-const ARC_SAMPLES = 48;
+const ARC_SAMPLES = 96;   // denser sampling → tighter minimal-distance feet
 
 /**
  * Compute thickness readings between two 3-point arcs.
  *
- * @param topPct 3 points (x%,y%) for the top surface
- * @param botPct 3 points (x%,y%) for the bottom surface
- * @param numReadings how many perpendicular readings
- * @param center 0..1 — where the reading group centres on the top arc
- * @param spacing step between adjacent readings as a fraction of the top arc length
- * @param iw,ih panel image pixel dimensions (for correct aspect)
- * @param existing prior readings — `edited` ones are kept; hidden/text carried over by index
+ * @param center 0..1 — the user's centre node along the top arc. A reading
+ *               ALWAYS lands exactly here (counts are forced odd).
+ * @param spacing step between adjacent readings, fraction of top arc length.
+ * @param existing prior readings — `edited` ones are kept verbatim; hidden /
+ *                 text / label position are carried over by index.
  */
 export function computeThicknessReadings(
   topPct: Pt[], botPct: Pt[],
@@ -200,8 +164,9 @@ export function computeThicknessReadings(
   const toPx = (p: Pt): Pt => [(p[0] / 100) * iw, (p[1] / 100) * ih];
   const toPct = (p: Pt): Pt => [(p[0] / iw) * 100, (p[1] / ih) * 100];
 
+  const n = normalizeCount(numReadings);
   if (topPct.length < 3 || botPct.length < 3 || iw <= 0 || ih <= 0) {
-    return { readings: existing.slice(0, Math.max(0, numReadings)), topSamples: [], bottomSamples: [] };
+    return { readings: existing.slice(0, n), topSamples: [], bottomSamples: [] };
   }
 
   const top = buildCurve(toPx(topPct[0]), toPx(topPct[1]), toPx(topPct[2]));
@@ -209,49 +174,34 @@ export function computeThicknessReadings(
   const topSamplesPx = top.sample(ARC_SAMPLES);
   const bottomSamplesPx = bottom.sample(ARC_SAMPLES);
 
-  const n = Math.max(1, Math.floor(numReadings));
   const L = top.length;
-  const stepS = Math.max(0, spacing) * L;   // arc-length step in pixels
+  const step = Math.max(0, Math.min(spacing, maxSpacingFor(n))) * L;
   const centerS = Math.min(1, Math.max(0, center)) * L;
+  const mid = (n - 1) / 2;   // integer, since n is odd → a reading sits on centre
 
   const readings: ThicknessReadingData[] = [];
   for (let k = 0; k < n; k++) {
     const prev = existing[k];
     if (prev && prev.edited) {
-      // Frozen: keep the user's manual placement verbatim.
       readings.push({ ...prev });
       continue;
     }
-    // arc-length position of reading k, symmetric about the centre
-    let s = centerS + (k - (n - 1) / 2) * stepS;
+    let s = centerS + (k - mid) * step;
     s = Math.min(L, Math.max(0, s));
     const t = L < EPS ? 0 : s / L;
     const T = top.pointAt(t);
-    const nOut = top.normalAt(t);
-    // Choose the radial direction that points toward the bottom surface.
-    // Use the NEAREST point on the bottom arc as the "toward" reference —
-    // robust for concentric arcs (where the shared circle centre would
-    // point the wrong way) as well as tilted / parallel surfaces.
-    const nb = nearestOnPolyline(bottomSamplesPx, T);
-    const toward = sub(nb, T);
-    const nDir: Pt = dot(nOut, toward) >= 0 ? nOut : [-nOut[0], -nOut[1]];
-    // Perpendicular line through T, intersect with the bottom curve.
-    const cands = bottom.intersectLine(T, nDir);
-    let B: Pt | null = null;
-    let bestScore = Infinity;
-    for (const cand of cands) {
-      const along = dot(sub(cand, T), nDir);     // >0 = toward bottom
-      // Prefer candidates in front; distance is the tiebreaker.
-      const score = (along > 0 ? 0 : 1e6) + Math.abs(along);
-      if (score < bestScore) { bestScore = score; B = cand; }
-    }
-    if (!B) B = nb;   // fallback: closest bottom point (line missed the arc)
+    // Minimal distance from the anchor to the bottom surface. The foot of a
+    // minimal-distance segment is perpendicular to the bottom curve there.
+    const B = nearestOnPolyline(bottomSamplesPx, T).pt;
     readings.push({
       top: toPct(T),
       bottom: toPct(B),
-      hidden: prev ? prev.hidden : false,   // carry hide/relabel across regen
+      hidden: prev ? prev.hidden : false,
       text: prev ? prev.text : "",
       edited: false,
+      measure_position_x: prev?.measure_position_x ?? -1,
+      measure_position_y: prev?.measure_position_y ?? -1,
+      styled_segments: prev?.styled_segments ?? [],
     });
   }
 
@@ -260,6 +210,53 @@ export function computeThicknessReadings(
     topSamples: topSamplesPx.map(toPct),
     bottomSamples: bottomSamplesPx.map(toPct),
   };
+}
+
+/**
+ * Snap a freely-dragged point onto a 3-point arc when it lands close to it.
+ * Lets a manual reading endpoint sit exactly on the surface without forcing
+ * it — beyond `tolPct` of the image's smaller side, the raw point is kept.
+ *
+ * @param pPct dragged point (x%, y%)
+ * @param curvePct the arc's 3 defining points
+ * @returns {point, snapped}
+ */
+export function snapToCurve(
+  pPct: Pt, curvePct: Pt[], iw: number, ih: number, tolPct = 1.5,
+): { point: Pt; snapped: boolean } {
+  if (curvePct.length < 3 || iw <= 0 || ih <= 0) return { point: pPct, snapped: false };
+  const toPx = (p: Pt): Pt => [(p[0] / 100) * iw, (p[1] / 100) * ih];
+  const curve = buildCurve(toPx(curvePct[0]), toPx(curvePct[1]), toPx(curvePct[2]));
+  const { pt, dist } = nearestOnPolyline(curve.sample(ARC_SAMPLES), toPx(pPct));
+  const tolPx = (tolPct / 100) * Math.min(iw, ih);
+  if (dist > tolPx) return { point: pPct, snapped: false };
+  return { point: [(pt[0] / iw) * 100, (pt[1] / ih) * 100], snapped: true };
+}
+
+/** Parameter (0..1) along the top arc nearest to a dragged point — used by
+ *  the centre node, which slides along the surface rather than free-floating. */
+export function paramOnCurve(pPct: Pt, curvePct: Pt[], iw: number, ih: number): number {
+  if (curvePct.length < 3 || iw <= 0 || ih <= 0) return 0.5;
+  const toPx = (p: Pt): Pt => [(p[0] / 100) * iw, (p[1] / 100) * ih];
+  const curve = buildCurve(toPx(curvePct[0]), toPx(curvePct[1]), toPx(curvePct[2]));
+  const q = toPx(pPct);
+  const N = ARC_SAMPLES;
+  let bestT = 0.5, bestD = Infinity;
+  for (let i = 0; i < N; i++) {
+    const t = i / (N - 1);
+    const d = norm(sub(curve.pointAt(t), q));
+    if (d < bestD) { bestD = d; bestT = t; }
+  }
+  return bestT;
+}
+
+/** Point on the top arc at parameter t — for drawing the centre node. */
+export function pointOnCurve(curvePct: Pt[], t: number, iw: number, ih: number): Pt | null {
+  if (curvePct.length < 3 || iw <= 0 || ih <= 0) return null;
+  const toPx = (p: Pt): Pt => [(p[0] / 100) * iw, (p[1] / 100) * ih];
+  const curve = buildCurve(toPx(curvePct[0]), toPx(curvePct[1]), toPx(curvePct[2]));
+  const p = curve.pointAt(Math.min(1, Math.max(0, t)));
+  return [(p[0] / iw) * 100, (p[1] / ih) * 100];
 }
 
 /** Physical length of a reading (top→bottom) in the given unit. Mirrors

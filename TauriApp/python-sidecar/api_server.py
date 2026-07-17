@@ -3590,26 +3590,38 @@ def _collect_measurements():
                     results.append({"panel": label, "name": area.name, "type": "area",
                                     "value": text, "numeric": round(numeric, 4),
                                     "unit": unit_label(unit, squared=True)})
-            # Thickness measurements — one row per visible reading
+            # Curved surface measurements — one row per visible reading
             for tm in (getattr(panel, 'thickness_measurements', None) or []):
                 if not getattr(tm, 'show_measure', True):
                     continue
                 unit = getattr(tm, 'measure_unit', 'um')
                 ulabel = unit_label(unit, squared=False)
+                # An annotation pinned to a custom scale measures with its own
+                # mpp — deliberately independent of the panel's scale bar.
+                try:
+                    eff_mpp = tm.effective_mpp(mpp)
+                except Exception:
+                    eff_mpp = (getattr(tm, 'micron_per_pixel', mpp)
+                               if (getattr(tm, 'scale_mode', 'image') or 'image') == 'custom'
+                               else mpp)
+                custom = (getattr(tm, 'scale_mode', 'image') or 'image') == 'custom'
                 for ri, rd in enumerate(getattr(tm, 'readings', None) or []):
                     if getattr(rd, 'hidden', False):
                         continue
                     top = getattr(rd, 'top', None); bottom = getattr(rd, 'bottom', None)
                     if not top or not bottom:
                         continue
-                    numeric = compute_line_measurement_value([top, bottom], iw, ih, mpp, unit)
+                    numeric = compute_line_measurement_value([top, bottom], iw, ih, eff_mpp, unit)
                     text = getattr(rd, 'text', '') or compute_line_measurement(
-                        [top, bottom], iw, ih, mpp, unit)
+                        [top, bottom], iw, ih, eff_mpp, unit)
                     results.append({"panel": label,
-                                    "name": f"{tm.name or 'Thickness'} #{ri + 1}",
-                                    "type": "thickness",
+                                    "name": f"{tm.name or 'Curved surface'} #{ri + 1}",
+                                    "type": "curved_surface",
                                     "value": text, "numeric": round(numeric, 4),
-                                    "unit": ulabel})
+                                    "unit": ulabel,
+                                    # Flags a reading measured with a scale that
+                                    # differs from the image's own bar.
+                                    "custom_scale": custom})
     return results
 
 

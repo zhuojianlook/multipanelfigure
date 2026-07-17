@@ -46,6 +46,7 @@ import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import DeleteIcon from "@mui/icons-material/Delete";
 import AddIcon from "@mui/icons-material/Add";
+import RemoveIcon from "@mui/icons-material/Remove";
 import SettingsIcon from "@mui/icons-material/Settings";
 import AutoFixHighIcon from "@mui/icons-material/AutoFixHigh";
 import FlipIcon from "@mui/icons-material/Flip";
@@ -60,14 +61,18 @@ import UndoIcon from "@mui/icons-material/Undo";
 import RedoIcon from "@mui/icons-material/Redo";
 import VisibilityIcon from "@mui/icons-material/Visibility";
 import VisibilityOffIcon from "@mui/icons-material/VisibilityOff";
+import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import { VolumeViewerDialog } from "./VolumeViewer";
 import { useFigureStore } from "../../store/figureStore";
 import { api } from "../../api/client";
 import { niceScaleBarUm } from "../../utils/scaleBarRounding";
 import { computeScaleBarRect } from "../../utils/scaleBarGeometry";
-import { computeThicknessReadings, readingValue } from "../../utils/thicknessGeometry";
+import {
+  computeThicknessReadings, readingValue, normalizeCount, maxSpacingFor,
+  snapToCurve, paramOnCurve, pointOnCurve,
+} from "../../utils/thicknessGeometry";
 import type { Pt as ThickPt, ThicknessReadingData } from "../../utils/thicknessGeometry";
-import { alert as alertDialog } from "../shared/ConfirmDialog";
+import { alert as alertDialog, confirmThree } from "../shared/ConfirmDialog";
 import { StyledTextField } from "../shared/StyledTextField";
 import type {
   PanelInfo,
@@ -2908,6 +2913,29 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   const tabIdxRef = useRef(tabIdx);
   tabIdxRef.current = tabIdx;
 
+  // µm/px of the image scale bar when its field gained focus — so blur can
+  // tell whether it actually changed (and offer to undo).
+  const mppAtFocusRef = useRef<number>(0);
+
+  /* ── Preview zoom / pan ─────────────────────────────────────────
+     A CSS transform on the aspect wrapper. Everything inside (the <img> and
+     every % -positioned overlay) scales together, and because drag handlers
+     derive their coordinates from the <img>'s getBoundingClientRect() — which
+     already reflects the transform — placing and dragging stay pixel-accurate
+     at any zoom, with no per-handler maths.
+     Pan is bound to shift-drag / middle-drag so it can never be confused with
+     dragging an annotation handle. */
+  const [previewZoom, setPreviewZoom] = useState(1);
+  const [previewPan, setPreviewPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const resetPreviewView = () => { setPreviewZoom(1); setPreviewPan({ x: 0, y: 0 }); };
+  const ZOOM_MIN = 1, ZOOM_MAX = 8;
+  const nudgeZoom = (factor: number) =>
+    setPreviewZoom((z) => {
+      const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z * factor));
+      if (next === 1) setPreviewPan({ x: 0, y: 0 });   // snap back when fully out
+      return next;
+    });
+
   // Request sequencing — only apply the response from the LATEST request.
   // Prevents stale previews from overwriting newer ones when requests overlap.
   const previewSeqRef = useRef(0);
@@ -3550,6 +3578,10 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     const cur = arr[i];
     if (!cur) return;
     const next = { ...cur, ...patch };
+    // Counts are forced ODD so a reading always lands on the centre node, and
+    // spacing can't exceed what the arc can hold for that count.
+    next.num_readings = normalizeCount(next.num_readings);
+    next.spacing = Math.min(Math.max(next.spacing, 0.005), maxSpacingFor(next.num_readings));
     const res = computeThicknessReadings(
       (next.top_points ?? []) as ThickPt[],
       (next.bottom_points ?? []) as ThickPt[],
@@ -3559,7 +3591,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     );
     arr[i] = {
       ...next,
-      readings: res.readings,
+      readings: res.readings as ThicknessMeasurement["readings"],
       top_samples: res.topSamples as [number, number][],
       bottom_samples: res.bottomSamples as [number, number][],
     };
@@ -3574,18 +3606,73 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
         : null;
 
   const defaultThickness = (n: number): ThicknessMeasurement => ({
-    name: `Thickness ${n}`,
+    name: `Curved surface ${n}`,
     top_points: [], bottom_points: [],
     num_readings: 5, center: 0.5, spacing: 0.12,
     readings: [], top_samples: [], bottom_samples: [],
-    color: "#00E5FF", width: 2,
-    show_curves: true, show_measure: true,
+    // Follow the image's scale bar by default, seeded with its current value
+    // so switching to Custom starts from something sensible.
+    scale_mode: "image",
+    micron_per_pixel: local?.scale_bar?.micron_per_pixel || 1,
+    color: "#00E5FF", width: 1,
+    show_curves: false, show_measure: true,
+    label_offset: 14,
     measure_unit: local?.scale_bar?.unit || "um",
     measure_font_size: 12,
     measure_color: "#00E5FF",
     measure_font_name: config?.column_labels?.[0]?.font_name || "arial.ttf",
     measure_font_style: [],
   });
+
+  /* ── Annotation scale helpers ───────────────────────────────────
+     An annotation measures with the panel's scale bar by default, but may be
+     pinned to its OWN micron_per_pixel. A pinned annotation is deliberately
+     independent: it neither follows the image bar nor affects other
+     annotations. `thicknessDiscordant` drives the warning indicator. */
+  const panelMpp = local?.scale_bar?.micron_per_pixel || 1;
+
+  const thicknessMpp = (tm: ThicknessMeasurement) =>
+    (tm.scale_mode === "custom" ? (tm.micron_per_pixel || 1) : panelMpp);
+
+  /** True when this annotation measures with a scale that disagrees with the
+   *  image's own bar — surfaced as an indicator next to the annotation. */
+  const thicknessDiscordant = (tm: ThicknessMeasurement) =>
+    tm.scale_mode === "custom"
+    && !!local?.add_scale_bar
+    && Math.abs((tm.micron_per_pixel || 1) - panelMpp) > 1e-9;
+
+  /** After the user edits the IMAGE scale bar, custom-pinned annotations keep
+   *  measuring on their own scale. Offer to re-point them at the new image
+   *  scale, keep them as they are, or undo the image change. Fired on blur of
+   *  the µm/px field (see the Scale Bar tab), never mid-typing. */
+  const maybeReconcileAnnotationScales = async (prevMpp: number) => {
+    const cur = localRef.current;
+    const nowMpp = cur?.scale_bar?.micron_per_pixel;
+    if (!cur || nowMpp === undefined || prevMpp === undefined) return;
+    if (Math.abs(nowMpp - prevMpp) < 1e-9) return;   // nothing actually changed
+    const pinned = ((cur.thickness_measurements ?? []) as ThicknessMeasurement[])
+      .filter((t) => t.scale_mode === "custom");
+    if (pinned.length === 0) return;                 // nothing to reconcile
+    const r = await confirmThree({
+      title: "Update annotation scales?",
+      body: `${pinned.length} annotation${pinned.length > 1 ? "s are" : " is"} pinned to a custom scale and will keep measuring at the old value. Point ${pinned.length > 1 ? "them" : "it"} at the new image scale bar (${nowMpp} µm/px), or leave ${pinned.length > 1 ? "them" : "it"} on the allocated scale?`,
+      confirmLabel: "Update to image scale",
+      tertiaryLabel: "Keep their scales",
+      cancelLabel: "Undo scale change",
+    });
+    if (r === "cancel") {
+      // Put the image scale bar back the way it was.
+      const sbNow = localRef.current?.scale_bar;
+      if (sbNow) updateLocal({ scale_bar: { ...sbNow, micron_per_pixel: prevMpp } });
+      return;
+    }
+    if (r === "confirm") {
+      const arr = ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[])
+        .map((t) => (t.scale_mode === "custom" ? { ...t, scale_mode: "image" as const } : t));
+      updateLocal({ thickness_measurements: arr } as unknown as Partial<PanelInfo>);
+    }
+    // "tertiary" → keep their allocated scales: nothing to do.
+  };
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="lg" fullWidth>
@@ -4680,6 +4767,12 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     type="number"
                     value={Number((sb.micron_per_pixel / umPerUnit).toPrecision(6))}
                     onChange={(e) => updateLocal({ scale_bar: { ...sb, micron_per_pixel: Number(e.target.value) * umPerUnit, scale_name: "" } })}
+                    // Annotations pinned to a CUSTOM scale don't follow the
+                    // image bar, so changing it silently leaves them measuring
+                    // on the old one. Ask what to do — on FOCUS/BLUR rather
+                    // than onChange, which fires on every keystroke.
+                    onFocus={() => { mppAtFocusRef.current = sb.micron_per_pixel; }}
+                    onBlur={() => { void maybeReconcileAnnotationScales(mppAtFocusRef.current); }}
                     inputProps={{ step: 0.01 }}
                     size="small"
                     fullWidth
@@ -5477,17 +5570,17 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
             })}
             </AnnotationSection>
 
-            {/* ── Thickness measurements ────────────────────────
+            {/* ── Curved surface measurements ───────────────────
                 Two 3-point circular-arc surfaces with N perpendicular
-                readings between them. Geometry runs in
+                readings between them. Geometry lives in
                 utils/thicknessGeometry.ts; every control here routes
                 through applyThickness() which re-resolves the readings. */}
             <AnnotationSection
-              title="Thickness"
+              title="Curved Surface"
               count={thicknessList.length}
               open={annotSectionsOpen.thickness}
               onToggle={() => setAnnotSectionsOpen((p) => ({ ...p, thickness: !p.thickness }))}
-              addLabel="Add Thickness"
+              addLabel="Add Measurement"
               onAdd={() => {
                 const arr = [...thicknessList, defaultThickness(thicknessList.length + 1)];
                 updateLocal({ thickness_measurements: arr } as unknown as Partial<PanelInfo>);
@@ -5500,6 +5593,10 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 const nTop = tm.top_points?.length ?? 0;
                 const nBot = tm.bottom_points?.length ?? 0;
                 const ready = nTop === 3 && nBot === 3;
+                const discordant = thicknessDiscordant(tm);
+                const uLab: Record<string, string> = { km: "km", m: "m", cm: "cm", mm: "mm", um: "µm", nm: "nm", pm: "pm" };
+                const uT = tm.measure_unit || "um";
+                const maxSpace = maxSpacingFor(tm.num_readings);
                 return (
                   <Box
                     key={`thick-${i}`}
@@ -5516,6 +5613,14 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       <Typography variant="caption" sx={{ flex: 1, fontSize: "0.7rem" }}>
                         {tm.name} — {ready ? `${tm.readings?.length ?? 0} readings` : `${nTop}/3 top, ${nBot}/3 bottom`}
                       </Typography>
+                      {/* Scale discordance indicator — this annotation measures
+                          with a scale that differs from the image's bar. */}
+                      {discordant && (
+                        <WarningAmberIcon
+                          sx={{ fontSize: 14, color: "warning.main" }}
+                          titleAccess={`Custom scale ${tm.micron_per_pixel} ${uLab[uT] || uT}/px differs from the image scale bar (${panelMpp} ${uLab[uT] || uT}/px)`}
+                        />
+                      )}
                       <IconButton
                         size="small" sx={{ p: 0.25 }}
                         onClick={(e) => {
@@ -5543,7 +5648,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         />
                       </Box>
 
-                      {/* Surface definition */}
+                      {/* Surfaces */}
                       <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary", fontSize: "0.68rem" }}>
                         Surfaces (3 points each)
                       </Typography>
@@ -5566,43 +5671,103 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.62rem", fontStyle: "italic" }}>
                         {active
                           ? `Click 3 points on the preview to trace the ${active} surface.`
-                          : "Both surfaces set — drag the handles on the preview to adjust."}
+                          : "Drag the white handles to reshape a surface; drag the ringed node to move the centre."}
                       </Typography>
+
+                      {/* Scale source */}
+                      <Divider sx={{ my: 0.5 }} />
+                      <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary", fontSize: "0.68rem" }}>
+                        Scale
+                      </Typography>
+                      <ToggleButtonGroup
+                        size="small" exclusive
+                        value={tm.scale_mode || "image"}
+                        onChange={async (_, v) => {
+                          if (!v || v === (tm.scale_mode || "image")) return;
+                          if (v === "image") {
+                            applyThickness(i, { scale_mode: "image" });
+                            return;
+                          }
+                          // Switching to a custom scale — warn when it would
+                          // disagree with the image's bar.
+                          const cur = tm.micron_per_pixel || panelMpp;
+                          if (local.add_scale_bar && Math.abs(cur - panelMpp) > 1e-9) {
+                            const r = await confirmThree({
+                              title: "Custom scale differs from image scale bar",
+                              body: `This annotation would measure at ${cur} ${uLab[uT] || uT}/px, but the image scale bar is ${panelMpp} ${uLab[uT] || uT}/px. The custom scale applies to THIS annotation only — other annotations and the image scale bar are unaffected.`,
+                              confirmLabel: "Proceed",
+                              tertiaryLabel: "Use image scale bar",
+                              cancelLabel: "Cancel",
+                            });
+                            if (r === "cancel") return;
+                            if (r === "tertiary") { applyThickness(i, { scale_mode: "image" }); return; }
+                          }
+                          applyThickness(i, { scale_mode: "custom", micron_per_pixel: cur });
+                        }}
+                      >
+                        <ToggleButton value="image" sx={{ px: 1, py: 0.25, fontSize: "0.62rem", textTransform: "none" }}>
+                          Image scale bar
+                        </ToggleButton>
+                        <ToggleButton value="custom" sx={{ px: 1, py: 0.25, fontSize: "0.62rem", textTransform: "none" }}>
+                          Custom
+                        </ToggleButton>
+                      </ToggleButtonGroup>
+                      {tm.scale_mode === "custom" ? (
+                        <TextField
+                          label={`${uLab[uT] || uT}/pixel (this annotation only)`}
+                          type="number"
+                          value={Number((tm.micron_per_pixel || 1).toPrecision(6))}
+                          onChange={(e) => applyThickness(i, { micron_per_pixel: Number(e.target.value) })}
+                          inputProps={{ step: 0.01 }}
+                          size="small" fullWidth
+                          sx={{ "& input": { fontSize: "0.72rem" } }}
+                        />
+                      ) : (
+                        <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.62rem", fontStyle: "italic" }}>
+                          {local.add_scale_bar
+                            ? `Following the image scale bar (${panelMpp} ${uLab[uT] || uT}/px).`
+                            : "No image scale bar set — readings are in pixels until you add one."}
+                        </Typography>
+                      )}
 
                       {/* Readings */}
                       <Divider sx={{ my: 0.5 }} />
                       <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary", fontSize: "0.68rem" }}>
                         Readings
                       </Typography>
+                      {/* Odd only — guarantees a reading sits on the centre node. */}
                       <AdjustSlider
                         label="Count" value={tm.num_readings} defaultValue={5}
-                        min={1} max={30} step={1}
-                        onChange={(v) => applyThickness(i, { num_readings: Math.round(v) })}
+                        min={1} max={31} step={2}
+                        onChange={(v) => applyThickness(i, { num_readings: normalizeCount(v) })}
                       />
-                      {/* The "scroll bar" for how far apart the readings sit —
-                          arc-length step along the top surface, as a fraction
-                          of that surface's length. */}
+                      {/* Spacing as a % of the total arc; the cap falls out of
+                          the count, since the group spans (count-1) gaps. */}
                       <AdjustSlider
-                        label="Spacing" value={tm.spacing} defaultValue={0.12}
-                        min={0.01} max={0.5} step={0.01}
-                        onChange={(v) => applyThickness(i, { spacing: v })}
+                        label="Spacing %" value={Number((tm.spacing * 100).toFixed(1))}
+                        defaultValue={Number((Math.min(0.12, maxSpace) * 100).toFixed(1))}
+                        min={0.5} max={Number((maxSpace * 100).toFixed(1))} step={0.5}
+                        onChange={(v) => applyThickness(i, { spacing: v / 100 })}
                       />
+                      <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.6rem", fontStyle: "italic", mt: -0.5 }}>
+                        Max {(maxSpace * 100).toFixed(1)}% at {tm.num_readings} readings — the set spans the whole arc.
+                      </Typography>
                       <AdjustSlider
-                        label="Centre" value={tm.center} defaultValue={0.5}
-                        min={0} max={1} step={0.01}
-                        onChange={(v) => applyThickness(i, { center: v })}
-                      />
-                      <AdjustSlider
-                        label="Width" value={tm.width} defaultValue={2}
-                        min={0.5} max={10} step={0.5}
+                        label="Width" value={tm.width} defaultValue={1}
+                        min={0.25} max={5} step={0.25}
                         onChange={(v) => applyThickness(i, { width: v })}
+                      />
+                      <AdjustSlider
+                        label="Label gap" value={tm.label_offset} defaultValue={14}
+                        min={0} max={60} step={1}
+                        onChange={(v) => applyThickness(i, { label_offset: v })}
                       />
                       <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
                         <FormControlLabel
                           sx={{ ml: 0 }}
                           control={<Checkbox size="small" checked={tm.show_curves}
                             onChange={(e) => applyThickness(i, { show_curves: e.target.checked })} />}
-                          label={<Typography variant="caption" sx={{ fontSize: "0.68rem" }}>Guide curves</Typography>}
+                          label={<Typography variant="caption" sx={{ fontSize: "0.68rem" }}>Curves in figure</Typography>}
                         />
                         <FormControlLabel
                           sx={{ ml: 0 }}
@@ -5611,57 +5776,61 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                           label={<Typography variant="caption" sx={{ fontSize: "0.68rem" }}>Values</Typography>}
                         />
                       </Box>
+                      <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.6rem", fontStyle: "italic", mt: -0.5 }}>
+                        Guide curves always show here for editing; "Curves in figure" controls the exported image.
+                      </Typography>
                       <Button
                         size="small" variant="outlined"
                         disabled={!(tm.readings ?? []).some((r) => r.edited || r.hidden || r.text)}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          // Drop every manual override → pure parametric layout.
-                          applyThickness(i, { readings: [] });
-                        }}
+                        onClick={(e) => { e.stopPropagation(); applyThickness(i, { readings: [] }); }}
                         sx={{ fontSize: "0.62rem", py: 0.25, textTransform: "none", alignSelf: "flex-start" }}
                       >
                         Reset manual edits
                       </Button>
 
-                      {/* Per-reading editing */}
+                      {/* Per-reading editing — same rich-text affordance as a
+                          line's measurement label (drag-select for the hover
+                          toolbar: font / size / colour / B-I-U). */}
                       {ready && (tm.readings ?? []).length > 0 && (() => {
-                        const mppT = local.scale_bar?.micron_per_pixel || 1;
-                        const uT = tm.measure_unit || "um";
-                        const uLab: Record<string, string> = { km: "km", m: "m", cm: "cm", mm: "mm", um: "µm", nm: "nm", pm: "pm" };
+                        const mppT = thicknessMpp(tm);
                         return (
                           <>
                             <Divider sx={{ my: 0.5 }} />
                             <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary", fontSize: "0.68rem" }}>
                               Individual readings
                             </Typography>
-                            <Box sx={{ display: "flex", flexDirection: "column", gap: 0.25, maxHeight: 180, overflowY: "auto" }}>
+                            <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5, maxHeight: 260, overflowY: "auto" }}>
                               {(tm.readings ?? []).map((rd, ri) => {
                                 const val = readingValue(rd as ThicknessReadingData, svgDims.w || 1000, svgDims.h || 1000, mppT, uT);
+                                const auto = `${val.toFixed(1)} ${uLab[uT] || uT}`;
                                 return (
                                   <Box key={`rd-${ri}`} sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-                                    <Typography variant="caption" sx={{ width: 18, fontSize: "0.62rem", color: "text.disabled" }}>
+                                    <Typography variant="caption" sx={{ width: 16, fontSize: "0.62rem", color: "text.disabled", flexShrink: 0 }}>
                                       {ri + 1}
                                     </Typography>
-                                    <TextField
-                                      placeholder={`${val.toFixed(1)} ${uLab[uT] || uT}`}
-                                      value={rd.text || ""}
-                                      size="small"
-                                      onChange={(e) => {
-                                        const rds = [...(tm.readings ?? [])];
-                                        rds[ri] = { ...rds[ri], text: e.target.value };
-                                        applyThickness(i, { readings: rds });
-                                      }}
-                                      sx={{ flex: 1, "& input": { fontSize: "0.65rem", py: 0.25 } }}
-                                    />
+                                    <Box sx={{ flex: 1, minWidth: 0 }}>
+                                      <StyledTextField
+                                        placeholder={auto}
+                                        text={rd.text || ""}
+                                        segments={rd.styled_segments as StyledSegment[] | undefined}
+                                        defaultColor={tm.measure_color || tm.color}
+                                        baseFontSize={tm.measure_font_size}
+                                        fonts={fonts}
+                                        onChange={(text, styled_segments) => {
+                                          const rds = [...(tm.readings ?? [])];
+                                          rds[ri] = { ...rds[ri], text, styled_segments };
+                                          applyThickness(i, { readings: rds });
+                                        }}
+                                      />
+                                    </Box>
                                     {rd.edited && (
-                                      <Typography variant="caption" title="Manually moved — kept when regenerating"
-                                        sx={{ fontSize: "0.58rem", color: "primary.main" }}>
+                                      <Typography variant="caption" title="Manually placed — kept when regenerating"
+                                        sx={{ fontSize: "0.55rem", color: "primary.main", flexShrink: 0 }}>
                                         edited
                                       </Typography>
                                     )}
                                     <IconButton
-                                      size="small" sx={{ p: 0.25 }}
+                                      size="small" sx={{ p: 0.25, flexShrink: 0 }}
                                       title={rd.hidden ? "Show reading" : "Hide reading"}
                                       onClick={(e) => {
                                         e.stopPropagation();
@@ -5679,7 +5848,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                               })}
                             </Box>
                             <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.62rem", fontStyle: "italic" }}>
-                              Drag a reading's endpoint on the preview to place it by hand.
+                              Drag a reading's endpoint to place it by hand (snaps to the surface when close); drag its value to reposition the label.
                             </Typography>
                           </>
                         );
@@ -6822,7 +6991,64 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
           </Box>{/* end left controls panel */}
 
           {/* -- Right: Live Preview with draggable labels ----------- */}
-          <Box sx={{ flex: 1, display: "flex", alignItems: "flex-start", justifyContent: "center", p: 1, bgcolor: "action.hover", borderRadius: 2, border: "1px solid", borderColor: "divider", maxHeight: "70vh", overflow: "hidden" }}>
+          <Box
+            sx={{ position: "relative", flex: 1, display: "flex", alignItems: "flex-start", justifyContent: "center", p: 1, bgcolor: "action.hover", borderRadius: 2, border: "1px solid", borderColor: "divider", maxHeight: "70vh", overflow: "hidden" }}
+            onWheel={(e) => {
+              // Wheel = zoom. Only when there's something to zoom into.
+              if (!(previewB64 || renderedPreviewB64)) return;
+              e.preventDefault();
+              nudgeZoom(e.deltaY < 0 ? 1.15 : 1 / 1.15);
+            }}
+            onMouseDown={(e) => {
+              // Pan with shift-drag or the middle button — deliberately NOT a
+              // plain drag, which belongs to the annotation handles.
+              if (previewZoom <= 1) return;
+              if (!(e.shiftKey || e.button === 1)) return;
+              e.preventDefault();
+              e.stopPropagation();
+              const sx = e.clientX, sy = e.clientY;
+              const start = { ...previewPan };
+              const onMove = (ev: MouseEvent) => {
+                setPreviewPan({ x: start.x + (ev.clientX - sx), y: start.y + (ev.clientY - sy) });
+              };
+              const onUp = () => {
+                window.removeEventListener("mousemove", onMove);
+                window.removeEventListener("mouseup", onUp);
+              };
+              window.addEventListener("mousemove", onMove);
+              window.addEventListener("mouseup", onUp);
+            }}
+          >
+            {/* Zoom controls — outside the transformed wrapper so they stay
+                put and unscaled. */}
+            {(previewB64 || renderedPreviewB64) && (
+              <Box sx={{
+                position: "absolute", top: 6, right: 6, zIndex: 20,
+                display: "flex", alignItems: "center", gap: 0.25,
+                bgcolor: "background.paper", border: "1px solid", borderColor: "divider",
+                borderRadius: 1, px: 0.25, py: 0.1, opacity: 0.92,
+              }}>
+                <IconButton size="small" sx={{ p: 0.25 }} title="Zoom out"
+                  disabled={previewZoom <= ZOOM_MIN}
+                  onClick={() => nudgeZoom(1 / 1.25)}>
+                  <RemoveIcon sx={{ fontSize: 14 }} />
+                </IconButton>
+                <Typography variant="caption" sx={{ fontSize: "0.6rem", minWidth: 30, textAlign: "center", userSelect: "none" }}>
+                  {Math.round(previewZoom * 100)}%
+                </Typography>
+                <IconButton size="small" sx={{ p: 0.25 }} title="Zoom in"
+                  disabled={previewZoom >= ZOOM_MAX}
+                  onClick={() => nudgeZoom(1.25)}>
+                  <AddIcon sx={{ fontSize: 14 }} />
+                </IconButton>
+                <IconButton size="small" sx={{ p: 0.25 }}
+                  title="Reset view (scroll to zoom, shift-drag to pan)"
+                  disabled={previewZoom === 1 && previewPan.x === 0 && previewPan.y === 0}
+                  onClick={resetPreviewView}>
+                  <RestartAltIcon sx={{ fontSize: 14 }} />
+                </IconButton>
+              </Box>
+            )}
             {/* Adjacent-zoom target panels have no `image_name` of
                 their own, so `previewB64` (which is fetched from the
                 base /api/panel-preview endpoint, gated on
@@ -6865,6 +7091,12 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
+                  // Zoom / pan. The <img> and every % -positioned overlay live
+                  // inside, so they transform together and getBoundingClientRect
+                  // keeps every drag handler accurate without extra maths.
+                  transform: `translate(${previewPan.x}px, ${previewPan.y}px) scale(${previewZoom})`,
+                  transformOrigin: "center center",
+                  cursor: previewZoom > 1 ? "grab" : undefined,
                 }}>
                 {(() => {
                   // Use PIL-rendered preview on Adjustments, Labels, Scale Bar tabs.
@@ -7851,20 +8083,20 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   </svg>
                   );
                 })()}
-                {/* Thickness measurement overlay — guide arcs, the 6 curve
-                    handles, and each perpendicular reading (draggable when
-                    the annotation is selected). Everything is derived from
-                    the resolved readings/samples that the backend also
-                    renders, so this preview matches the figure. */}
+                {/* Curved surface measurement overlay — guide arcs, the 6
+                    surface handles, the centre node, and each reading
+                    (draggable, with a draggable value label) when selected.
+                    Everything derives from the resolved readings/samples the
+                    backend also renders, so this preview matches the figure.
+                    NOTE the guide arcs are drawn here ALWAYS (they're an
+                    editing aid); `show_curves` only governs the figure. */}
                 {tabIdx === TAB_ANNOT && thicknessList.length > 0 && (() => {
                   const vbW = svgDims.w || 1000;
                   const vbH = svgDims.h || 1000;
-                  const mppT = local.scale_bar?.micron_per_pixel || 1;
                   const uLab: Record<string, string> = { km: "km", m: "m", cm: "cm", mm: "mm", um: "µm", nm: "nm", pm: "pm" };
                   const toVb = (p: [number, number]): [number, number] => [p[0] / 100 * vbW, p[1] / 100 * vbH];
                   const handleR = Math.max(3, vbW / 200);
 
-                  // Shared drag plumbing: convert mouse → image-% and patch.
                   const startDrag = (onPct: (nx: number, ny: number) => void) =>
                     (e: React.MouseEvent) => {
                       e.preventDefault();
@@ -7895,28 +8127,52 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     >
                       {thicknessList.map((tm, ti) => {
                         const isActive = selectedAnnotIdx?.type === "thickness" && selectedAnnotIdx.idx === ti;
-                        const strokeW = Math.max(0.5, tm.width * Math.max(1, vbW / 1000));
+                        const strokeW = Math.max(0.4, tm.width * Math.max(1, vbW / 1000));
                         const uT = tm.measure_unit || "um";
+                        const mppT = thicknessMpp(tm);
                         const fs = Math.max(6, (tm.measure_font_size || 12) * (vbW / 216));
                         const poly = (pts: [number, number][]) =>
                           pts.map(toVb).map(([x, y]) => `${x},${y}`).join(" ");
+                        const centreNode = pointOnCurve((tm.top_points ?? []) as ThickPt[], tm.center, vbW, vbH);
                         return (
                           <g key={`thick-ov-${ti}`}>
-                            {/* Guide arcs */}
-                            {tm.show_curves && (tm.top_samples?.length ?? 0) >= 2 && (
-                              <polyline points={poly(tm.top_samples)} fill="none" stroke={tm.color} strokeWidth={strokeW} />
+                            {/* Guide arcs — always visible while editing; dashed
+                                when they won't be in the figure, so the user can
+                                see at a glance what will export. */}
+                            {(tm.top_samples?.length ?? 0) >= 2 && (
+                              <polyline
+                                points={poly(tm.top_samples)} fill="none" stroke={tm.color}
+                                strokeWidth={strokeW}
+                                strokeDasharray={tm.show_curves ? undefined : `${strokeW * 4},${strokeW * 3}`}
+                                opacity={tm.show_curves ? 1 : 0.75}
+                              />
                             )}
-                            {tm.show_curves && (tm.bottom_samples?.length ?? 0) >= 2 && (
-                              <polyline points={poly(tm.bottom_samples)} fill="none" stroke={tm.color} strokeWidth={strokeW} />
+                            {(tm.bottom_samples?.length ?? 0) >= 2 && (
+                              <polyline
+                                points={poly(tm.bottom_samples)} fill="none" stroke={tm.color}
+                                strokeWidth={strokeW}
+                                strokeDasharray={tm.show_curves ? undefined : `${strokeW * 4},${strokeW * 3}`}
+                                opacity={tm.show_curves ? 1 : 0.75}
+                              />
                             )}
 
-                            {/* Perpendicular readings */}
+                            {/* Readings */}
                             {(tm.readings ?? []).map((rd, ri) => {
                               if (rd.hidden) return null;
                               const [tx, ty] = toVb(rd.top);
                               const [bx, by] = toVb(rd.bottom);
                               const val = readingValue(rd as ThicknessReadingData, vbW, vbH, mppT, uT);
                               const label = rd.text || `${val.toFixed(1)} ${uLab[uT] || uT}`;
+                              // Label: dragged position, else pushed off the
+                              // line along its own perpendicular (mirrors the
+                              // backend's placement).
+                              const dx = bx - tx, dy = by - ty;
+                              const seg = Math.hypot(dx, dy) || 1;
+                              const nx = -dy / seg, ny = dx / seg;
+                              const off = (tm.label_offset ?? 14) * (vbW / 216) / 12 * Math.max(1, vbW / 216);
+                              const hasPos = (rd.measure_position_x ?? -1) >= 0 && (rd.measure_position_y ?? -1) >= 0;
+                              const lx = hasPos ? (rd.measure_position_x! / 100) * vbW : (tx + bx) / 2 + nx * off;
+                              const ly = hasPos ? (rd.measure_position_y! / 100) * vbH : (ty + by) / 2 + ny * off;
                               return (
                                 <g key={`rd-ov-${ri}`}>
                                   <line x1={tx} y1={ty} x2={bx} y2={by} stroke={tm.color} strokeWidth={strokeW} />
@@ -7928,12 +8184,15 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                                         cx={hx} cy={hy} r={handleR}
                                         fill={tm.color} stroke="#000" strokeWidth={strokeW * 0.3}
                                         style={{ pointerEvents: "auto", cursor: "grab" }}
-                                        onMouseDown={startDrag((nx, ny) => {
+                                        onMouseDown={startDrag((px, py) => {
                                           const cur = ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[])[ti];
                                           if (!cur) return;
+                                          // Free placement, but snap onto the
+                                          // surface when dropped near it.
+                                          const curvePts = (endKey === "top" ? cur.top_points : cur.bottom_points) as ThickPt[];
+                                          const { point } = snapToCurve([px, py], curvePts ?? [], vbW, vbH);
                                           const rds = [...(cur.readings ?? [])];
-                                          // Manual placement freezes this reading against regen.
-                                          rds[ri] = { ...rds[ri], [endKey]: [nx, ny], edited: true };
+                                          rds[ri] = { ...rds[ri], [endKey]: point, edited: true };
                                           applyThickness(ti, { readings: rds });
                                         })}
                                       />
@@ -7941,13 +8200,25 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                                   })}
                                   {tm.show_measure && (
                                     <text
-                                      x={(tx + bx) / 2 + fs * 0.3}
-                                      y={(ty + by) / 2}
+                                      x={lx} y={ly}
                                       fill={tm.measure_color || tm.color}
                                       fontSize={fs}
                                       fontFamily={(tm.measure_font_name || "arial.ttf").replace(/\.(ttf|otf|ttc)$/i, "") + ", sans-serif"}
+                                      textAnchor="middle"
                                       dominantBaseline="middle"
-                                      style={{ paintOrder: "stroke", stroke: "rgba(0,0,0,0.6)", strokeWidth: fs * 0.08 }}
+                                      style={{
+                                        paintOrder: "stroke", stroke: "rgba(0,0,0,0.6)", strokeWidth: fs * 0.08,
+                                        pointerEvents: isActive ? "auto" : "none",
+                                        cursor: isActive ? "move" : "default",
+                                        userSelect: "none",
+                                      }}
+                                      onMouseDown={isActive ? startDrag((px, py) => {
+                                        const cur = ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[])[ti];
+                                        if (!cur) return;
+                                        const rds = [...(cur.readings ?? [])];
+                                        rds[ri] = { ...rds[ri], measure_position_x: px, measure_position_y: py };
+                                        applyThickness(ti, { readings: rds });
+                                      }) : undefined}
                                     >
                                       {label}
                                     </text>
@@ -7967,17 +8238,37 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                                     cx={hx} cy={hy} r={handleR * 1.3}
                                     fill="#fff" stroke={tm.color} strokeWidth={strokeW}
                                     style={{ pointerEvents: "auto", cursor: "grab" }}
-                                    onMouseDown={startDrag((nx, ny) => {
+                                    onMouseDown={startDrag((nx2, ny2) => {
                                       const cur = ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[])[ti];
                                       if (!cur) return;
                                       const pts = [...((cur[key] ?? []) as [number, number][])];
-                                      pts[pi] = [nx, ny];
+                                      pts[pi] = [nx2, ny2];
                                       applyThickness(ti, { [key]: pts } as Partial<ThicknessMeasurement>);
                                     })}
                                   />
                                 );
                               });
                             })}
+
+                            {/* Centre node — drag along the top surface to move
+                                where the reading set is centred. A reading always
+                                sits exactly here (counts are forced odd). */}
+                            {isActive && centreNode && (
+                              <circle
+                                cx={toVb(centreNode)[0]} cy={toVb(centreNode)[1]}
+                                r={handleR * 1.7}
+                                fill="none" stroke="#fff" strokeWidth={strokeW * 1.6}
+                                style={{ pointerEvents: "auto", cursor: "ew-resize" }}
+                                onMouseDown={startDrag((px, py) => {
+                                  const cur = ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[])[ti];
+                                  if (!cur) return;
+                                  // Constrain to the top surface: take the arc
+                                  // parameter nearest the cursor.
+                                  const t = paramOnCurve([px, py], (cur.top_points ?? []) as ThickPt[], vbW, vbH);
+                                  applyThickness(ti, { center: t });
+                                })}
+                              />
+                            )}
                           </g>
                         );
                       })}
