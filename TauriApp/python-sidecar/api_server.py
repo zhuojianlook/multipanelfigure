@@ -3569,9 +3569,11 @@ def _collect_measurements():
                 ih = panel.crop[3] - panel.crop[1]
             mpp = panel.scale_bar.micron_per_pixel if panel.scale_bar else 1.0
             label = f"R{r+1}C{c+1}"
-            # Line measurements
+            # Line measurements. Gated on measure_in_analysis (default True),
+            # NOT show_measure — hiding a label on the figure must not silently
+            # drop the number from the data.
             for line in (panel.lines or []):
-                if line.show_measure and len(line.points) >= 2:
+                if getattr(line, 'measure_in_analysis', True) and len(line.points) >= 2:
                     unit = getattr(line, 'measure_unit', 'um')
                     numeric = compute_line_measurement_value(line.points, iw, ih, mpp, unit)
                     text = line.measure_text or compute_line_measurement(
@@ -3579,9 +3581,9 @@ def _collect_measurements():
                     results.append({"panel": label, "name": line.name, "type": "line",
                                     "value": text, "numeric": round(numeric, 4),
                                     "unit": unit_label(unit, squared=False)})
-            # Area measurements
+            # Area measurements — see the note on lines above.
             for area in (panel.areas or []):
-                if area.show_measure and len(area.points) >= 2:
+                if getattr(area, 'measure_in_analysis', True) and len(area.points) >= 2:
                     unit = getattr(area, 'measure_unit', 'um')
                     numeric = compute_area_measurement_value(
                         area.points, area.shape, iw, ih, mpp, unit)
@@ -3590,9 +3592,10 @@ def _collect_measurements():
                     results.append({"panel": label, "name": area.name, "type": "area",
                                     "value": text, "numeric": round(numeric, 4),
                                     "unit": unit_label(unit, squared=True)})
-            # Curved surface measurements — one row per visible reading
+            # Curved surface measurements — one row per reading (hidden
+            # readings excluded). Gated on measure_in_analysis, not show_measure.
             for tm in (getattr(panel, 'thickness_measurements', None) or []):
-                if not getattr(tm, 'show_measure', True):
+                if not getattr(tm, 'measure_in_analysis', True):
                     continue
                 unit = getattr(tm, 'measure_unit', 'um')
                 ulabel = unit_label(unit, squared=False)

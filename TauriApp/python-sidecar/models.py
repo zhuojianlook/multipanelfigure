@@ -129,7 +129,11 @@ class LineAnnotation:
     dash_style: str = "solid"           # "solid", "dashed", "dotted", "dash-dot"
     line_type: str = "straight"         # "straight", "multijointed", "curved"
     is_curved: bool = False             # straight line segments vs spline (legacy, use line_type)
-    show_measure: bool = False          # show length text on image
+    show_measure: bool = False          # DRAW the length text on the image
+    # Report this measurement in the Analysis list / CSV. Deliberately separate
+    # from show_measure: hiding a label on the figure must not silently drop
+    # the number from your data. Defaults ON — a measured annotation is data.
+    measure_in_analysis: bool = True
     measure_text: str = ""              # computed measurement text
     measure_unit: str = "um"            # "cm", "mm", "um", "nm"
     measure_font_size: int = 12
@@ -154,7 +158,11 @@ class AreaAnnotation:
     color: str = "#FF000040"            # RGBA hex with alpha for transparency
     border_color: str = "#FF0000"
     border_width: float = 1.0
-    show_measure: bool = False          # show area text on image
+    show_measure: bool = False          # DRAW the area text on the image
+    # Report this area in the Analysis list / CSV — see LineAnnotation. NOTE
+    # this is NOT `include_in_analysis` below, which exposes the region's
+    # PIXELS as an analysis data source; these are different features.
+    measure_in_analysis: bool = True
     measure_text: str = ""              # computed measurement text
     measure_unit: str = "um"            # "cm", "mm", "um", "nm"
     measure_font_size: int = 12
@@ -236,7 +244,9 @@ class ThicknessMeasurement:
     # Guide arcs are an EDITING aid: the dialog always draws them, but they are
     # off in the rendered/exported figure unless the user opts in.
     show_curves: bool = False
-    show_measure: bool = True
+    show_measure: bool = True      # DRAW each reading's value on the image
+    # Report these readings in the Analysis list / CSV — see LineAnnotation.
+    measure_in_analysis: bool = True
     label_offset: float = 14.0     # px (at 216pt ref) to push the value off its line
     measure_unit: str = "um"
     measure_font_size: int = 12

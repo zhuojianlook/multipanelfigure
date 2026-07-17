@@ -90,7 +90,11 @@ export interface LineAnnotation {
   dash_style: string;          // "solid", "dashed", "dotted", "dash-dot"
   line_type: string;           // "straight", "multijointed", "curved"
   is_curved: boolean;
-  show_measure: boolean;
+  show_measure: boolean;          // DRAW the length text on the image
+  /** Report this measurement in the Analysis list / CSV. Separate from
+   *  show_measure so hiding a label doesn't drop the number from your data.
+   *  Optional for projects saved before it existed — treat undefined as true. */
+  measure_in_analysis?: boolean;
   measure_text: string;
   measure_unit: string;
   measure_font_size: number;
@@ -109,7 +113,11 @@ export interface AreaAnnotation {
   color: string;               // RGBA hex with alpha
   border_color: string;
   border_width: number;
-  show_measure: boolean;
+  show_measure: boolean;          // DRAW the area text on the image
+  /** Report this area in the Analysis list / CSV. NOT the same as
+   *  include_in_analysis below, which exposes the region's PIXELS as an
+   *  analysis data source. Undefined = true. */
+  measure_in_analysis?: boolean;
   measure_text: string;
   measure_unit?: string;       // "km" | "m" | "cm" | "mm" | "um" | "nm" (area unit)
   measure_font_size: number;
@@ -161,7 +169,9 @@ export interface ThicknessMeasurement {
   color: string;
   width: number;
   show_curves: boolean;       // guide arcs in the RENDERED figure (dialog always shows them)
-  show_measure: boolean;
+  show_measure: boolean;      // DRAW each reading's value on the image
+  /** Report these readings in the Analysis list / CSV. Undefined = true. */
+  measure_in_analysis?: boolean;
   label_offset: number;       // px (at 216pt ref) pushing the value off its line
   measure_unit: string;
   measure_font_size: number;

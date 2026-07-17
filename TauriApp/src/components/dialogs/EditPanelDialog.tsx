@@ -3615,7 +3615,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     scale_mode: "image",
     micron_per_pixel: local?.scale_bar?.micron_per_pixel || 1,
     color: "#00E5FF", width: 1,
-    show_curves: false, show_measure: true,
+    show_curves: false, show_measure: true, measure_in_analysis: true,
     label_offset: 14,
     measure_unit: local?.scale_bar?.unit || "um",
     measure_font_size: 12,
@@ -5095,7 +5095,8 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 const lines = [...(local.lines ?? []), {
                   name: `Line ${(local.lines ?? []).length + 1}`,
                   points: [], color: "#FFFF00", width: 2, dash_style: "solid",
-                  line_type: "straight", is_curved: false, show_measure: false, measure_text: "",
+                  line_type: "straight", is_curved: false, show_measure: false,
+                  measure_in_analysis: true, measure_text: "",
                   measure_unit: "um", measure_font_size: 12, measure_color: "#FFFF00",
                   measure_font_name: config?.column_labels?.[0]?.font_name || "arial.ttf", measure_font_style: [],
                   measure_styled_segments: [], measure_position_x: -1, measure_position_y: -1,
@@ -5180,17 +5181,27 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       Smoothed
                     </ToggleButton>
                   </ToggleButtonGroup>
+                  {/* Two separate concerns: whether the value is DRAWN on the
+                      figure, and whether it's reported as data. */}
                   <FormControlLabel
                     control={<Checkbox size="small" checked={line.show_measure} onChange={(e) => {
                       const lines = [...(local.lines ?? [])];
                       lines[i] = { ...lines[i], show_measure: e.target.checked };
                       updateLocal({ lines } as unknown as Partial<PanelInfo>);
                     }} />}
-                    label={<Typography variant="caption">Measure</Typography>}
+                    label={<Typography variant="caption">Show measurement</Typography>}
+                  />
+                  <FormControlLabel
+                    control={<Checkbox size="small" checked={line.measure_in_analysis !== false} onChange={(e) => {
+                      const lines = [...(local.lines ?? [])];
+                      lines[i] = { ...lines[i], measure_in_analysis: e.target.checked };
+                      updateLocal({ lines } as unknown as Partial<PanelInfo>);
+                    }} />}
+                    label={<Typography variant="caption" title="Report this measurement in the Analysis list / CSV, whether or not it's drawn">Add to analysis</Typography>}
                   />
                 </Box>
                 {/* Scale selection for measurement */}
-                {line.show_measure && (
+                {(line.show_measure || line.measure_in_analysis !== false) && (
                   <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5, mb: 0.5 }}>
                     <Box sx={{ display: "flex", gap: 0.5, alignItems: "center" }}>
                       <Typography variant="caption" sx={{ flexShrink: 0, fontSize: "0.6rem" }}>Scale:</Typography>
@@ -5258,7 +5269,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 {/* Measurement text — styling via StyledTextField hover-
                     menu only.  Per-element font / size / colour pickers
                     removed; drag-select the text to apply formats. */}
-                {line.show_measure && (
+                {(line.show_measure || line.measure_in_analysis !== false) && (
                   <Box sx={{ mt: 1, display: "flex", flexDirection: "column", gap: 1 }}>
                     <Typography variant="caption" sx={{ fontWeight: 600, fontSize: "0.7rem" }}>Measurement Label</Typography>
                     <StyledTextField
@@ -5302,7 +5313,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 const areas = [...(local.areas ?? []), {
                   name: `Area ${(local.areas ?? []).length + 1}`,
                   shape: "Custom", points: [], color: "#FF000040", border_color: "#FF0000",
-                  border_width: 1, show_measure: true, measure_text: "",
+                  border_width: 1, show_measure: true, measure_in_analysis: true, measure_text: "",
                   measure_unit: local.scale_bar?.unit || "um",
                   measure_font_size: 12, measure_color: "#FF0000",
                   measure_font_name: config?.column_labels?.[0]?.font_name || "arial.ttf",
@@ -5448,6 +5459,20 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   }} />}
                   label={<Typography variant="caption" sx={{ fontSize: "0.75rem" }}>Show measurement</Typography>}
                 />
+                {/* Report the area VALUE as data — independent of whether it's
+                    drawn. Distinct from the pixel-source toggle below. */}
+                <FormControlLabel sx={{ ml: 0 }}
+                  control={<Checkbox size="small" checked={area.measure_in_analysis !== false} onChange={(e) => {
+                    const areas = [...(local.areas ?? [])];
+                    areas[i] = { ...areas[i], measure_in_analysis: e.target.checked };
+                    updateLocal({ areas } as unknown as Partial<PanelInfo>);
+                  }} />}
+                  label={
+                    <Tooltip placement="top" title="Report this area's measured value in the Analysis list / CSV, whether or not it's drawn on the figure.">
+                      <Typography variant="caption" sx={{ fontSize: "0.75rem" }}>Add to analysis (measurement)</Typography>
+                    </Tooltip>
+                  }
+                />
                 {/* Add to analysis — exposes the polygon-masked pixel
                     region as a source in the Analysis dialog so the
                     user can run pipelines on just the area's interior. */}
@@ -5465,7 +5490,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     </Tooltip>
                   }
                 />
-                {area.show_measure && (
+                {(area.show_measure || area.measure_in_analysis !== false) && (
                   <Box sx={{ display: "flex", flexDirection: "column", gap: 1, mt: 0.5 }}>
                     {/* Scale source */}
                     <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5 }}>
@@ -5773,9 +5798,22 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                           sx={{ ml: 0 }}
                           control={<Checkbox size="small" checked={tm.show_measure}
                             onChange={(e) => applyThickness(i, { show_measure: e.target.checked })} />}
-                          label={<Typography variant="caption" sx={{ fontSize: "0.68rem" }}>Values</Typography>}
+                          label={<Typography variant="caption" sx={{ fontSize: "0.68rem" }}>Show measurements</Typography>}
                         />
                       </Box>
+                      {/* Reporting the readings as data is independent of
+                          drawing them — hiding the labels on a busy figure
+                          must not drop the numbers from your analysis. */}
+                      <FormControlLabel
+                        sx={{ ml: 0 }}
+                        control={<Checkbox size="small" checked={tm.measure_in_analysis !== false}
+                          onChange={(e) => applyThickness(i, { measure_in_analysis: e.target.checked })} />}
+                        label={
+                          <Tooltip placement="top" title="Report every visible reading in the Analysis list / CSV, whether or not the values are drawn on the figure.">
+                            <Typography variant="caption" sx={{ fontSize: "0.68rem" }}>Add to analysis</Typography>
+                          </Tooltip>
+                        }
+                      />
                       <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.6rem", fontStyle: "italic", mt: -0.5 }}>
                         Guide curves always show here for editing; "Curves in figure" controls the exported image.
                       </Typography>

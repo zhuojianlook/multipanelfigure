@@ -789,9 +789,16 @@ function BuilderSidebar() {
   useEffect(() => {
     // Fetch measurements whenever config changes (lines/areas may have been added)
     if (!config) return;
+    // Gate on measure_in_analysis (undefined = true for projects saved before
+    // the flag existed), NOT show_measure — a measurement hidden on the figure
+    // still belongs in the data. Curved-surface measurements were missing here
+    // entirely, so their readings never triggered a fetch.
+    const wants = (a: any) => a?.measure_in_analysis !== false;
     const hasAny = config.panels.some((row: any[]) =>
       row.some((p: any) =>
-        (p.lines?.some((l: any) => l.show_measure) || p.areas?.some((a: any) => a.show_measure))
+        p.lines?.some(wants)
+        || p.areas?.some(wants)
+        || p.thickness_measurements?.some(wants)
       )
     );
     if (!hasAny) { setComputedMeasurements([]); return; }
