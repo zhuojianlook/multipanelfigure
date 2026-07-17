@@ -189,6 +189,8 @@ export interface ThicknessMeasurement {
   width: number;
   show_curves: boolean;       // guide arcs in the RENDERED figure (dialog always shows them)
   show_measure: boolean;      // DRAW each reading's value on the image
+  /** Thin leader from each value to the reading it measures. Undefined = true. */
+  show_connecting_lines?: boolean;
   /** Report these readings in the Analysis list / CSV. Undefined = true. */
   measure_in_analysis?: boolean;
   label_offset: number;       // px (at 216pt ref) pushing the value off its line

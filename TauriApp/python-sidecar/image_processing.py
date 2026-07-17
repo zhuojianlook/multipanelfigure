@@ -1030,6 +1030,28 @@ def draw_thickness_measurements(image: Image.Image, items,
             tx -= tw // 2; ty -= th // 2
             tx, ty = _clamp_text_pos(draw, text, font, tx, ty, iw, ih)
 
+            # Leader: a hairline from the value back to the tick it measures.
+            # Values sit off their line and alternate rows are staggered a
+            # further line out, so which value belongs to which reading is not
+            # obvious — this says so. Drawn BEFORE the text and stopped at the
+            # label's box edge, so it never crosses the glyphs.
+            if getattr(tm, 'show_connecting_lines', True) and tw > 0 and th > 0:
+                lcx, lcy = tx + tw / 2.0, ty + th / 2.0     # label centre
+                dx_l, dy_l = tx0 - lcx, ty0 - lcy           # centre -> reading top
+                dist = math.hypot(dx_l, dy_l)
+                if dist > 1e-6:
+                    ux_l, uy_l = dx_l / dist, dy_l / dist
+                    # Exit point of the ray on the label's axis-aligned box.
+                    hw, hh = tw / 2.0 + 1.0, th / 2.0 + 1.0
+                    tx_h = hw / abs(ux_l) if abs(ux_l) > 1e-6 else float("inf")
+                    ty_h = hh / abs(uy_l) if abs(uy_l) > 1e-6 else float("inf")
+                    t_edge = min(tx_h, ty_h)
+                    sx, sy = lcx + ux_l * t_edge, lcy + uy_l * t_edge
+                    # Only draw when the label actually sits off the tick.
+                    if dist > t_edge + 1.0:
+                        draw.line([(sx, sy), (tx0, ty0)], fill=m_color,
+                                  width=max(1, int(round(width * 0.5))))
+
             segs = getattr(rd, 'styled_segments', None) or []
             if segs:
                 _draw_styled_pil_text(

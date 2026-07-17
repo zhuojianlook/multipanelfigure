@@ -286,6 +286,11 @@ class ThicknessMeasurement:
     # off in the rendered/exported figure unless the user opts in.
     show_curves: bool = False
     show_measure: bool = True      # DRAW each reading's value on the image
+    # Thin leader from each value to the reading it measures. Values are offset
+    # off their line and alternate rows are staggered a further line out, so at
+    # a glance it isn't obvious which value belongs to which tick — the leader
+    # says so. Off = bare values (fine when readings are sparse).
+    show_connecting_lines: bool = True
     # Report these readings in the Analysis list / CSV — see LineAnnotation.
     measure_in_analysis: bool = True
     label_offset: float = 14.0     # px (at 216pt ref) to push the value off its line

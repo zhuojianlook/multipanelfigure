@@ -6053,6 +6053,17 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                             onChange={(e) => applyThickness(i, { show_measure: e.target.checked })} />}
                           label={<Typography variant="caption" sx={{ fontSize: "0.68rem" }}>Show measurements</Typography>}
                         />
+                        <FormControlLabel
+                          sx={{ ml: 0 }}
+                          control={<Checkbox size="small" disabled={!tm.show_measure}
+                            checked={tm.show_connecting_lines !== false}
+                            onChange={(e) => applyThickness(i, { show_connecting_lines: e.target.checked })} />}
+                          label={
+                            <Tooltip placement="top" title="Thin leader from each value to the reading it measures. Values sit off their line and alternate ones are staggered further out, so the leader says which value belongs to which tick.">
+                              <Typography variant="caption" sx={{ fontSize: "0.68rem" }}>Connecting lines</Typography>
+                            </Tooltip>
+                          }
+                        />
                       </Box>
                       {/* Reporting the readings as data is independent of
                           drawing them — hiding the labels on a busy figure
@@ -8561,6 +8572,34 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                                       />
                                     );
                                   })}
+                                  {/* Leader: hairline from the value back to
+                                      the tick it measures. Values sit off their
+                                      line and alternate rows stagger further
+                                      out, so this says which belongs to which.
+                                      Drawn BEFORE the text and stopped at the
+                                      label's box edge — mirrors the backend. */}
+                                  {tm.show_measure && (tm.show_connecting_lines !== false) && (() => {
+                                    const hw = Math.max(1, label.length * fs * 0.3) + fs * 0.1;
+                                    const hh = fs * 0.6 + fs * 0.1;
+                                    const dxl = tx - lx, dyl = ty - ly;   // label -> reading top
+                                    const dist = Math.hypot(dxl, dyl);
+                                    if (dist < 1e-6) return null;
+                                    const uxl = dxl / dist, uyl = dyl / dist;
+                                    const tEdge = Math.min(
+                                      Math.abs(uxl) > 1e-6 ? hw / Math.abs(uxl) : Infinity,
+                                      Math.abs(uyl) > 1e-6 ? hh / Math.abs(uyl) : Infinity,
+                                    );
+                                    if (dist <= tEdge + 1) return null;   // label sits on the tick
+                                    return (
+                                      <line
+                                        x1={lx + uxl * tEdge} y1={ly + uyl * tEdge}
+                                        x2={tx} y2={ty}
+                                        stroke={tm.measure_color || tm.color}
+                                        strokeWidth={Math.max(0.25, strokeW * 0.5)}
+                                        opacity={0.9}
+                                      />
+                                    );
+                                  })()}
                                   {tm.show_measure && (
                                     <text
                                       x={lx} y={ly}
