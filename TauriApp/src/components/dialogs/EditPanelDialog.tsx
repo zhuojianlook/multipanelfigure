@@ -64,6 +64,7 @@ import { VolumeViewerDialog } from "./VolumeViewer";
 import { useFigureStore } from "../../store/figureStore";
 import { api } from "../../api/client";
 import { niceScaleBarUm } from "../../utils/scaleBarRounding";
+import { computeScaleBarRect } from "../../utils/scaleBarGeometry";
 import { computeThicknessReadings, readingValue } from "../../utils/thicknessGeometry";
 import type { Pt as ThickPt, ThicknessReadingData } from "../../utils/thicknessGeometry";
 import { alert as alertDialog } from "../shared/ConfirmDialog";
@@ -2901,6 +2902,12 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   const localRef = useRef(local);
   localRef.current = local;
 
+  // Same trick for the active tab: refreshRenderedPreview is debounced 200ms,
+  // so it must read the tab as of FIRE time (not the render that scheduled it)
+  // when deciding whether to bake the zoom inset in.
+  const tabIdxRef = useRef(tabIdx);
+  tabIdxRef.current = tabIdx;
+
   // Request sequencing — only apply the response from the LATEST request.
   // Prevents stale previews from overwriting newer ones when requests overlap.
   const previewSeqRef = useRef(0);
@@ -2955,7 +2962,12 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
           // /api/panel-rendered-preview below).
           await api.patchPanel(row, col, cur as unknown as Record<string, unknown>);
         }
-        const resp = await api.getPanelRenderedPreview(row, col);
+        // Bake the zoom inset in on every overlay tab EXCEPT Zoom Inset,
+        // which draws it itself via an interactive SVG overlay (baking it
+        // there too would double-render it). Elsewhere — notably the Scale
+        // Bar tab — the user needs to see the inset to place the bar around
+        // it, even though it isn't interactive there.
+        const resp = await api.getPanelRenderedPreview(row, col, tabIdxRef.current !== TAB_ZOOM);
         if (resp.image) setRenderedPreviewB64(resp.image);
       } catch {
         /* ignore */
@@ -2966,7 +2978,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
         setPendingRenderedRefresh(false);
       }
     }, 200);
-  }, [row, col, isZoomTarget]);
+  }, [row, col, isZoomTarget, TAB_ZOOM]);
 
   // Refresh rendered preview when overlays change or tab switches to overlay tabs.
   //
@@ -3491,6 +3503,35 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     Math.max(0, Math.min(100, (dispX / dispW) * 100)),
     Math.max(0, Math.min(100, (dispY / dispH) * 100)),
   ];
+
+  /* ── Scale bar geometry ─────────────────────────────────────────
+     The bar's rect in IMAGE-PIXEL space, mirroring the backend's
+     `_add_panel_scale_bars` formula EXACTLY:
+       bx = bar LEFT edge, by = bar TOP edge
+       preset → anchored off edge_distance; Custom → position_x is the bar's
+       CENTRE-x and position_y is its TOP.
+     Both the inline preview overlay and the drag hitbox derive from this, so
+     what you grab, what you see mid-drag, and what the figure renders all
+     agree — previously the overlay positioned a flex CONTAINER (bar + label)
+     which made the bar's on-screen spot depend on the label's height and
+     side, so it drifted on drop and jumped whenever "auto" flipped the label.
+     Note bx/by deliberately do NOT depend on the label side — matching the
+     backend, where only the text moves. */
+  const scaleBarRect = () => {
+    const sb = local?.scale_bar;
+    if (!sb) return null;
+    // The bar's coordinate space is the backend's PROCESSED image (post-crop,
+    // pre-normalize) — the same space matplotlib places the bar in.
+    const iw = processedW > 0 ? processedW
+      : (local?.crop_image && local?.crop && local.crop.length === 4)
+        ? Math.max(1, local.crop[2] - local.crop[0])
+        : (origFullW > 0 ? origFullW : 1000);
+    const ih = processedH > 0 ? processedH
+      : (local?.crop_image && local?.crop && local.crop.length === 4)
+        ? Math.max(1, local.crop[3] - local.crop[1])
+        : (origFullH > 0 ? origFullH : 1000);
+    return computeScaleBarRect(sb, iw, ih);
+  };
 
   /* ── Thickness measurement helpers ──────────────────────────────
      Every parametric edit (curve points, count, centre, spacing) routes
@@ -7023,232 +7064,155 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 {OVERLAY_TABS.includes(tabIdx) && !(renderedPreviewB64 && !pendingRenderedRefresh) && local.add_scale_bar && local.scale_bar && (() => {
                   const isScaleBarTab = tabIdx === TAB_SCALE;
                   const sb = local.scale_bar!;
-                  const edgePct = sb.edge_distance ?? 5;
-                  let posXPct = sb.position_x ?? 90;
-                  let posYPct = sb.position_y ?? 90;
-                  // Pre-compute bar dimensions for position calculations
-                  const barPx = sb.bar_length_microns / Math.max(sb.micron_per_pixel || 1, 1e-9);
+                  // Single source of truth, mirroring the backend formula.
+                  const rect = scaleBarRect();
+                  if (!rect) return null;
+                  const { iw, ih, bx, by, barLen, barH, isBottom } = rect;
                   const sbPrevEl = document.querySelector('[alt="Panel preview"]') as HTMLImageElement | null;
                   const sbDispW = sbPrevEl?.clientWidth || 400;
-                  const sbDispH = sbPrevEl?.clientHeight || 400;
-                  // The bar's "source coord width" — what matplotlib
-                  // treats as 1 unit of bar_length_px. That's the
-                  // backend's PROCESSED image width (post-crop / cascade
-                  // / pre-normalize), returned as `processed_width` by
-                  // /api/panel-preview. Using previewNatW here was
-                  // wrong because the displayed PNG can be larger
-                  // (we upscale for crispness without changing the
-                  // data range). Now the inline bar's visual fraction
-                  // matches the figure's bar.
-                  const sbActW = processedW > 0
-                    ? processedW
-                    : (local.crop_image && local.crop && local.crop.length === 4)
-                      ? Math.max(1, local.crop[2] - local.crop[0])
-                      : (origFullW > 0 ? origFullW : 1000);
-                  const sbScale = sbDispW / sbActW;
-                  // For presets, override with calculated positions that keep bar inside
-                  if (sb.position_preset === "Bottom-Right") {
-                    posXPct = 100 - edgePct;
-                    posYPct = 100 - edgePct;
-                  } else if (sb.position_preset === "Bottom-Left") {
-                    posXPct = edgePct;
-                    posYPct = 100 - edgePct;
-                  } else if (sb.position_preset === "Top-Right") {
-                    posXPct = 100 - edgePct;
-                    posYPct = edgePct;
-                  } else if (sb.position_preset === "Top-Left") {
-                    posXPct = edgePct;
-                    posYPct = edgePct;
-                  }
-                  // Whether the label sits above or below the bar.
-                  // sb.label_position is the explicit user pick:
-                  //   "above" / "below" → honour that
-                  //   "auto"           → fall back to vertical position
-                  // (default behaviour: bar near bottom → label above,
-                  // bar near top → label below, so the label doesn't
-                  // clip off the image edge).
-                  const labelPosMode = (sb.label_position ?? "auto") as "auto" | "above" | "below";
-                  const isBottom = labelPosMode === "above"
-                    ? true
-                    : labelPosMode === "below"
-                      ? false
-                      : posYPct > 50;
-                  const isRight = posXPct > 50;
-                  // Position matching backend: bar right edge at (100-edge)%,
-                  // bar bottom at (100-edge)% - 5px offset
-                  const barPxDisp = barPx * sbScale;
-                  const barHDisp = sb.bar_height * sbScale;
-                  const barPct = (barPxDisp / sbDispW) * 100;
+                  // Match matplotlib: font_size pts on a 3-inch (216pt) panel.
+                  const fontSize = Math.max(6, (sb.font_size || 10) * sbDispW / 216);
+                  const labelColor = sb.label_color || sb.bar_color;
+                  const fontFamily = (sb.font_name || "arial.ttf").replace(/\.(ttf|otf|ttc)$/i, "") + ", sans-serif";
+                  const autoLabelText = sb.label || (() => {
+                    const sbU = sb.unit || "um";
+                    const uToUm: Record<string, number> = { km: 1e9, m: 1e6, cm: 10000, mm: 1000, um: 1, nm: 0.001, pm: 1e-6 };
+                    const uLabels: Record<string, string> = { km: "km", m: "m", cm: "cm", mm: "mm", um: "µm", nm: "nm", pm: "pm" };
+                    const val = sb.bar_length_microns / (uToUm[sbU] || 1);
+                    return `${Number(val.toPrecision(6))} ${uLabels[sbU] || sbU}`;
+                  })();
 
-                  // Use right/bottom anchoring for bottom-right presets (matches backend clamping)
-                  // Position matching backend pixel formula exactly:
-                  // Backend: bx = iw*(1-edge) - bar_length (Right), iw*edge (Left)
-                  //          by = ih*(1-edge) - bar_height - 5 (Bottom), ih*edge + 5 (Top)
-                  // CSS uses left% for bar's left edge position
-                  // Position using bar CENTER point, then center the box on it.
-                  // Backend: bx = iw*(1-edge)-bar_length (Right) → bar center at (1-edge) - bar_length/2
-                  //          by = ih*(1-edge)-bar_height-5 (Bottom) → bar center at that + bar_height/2
-                  const posStyle: Record<string, string> = {};
-                  let centerXPct: number, centerYPct: number;
-                  if (!sb.position_preset || sb.position_preset === "Custom") {
-                    centerXPct = posXPct;
-                    centerYPct = posYPct;
-                  } else {
-                    if (isRight) {
-                      // bar center X = (100-edge)% - barWidth/2%
-                      centerXPct = 100 - edgePct - barPct / 2;
-                    } else {
-                      centerXPct = edgePct + barPct / 2;
-                    }
-                    if (isBottom) {
-                      const barHPct = barHDisp / sbDispH * 100;
-                      const offsetPct = 5 * sbScale / sbDispH * 100;
-                      centerYPct = 100 - edgePct - barHPct / 2 - offsetPct;
-                    } else {
-                      const offsetPct = 5 * sbScale / sbDispH * 100;
-                      centerYPct = edgePct + offsetPct + (barHDisp / sbDispH * 100) / 2;
-                    }
-                  }
-                  posStyle.left = `${centerXPct}%`;
-                  posStyle.top = `${centerYPct}%`;
-                  const transformStr = `translate(-50%, ${isBottom ? "0%" : "-50%"})`;
+                  const beginDrag = (e: React.MouseEvent) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    // Resolve the preview <img> globally (same lookup as
+                    // sbPrevEl) — walking up from the handle would land on the
+                    // bar Box, which has no <img> inside it.
+                    const imgEl = document.querySelector('[alt="Panel preview"]') as HTMLImageElement | null;
+                    if (!imgEl) return;
+                    const onMove = (ev: MouseEvent) => {
+                      ev.preventDefault();
+                      const r = imgEl.getBoundingClientRect();
+                      const px = Math.max(0, Math.min(100, ((ev.clientX - r.left) / r.width) * 100));
+                      const py = Math.max(0, Math.min(100, ((ev.clientY - r.top) / r.height) * 100));
+                      // localRef so updates compound correctly across moves.
+                      const curSb = localRef.current?.scale_bar;
+                      if (!curSb) return;
+                      updateLocal({ scale_bar: { ...curSb, position_x: Math.round(px), position_y: Math.round(py), position_preset: "Custom", bar_position: [px / 100, py / 100] } });
+                    };
+                    const onUp = () => {
+                      window.removeEventListener("mousemove", onMove);
+                      window.removeEventListener("mouseup", onUp);
+                      setTimeout(() => refreshPreview(), 0);
+                    };
+                    window.addEventListener("mousemove", onMove);
+                    window.addEventListener("mouseup", onUp);
+                  };
+
                   return (
-                  <Box
-                    sx={{
-                      position: "absolute",
-                      ...posStyle,
-                      transform: transformStr,
-                      // Always "grab" on the Scale Bar tab — dragging
-                      // auto-switches preset → Custom (see onMouseDown).
-                      // This makes inherited scalebars on zoom targets
-                      // (which copy the source's preset, often
-                      // Bottom-Right) draggable just like the parent
-                      // panel's bar.
-                      cursor: isScaleBarTab ? "grab" : "default",
-                      pointerEvents: isScaleBarTab ? "auto" : "none",
-                      userSelect: "none",
-                      display: "flex",
-                      flexDirection: isBottom ? "column-reverse" : "column",
-                      alignItems: "center",  // center text over bar, matching PIL rendering
-                      gap: 0.25,
-                      zIndex: 5,
-                    }}
-                    onMouseDown={isScaleBarTab ? (e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      const imgEl = (e.currentTarget.parentElement?.querySelector("img")) as HTMLImageElement | null;
-                      if (!imgEl) return;
-                      const onMove = (ev: MouseEvent) => {
-                        ev.preventDefault();
-                        const rect = imgEl.getBoundingClientRect();
-                        const px = Math.max(0, Math.min(100, ((ev.clientX - rect.left) / rect.width) * 100));
-                        const py = Math.max(0, Math.min(100, ((ev.clientY - rect.top) / rect.height) * 100));
-                        // localRef so updates compound correctly
-                        // across mousemoves (see other drag handler).
-                        const curSb = localRef.current?.scale_bar;
-                        if (!curSb) return;
-                        updateLocal({ scale_bar: { ...curSb, position_x: Math.round(px), position_y: Math.round(py), position_preset: "Custom", bar_position: [px / 100, py / 100] } });
-                      };
-                      const onUp = () => {
-                        window.removeEventListener("mousemove", onMove);
-                        window.removeEventListener("mouseup", onUp);
-                        setTimeout(() => refreshPreview(), 0);
-                      };
-                      window.addEventListener("mousemove", onMove);
-                      window.addEventListener("mouseup", onUp);
-                    } : undefined}
-                  >
-                    {(() => {
-                      // Use pre-computed outer scope variables for consistency
-                      const barW = Math.max(8, barPx * sbScale);
-                      const barH = Math.max(2, sb.bar_height * sbScale);
-                      // Match matplotlib: font_size pts on 3-inch (216pt) panel
-                      const fontSize = Math.max(6, (sb.font_size || 10) * sbDispW / 216);
-                      return (
-                        <>
-                          <Box sx={{ width: barW, height: barH, bgcolor: local.scale_bar!.bar_color, borderRadius: 0.25 }} />
-                          {/* When styled_segments are present (user
-                              applied per-character styling via the
-                              StyledTextField hovermenu), render each
-                              segment as its own span so the Bold /
-                              Italic / colour / font overrides show
-                              live in the dialog preview before the
-                              matplotlib re-render lands. */}
-                          {(local.scale_bar!.styled_segments && local.scale_bar!.styled_segments.length > 0) ? (
-                            <Typography sx={{ fontSize: `${fontSize}px`, color: local.scale_bar!.label_color || local.scale_bar!.bar_color, textShadow: "0 1px 2px rgba(0,0,0,0.8)", whiteSpace: "nowrap", fontFamily: (local.scale_bar!.font_name || "arial.ttf").replace(/\.(ttf|otf|ttc)$/i, "") + ", sans-serif" }}>
-                              {renderStyledSegmentsInline(
-                                local.scale_bar!.styled_segments,
-                                fontSize / (local.scale_bar!.font_size || 12),
-                                local.scale_bar!.label_color || local.scale_bar!.bar_color,
-                                false,
-                              )}
-                            </Typography>
-                          ) : (
-                            <Typography sx={{ fontSize: `${fontSize}px`, color: local.scale_bar!.label_color || local.scale_bar!.bar_color, textShadow: "0 1px 2px rgba(0,0,0,0.8)", whiteSpace: "nowrap", fontFamily: (local.scale_bar!.font_name || "arial.ttf").replace(/\.(ttf|otf|ttc)$/i, "") + ", sans-serif" }}>
-                              {local.scale_bar!.label || (() => {
-                                const sbU = local.scale_bar!.unit || "um";
-                                const uToUm: Record<string, number> = { km: 1e9, m: 1e6, cm: 10000, mm: 1000, um: 1, nm: 0.001, pm: 1e-6 };
-                                const uLabels: Record<string, string> = { km: "km", m: "m", cm: "cm", mm: "mm", um: "\u00B5m", nm: "nm", pm: "pm" };
-                                const val = local.scale_bar!.bar_length_microns / (uToUm[sbU] || 1);
-                                return `${Number(val.toPrecision(6))} ${uLabels[sbU] || sbU}`;
-                              })()}
-                            </Typography>
-                          )}
-                        </>
-                      );
-                    })()}
-                  </Box>
-                  ); })()}
-                {/* Scale bar drag hitbox — invisible overlay that
-                    lets the user drag the bar on the Scale Bar tab
-                    when the matplotlib-rendered preview is showing.
-                    Now works regardless of preset: if the bar is at a
-                    preset position (Bottom-Right etc.), we compute
-                    its effective on-image position and place the
-                    hitbox there. The mousedown auto-switches the
-                    bar to "Custom" mode so the drag commits. */}
+                    <Box
+                      sx={{
+                        // The BAR itself is the positioned element, sized and
+                        // placed exactly as the backend draws it. Nothing about
+                        // the label can move it.
+                        position: "absolute",
+                        left: `${(bx / iw) * 100}%`,
+                        top: `${(by / ih) * 100}%`,
+                        width: `${(barLen / iw) * 100}%`,
+                        height: `${(barH / ih) * 100}%`,
+                        bgcolor: sb.bar_color,
+                        borderRadius: 0.25,
+                        userSelect: "none",
+                        pointerEvents: "none",
+                        zIndex: 5,
+                      }}
+                    >
+                      {/* Label — absolutely positioned OFF the bar, so an
+                          "auto" side flip moves only the text and never
+                          nudges the bar (matches the backend, where bx/by are
+                          independent of is_bottom). */}
+                      <Box
+                        sx={{
+                          position: "absolute",
+                          left: "50%",
+                          transform: "translateX(-50%)",
+                          ...(isBottom ? { bottom: "100%", mb: "2px" } : { top: "100%", mt: "2px" }),
+                          whiteSpace: "nowrap",
+                          pointerEvents: "none",
+                        }}
+                      >
+                        <Typography sx={{ fontSize: `${fontSize}px`, color: labelColor, textShadow: "0 1px 2px rgba(0,0,0,0.8)", whiteSpace: "nowrap", fontFamily, lineHeight: 1.1 }}>
+                          {(sb.styled_segments && sb.styled_segments.length > 0)
+                            ? renderStyledSegmentsInline(sb.styled_segments, fontSize / (sb.font_size || 12), labelColor, false)
+                            : autoLabelText}
+                        </Typography>
+                      </Box>
+                      {/* Grab handle — the bar can be only a couple of pixels
+                          tall, so give the drag a usable target centred on it. */}
+                      {isScaleBarTab && (
+                        <Box
+                          onMouseDown={beginDrag}
+                          sx={{
+                            position: "absolute",
+                            left: 0, width: "100%",
+                            top: "50%", transform: "translateY(-50%)",
+                            height: 16, minHeight: 16,
+                            cursor: "grab",
+                            pointerEvents: "auto",
+                            "&:active": { cursor: "grabbing" },
+                          }}
+                        />
+                      )}
+                    </Box>
+                  );
+                })()}
+                {/* Scale bar drag hitbox — invisible grab target shown when
+                    the matplotlib-rendered preview is on screen (the bar is
+                    baked into that PNG, so there's no CSS bar to grab).
+                    It now sits on the bar's ACTUAL rect via scaleBarRect(),
+                    the same formula the backend draws with. It used to be
+                    parked at the preset's ANCHOR point (e.g. 95%,95% for
+                    Bottom-Right) — but a Bottom-Right bar extends LEFT from
+                    that anchor, so its centre is nowhere near it and the
+                    hitbox missed the bar entirely. That's why dragging only
+                    started working after manually editing X/Y (which flips the
+                    preset to Custom, where anchor == centre by luck).
+                    The mousedown switches the bar to Custom so the drag
+                    commits. */}
                 {tabIdx === TAB_SCALE && renderedPreviewB64 && local.add_scale_bar && local.scale_bar && (() => {
-                  const sb = local.scale_bar!;
-                  const edgePct = sb.edge_distance ?? 5;
-                  // Compute the bar's effective on-image position
-                  // (matches the backend's preset math).
-                  let posX = sb.position_x ?? 50;
-                  let posY = sb.position_y ?? 90;
-                  const preset = sb.position_preset ?? "Bottom-Right";
-                  if (preset && preset !== "Custom") {
-                    if (preset === "Bottom-Right") { posX = 100 - edgePct; posY = 100 - edgePct; }
-                    else if (preset === "Bottom-Left") { posX = edgePct; posY = 100 - edgePct; }
-                    else if (preset === "Top-Right") { posX = 100 - edgePct; posY = edgePct; }
-                    else if (preset === "Top-Left") { posX = edgePct; posY = edgePct; }
-                  }
+                  const rect = scaleBarRect();
+                  if (!rect) return null;
+                  const { iw, ih, bx, by, barLen, barH } = rect;
                   return (
                     <Box
                       sx={{
                         position: "absolute",
-                        left: `${posX}%`,
-                        top: `${posY}%`,
+                        // Centre the grab target on the bar itself.
+                        left: `${((bx + barLen / 2) / iw) * 100}%`,
+                        top: `${((by + barH / 2) / ih) * 100}%`,
                         transform: "translate(-50%, -50%)",
-                        width: "20%",
-                        height: "12%",
+                        // Cover the bar's length, with a minimum so a short bar
+                        // is still grabbable; height is a fixed comfortable band.
+                        width: `${(barLen / iw) * 100}%`,
+                        minWidth: 24,
+                        height: 18,
                         cursor: "grab",
                         zIndex: 10,
+                        "&:active": { cursor: "grabbing" },
                       }}
                       onMouseDown={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
-                        const imgEl = (e.currentTarget.parentElement?.querySelector("img")) as HTMLImageElement | null;
+                        const imgEl = document.querySelector('[alt="Panel preview"]') as HTMLImageElement | null;
                         if (!imgEl) return;
                         const onMove = (ev: MouseEvent) => {
                           ev.preventDefault();
-                          const rect = imgEl.getBoundingClientRect();
-                          const px = Math.max(0, Math.min(100, ((ev.clientX - rect.left) / rect.width) * 100));
-                          const py = Math.max(0, Math.min(100, ((ev.clientY - rect.top) / rect.height) * 100));
-                          // Use localRef so each mousemove sees the
-                          // LATEST scale_bar (closure on `local` would
-                          // pin to the value at mousedown — after one
-                          // updateLocal call the stale `local.scale_bar`
-                          // gets re-applied, undoing subsequent edits
-                          // and effectively breaking the drag).
+                          const r = imgEl.getBoundingClientRect();
+                          const px = Math.max(0, Math.min(100, ((ev.clientX - r.left) / r.width) * 100));
+                          const py = Math.max(0, Math.min(100, ((ev.clientY - r.top) / r.height) * 100));
+                          // Use localRef so each mousemove sees the LATEST
+                          // scale_bar (a closure on `local` would pin to the
+                          // value at mousedown and undo prior moves).
                           const curSb = localRef.current?.scale_bar;
                           if (!curSb) return;
                           updateLocal({ scale_bar: { ...curSb, position_x: Math.round(px), position_y: Math.round(py), position_preset: "Custom", bar_position: [px / 100, py / 100] } });

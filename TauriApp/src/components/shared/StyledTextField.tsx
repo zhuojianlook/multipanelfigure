@@ -65,6 +65,15 @@ import {
  *  segments aligned.  If segments is empty / null / out-of-sync,
  *  rebuilds a single "default style" segment covering the whole
  *  text. */
+/** Palette for the inline colour picker — figure-annotation staples: a
+ *  greyscale ramp plus high-contrast primaries that read well over both
+ *  bright-field and fluorescence panels. Anything outside this set is still
+ *  reachable via "Custom…" (the OS picker). */
+const COLOR_SWATCHES = [
+  "#FFFFFF", "#C0C0C0", "#808080", "#404040", "#000000", "#FF0000", "#FF6D00", "#FFD600",
+  "#FFFF00", "#00E676", "#00C853", "#00E5FF", "#2979FF", "#0000FF", "#D500F9", "#FF00FF",
+];
+
 export function reconcileSegments(
   text: string,
   segments: StyledTextSegment[] | null | undefined,
@@ -258,6 +267,8 @@ export function StyledTextField({
   // no MUI Menu / Popover, because their portal-based positioning
   // misbehaves when nested inside our parent <Popper>.
   const [fontMenuOpen, setFontMenuOpen] = useState(false);
+  // Same for the inline colour palette (see COLOR_SWATCHES).
+  const [colorMenuOpen, setColorMenuOpen] = useState(false);
 
   // Keep segments coherent with text — if the parent passes
   // inconsistent data (e.g. only updates text without segments),
@@ -273,6 +284,17 @@ export function StyledTextField({
   // INTO the toolbar — handled below via the mousedown snapshot).
   const toolbarOpen = focused && hasSel;
 
+  // Reset the inline dropdowns whenever the toolbar goes away — the Popper
+  // unmounts (keepMounted is false) but this component's state survives, so
+  // without this a menu left open would reappear already-open the next time
+  // the user selects text.
+  useEffect(() => {
+    if (!toolbarOpen) {
+      setFontMenuOpen(false);
+      setColorMenuOpen(false);
+    }
+  }, [toolbarOpen]);
+
   const handleTextChange = (newText: string) => {
     fireChange(newText, safeSegments);
   };
@@ -281,10 +303,18 @@ export function StyledTextField({
     if (sel && sel.start !== sel.end) {
       cachedSelRef.current = sel;
       setHasSel(true);
-    } else if (!sel) {
+    } else {
+      // No selection (null) OR the selection COLLAPSED (start === end, i.e.
+      // the user clicked to deselect). Both mean "nothing is highlighted", so
+      // the toolbar must go away — previously the collapse case fell through
+      // and left the toolbar stranded on top of the UI.
+      //
+      // cachedSelRef is deliberately NOT cleared: toolbar buttons preventDefault
+      // on mousedown so they never collapse the selection themselves, but if a
+      // stray collapse does land mid-interaction the cached range still lets an
+      // in-flight applyPatch target the right text.
       setHasSel(false);
     }
-    // Don't drop cachedSel on collapse — toolbar buttons need it.
   };
 
   const applyPatch = (patch: Parameters<typeof applyStyleToRange>[3]) => {
@@ -382,6 +412,7 @@ export function StyledTextField({
       // it land here as "not outside" (the Paper is inside the
       // toolbar's Popper, which contains the click target).
       setFontMenuOpen(false);
+      setColorMenuOpen(false);
       setHasSel(false);
       cachedSelRef.current = null;
     };
@@ -694,31 +725,22 @@ export function StyledTextField({
             );
           })()}
 
-          {/* Colour swatch — the IconButton opens the native colour
-              picker for the hidden <input type="color"> next to it.
-              We trigger via showPicker() rather than a synthetic
-              .click(): in WKWebView (this app's macOS webview) a
-              programmatic .click() on a zero-size / pointer-events:none
-              colour input is a silent no-op — the picker never opens,
-              so the icon looked dead.  showPicker() is purpose-built to
-              open the picker programmatically regardless of the input's
-              size or visibility; .click() stays as a fallback for
-              engines that predate it. */}
+          {/* Colour — an INLINE palette, not the native <input type="color">.
+              WKWebView (this app's macOS webview) hands a native colour input
+              to the OS NSColorPanel: a free-floating window that opens wherever
+              macOS last left it — frequently nowhere near the app, which is
+              exactly what the user hit. A <Paper> positioned by CSS under the
+              swatch (same trick as the Font dropdown above — MUI's portal
+              widgets mis-position inside our parent <Popper>) opens right where
+              you clicked, every time. "Custom…" still reaches the OS picker for
+              colours outside the palette. */}
           <Box sx={{ position: "relative", display: "inline-flex", ml: 0.5 }}>
             <IconButton
               title="Colour (selection)"
               size="small"
               sx={{ p: 0.25 }}
               onMouseDown={swallowMouseDown}
-              onClick={() => {
-                const el = colorInputRef.current as
-                  (HTMLInputElement & { showPicker?: () => void }) | null;
-                if (!el) return;
-                try {
-                  if (typeof el.showPicker === "function") { el.showPicker(); return; }
-                } catch { /* fall through to .click() below */ }
-                el.click();
-              }}
+              onClick={() => setColorMenuOpen((v) => !v)}
             >
               <Box sx={{
                 width: 14, height: 14, borderRadius: 0.25,
@@ -727,15 +749,69 @@ export function StyledTextField({
                 bgcolor: selStyle?.color || defaultColor,
               }} />
             </IconButton>
+            {colorMenuOpen && (
+              <Paper
+                elevation={6}
+                sx={{
+                  position: "absolute", top: "100%", left: 0, mt: 0.25,
+                  p: 0.75, zIndex: 1600,
+                  border: "1px solid", borderColor: "divider",
+                }}
+                onMouseDown={(e) => e.preventDefault()}
+              >
+                <Box sx={{ display: "grid", gridTemplateColumns: "repeat(8, 16px)", gap: 0.375 }}>
+                  {COLOR_SWATCHES.map((c) => {
+                    const selected = (selStyle?.color || "").toLowerCase() === c.toLowerCase();
+                    return (
+                      <Box
+                        key={c}
+                        title={c}
+                        onMouseDown={swallowMouseDown}
+                        onClick={() => { applyPatch({ color: c }); setColorMenuOpen(false); }}
+                        sx={{
+                          width: 16, height: 16, borderRadius: 0.25,
+                          bgcolor: c, cursor: "pointer",
+                          border: "1px solid",
+                          borderColor: selected ? "primary.main" : "divider",
+                          boxShadow: selected ? 2 : 0,
+                          "&:hover": { transform: "scale(1.15)" },
+                          transition: "transform 80ms",
+                        }}
+                      />
+                    );
+                  })}
+                </Box>
+                <Box
+                  onMouseDown={swallowMouseDown}
+                  onClick={() => {
+                    const el = colorInputRef.current as
+                      (HTMLInputElement & { showPicker?: () => void }) | null;
+                    if (!el) return;
+                    setColorMenuOpen(false);
+                    try {
+                      if (typeof el.showPicker === "function") { el.showPicker(); return; }
+                    } catch { /* fall through to .click() below */ }
+                    el.click();
+                  }}
+                  sx={{
+                    mt: 0.75, px: 0.5, py: 0.25, borderRadius: 0.5,
+                    fontSize: "0.65rem", textAlign: "center", cursor: "pointer",
+                    color: "text.secondary",
+                    border: "1px dashed", borderColor: "divider",
+                    "&:hover": { bgcolor: "action.hover" },
+                  }}
+                >
+                  Custom…
+                </Box>
+              </Paper>
+            )}
             <input
               ref={colorInputRef}
               type="color"
               value={selStyle?.color || defaultColor}
               onChange={(e) => applyPatch({ color: e.target.value })}
-              // Kept mounted but visually hidden (the swatch above shows
-              // the colour).  A 1×1 footprint anchored under the swatch
-              // gives the native picker a sane position to open next to.
-              // tabIndex=-1 keeps it out of tab order.
+              // Only reachable via "Custom…" now. Kept mounted + 1×1 so
+              // showPicker() has a live, rendered element to open from.
               tabIndex={-1}
               style={{ position: "absolute", left: 4, bottom: 0, width: 1, height: 1, opacity: 0, border: "none", padding: 0, pointerEvents: "none" }}
             />

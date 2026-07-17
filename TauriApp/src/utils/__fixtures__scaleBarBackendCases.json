@@ -1,0 +1,376 @@
+[
+ {
+  "sb": {
+   "bar_length_microns": 100,
+   "micron_per_pixel": 0.5,
+   "bar_height": 5,
+   "edge_distance": 5,
+   "position_preset": "Bottom-Right"
+  },
+  "iw": 1000,
+  "ih": 1000,
+  "expect": {
+   "bx": 750.0,
+   "by": 940.0,
+   "barLen": 200.0,
+   "barH": 5,
+   "isBottom": true
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 100,
+   "micron_per_pixel": 0.5,
+   "bar_height": 5,
+   "edge_distance": 5,
+   "position_preset": "Bottom-Left"
+  },
+  "iw": 1000,
+  "ih": 1000,
+  "expect": {
+   "bx": 50.0,
+   "by": 940.0,
+   "barLen": 200.0,
+   "barH": 5,
+   "isBottom": true
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 100,
+   "micron_per_pixel": 0.5,
+   "bar_height": 5,
+   "edge_distance": 8,
+   "position_preset": "Top-Right"
+  },
+  "iw": 1000,
+  "ih": 1000,
+  "expect": {
+   "bx": 720.0,
+   "by": 85.0,
+   "barLen": 200.0,
+   "barH": 5,
+   "isBottom": false
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 100,
+   "micron_per_pixel": 0.5,
+   "bar_height": 5,
+   "edge_distance": 8,
+   "position_preset": "Top-Left"
+  },
+  "iw": 1000,
+  "ih": 1000,
+  "expect": {
+   "bx": 80.0,
+   "by": 85.0,
+   "barLen": 200.0,
+   "barH": 5,
+   "isBottom": false
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 200,
+   "micron_per_pixel": 1.0,
+   "bar_height": 8,
+   "position_preset": "Custom",
+   "position_x": 50,
+   "position_y": 80
+  },
+  "iw": 1000,
+  "ih": 1000,
+  "expect": {
+   "bx": 400.0,
+   "by": 800.0,
+   "barLen": 200.0,
+   "barH": 8,
+   "isBottom": true
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 200,
+   "micron_per_pixel": 1.0,
+   "bar_height": 8,
+   "position_preset": "Custom",
+   "position_x": 30,
+   "position_y": 20
+  },
+  "iw": 1000,
+  "ih": 1000,
+  "expect": {
+   "bx": 200.0,
+   "by": 200.0,
+   "barLen": 200.0,
+   "barH": 8,
+   "isBottom": false
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 50,
+   "micron_per_pixel": 1.0,
+   "bar_height": 4,
+   "position_preset": "Custom",
+   "position_x": 50,
+   "position_y": 49
+  },
+  "iw": 1000,
+  "ih": 1000,
+  "expect": {
+   "bx": 475.0,
+   "by": 490.0,
+   "barLen": 50.0,
+   "barH": 4,
+   "isBottom": false
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 50,
+   "micron_per_pixel": 1.0,
+   "bar_height": 4,
+   "position_preset": "Custom",
+   "position_x": 50,
+   "position_y": 51
+  },
+  "iw": 1000,
+  "ih": 1000,
+  "expect": {
+   "bx": 475.0,
+   "by": 510.0,
+   "barLen": 50.0,
+   "barH": 4,
+   "isBottom": true
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 50,
+   "micron_per_pixel": 1.0,
+   "bar_height": 4,
+   "position_preset": "Custom",
+   "position_x": 50,
+   "position_y": 20,
+   "label_position": "above"
+  },
+  "iw": 1000,
+  "ih": 1000,
+  "expect": {
+   "bx": 475.0,
+   "by": 200.0,
+   "barLen": 50.0,
+   "barH": 4,
+   "isBottom": true
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 5000,
+   "micron_per_pixel": 1.0,
+   "bar_height": 5,
+   "position_preset": "Custom",
+   "position_x": 50,
+   "position_y": 50
+  },
+  "iw": 1000,
+  "ih": 1000,
+  "expect": {
+   "bx": 0,
+   "by": 500.0,
+   "barLen": 5000.0,
+   "barH": 5,
+   "isBottom": false
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 100,
+   "micron_per_pixel": 0.5,
+   "bar_height": 5,
+   "edge_distance": 5,
+   "position_preset": "Bottom-Right"
+  },
+  "iw": 1600,
+  "ih": 900,
+  "expect": {
+   "bx": 1320.0,
+   "by": 845.0,
+   "barLen": 200.0,
+   "barH": 5,
+   "isBottom": true
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 100,
+   "micron_per_pixel": 0.5,
+   "bar_height": 5,
+   "edge_distance": 5,
+   "position_preset": "Bottom-Left"
+  },
+  "iw": 1600,
+  "ih": 900,
+  "expect": {
+   "bx": 80.0,
+   "by": 845.0,
+   "barLen": 200.0,
+   "barH": 5,
+   "isBottom": true
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 100,
+   "micron_per_pixel": 0.5,
+   "bar_height": 5,
+   "edge_distance": 8,
+   "position_preset": "Top-Right"
+  },
+  "iw": 1600,
+  "ih": 900,
+  "expect": {
+   "bx": 1272.0,
+   "by": 77.0,
+   "barLen": 200.0,
+   "barH": 5,
+   "isBottom": false
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 100,
+   "micron_per_pixel": 0.5,
+   "bar_height": 5,
+   "edge_distance": 8,
+   "position_preset": "Top-Left"
+  },
+  "iw": 1600,
+  "ih": 900,
+  "expect": {
+   "bx": 128.0,
+   "by": 77.0,
+   "barLen": 200.0,
+   "barH": 5,
+   "isBottom": false
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 200,
+   "micron_per_pixel": 1.0,
+   "bar_height": 8,
+   "position_preset": "Custom",
+   "position_x": 50,
+   "position_y": 80
+  },
+  "iw": 1600,
+  "ih": 900,
+  "expect": {
+   "bx": 700.0,
+   "by": 720.0,
+   "barLen": 200.0,
+   "barH": 8,
+   "isBottom": true
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 200,
+   "micron_per_pixel": 1.0,
+   "bar_height": 8,
+   "position_preset": "Custom",
+   "position_x": 30,
+   "position_y": 20
+  },
+  "iw": 1600,
+  "ih": 900,
+  "expect": {
+   "bx": 380.0,
+   "by": 180.0,
+   "barLen": 200.0,
+   "barH": 8,
+   "isBottom": false
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 50,
+   "micron_per_pixel": 1.0,
+   "bar_height": 4,
+   "position_preset": "Custom",
+   "position_x": 50,
+   "position_y": 49
+  },
+  "iw": 1600,
+  "ih": 900,
+  "expect": {
+   "bx": 775.0,
+   "by": 441.0,
+   "barLen": 50.0,
+   "barH": 4,
+   "isBottom": false
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 50,
+   "micron_per_pixel": 1.0,
+   "bar_height": 4,
+   "position_preset": "Custom",
+   "position_x": 50,
+   "position_y": 51
+  },
+  "iw": 1600,
+  "ih": 900,
+  "expect": {
+   "bx": 775.0,
+   "by": 459.0,
+   "barLen": 50.0,
+   "barH": 4,
+   "isBottom": true
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 50,
+   "micron_per_pixel": 1.0,
+   "bar_height": 4,
+   "position_preset": "Custom",
+   "position_x": 50,
+   "position_y": 20,
+   "label_position": "above"
+  },
+  "iw": 1600,
+  "ih": 900,
+  "expect": {
+   "bx": 775.0,
+   "by": 180.0,
+   "barLen": 50.0,
+   "barH": 4,
+   "isBottom": true
+  }
+ },
+ {
+  "sb": {
+   "bar_length_microns": 5000,
+   "micron_per_pixel": 1.0,
+   "bar_height": 5,
+   "position_preset": "Custom",
+   "position_x": 50,
+   "position_y": 50
+  },
+  "iw": 1600,
+  "ih": 900,
+  "expect": {
+   "bx": 0,
+   "by": 450.0,
+   "barLen": 5000.0,
+   "barH": 5,
+   "isBottom": false
+  }
+ }
+]

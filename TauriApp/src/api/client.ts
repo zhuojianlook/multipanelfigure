@@ -236,8 +236,13 @@ class ApiClient {
 
   // ── Panel rendered preview (with matplotlib overlays) ──
 
-  async getPanelRenderedPreview(row: number, col: number): Promise<{ image: string }> {
-    return apiJson(`/api/panel-rendered-preview/${row}/${col}`);
+  /** `includeZoom` bakes the panel's zoom inset into the returned PNG. The
+   *  Zoom Inset tab draws the inset itself via an interactive SVG overlay, so
+   *  it must stay OFF there (double render); every other overlay tab wants it
+   *  visible for context — e.g. placing a scale bar around an inset. */
+  async getPanelRenderedPreview(row: number, col: number, includeZoom = false): Promise<{ image: string }> {
+    const q = includeZoom ? "?include_zoom=1" : "";
+    return apiJson(`/api/panel-rendered-preview/${row}/${col}${q}`);
   }
 
   // ── Preview ────────────────────────────────────────────

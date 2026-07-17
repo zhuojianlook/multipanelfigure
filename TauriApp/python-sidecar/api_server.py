@@ -3195,10 +3195,16 @@ def patch_panel_and_preview(r: int, c: int, body: PanelPatchAndPreview):
 # ── Single-panel rendered preview (with matplotlib overlays) ──────────────
 
 @app.get("/api/panel-rendered-preview/{r}/{c}")
-def get_panel_rendered_preview(r: int, c: int):
+def get_panel_rendered_preview(r: int, c: int, include_zoom: bool = False):
     """Render a single panel through matplotlib with scale bars, labels, and
     symbols — using the SAME rendering functions as the final figure output.
-    Produces an image with exact pixel dimensions matching the base preview."""
+    Produces an image with exact pixel dimensions matching the base preview.
+
+    `include_zoom` bakes the panel's zoom inset into the image. The Zoom Inset
+    tab draws the inset itself via an interactive SVG overlay, so it asks for
+    include_zoom=0 to avoid a double render; the other overlay tabs ask for 1
+    so the inset is visible (non-interactive) as context — otherwise e.g. the
+    Scale Bar tab shows a panel with the inset mysteriously missing."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -3276,7 +3282,8 @@ def get_panel_rendered_preview(r: int, c: int):
         # Temporarily disable zoom inset to prevent double rendering
         # with the SVG overlay.
         saved_zoom = panel.add_zoom_inset
-        panel.add_zoom_inset = False
+        if not include_zoom:
+            panel.add_zoom_inset = False
         processed = process_panel(
             _get_panel_image(panel) or loaded_images[panel.image_name], panel, min_dims, loaded_images,
             skip_labels=True, skip_symbols=True)
