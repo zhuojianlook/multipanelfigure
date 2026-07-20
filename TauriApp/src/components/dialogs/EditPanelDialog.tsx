@@ -4972,7 +4972,14 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       const oldAutoLabel = `${Number((sb.bar_length_microns / umPerUnit).toPrecision(6))} ${unitLabel}`;
                       const shouldClearLabel = !sb.label || sb.label === oldAutoLabel;
                       updateLocal({ scale_bar: { ...sb, unit: newUnit, label: shouldClearLabel ? "" : sb.label } });
-                    }}>
+                    }}
+                    // SI unit symbols are case-sensitive, so they must NOT be
+                    // uppercased. MUI's ToggleButton inherits typography.button
+                    // (textTransform: uppercase), which rendered "mm" as "MM"
+                    // and — worse — "µm" as "ΜM", because µ (U+00B5) uppercases
+                    // to Greek capital Mu (U+039C), visually identical to "M".
+                    // That made millimetres and micrometres indistinguishable.
+                    sx={{ "& .MuiToggleButton-root": { textTransform: "none" } }}>
                     <ToggleButton value="km" sx={{ px: 0.75, py: 0.25, fontSize: "0.65rem" }}>km</ToggleButton>
                     <ToggleButton value="m" sx={{ px: 0.75, py: 0.25, fontSize: "0.65rem" }}>m</ToggleButton>
                     <ToggleButton value="cm" sx={{ px: 0.75, py: 0.25, fontSize: "0.65rem" }}>cm</ToggleButton>
@@ -7522,9 +7529,21 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         left: `${lbl.position_x}%`,
                         top: `${lbl.position_y}%`,
                         transform: `rotate(${lbl.rotation || 0}deg)`,
+                        // This label is drawn TWICE — baked into the matplotlib
+                        // preview PNG by the backend, and as this CSS overlay —
+                        // and the dialog swaps between them (see hideText /
+                        // useRendered). matplotlib anchors the GLYPH bbox's
+                        // top-left exactly on (position_x%, position_y%) with
+                        // ha="left", va="top", so this box must do the same:
+                        // any padding, border, or line-height half-leading
+                        // insets the glyph from the anchor and the label
+                        // visibly jumps on every swap — e.g. while dragging the
+                        // scale bar, which forces a preview refresh each tick.
+                        transformOrigin: "0 0",
+                        p: 0,
+                        lineHeight: 1,
                         cursor: isDraggable ? "grab" : "default",
                         userSelect: "none",
-                        px: 0.5, py: 0.25,
                         bgcolor: isDraggable && isSelected ? "rgba(33,150,243,0.3)" : "transparent",
                         color: hideText ? "transparent" : (lbl.color || "#fff"),
                         borderRadius: 0.5,
@@ -7534,12 +7553,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         fontStyle: isItalic ? "italic" : "normal",
                         textDecoration: hasStrike ? "line-through" : "none",
                         verticalAlign: hasSup ? "super" : hasSub ? "sub" : "baseline",
-                        border: isLabelsTab && isSelected ? "1px solid rgba(255,255,255,0.5)" : "1px solid transparent",
+                        // Selection/hover ring via OUTLINE, not border: outline is
+                        // painted outside the box and takes no layout space, so
+                        // the affordance can't shift the glyph off its anchor.
+                        outline: isLabelsTab && isSelected ? "1px solid rgba(255,255,255,0.5)" : "none",
+                        outlineOffset: "2px",
                         whiteSpace: "nowrap",
                         zIndex: isLabelsTab && isSelected ? 10 : 1,
                         textShadow: hideText ? "none" : "0 1px 3px rgba(0,0,0,0.8)",
                         pointerEvents: isDraggable ? "auto" : "none",
-                        "&:hover": isDraggable ? { border: "1px solid rgba(255,255,255,0.5)" } : {},
+                        "&:hover": isDraggable ? { outline: "1px solid rgba(255,255,255,0.5)", outlineOffset: "2px" } : {},
                       }}
                       onMouseDown={isDraggable ? (e) => {
                         e.preventDefault();

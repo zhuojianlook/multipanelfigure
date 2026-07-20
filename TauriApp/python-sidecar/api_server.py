@@ -154,7 +154,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.385"  # CI re-syncs this from the release tag (build-sidecar)
+SIDECAR_BUILD = "0.1.386"  # CI re-syncs this from the release tag (build-sidecar)
 
 
 @app.get("/api/version")
