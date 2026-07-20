@@ -31,6 +31,25 @@ jobs:
         # known-good set (the versions that shipped in v0.1.357). Bump these
         # deliberately, not by accident. Server/build tools stay unpinned.
         run: pip install 'pillow==12.2.0' 'numpy==2.4.6' 'scipy==1.17.1' 'matplotlib==3.10.9' 'opencv-python-headless==4.13.0.92' fastapi uvicorn python-multipart nibabel tifffile pyinstaller
+      - name: Sync SIDECAR_BUILD to release tag
+        # api_server.py's SIDECAR_BUILD stamps the provenance watermark embedded
+        # in every exported figure/collage. CI force-syncs package.json +
+        # tauri.conf.json from the tag but NOT this constant, so it silently
+        # drifted once — a 0.1.384 build stamping exports "v0.1.369". Pin it from
+        # the tag HERE, before pyinstaller freezes the binary. Fails loudly if the
+        # constant is ever renamed, so the drift can't come back unnoticed.
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" == exp-* ]]; then VERSION="${TAG#exp-}";
+          elif [[ "$TAG" == v* ]]; then VERSION="${TAG#v}";
+          else VERSION=""; fi
+          if [ -n "$VERSION" ]; then
+            python -c 'import re,sys;p="TauriApp/python-sidecar/api_server.py";s=open(p).read();s2,n=re.subn(r"^SIDECAR_BUILD = .*$","SIDECAR_BUILD = \"%s\"  # synced from the release tag by CI" % sys.argv[1],s,count=1,flags=re.M);sys.exit("SIDECAR_BUILD line not found in "+p) if n!=1 else open(p,"w").write(s2)' "$VERSION"
+            grep -n '^SIDECAR_BUILD' TauriApp/python-sidecar/api_server.py
+          else
+            echo "Not a version tag ($TAG) — leaving SIDECAR_BUILD as committed."
+          fi
+        shell: bash
       - name: Build sidecar
         working-directory: TauriApp/python-sidecar
         run: |
@@ -294,7 +313,17 @@ jobs:
           STAGE=$(mktemp -d)
           cp -R "$APP_PATH" "$STAGE/"
           ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname "Multi-Panel Figure Builder" -srcfolder "$STAGE" -ov -format UDZO "$DMG_DIR/$DMG_NAME"
+          # hdiutil intermittently fails with "Resource busy" on the runner (a
+          # transient mount/lock race, not a real error) — that flake failed a
+          # whole stable release once. Retry with backoff before giving up.
+          for attempt in 1 2 3 4; do
+            if hdiutil create -volname "Multi-Panel Figure Builder" -srcfolder "$STAGE" -ov -format UDZO "$DMG_DIR/$DMG_NAME"; then
+              echo "DMG created (attempt $attempt)"; break
+            fi
+            if [ "$attempt" = "4" ]; then echo "hdiutil create failed after 4 attempts"; exit 1; fi
+            echo "hdiutil create failed (attempt $attempt) — retrying in $((attempt * 10))s"
+            rm -f "$DMG_DIR/$DMG_NAME"; sync; sleep $((attempt * 10))
+          done
           rm -rf "$STAGE"
           # Regenerate the updater bundle (.app.tar.gz) from the signed app + re-sign it
           ( cd "$MACOS_DIR" && rm -f "$APP_NAME.tar.gz" "$APP_NAME.tar.gz.sig" && COPYFILE_DISABLE=1 tar czf "$APP_NAME.tar.gz" "$APP_NAME" )
@@ -321,7 +350,15 @@ jobs:
           STAGE_DIR=$(mktemp -d)
           cp -R "$APP_PATH" "$STAGE_DIR/"
           ln -s /Applications "$STAGE_DIR/Applications"
-          hdiutil create -volname "Multi-Panel Figure Builder" -srcfolder "$STAGE_DIR" -ov -format UDZO "$DMG_DIR/$DMG_NAME"
+          # Same transient "Resource busy" retry as the signed path above.
+          for attempt in 1 2 3 4; do
+            if hdiutil create -volname "Multi-Panel Figure Builder" -srcfolder "$STAGE_DIR" -ov -format UDZO "$DMG_DIR/$DMG_NAME"; then
+              echo "DMG created (attempt $attempt)"; break
+            fi
+            if [ "$attempt" = "4" ]; then echo "hdiutil create failed after 4 attempts"; exit 1; fi
+            echo "hdiutil create failed (attempt $attempt) — retrying in $((attempt * 10))s"
+            rm -f "$DMG_DIR/$DMG_NAME"; sync; sleep $((attempt * 10))
+          done
           rm -rf "$STAGE_DIR"
         shell: bash
       - name: Upload artifacts
