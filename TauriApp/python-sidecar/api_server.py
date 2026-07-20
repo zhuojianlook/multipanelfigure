@@ -154,7 +154,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.369"  # keep in sync with package.json / tauri.conf.json on each release
+SIDECAR_BUILD = "0.1.384"  # keep in sync with package.json / tauri.conf.json on each release
 
 
 @app.get("/api/version")
