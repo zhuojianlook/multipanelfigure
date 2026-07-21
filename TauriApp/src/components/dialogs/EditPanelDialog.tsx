@@ -408,6 +408,63 @@ function makeInsetId(): string {
   return `inset_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
+/** matplotlib's `va="top"` anchors text at the font's TYPOGRAPHIC ASCENDER,
+ *  which is NOT the ascent a browser uses to lay out a line box.  Measured
+ *  directly out of matplotlib (render "H" with va="top", locate the baseline
+ *  from the glyph's ink bottom, take the anchor-to-baseline distance):
+ *
+ *      Arial 0.720   Times New Roman 0.695   Courier New 0.616
+ *      Verdana 0.760   DejaVu Sans 0.763 (matplotlib's fallback face)
+ *
+ *  A browser instead puts the box top at `baseline - halfLeading - ascent`,
+ *  and for Arial that lands the glyph ~0.127em LOWER than matplotlib puts it
+ *  — about 5 px at a typical preview size.  That is why a label appeared to
+ *  drop slightly whenever the dialog swapped from the matplotlib-baked PNG
+ *  to this CSS overlay, which it does on every scale-bar drag tick. */
+const MPL_TOP_ANCHOR_EM: Record<string, number> = {
+  "arial.ttf": 0.720,
+  "times.ttf": 0.695,
+  "cour.ttf": 0.616,
+  "verdana.ttf": 0.760,
+};
+/** matplotlib falls back to DejaVu Sans when the requested face is missing. */
+const MPL_TOP_ANCHOR_EM_DEFAULT = 0.763;
+
+/** Distance from an inline box's top edge down to its text baseline, for a
+ *  given font at a given size, with `line-height: 1` (what the label overlay
+ *  uses).  MEASURED from real layout via a zero-height baseline-aligned
+ *  strut rather than derived from canvas metrics, because canvas's
+ *  `fontBoundingBoxAscent` and the ascent the engine uses for line layout do
+ *  not always agree.  Cached — the measurement forces a reflow. */
+const _baselineOffsetCache = new Map<string, number>();
+function cssBaselineOffsetPx(
+  fontFamily: string, fontSizePx: number, bold: boolean, italic: boolean,
+): number {
+  const key = `${fontFamily}|${fontSizePx}|${bold}|${italic}`;
+  const cached = _baselineOffsetCache.get(key);
+  if (cached !== undefined) return cached;
+  if (typeof document === "undefined") return fontSizePx * 0.85;
+  const host = document.createElement("div");
+  host.style.cssText =
+    `position:absolute;visibility:hidden;left:-9999px;top:0;padding:0;` +
+    `line-height:1;white-space:nowrap;font-size:${fontSizePx}px;` +
+    `font-family:${fontFamily};font-weight:${bold ? 700 : 400};` +
+    `font-style:${italic ? "italic" : "normal"}`;
+  host.textContent = "Hg";
+  const strut = document.createElement("span");
+  // Zero-sized and baseline-aligned: its box collapses onto the baseline,
+  // so its offset from the host's top edge IS the baseline offset.
+  strut.style.cssText = "display:inline-block;width:0;height:0;vertical-align:baseline";
+  host.appendChild(strut);
+  document.body.appendChild(host);
+  const offset = strut.getBoundingClientRect().top - host.getBoundingClientRect().top;
+  document.body.removeChild(host);
+  // A detached/zero-metric measurement would poison the cache; fall back.
+  const safe = Number.isFinite(offset) && offset > 0 ? offset : fontSizePx * 0.85;
+  _baselineOffsetCache.set(key, safe);
+  return safe;
+}
+
 /** Render a styled-segments array as inline `<span>`s so the
  *  EditPanelDialog's interactive CSS overlay can show per-character
  *  formatting (Bold/Italic/Underline/Strike/Sub/Sup + per-seg colour /
@@ -7521,6 +7578,17 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   const isSelected = selectedLabelIdx === i;
                   const isDragging = draggingLabelIdx === i;
                   const hideText = matplotlibShowing && !isDragging;
+                  // Lift the box so its TYPOGRAPHIC ASCENDER — not its line-box
+                  // top — sits on the anchor, which is where matplotlib's
+                  // va="top" puts it. Without this the CSS copy sits ~0.13em
+                  // lower than the baked copy, so the label visibly dropped
+                  // every time the dialog swapped layers (i.e. on every tick of
+                  // a scale-bar drag).
+                  const mplAnchorEm =
+                    MPL_TOP_ANCHOR_EM[lbl.font_name] ?? MPL_TOP_ANCHOR_EM_DEFAULT;
+                  const anchorLiftPx =
+                    cssBaselineOffsetPx(fontFamily, scaledSize, !!isBold, !!isItalic)
+                    - mplAnchorEm * scaledSize;
                   return (
                     <Box
                       key={`label-${i}`}
@@ -7528,7 +7596,12 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         position: "absolute",
                         left: `${lbl.position_x}%`,
                         top: `${lbl.position_y}%`,
-                        transform: `rotate(${lbl.rotation || 0}deg)`,
+                        // rotate() is listed FIRST so the lift is applied
+                        // before it — i.e. in the text's own frame — leaving
+                        // the rotation centred on the anchor, as matplotlib
+                        // does. Writing translateY first would rotate the
+                        // already-shifted box and swing it off the anchor.
+                        transform: `rotate(${lbl.rotation || 0}deg) translateY(${-anchorLiftPx}px)`,
                         // This label is drawn TWICE — baked into the matplotlib
                         // preview PNG by the backend, and as this CSS overlay —
                         // and the dialog swaps between them (see hideText /
