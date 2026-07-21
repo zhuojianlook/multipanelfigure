@@ -1,0 +1,486 @@
+/* ──────────────────────────────────────────────────────────
+   PanelCell — a single cell in the panel grid.
+   Shows position label, thumbnail, image dropdown, edit button.
+   Right-click context menu for copy/paste panel settings.
+   ────────────────────────────────────────────────────────── */
+
+import { useState, useEffect } from "react";
+import {
+  Box,
+  Typography,
+  Select,
+  MenuItem,
+  IconButton,
+  Menu,
+  ListItemIcon,
+  ListItemText,
+  Snackbar,
+  Alert,
+  Tooltip,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Button,
+} from "@mui/material";
+import SettingsIcon from "@mui/icons-material/Settings";
+import ContentCopyIcon from "@mui/icons-material/ContentCopy";
+import ContentPasteIcon from "@mui/icons-material/ContentPaste";
+import DeleteSweepIcon from "@mui/icons-material/DeleteSweep";
+import { useFigureStore, type LoadedImage } from "../../store/figureStore";
+import { EditPanelDialog } from "../dialogs/EditPanelDialog";
+import { getSelectedImageName, clearSelectedImage, useSelectedImage } from "../image-strip/ImageStrip";
+import type { PanelInfo } from "../../api/types";
+import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
+
+// Global clipboard for panel settings (excludes zoom_inset per spec 3.1.7)
+let copiedPanelSettings: Partial<PanelInfo> | null = null;
+
+interface Props {
+  row: number;
+  col: number;
+  imageName: string;
+}
+
+export function PanelCell({ row, col, imageName }: Props) {
+  const loadedImages = useFigureStore((s) => s.loadedImages);
+  const panelThumbnails = useFigureStore((s) => s.panelThumbnails);
+  const setPanelImage = useFigureStore((s) => s.setPanelImage);
+  const clearPanel = useFigureStore((s) => s.clearPanel);
+  const updatePanel = useFigureStore((s) => s.updatePanel);
+  const config = useFigureStore((s) => s.config);
+  const swapPanels = useFigureStore((s) => s.swapPanels);
+  const [editOpen, setEditOpen] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const [ctxMenu, setCtxMenu] = useState<{ mouseX: number; mouseY: number } | null>(null);
+  const [snackMsg, setSnackMsg] = useState("");
+  const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
+  const selectedImage = useSelectedImage();
+
+  const img: LoadedImage | undefined = imageName
+    ? loadedImages[imageName]
+    : undefined;
+
+  const processedThumb = panelThumbnails[`${row}-${col}`];
+  const imageEntries = Object.values(loadedImages);
+  const panel = config?.panels[row]?.[col];
+
+  const handleContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    setCtxMenu({ mouseX: e.clientX + 2, mouseY: e.clientY - 6 });
+  };
+
+  const handleCopySettings = () => {
+    if (!panel) return;
+    // Copy everything except image_name and zoom_inset
+    const { image_name, zoom_inset, add_zoom_inset, ...settings } = panel;
+    copiedPanelSettings = settings;
+    setSnackMsg("Settings copied");
+    setCtxMenu(null);
+  };
+
+  const handlePasteSettings = () => {
+    if (!copiedPanelSettings || !panel) { setCtxMenu(null); return; }
+    const statusParts: string[] = [];
+
+    // Check crop compatibility
+    if (copiedPanelSettings.crop) {
+      statusParts.push("crop area...applied");
+    }
+    if (copiedPanelSettings.brightness !== undefined || copiedPanelSettings.contrast !== undefined) {
+      statusParts.push("adjustments...ok");
+    }
+    if (copiedPanelSettings.scale_bar || copiedPanelSettings.add_scale_bar) {
+      statusParts.push("scale bar...ok");
+    }
+    if (copiedPanelSettings.labels && (copiedPanelSettings.labels as unknown[]).length > 0) {
+      statusParts.push("labels...ok");
+    }
+    if (copiedPanelSettings.symbols && (copiedPanelSettings.symbols as unknown[]).length > 0) {
+      statusParts.push("symbols...ok");
+    }
+
+    // Apply settings (excluding image_name and zoom_inset)
+    updatePanel(row, col, copiedPanelSettings);
+    const msg = statusParts.length > 0 ? `Settings pasted: ${statusParts.join(", ")}` : "Settings pasted";
+    setSnackMsg(msg);
+    setCtxMenu(null);
+  };
+
+  const handleClearPanel = () => {
+    if (!imageName) { setCtxMenu(null); return; }
+    setClearConfirmOpen(true);
+    setCtxMenu(null);
+  };
+
+  // Check if this panel is a zoom inset target (protected from drops).
+  // Returns a hash of the source inset's geometry so an upstream effect
+  // can re-fetch the synthesised thumbnail whenever the source rect or
+  // its zoom_factor / side changes.
+  const zoomTargetInfo: { isTarget: boolean; sourceHash: string } = (() => {
+    if (!config) return { isTarget: false, sourceHash: "" };
+    for (let r = 0; r < config.rows; r++) {
+      for (let c = 0; c < config.cols; c++) {
+        const p = config.panels[r]?.[c];
+        if (!p?.add_zoom_inset) continue;
+        const insets = (p.zoom_insets && p.zoom_insets.length > 0)
+          ? p.zoom_insets
+          : (p.zoom_inset ? [p.zoom_inset] : []);
+        for (const zi of insets) {
+          if (!zi || zi.inset_type !== "Adjacent Panel") continue;
+          const side = zi.side || "Right";
+          let tr = r, tc = c;
+          if (side === "Top") tr--; else if (side === "Bottom") tr++;
+          else if (side === "Left") tc--; else if (side === "Right") tc++;
+          if (tr === row && tc === col) {
+            // Found a source pointing here — record geometry so we can
+            // refetch the synthesised thumbnail when it changes.
+            const h = `${r}|${c}|${zi.x}|${zi.y}|${zi.width}|${zi.height}|${zi.zoom_factor}|${zi.rotation || 0}`;
+            return { isTarget: true, sourceHash: h };
+          }
+        }
+      }
+    }
+    return { isTarget: false, sourceHash: "" };
+  })();
+  const isZoomTarget = zoomTargetInfo.isTarget;
+
+  // Auto-refetch the synthesised thumbnail for adjacent-zoom target
+  // cells whenever the source's inset geometry changes, so the panel
+  // planner shows live updates as the user drags the source rect.
+  useEffect(() => {
+    if (!isZoomTarget) return;
+    const refreshPanelThumbnail = useFigureStore.getState().refreshPanelThumbnail;
+    refreshPanelThumbnail(row, col).catch(() => { /* ignore */ });
+  }, [isZoomTarget, zoomTargetInfo.sourceHash, row, col]);
+
+  // Centralized drop handler — extracted so we can use it on a transparent overlay too.
+  // Async because the confirm/alert dialogs are MUI components (Promise-based) rather
+  // than native blocking popups; we capture all DataTransfer payloads up-front so they
+  // survive the await (the React.DragEvent is reused & its dataTransfer reset by
+  // subsequent dispatches).
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+    // Snapshot drag payloads before any await — `e.dataTransfer` is
+    // wiped once we yield to the event loop.
+    const imgName = e.dataTransfer.getData("application/x-image-name");
+    const panelSrcRaw = e.dataTransfer.getData("application/x-panel-source");
+    const drawerSrc = e.dataTransfer.getData("application/x-drawer-index");
+    if (isZoomTarget) {
+      await alertDialog({
+        title: "Panel reserved",
+        body: "This panel is reserved for a zoom inset. Disable the zoom inset first.",
+      });
+      return;
+    }
+    if (imgName) {
+      if (imageName) {
+        const ok = await confirmDialog({
+          title: "Replace image",
+          body: `Replace image in R${row + 1}C${col + 1}? Current settings will be lost.`,
+          confirmLabel: "Replace",
+          destructive: true,
+        });
+        if (!ok) return;
+      }
+      setPanelImage(row, col, imgName);
+      return;
+    }
+    if (panelSrcRaw) {
+      const src = JSON.parse(panelSrcRaw) as { row: number; col: number };
+      swapPanels(src.row, src.col, row, col);
+      return;
+    }
+    if (drawerSrc) {
+      const drawerIdx = Number(drawerSrc);
+      const movePanelFromDrawer = useFigureStore.getState().movePanelFromDrawer;
+      movePanelFromDrawer(drawerIdx, row, col);
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Accept both "copy" (from filmstrip) and "move" (from drawer/panel swap)
+    const allowed = e.dataTransfer.effectAllowed;
+    e.dataTransfer.dropEffect = (allowed === "move") ? "move" : "copy";
+    setDragOver(true);
+  };
+
+  return (
+    <Box
+      onContextMenu={handleContextMenu}
+      onDragEnter={(e) => { e.preventDefault(); e.stopPropagation(); setDragOver(true); }}
+      onDragOver={handleDragOver}
+      onDragLeave={(e) => {
+        const relTarget = e.relatedTarget as HTMLElement | null;
+        if (relTarget && (e.currentTarget as HTMLElement).contains(relTarget)) return;
+        setDragOver(false);
+      }}
+      onDrop={handleDrop}
+      draggable={!!imageName}
+      onDragStart={(e) => {
+        if (!imageName) { e.preventDefault(); return; }
+        e.dataTransfer.setData("application/x-panel-source", JSON.stringify({ row, col }));
+        e.dataTransfer.setData("text/plain", `Panel R${row+1}C${col+1}`);
+        e.dataTransfer.effectAllowed = "move";
+        // Set custom drag image to show only this panel's thumbnail
+        const thumbEl = e.currentTarget.querySelector("img");
+        if (thumbEl) {
+          e.dataTransfer.setDragImage(thumbEl, thumbEl.offsetWidth / 2, thumbEl.offsetHeight / 2);
+        }
+      }}
+      onClick={async () => {
+        // Click-to-assign: if an image is selected in the filmstrip, assign it here.
+        const selImg = getSelectedImageName();
+        if (selImg) {
+          if (imageName && imageName !== selImg) {
+            const ok = await confirmDialog({
+              title: "Replace image",
+              body: `Replace image in R${row + 1}C${col + 1}? Current settings will be lost.`,
+              confirmLabel: "Replace",
+              destructive: true,
+            });
+            if (!ok) return;
+          }
+          setPanelImage(row, col, selImg);
+          clearSelectedImage();
+          return;
+        }
+      }}
+      sx={{
+        position: "relative",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "space-between",
+        borderRadius: 1,
+        border: dragOver || selectedImage ? 3 : imageName ? 2 : 1,
+        borderColor: dragOver ? "#2196f3" : selectedImage ? "#2196f3" : imageName ? "primary.main" : "divider",
+        height: "100%",
+        overflow: "hidden",
+        p: 0.75,
+        transition: "border-color 0.15s",
+        "&:hover .edit-btn, & .edit-btn:focus-visible": { opacity: 1 },
+        cursor: selectedImage ? "pointer" : imageName ? "grab" : "default",
+      }}
+    >
+      {/* Invisible drop overlay — ensures drops always work even over child elements */}
+      {dragOver && (
+        <Box
+          onDragOver={handleDragOver}
+          onDrop={handleDrop}
+          onDragLeave={() => setDragOver(false)}
+          sx={{
+            position: "absolute",
+            inset: 0,
+            zIndex: 100,
+            backgroundColor: "rgba(33, 150, 243, 0.1)",
+          }}
+        />
+      )}
+      {/* Position label + Edit button row */}
+      <Box sx={{ display: "flex", justifyContent: "space-between", width: "100%", alignItems: "center" }}>
+        <Typography
+          variant="caption"
+          sx={{ fontSize: "0.55rem", fontFamily: "monospace", color: "text.secondary" }}
+        >
+          R{row + 1} C{col + 1}
+        </Typography>
+        <IconButton
+          className="edit-btn"
+          size="small"
+          onClick={() => setEditOpen(true)}
+          sx={{ opacity: 0.7, transition: "opacity 0.15s", p: 0.25 }}
+          aria-label="Edit panel"
+          title="Edit panel"
+        >
+          <SettingsIcon sx={{ fontSize: 14 }} />
+        </IconButton>
+      </Box>
+
+      {/* Thumbnail area — also handles click-to-assign */}
+      <Box
+        onClick={async () => {
+          if (isZoomTarget) return;
+          const selImg = getSelectedImageName();
+          if (selImg) {
+            if (imageName && imageName !== selImg) {
+              const ok = await confirmDialog({
+                title: "Replace image",
+                body: `Replace image in R${row + 1}C${col + 1}? Current settings will be lost.`,
+                confirmLabel: "Replace",
+                destructive: true,
+              });
+              if (!ok) return;
+            }
+            setPanelImage(row, col, selImg);
+            clearSelectedImage();
+          }
+        }}
+        sx={{
+          flex: 1,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          width: "100%",
+          minHeight: 0,
+          cursor: selectedImage ? "pointer" : "default",
+          border: selectedImage && !imageName ? "2px dashed #2196f3" : "none",
+          borderRadius: 1,
+          transition: "border-color 0.15s",
+        }}
+      >
+        {img ? (
+          <Box
+            component="img"
+            src={`data:image/png;base64,${processedThumb || img.thumbnailB64}`}
+            alt={img.name}
+            // width:100% + objectFit:contain SCALES UP small thumbs to
+            // fill the cell while keeping their aspect. (maxWidth/maxHeight
+            // alone only shrunk oversize images and left tiny synth
+            // thumbnails \u2014 e.g. a 40\u00d740 secondary zoom \u2014 looking like
+            // small icons in the middle of a large empty cell.)
+            sx={{ width: "100%", height: "100%", objectFit: "contain", borderRadius: 0.5 }}
+            draggable={false}
+          />
+        ) : isZoomTarget && processedThumb ? (
+          // Adjacent-zoom target \u2014 show the cascade-synthesised preview
+          // the backend produces (now that /api/panel-preview handles
+          // image-less target cells). Lets the user see what content
+          // will appear here in the figure preview, instead of just a
+          // lock icon. Scaled to fill the cell so a tiny 40\u00d740 secondary
+          // zoom isn't lost in the middle of a large empty box.
+          <Box
+            component="img"
+            src={`data:image/png;base64,${processedThumb}`}
+            alt={`Zoom target R${row + 1}C${col + 1}`}
+            sx={{ width: "100%", height: "100%", objectFit: "contain", borderRadius: 0.5, opacity: 0.92, imageRendering: "pixelated" }}
+            draggable={false}
+          />
+        ) : (
+          <Typography sx={{ fontSize: selectedImage ? "0.7rem" : "1.5rem", color: selectedImage ? "#2196f3" : "divider" }}>
+            {selectedImage ? "Click to assign" : "\u25A2"}
+          </Typography>
+        )}
+      </Box>
+
+      {/* Zoom target indicator */}
+      {isZoomTarget && (
+        <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "warning.main", textAlign: "center", mt: 0.25, fontStyle: "italic" }}>
+          🔒 Zoom inset target
+        </Typography>
+      )}
+      {/* Image dropdown */}
+      <Tooltip title={isZoomTarget ? "Protected: zoom inset target" : (imageName || "")} placement="bottom" arrow enterDelay={200}>
+      <div>
+      <Select
+        value={imageName}
+        onChange={async (e) => {
+          if (isZoomTarget) return;
+          // Capture the target value before any await — MUI's
+          // SelectChangeEvent reuses the underlying object.
+          const nextVal = e.target.value;
+          if (!nextVal && imageName) {
+            const ok = await confirmDialog({
+              title: "Remove image",
+              body: `Remove image from R${row + 1}C${col + 1}? All settings will be lost.`,
+              confirmLabel: "Remove",
+              destructive: true,
+            });
+            if (!ok) return;
+          }
+          setPanelImage(row, col, nextVal);
+        }}
+        disabled={isZoomTarget}
+        displayEmpty
+        fullWidth
+        sx={{
+          fontSize: "0.625rem",
+          mt: 0.5,
+          "& .MuiSelect-select": { py: 0.25, px: 0.5 },
+        }}
+      >
+        <MenuItem value="" sx={{ fontSize: "0.625rem", py: 0.25, px: 0.5 }}>
+          No Image
+        </MenuItem>
+        {imageEntries.map((im) => (
+          <MenuItem key={im.name} value={im.name} title={im.name} sx={{ fontSize: "0.625rem", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }}>
+            {im.name}
+          </MenuItem>
+        ))}
+      </Select>
+      </div>
+      </Tooltip>
+
+      {/* Right-click context menu */}
+      <Menu
+        open={ctxMenu !== null}
+        onClose={() => setCtxMenu(null)}
+        anchorReference="anchorPosition"
+        anchorPosition={ctxMenu ? { top: ctxMenu.mouseY, left: ctxMenu.mouseX } : undefined}
+      >
+        <MenuItem onClick={handleCopySettings} disabled={!imageName}>
+          <ListItemIcon><ContentCopyIcon fontSize="small" /></ListItemIcon>
+          <ListItemText>Copy Settings</ListItemText>
+        </MenuItem>
+        <MenuItem onClick={handlePasteSettings} disabled={!copiedPanelSettings || !imageName}>
+          <ListItemIcon><ContentPasteIcon fontSize="small" /></ListItemIcon>
+          <ListItemText>Paste Settings</ListItemText>
+        </MenuItem>
+        <MenuItem onClick={handleClearPanel} disabled={!imageName}>
+          <ListItemIcon><DeleteSweepIcon fontSize="small" /></ListItemIcon>
+          <ListItemText>Clear Panel</ListItemText>
+        </MenuItem>
+      </Menu>
+
+      {/* Status snackbar */}
+      <Snackbar
+        open={!!snackMsg}
+        autoHideDuration={2000}
+        onClose={() => setSnackMsg("")}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert severity="success" onClose={() => setSnackMsg("")} sx={{ py: 0 }}>
+          {snackMsg}
+        </Alert>
+      </Snackbar>
+
+      <EditPanelDialog
+        open={editOpen}
+        onClose={() => setEditOpen(false)}
+        row={row}
+        col={col}
+      />
+
+      {/* Clear panel confirmation dialog — same MUI style as the New button */}
+      <Dialog open={clearConfirmOpen} onClose={() => setClearConfirmOpen(false)}>
+        <DialogTitle>Clear Panel</DialogTitle>
+        <DialogContent>
+          <Typography>
+            Clear image from R{row + 1}C{col + 1}? All settings for this panel
+            will be lost.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setClearConfirmOpen(false)}>Cancel</Button>
+          <Button
+            variant="contained"
+            color="error"
+            onClick={() => {
+              // Use clearPanel (not setPanelImage(row,col,"")) so the
+              // wipe truly resets crops, insets, labels, annotations
+              // and per-channel state — not just the image_name.
+              clearPanel(row, col);
+              setClearConfirmOpen(false);
+            }}
+          >
+            Clear
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+}

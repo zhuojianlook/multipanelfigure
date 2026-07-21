@@ -1,0 +1,22 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "multipanelfigure-ui",
+      "runtimeExecutable": "/Users/zhuojian/.nvm/versions/node/v20.20.1/bin/node",
+      "runtimeArgs": ["./node_modules/vite/bin/vite.js", "--port", "1421", "--host", "127.0.0.1"],
+      "cwd": "TauriApp",
+      "port": 1421
+    },
+    {
+      "name": "multipanelfigure-ui-isolated",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "VITE_API_BASE=http://127.0.0.1:8799 /Users/zhuojian/.nvm/versions/node/v20.20.1/bin/node ./node_modules/vite/bin/vite.js --port 1422 --host 127.0.0.1"
+      ],
+      "cwd": "TauriApp",
+      "port": 1422
+    }
+  ]
+}

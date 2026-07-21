@@ -1014,6 +1014,34 @@ export function figureLabels(docs: Array<{ id: string; name: string }>): Record<
    that tag used to be dropped right here. */
 export const MEAS_CSV_HEADER = "Panel,Name,Group,Value,Unit,Type,Figure";
 
+/** Identity of the READINGS in a measurements CSV: the set of
+ *  "Figure|Panel|Name" keys, ignoring Group/Value formatting.
+ *
+ *  Used to catch re-drops of the same readings that produce a byte-DIFFERENT
+ *  csv — most importantly the flow the ANOVA script itself instructs: drop a
+ *  figure's measurements, assign Group labels in the Sources panel, drop it
+ *  again. Group changes rewrite the csv, so a raw string compare sees a new
+ *  table, wires it alongside the first, and rbind then pools every reading
+ *  twice (n doubles, sd shrinks, p-values go optimistic) with both 📋 rows
+ *  carrying the same label — it reads as a cosmetic duplicate, not a
+ *  corrupted analysis. */
+function measRowKeys(csv: string): Set<string> {
+  const out = new Set<string>();
+  const lines = (csv || "").split("\n");
+  for (let i = 1; i < lines.length; i++) {   // skip header
+    const line = lines[i];
+    if (!line.trim()) continue;
+    // Split on commas outside double quotes, then unquote.
+    const cells = (line.match(/("([^"]|"")*"|[^,]*)(,|$)/g) || [])
+      .map((c) => c.replace(/,$/, "").replace(/^"|"$/g, "").replace(/""/g, '"'));
+    // header: Panel,Name,Group,Value,Unit,Type,Figure
+    const [panel, name] = cells;
+    const figure = cells[6] ?? "";
+    out.add(`${figure}|${panel}|${name}`);
+  }
+  return out;
+}
+
 /** Rows -> CSV. `figure` is the document the rows came from.
  *
  *  Without it, two figures both emit rows keyed "R1C1" (panel labels are bare
@@ -5088,6 +5116,15 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     if (toAdd.length > 0) setEdges((eds) => [...eds, ...toAdd]);
   }, [nodes, edges, setEdges]);
 
+  // NOTE: there is deliberately NO table equivalent of the image fan-out
+  // effect above. Images fan out per SOURCE inside collectInputs (one edge
+  // carries every inset), so re-adding a deleted image edge is cosmetic. A
+  // measurements edge is LOAD-BEARING — collectInputs resolves tables
+  // strictly per-edge — so an add-only reconciliation effect would resurrect
+  // any edge the user deleted, making "exclude this group from the ANOVA"
+  // impossible. Table wiring is therefore mirrored ONCE per drop, inside
+  // attachMeasurements, and re-indexed (not dropped) in detachMeasurements.
+
   // Persist the open tabs + active id to localStorage on every change so
   // leaving and returning to the Analysis tab WITHIN A RUN restores in-flight
   // work. A fresh app launch deliberately starts empty (see
@@ -5888,20 +5925,153 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   // to partition insets across multiple parallel pipelines on the
   // same canvas.
 
+  // Live next-free-slot counter per source node. attachMeasurements reads it
+  // instead of the closed-over `nodes` length so two drops batched into one
+  // render get distinct indices; this effect resyncs it to the truth once the
+  // render lands (and after detach).
+  const measSlotRef = useRef<Map<string, number>>(new Map());
+  useEffect(() => {
+    const m = new Map<string, number>();
+    for (const n of nodes) if (n.data.kind === "source") m.set(n.id, measRefsOf(n.data).length);
+    measSlotRef.current = m;
+  }, [nodes]);
+
   /** Attach a figure's measurements table to a source node (drag the
    *  📋 Measurements tile onto it). The node then exposes its 📋 port
    *  carrying that figure's CSV. */
   const attachMeasurements = useCallback((nodeId: string, ref: MeasurementRef) => {
+    const src = nodes.find((n) => n.id === nodeId);
+    const existingRefs = src?.data.kind === "source" ? measRefsOf(src.data) : [];
+    // Dedup on the READINGS, not the raw csv: a re-drop after assigning Group
+    // labels (exactly what the ANOVA script's header tells users to do)
+    // rewrites the csv, so a string compare would let the same readings in
+    // twice and rbind would silently double every row.
+    const incoming = measRowKeys(ref.csv);
+    const dupIdx = existingRefs.findIndex((m) => {
+      if (m.mpfId !== ref.mpfId) return false;
+      if (m.csv === ref.csv) return true;
+      const have = measRowKeys(m.csv);
+      for (const k of incoming) if (have.has(k)) return true;   // overlap
+      return false;
+    });
+    if (dupIdx >= 0) {
+      const same = existingRefs[dupIdx].csv === ref.csv;
+      setSelectedNodeId(nodeId);
+      if (same) {
+        consoleRef.current += `\n[attach] ${ref.label} is already on this source — ignored.\n`;
+        setConsoleOut(consoleRef.current);
+        return;   // identical → no state churn, no RF remount
+      }
+      // Same readings, different csv (re-drop after grouping) → REPLACE in
+      // place. Keeps the slot (so its edge stays valid) and picks up the new
+      // Group labels, instead of pooling the readings twice.
+      setNodes((cur) => cur.map((n) => {
+        if (n.id !== nodeId || n.data.kind !== "source") return n;
+        const cr = measRefsOf(n.data);
+        const i = cr.findIndex((m) => m.mpfId === ref.mpfId && m.csv === existingRefs[dupIdx].csv);
+        if (i < 0) return n;
+        const next = cr.slice();
+        next[i] = ref;
+        return { ...n, data: { ...n.data, measurementsRef: next[0], measurementRefs: next } };
+      }));
+      consoleRef.current += `\n[attach] ${ref.label} updated in place (same readings, new grouping).\n`;
+      setConsoleOut(consoleRef.current);
+      return;   // slot + edge unchanged → no rewiring, no remount needed
+    }
+    // Slot the new table will occupy. Taken from a live counter rather than
+    // the closed-over `nodes` so two drops batched into one render can't both
+    // claim the same index (which would leave the second table unwired).
+    const pendingSlot = measSlotRef.current.get(nodeId);
+    const newIdx = pendingSlot != null ? pendingSlot : existingRefs.length;
+    measSlotRef.current.set(nodeId, newIdx + 1);
+
     setNodes((cur) => cur.map((n) => {
       if (n.id !== nodeId || n.data.kind !== "source") return n;
       // APPEND rather than replace — a second drop used to silently discard
       // the first table. Slot 0 stays mirrored into the legacy
       // `measurementsRef` so its handle id and any saved edge keep working.
-      const next = [...measRefsOf(n.data), ref];
+      const existing = measRefsOf(n.data);
+      // Authoritative dedup: two drops batched into one render would both see
+      // the same pre-drop `nodes` snapshot above.
+      if (existing.some((m) => m.mpfId === ref.mpfId && m.csv === ref.csv)) return n;
+      const next = [...existing, ref];
       return { ...n, data: { ...n.data, measurementsRef: next[0], measurementRefs: next } };
     }));
     setSelectedNodeId(nodeId);
-  }, [setNodes]);
+
+    // Wire the new table ONCE, here — never from a reconciliation effect, so
+    // a later manual edge deletion stays deleted (that's how a user excludes
+    // one group from the pooled ANOVA).
+    if (src && src.data.kind === "source") {
+      setEdges((eds) => {
+        const tblEdges = eds.filter(
+          (e) => e.source === nodeId && (e.sourceHandle || "").startsWith("out_table_measurements"),
+        );
+        const handle = measHandleId(newIdx);
+        if (tblEdges.length > 0) {
+          // Source already feeds somewhere: mirror that wiring to the new
+          // table so it joins the pool and the user SEES the extra line.
+          const targets = new Map<string, string>();
+          for (const e of tblEdges) targets.set(e.target, e.targetHandle || "in_table");
+          const toAdd: Edge[] = [];
+          for (const [targetId, targetHandle] of targets) {
+            if (eds.some((e) => e.source === nodeId && e.sourceHandle === handle && e.target === targetId)) continue;
+            toAdd.push({
+              id: `e_${nodeId}_${handle}__${targetId}_${targetHandle}`,
+              source: nodeId, sourceHandle: handle,
+              target: targetId, targetHandle,
+              type: "deletable", animated: false,
+              style: { stroke: PORT_COLOR.table, strokeWidth: 2 },
+            });
+          }
+          return toAdd.length ? [...eds, ...toAdd] : eds;
+        }
+        // Nothing wired yet → auto-wire, but ONLY for the unambiguous shape
+        // this exists for: the ANOVA template, which ships one source + one
+        // consumer and no edges (it can't pre-wire a handle that doesn't
+        // exist until data lands). With 2+ process nodes there's no reliable
+        // way to tell which reads TABLES — every ProcessNode renders an
+        // in_table handle whether or not its script touches one — so a
+        // nearest-Δx guess would drop a CSV into an image-only node.
+        const others = nodes.filter((n) => n.id !== nodeId && n.data.kind !== "source");
+        if (others.length !== 1) return eds;
+        const target = others[0];
+        if (target.position.x <= src.position.x) return eds;
+        // Scope the "already fed" bail to the TABLE port. Matching any edge
+        // would let the source's own IMAGE auto-wire (addSourceToNode, same
+        // template, same target) permanently block table wiring — the ANOVA
+        // template would then run with zero tables and die on "No
+        // curved-surface measurements".
+        if (eds.some((e) => e.target === target.id && (e.targetHandle || "") === "in_table")) return eds;
+        // Wire EVERY slot, not just the new one: tblEdges.length === 0 proves
+        // none is wired, so tables dropped before a consumer existed would
+        // otherwise sit silently excluded from the pool while the console
+        // reported a successful auto-wire.
+        const toAdd: Edge[] = [];
+        for (let i = 0; i <= newIdx; i++) {
+          const h = measHandleId(i);
+          toAdd.push({
+            id: `e_${nodeId}_${h}__${target.id}_in_table`,
+            source: nodeId, sourceHandle: h,
+            target: target.id, targetHandle: "in_table",
+            type: "deletable", animated: false,
+            style: { stroke: PORT_COLOR.table, strokeWidth: 2 },
+          });
+        }
+        consoleRef.current += `\n[auto-wire] ${src.data.label || nodeId} 📋${toAdd.length > 1 ? ` ×${toAdd.length}` : ""} → ${target.data.label || target.id}\n`;
+        setConsoleOut(consoleRef.current);
+        return [...eds, ...toAdd];
+      });
+    }
+    // Attaching a measurements table spawns a NEW output handle on this
+    // source node (`out_table_<idx>`) — exactly the same handle-set mutation
+    // as addSourceToNode, and exactly the same RF v12 stale-handle-cache
+    // hazard. Without this bump the freshly-added handle can't be dragged
+    // from until the RF tree remounts, which is why "load a workflow, drop
+    // data on the source, try to wire source → first node" only worked after
+    // leaving the Analysis tab and coming back.
+    setHandleRev((r) => r + 1);
+  }, [nodes, setNodes, setEdges]);
 
   /** Detach one measurements table from a source node (the 📋 row's ×), or all
    *  of them when no index is given. */
@@ -5921,7 +6091,34 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         },
       };
     }));
-  }, [setNodes]);
+    // Re-index the surviving edges. Removing slot i shifts every later table
+    // down one, so an edge above the removed slot isn't invalid — it's off by
+    // one, and the correct repair is a SHIFT, not a delete. (Deleting them
+    // would silently disconnect the source: detaching slot 0 of 2 removes
+    // every table edge, and with no reconciliation effect nothing would ever
+    // redraw them — the node keeps rendering its 📋 port while feeding
+    // nothing, and the ANOVA dies on "No curved-surface measurements".)
+    setEdges((eds) => {
+      const next: Edge[] = [];
+      for (const e of eds) {
+        const h = e.sourceHandle || "";
+        if (e.source !== nodeId || !h.startsWith("out_table_measurements")) { next.push(e); continue; }
+        if (index == null) continue;                  // detach-all → drop
+        const i = measIndexFromHandle(h);
+        if (i === index) continue;                    // the detached table's edge
+        if (i < index) { next.push(e); continue; }    // unaffected by the splice
+        const nh = measHandleId(i - 1);
+        const th = e.targetHandle || "in_table";
+        // Ids stay unique: kept edges sit below `index`, shifted ones at or
+        // above it, so the two sets can't collide.
+        next.push({ ...e, id: `e_${nodeId}_${nh}__${e.target}_${th}`, sourceHandle: nh });
+      }
+      return next;
+    });
+    // Detaching shrinks the handle set — same staleness hazard, same fix as
+    // removeSourceFromNode.
+    setHandleRev((r) => r + 1);
+  }, [setNodes, setEdges]);
 
   /** Attach an inset (looked up by InsetSource.key) to a source node. */
   const addSourceToNode = useCallback((nodeId: string, sourceKey: string) => {

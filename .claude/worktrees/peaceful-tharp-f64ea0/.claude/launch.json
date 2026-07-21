@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "tauri-dev",
+      "runtimeExecutable": "/bin/zsh",
+      "runtimeArgs": ["-c", "PATH=/opt/homebrew/bin:$PATH npm --prefix TauriApp run dev"],
+      "port": 1420
+    }
+  ]
+}

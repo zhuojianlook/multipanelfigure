@@ -1,0 +1,350 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'      # stable releases
+      - 'exp-*'   # experimental releases
+  workflow_dispatch:
+
+jobs:
+  build-sidecar:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14       # Apple Silicon
+            triple: aarch64-apple-darwin
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Python deps
+        run: pip install pillow numpy matplotlib opencv-python-headless fastapi uvicorn python-multipart nibabel tifffile pyinstaller
+      - name: Build sidecar
+        working-directory: TauriApp/python-sidecar
+        run: |
+          pyinstaller --onefile --name api-server \
+            --hidden-import=uvicorn.logging \
+            --hidden-import=uvicorn.protocols.http \
+            --hidden-import=uvicorn.protocols.http.auto \
+            --hidden-import=uvicorn.protocols.websockets \
+            --hidden-import=uvicorn.protocols.websockets.auto \
+            --hidden-import=uvicorn.lifespan \
+            --hidden-import=uvicorn.lifespan.on \
+            --hidden-import=uvicorn.lifespan.off \
+            --hidden-import=multipart --hidden-import=multipart.multipart \
+            --collect-all PIL --collect-all matplotlib --collect-all cv2 \
+            --collect-all tifffile --collect-all nibabel \
+            --noconfirm api_server.py
+        shell: bash
+      - name: Copy sidecar binary
+        run: |
+          mkdir -p TauriApp/src-tauri/binaries
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp TauriApp/python-sidecar/dist/api-server.exe "TauriApp/src-tauri/binaries/api-server-${{ matrix.triple }}.exe"
+          else
+            cp TauriApp/python-sidecar/dist/api-server "TauriApp/src-tauri/binaries/api-server-${{ matrix.triple }}"
+          fi
+        shell: bash
+      - name: Upload sidecar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidecar-${{ matrix.triple }}
+          path: TauriApp/src-tauri/binaries/
+
+  build-tauri:
+    needs: build-sidecar
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            triple: aarch64-apple-darwin
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Download sidecar
+        uses: actions/download-artifact@v4
+        with:
+          name: sidecar-${{ matrix.triple }}
+          path: TauriApp/src-tauri/binaries/
+      - name: Make sidecar executable
+        if: runner.os != 'Windows'
+        run: chmod +x TauriApp/src-tauri/binaries/api-server-*
+
+      # ── Bundle ffmpeg (static) so audio retention works without
+      # requiring the user to install ffmpeg system-wide. We pin to
+      # eugeneware/ffmpeg-static b6.1.1 — a stable release that ships
+      # single statically-linked binaries (no archive extraction, no
+      # dylib bundling), unlike yt-dlp/FFmpeg-Builds which dropped
+      # macOS + LGPL builds and BtbN which ships no macOS arm64.
+      - name: Download ffmpeg (macOS arm64)
+        if: runner.os == 'macOS'
+        run: |
+          set -e
+          mkdir -p TauriApp/src-tauri/binaries
+          # --retry handles 5xx + connection failures with exponential
+          # backoff so a single-shot GitHub 502 doesn't kill the release
+          # (--retry-all-errors so HTTP 4xx/5xx also retry, not just
+          # transport errors). 5 attempts × 4-second base delay.
+          curl -fL --retry 5 --retry-delay 4 --retry-all-errors \
+            -o TauriApp/src-tauri/binaries/ffmpeg-aarch64-apple-darwin \
+            https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-darwin-arm64
+          chmod +x TauriApp/src-tauri/binaries/ffmpeg-aarch64-apple-darwin
+          TauriApp/src-tauri/binaries/ffmpeg-aarch64-apple-darwin -version | head -1
+        shell: bash
+      - name: Download ffmpeg (Windows x86_64)
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force -Path TauriApp/src-tauri/binaries | Out-Null
+          $url = "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-win32-x64"
+          $dest = "TauriApp/src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe"
+          # Invoke-WebRequest has no native retry, so wrap it in a loop
+          # that backs off on transient failures (GitHub 502, network
+          # blips). 5 attempts with linear backoff.
+          $max = 5
+          for ($i = 1; $i -le $max; $i++) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $dest -ErrorAction Stop
+              break
+            } catch {
+              if ($i -eq $max) { throw }
+              Write-Host "Download attempt $i/$max failed: $_ — retrying..."
+              Start-Sleep -Seconds (4 * $i)
+            }
+          }
+          & $dest -version | Select-Object -First 1
+        shell: pwsh
+
+      - name: Install frontend deps
+        working-directory: TauriApp
+        run: npm ci
+      - name: Build frontend
+        working-directory: TauriApp
+        run: npm run build
+      - name: Build Tauri (with updater signing)
+        working-directory: TauriApp
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build
+      - name: Ad-hoc sign macOS app and rebuild DMG
+        if: runner.os == 'macOS'
+        run: |
+          APP_PATH=$(find TauriApp/src-tauri/target/release/bundle/macos -name "*.app" -maxdepth 1)
+          echo "Signing $APP_PATH"
+          codesign --force --deep -s - "$APP_PATH"
+          codesign --verify "$APP_PATH" && echo "Signature valid"
+          # Rebuild DMG with signed app + Applications symlink
+          DMG_PATH=$(find TauriApp/src-tauri/target/release/bundle/dmg -name "*.dmg" -maxdepth 1)
+          DMG_NAME=$(basename "$DMG_PATH")
+          rm "$DMG_PATH"
+          STAGE_DIR=$(mktemp -d)
+          cp -R "$APP_PATH" "$STAGE_DIR/"
+          ln -s /Applications "$STAGE_DIR/Applications"
+          hdiutil create -volname "Multi-Panel Figure Builder" -srcfolder "$STAGE_DIR" -ov -format UDZO "TauriApp/src-tauri/target/release/bundle/dmg/$DMG_NAME"
+          rm -rf "$STAGE_DIR"
+        shell: bash
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.triple }}
+          path: |
+            TauriApp/src-tauri/target/release/bundle/dmg/*.dmg
+            TauriApp/src-tauri/target/release/bundle/nsis/*.exe
+            TauriApp/src-tauri/target/release/bundle/nsis/*.exe.sig
+            TauriApp/src-tauri/target/release/bundle/macos/*.app.tar.gz
+            TauriApp/src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
+
+  create-release:
+    needs: build-tauri
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/exp-')
+    # Serialize updater-branch writes so parallel tag pushes (e.g. 108 + 109
+    # pushed together) don't race each other — older job would --force-push
+    # its (now-stale) manifest over the newer one. `cancel-in-progress: false`
+    # so every release still gets its chance to update the branch.
+    concurrency:
+      group: updater-branch-write
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history + all tags so we can git-log between this
+          # tag and the previous tag of the same channel for the
+          # auto-generated release notes.
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+      - name: List artifacts for debugging
+        run: find artifacts/ -type f | sort
+      - name: Generate latest.json for Tauri updater
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # Determine channel and strip prefix
+          if [[ "$TAG" == exp-* ]]; then
+            CHANNEL="experimental"
+            VERSION="${TAG#exp-}"
+          else
+            CHANNEL="stable"
+            VERSION="${TAG#v}"
+          fi
+          echo "Channel: $CHANNEL, Version: $VERSION, Tag: $TAG"
+          REPO="zhuojianlook/multipanelfigure"
+
+          # Find signature files
+          WIN_SIG=$(find artifacts/ -name "*.exe.sig" | head -1)
+          MAC_SIG=$(find artifacts/ -name "*.app.tar.gz.sig" | head -1)
+
+          # Read signatures
+          WIN_SIGNATURE=""
+          MAC_SIGNATURE=""
+          if [ -f "$WIN_SIG" ]; then WIN_SIGNATURE=$(cat "$WIN_SIG"); fi
+          if [ -f "$MAC_SIG" ]; then MAC_SIGNATURE=$(cat "$MAC_SIG"); fi
+
+          # Find actual filenames for download URLs (use setup.exe, not sidecar)
+          WIN_EXE=$(find artifacts/ -name "*-setup.exe" | head -1)
+          MAC_TAR=$(find artifacts/ -name "*.app.tar.gz" ! -name "*.sig" | head -1)
+          WIN_NAME=$(basename "$WIN_EXE" 2>/dev/null || echo "")
+          MAC_NAME=$(basename "$MAC_TAR" 2>/dev/null || echo "")
+
+          # GitHub replaces spaces with dots in release asset names
+          WIN_NAME_GH=$(echo "$WIN_NAME" | tr ' ' '.')
+          MAC_NAME_GH=$(echo "$MAC_NAME" | tr ' ' '.')
+
+          MANIFEST_NAME="latest.json"
+          if [ "$CHANNEL" = "experimental" ]; then
+            MANIFEST_NAME="latest-experimental.json"
+          fi
+
+          cat > "artifacts/${MANIFEST_NAME}" << ENDJSON
+          {
+            "version": "${VERSION}",
+            "notes": "Update to ${TAG}",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "windows-x86_64": {
+                "signature": "${WIN_SIGNATURE}",
+                "url": "https://github.com/${REPO}/releases/download/${TAG}/${WIN_NAME_GH}"
+              },
+              "darwin-aarch64": {
+                "signature": "${MAC_SIGNATURE}",
+                "url": "https://github.com/${REPO}/releases/download/${TAG}/${MAC_NAME_GH}"
+              }
+            }
+          }
+          ENDJSON
+          echo "Generated ${MANIFEST_NAME}:"
+          cat "artifacts/${MANIFEST_NAME}"
+      - name: Push manifest to updater branch
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" == exp-* ]]; then
+            CHANNEL="experimental"
+            VERSION="${TAG#exp-}"
+            MANIFEST="latest-experimental.json"
+          else
+            CHANNEL="stable"
+            VERSION="${TAG#v}"
+            MANIFEST="latest.json"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Fetch existing updater branch content if it exists
+          git fetch origin updater:updater-local 2>/dev/null || true
+
+          if git rev-parse --verify updater-local >/dev/null 2>&1; then
+            git checkout updater-local
+          else
+            git checkout --orphan updater-local
+            git rm -rf . 2>/dev/null || true
+          fi
+
+          # Downgrade guard: if the remote manifest for this channel is
+          # already a newer version, don't overwrite it (protects against
+          # out-of-order tag pushes — e.g. 0.1.108 completing after 0.1.109).
+          if [ -f "$MANIFEST" ]; then
+            REMOTE_VER=$(python3 -c "import json; print(json.load(open('$MANIFEST')).get('version',''))" 2>/dev/null || echo "")
+            if [ -n "$REMOTE_VER" ]; then
+              NEWER=$(python3 -c "r=tuple(int(x) for x in '$REMOTE_VER'.split('.') if x.isdigit()); v=tuple(int(x) for x in '$VERSION'.split('.') if x.isdigit()); print('1' if r>v else '0')")
+              if [ "$NEWER" = "1" ]; then
+                echo "Remote manifest is $REMOTE_VER (newer than $VERSION) — refusing to overwrite."
+                exit 0
+              fi
+            fi
+          fi
+
+          # Copy the manifest (stable or experimental)
+          cp "artifacts/${MANIFEST}" "${MANIFEST}"
+          git add "${MANIFEST}"
+
+          git commit -m "Update manifest for ${TAG}" --allow-empty
+          git push origin updater-local:updater --force
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate release notes from git log
+        id: notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # Walk same-channel history so the notes for v0.1.X cover
+          # commits since v0.1.(X-1), not since exp-0.1.X.
+          if [[ "$TAG" == exp-* ]]; then
+            PATTERN='exp-*'
+          else
+            PATTERN='v*'
+          fi
+          PREV_TAG=$(git tag -l "$PATTERN" --sort=-v:refname | grep -vx "$TAG" | head -1)
+          echo "Previous tag: ${PREV_TAG:-<none>}"
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..${TAG}"
+            COMPARE_LINE="**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${TAG}"
+          else
+            RANGE="$TAG"
+            COMPARE_LINE=""
+          fi
+          # Bullets: skip merges, the Co-Authored-By trailer, and empties.
+          # Keep the conventional-commit prefix so readers can scan by type
+          # (feat/fix/ci/chore/...). The frontend changelog parser will
+          # strip those prefixes again for display.
+          BULLETS=$(git log --no-merges --pretty=format:'* %s' "$RANGE" \
+            | grep -vE '^\* (Merge|Co-Authored-By)' \
+            | grep -vE '^\*\s*$' || true)
+          if [ -z "$BULLETS" ]; then
+            BULLETS="* Release ${TAG}"
+          fi
+          {
+            echo "body<<MPF_NOTES_EOF"
+            echo "$BULLETS"
+            if [ -n "$COMPARE_LINE" ]; then
+              echo ""
+              echo "$COMPARE_LINE"
+            fi
+            echo "MPF_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/release-*/**/*.dmg
+            artifacts/release-*/**/*-setup.exe
+            artifacts/release-*/**/*.app.tar.gz
+            artifacts/release-*/**/*.sig
+            artifacts/latest*.json
+          body: ${{ steps.notes.outputs.body }}
+          prerelease: ${{ startsWith(github.ref, 'refs/tags/exp-') }}

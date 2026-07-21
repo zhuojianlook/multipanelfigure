@@ -1,6 +1,6 @@
 {
   "name": "tauriapp",
-  "version": "0.1.393",
+  "version": "0.1.183",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -15,7 +15,6 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@babel/helper-compilation-targets": "^7.28.6",
     "@codemirror/lang-python": "^6.2.1",
     "@codemirror/language": "^6.12.3",
     "@codemirror/legacy-modes": "^6.5.2",
