@@ -841,6 +841,34 @@ interface MeasurementRef {
   csv: string;
 }
 
+/** Every measurement table attached to a node, oldest first.
+ *
+ *  Normalises the two shapes a node can carry: the legacy single
+ *  `measurementsRef` (all that saved workflows / stored sessions ever wrote)
+ *  and the newer `measurementRefs` list. Slot 0 is always the legacy field, so
+ *  the first table keeps the stable `out_table_measurements` handle id and old
+ *  edges stay connected. */
+function measRefsOf(
+  data: { measurementsRef?: MeasurementRef; measurementRefs?: MeasurementRef[] } | undefined,
+): MeasurementRef[] {
+  if (!data) return [];
+  if (data.measurementRefs && data.measurementRefs.length) return data.measurementRefs;
+  return data.measurementsRef ? [data.measurementsRef] : [];
+}
+
+/** Handle id for the i-th measurement table. Index 0 keeps the original id so
+ *  every previously-saved edge keeps resolving. */
+function measHandleId(i: number): string {
+  return i === 0 ? "out_table_measurements" : `out_table_measurements_${i}`;
+}
+
+/** Inverse of measHandleId — the bare id (and anything unparseable) is slot 0,
+ *  which is what keeps legacy edges pointing at the first table. */
+function measIndexFromHandle(handle: string | null | undefined): number {
+  const m = /^out_table_measurements_(\d+)$/.exec(handle || "");
+  return m ? Number(m[1]) : 0;
+}
+
 /** The parts of a collageStore DocTab this module binds against. */
 type DocTabLike = { id: string; name: string; path?: string | null };
 
@@ -1273,7 +1301,7 @@ interface GraphCallbacks {
    *  📋 Measurements tile onto it). The node then exposes its 📋 port. */
   attachMeasurements: (nodeId: string, ref: MeasurementRef) => void;
   /** Detach the measurements table from a SourceNode (the 📋 row's ×). */
-  detachMeasurements: (nodeId: string) => void;
+  detachMeasurements: (nodeId: string, index?: number) => void;
   /** Delete a connecting edge by id (used by the edge's hover × button). */
   removeEdge: (edgeId: string) => void;
   /** Open the output drawer focused on this output + briefly flash it. */
@@ -1477,6 +1505,13 @@ export interface NodeData {
    *  dragging the 📋 Measurements tile onto the node. When set, the node
    *  exposes its 📋 (out_table_measurements) port carrying this CSV. */
   measurementsRef?: MeasurementRef;
+  /** Additional measurement tables attached to the same source node. A node
+   *  used to hold exactly ONE table, so a second drop silently replaced the
+   *  first — wiring e.g. "control readings" and "treated readings" into one
+   *  script was impossible. `measurementsRef` is kept as the FIRST slot so
+   *  saved workflows / sessions (which stored only that field) still load and
+   *  keep their existing `out_table_measurements` edge valid. */
+  measurementRefs?: MeasurementRef[];
   /** When true, the user has explicitly removed the node from
    *  the canvas — used to no-op stale auto-edges. */
   deleted?: boolean;
@@ -1585,7 +1620,7 @@ function SourceNode({ data, id }: NodeCardProps) {
   const cbs = useGraphCallbacks();
   // The 📋 port shows once a figure's measurements are ATTACHED to this
   // node (drag the Measurements tile onto it) — like any other source.
-  const measRef = data.measurementsRef;
+  const measRefs = measRefsOf(data);
   const isUpstreamHi = cbs?.highlightedUpstreamIds.has(id) ?? false;
   const [dragOver, setDragOver] = useState(false);
   // React Flow caches a node's handle set from the first render —
@@ -1629,7 +1664,7 @@ function SourceNode({ data, id }: NodeCardProps) {
       clearTimeout(t1); clearTimeout(t2); clearTimeout(t3);
       cancelAnimationFrame(raf1); if (raf2) cancelAnimationFrame(raf2);
     };
-  }, [id, sources.length, measRef, updateNodeInternals]);
+  }, [id, sources.length, measRefs.length, updateNodeInternals]);
 
   const onDragOver = (e: React.DragEvent) => {
     const t = e.dataTransfer.types;
@@ -1720,24 +1755,24 @@ function SourceNode({ data, id }: NodeCardProps) {
             were ATTACHED to this node (drag the 📋 Measurements tile onto
             it), like any other source. The port carries THAT figure's
             measurements CSV downstream; × detaches it. */}
-        {measRef && (
-          <Box sx={{ position: "relative", display: "flex", alignItems: "center", gap: 0.4, py: 0.25, pr: 1.5, borderTop: "1px dashed", borderColor: "divider" }}>
+        {measRefs.map((mr, mi) => (
+          <Box key={measHandleId(mi)} sx={{ position: "relative", display: "flex", alignItems: "center", gap: 0.4, py: 0.25, pr: 1.5, borderTop: "1px dashed", borderColor: "divider" }}>
             <Typography variant="caption" sx={{ fontSize: "0.55rem", fontWeight: 600, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              📋 {measRef.label || "measurements"}
+              📋 {mr.label || "measurements"}
             </Typography>
             <Box
               component="span"
-              onClick={(e) => { e.stopPropagation(); cbs?.detachMeasurements(id); }}
+              onClick={(e) => { e.stopPropagation(); cbs?.detachMeasurements(id, mi); }}
               sx={{ fontSize: "0.55rem", cursor: "pointer", color: "text.disabled", px: 0.25, "&:hover": { color: "error.main" } }}
             >×</Box>
             <Handle
               type="source"
               position={Position.Right}
-              id="out_table_measurements"
+              id={measHandleId(mi)}
               style={{ background: PORT_COLOR.table, width: 8, height: 8, border: "2px solid white", right: -4 }}
             />
           </Box>
-        )}
+        ))}
       </Box>
     </Box>
   );
@@ -5570,16 +5605,35 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
    *  📋 Measurements tile onto it). The node then exposes its 📋 port
    *  carrying that figure's CSV. */
   const attachMeasurements = useCallback((nodeId: string, ref: MeasurementRef) => {
-    setNodes((cur) => cur.map((n) =>
-      n.id === nodeId && n.data.kind === "source"
-        ? { ...n, data: { ...n.data, measurementsRef: ref } } : n));
+    setNodes((cur) => cur.map((n) => {
+      if (n.id !== nodeId || n.data.kind !== "source") return n;
+      // APPEND rather than replace — a second drop used to silently discard
+      // the first table. Slot 0 stays mirrored into the legacy
+      // `measurementsRef` so its handle id and any saved edge keep working.
+      const next = [...measRefsOf(n.data), ref];
+      return { ...n, data: { ...n.data, measurementsRef: next[0], measurementRefs: next } };
+    }));
     setSelectedNodeId(nodeId);
   }, [setNodes]);
 
-  /** Detach the measurements table from a source node (the 📋 row's ×). */
-  const detachMeasurements = useCallback((nodeId: string) => {
-    setNodes((cur) => cur.map((n) =>
-      n.id === nodeId ? { ...n, data: { ...n.data, measurementsRef: undefined } } : n));
+  /** Detach one measurements table from a source node (the 📋 row's ×), or all
+   *  of them when no index is given. */
+  const detachMeasurements = useCallback((nodeId: string, index?: number) => {
+    setNodes((cur) => cur.map((n) => {
+      if (n.id !== nodeId) return n;
+      if (index == null) {
+        return { ...n, data: { ...n.data, measurementsRef: undefined, measurementRefs: undefined } };
+      }
+      const next = measRefsOf(n.data).filter((_, i) => i !== index);
+      return {
+        ...n,
+        data: {
+          ...n.data,
+          measurementsRef: next[0],
+          measurementRefs: next.length ? next : undefined,
+        },
+      };
+    }));
   }, [setNodes]);
 
   /** Attach an inset (looked up by InsetSource.key) to a source node. */
@@ -6090,13 +6144,18 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
             const key = `inset_${imgCount++}_${src.key}`;
             result.push({ key, kind: "image", label: displayName(src, sourceNameOverrides), image_b64: src.thumbnail });
           }
-        } else if (e.sourceHandle === "out_table_measurements") {
-          // Emit the figure's measurements ATTACHED to this source node
-          // (its own CSV); fall back to the active figure for any legacy
-          // edge whose node has no attached ref.
-          result.push({ key: "measurements", kind: "table",
-            label: upstreamData.measurementsRef?.label || "measurements",
-            csv: upstreamData.measurementsRef?.csv ?? measurementsCsv });
+        } else if (e.sourceHandle?.startsWith("out_table_measurements")) {
+          // Emit the measurements table ATTACHED to this source node for THIS
+          // handle (a node can now carry several). Prefix-matched, not equality
+          // — extra tables use out_table_measurements_<i>. Falls back to the
+          // active figure for any legacy edge whose node has no attached ref.
+          const mi = measIndexFromHandle(e.sourceHandle);
+          const mr = measRefsOf(upstreamData)[mi];
+          // Unique key per table: the R prelude names inputs by key/label, so
+          // reusing "measurements" would collapse several tables into one.
+          result.push({ key: mi === 0 ? "measurements" : `measurements_${mi}`, kind: "table",
+            label: mr?.label || (mi === 0 ? "measurements" : `measurements ${mi + 1}`),
+            csv: mr?.csv ?? measurementsCsv });
         }
         continue;
       }
@@ -6297,10 +6356,15 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
               const key = `inset_${imgCount++}_${src.key}`;
               result.push({ key, kind: "image", label: displayName(src, sourceNameOverrides), image_b64: src.thumbnail });
             }
-          } else if (e.sourceHandle === "out_table_measurements") {
-            result.push({ key: "measurements", kind: "table",
-              label: upstreamData.measurementsRef?.label || "measurements",
-              csv: upstreamData.measurementsRef?.csv ?? measurementsCsv });
+          } else if (e.sourceHandle?.startsWith("out_table_measurements")) {
+            // Mirrors the main collectInputs path above (this branch is
+            // duplicated) — prefix match + per-table key so multiple attached
+            // measurement tables all reach the script.
+            const mi = measIndexFromHandle(e.sourceHandle);
+            const mr = measRefsOf(upstreamData)[mi];
+            result.push({ key: mi === 0 ? "measurements" : `measurements_${mi}`, kind: "table",
+              label: mr?.label || (mi === 0 ? "measurements" : `measurements ${mi + 1}`),
+              csv: mr?.csv ?? measurementsCsv });
           }
           continue;
         }
