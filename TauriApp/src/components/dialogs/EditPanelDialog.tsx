@@ -8460,7 +8460,12 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   const vbH = svgDims.h || 1000;
                   const uLab: Record<string, string> = { km: "km", m: "m", cm: "cm", mm: "mm", um: "µm", nm: "nm", pm: "pm" };
                   const toVb = (p: [number, number]): [number, number] => [p[0] / 100 * vbW, p[1] / 100 * vbH];
-                  const handleR = Math.max(3, vbW / 200);
+                  // Node/handle radius. Kept deliberately small so the nodes
+                  // don't obscure the surface they sit on — they're grab
+                  // targets, not decoration (the hit area is widened
+                  // separately by the transparent circle drawn under the
+                  // centre node).
+                  const handleR = Math.max(2, vbW / 320);
 
                   const startDrag = (onPct: (nx: number, ny: number) => void) =>
                     (e: React.MouseEvent) => {

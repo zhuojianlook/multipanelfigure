@@ -235,7 +235,11 @@ export function computeThicknessReadings(
  * @returns {point, snapped}
  */
 export function snapToCurve(
-  pPct: Pt, curvePct: Pt[], iw: number, ih: number, tolPct = 1.5,
+  // tolPct was 1.5% of the smaller side — so tight that dragging a reading
+  // endpoint essentially never snapped back onto the surface, and the snap
+  // read as non-existent. 4% is a reachable grab distance while still leaving
+  // deliberate free placement possible further out.
+  pPct: Pt, curvePct: Pt[], iw: number, ih: number, tolPct = 4,
 ): { point: Pt; snapped: boolean } {
   if (curvePct.length < 3 || iw <= 0 || ih <= 0) return { point: pPct, snapped: false };
   const toPx = (p: Pt): Pt => [(p[0] / 100) * iw, (p[1] / 100) * ih];
