@@ -4584,12 +4584,170 @@ function buildCellCharacteristicsWorkflow(): SavedWorkflow {
   };
 }
 
+// ── Curved-surface thickness — ANOVA across groups ───────────
+// The first built-in that consumes MEASUREMENTS rather than images:
+// curved-surface readings from any number of images/panels, compared
+// across user-assigned groups, with the individual readings drawn over
+// the bars and post-hoc significance brackets.
+//
+// Control handling follows the convention the Analysis tab already
+// teaches ("the FIRST level becomes the reference group"): naming a
+// CONTROL re-levels the factor so it sits first, and the post-hoc table
+// is filtered to comparisons against it (Dunnett-style) instead of every
+// pairwise combination.
+const THICKNESS_ANOVA_R = `# Curved-surface thickness — group comparison (ANOVA + post-hoc)
+#
+# INPUT: a measurements table from a Source node's 📋 port.
+#   Columns: Panel, Name, Group, Value, Unit, Type, Figure
+#
+# Group is the label you assign in the Sources panel: tick the readings,
+# type a name (e.g. Control / Treated), press "set". Rows with no label
+# fall back to their panel id, so this still runs unlabelled.
+#
+# Readings from SEVERAL images: drop each image's curved-surface
+# measurements onto the same Source node (it holds several tables now) and
+# wire each 📋 port into this node.
+
+CONTROL <- ""   # <- EDIT: your control group's name. "" = no control, and
+                #    every pair is compared (Tukey). When set, that group
+                #    becomes the reference and only comparisons against it
+                #    are shown.
+
+suppressWarnings(suppressMessages({ library(ggplot2); library(ggprism) }))
+
+# Pool every wired measurements table.
+d <- if (length(inputs) > 1) do.call(rbind, lapply(inputs, function(t) t[, intersect(names(t), names(inputs[[1]])), drop = FALSE])) else data
+
+# Curved-surface readings only — a panel may also carry line/area annotations.
+if ("Type" %in% names(d)) d <- d[d$Type == "curved_surface", , drop = FALSE]
+if (nrow(d) == 0) stop("No curved-surface measurements in the input. In the Sources panel use the 'curved surface' filter, then drag those readings onto the Source node.")
+
+d$val <- suppressWarnings(as.numeric(d$Value))
+d <- d[!is.na(d$val), , drop = FALSE]
+if (nrow(d) == 0) stop("Curved-surface rows found, but none had a numeric Value.")
+
+g <- if ("Group" %in% names(d)) as.character(d$Group) else as.character(d$Panel)
+d$group <- ifelse(is.na(g) | g == "", as.character(d$Panel), g)
+
+unit <- if ("Unit" %in% names(d) && length(unique(d$Unit)) == 1) unique(d$Unit)[1] else ""
+
+lv <- unique(d$group)
+if (nzchar(CONTROL)) {
+  if (!(CONTROL %in% lv)) stop(sprintf("CONTROL '%s' is not one of the groups: %s", CONTROL, paste(lv, collapse = ", ")))
+  lv <- c(CONTROL, setdiff(lv, CONTROL))   # first level = reference
+}
+d$group <- factor(d$group, levels = lv)
+
+summ <- do.call(rbind, lapply(levels(d$group), function(gg) {
+  v <- d$val[d$group == gg]
+  data.frame(group = gg, mean = mean(v), sd = if (length(v) > 1) sd(v) else 0,
+             n = length(v), stringsAsFactors = FALSE)
+}))
+summ$group <- factor(summ$group, levels = levels(d$group))
+ymax_v <- max(d$val, summ$mean + summ$sd, na.rm = TRUE)
+
+# ── ANOVA + post-hoc ───────────────────────────────────────────────────
+brackets <- NULL
+aov_txt <- "ANOVA needs >=2 groups with >=2 readings each"
+usable <- levels(d$group)[vapply(levels(d$group), function(gg) sum(d$group == gg) >= 2, logical(1))]
+if (length(usable) >= 2) {
+  sub2 <- d[d$group %in% usable, , drop = FALSE]
+  sub2$group <- factor(sub2$group, levels = usable)
+  aov_res <- tryCatch(aov(val ~ group, data = sub2), error = function(e) NULL)
+  if (!is.null(aov_res)) {
+    s <- summary(aov_res)[[1]]
+    aov_txt <- sprintf("One-way ANOVA: F(%g, %g) = %.3f, p = %.4g",
+                       s[1, "Df"], s[2, "Df"], s[1, "F value"], s[1, "Pr(>F)"])
+    tk <- tryCatch(TukeyHSD(aov_res), error = function(e) NULL)
+    tk_mat <- if (!is.null(tk)) tk[["group"]] else NULL
+    if (!is.null(tk_mat) && nrow(tk_mat) > 0) {
+      prs <- strsplit(rownames(tk_mat), "-", fixed = TRUE)
+      bk <- data.frame(group1 = vapply(prs, function(p) p[2], character(1)),
+                       group2 = vapply(prs, function(p) p[1], character(1)),
+                       p.adj  = tk_mat[, "p adj"], stringsAsFactors = FALSE)
+      if (nzchar(CONTROL)) bk <- bk[bk$group1 == CONTROL | bk$group2 == CONTROL, , drop = FALSE]
+      bk <- bk[order(bk$p.adj), , drop = FALSE]
+      step <- 0.13 * ymax_v; out <- list()
+      for (i in seq_len(nrow(bk))) {
+        pv <- bk$p.adj[i]; if (is.na(pv)) next
+        lab <- if (pv < 0.001) "***" else if (pv < 0.01) "**" else if (pv < 0.05) "*" else "ns"
+        out[[length(out) + 1]] <- data.frame(
+          group1 = bk$group1[i], group2 = bk$group2[i], p.label = lab,
+          y.position = ymax_v + step * length(out), stringsAsFactors = FALSE)
+      }
+      if (length(out) > 0) brackets <- do.call(rbind, out)
+      mpfig_data("posthoc", "group1,group2,p_adj", bk$group1, bk$group2, bk$p.adj)
+    }
+  }
+}
+cat(aov_txt, "\\n")
+
+p <- ggplot() +
+  geom_col(data = summ, aes(x = group, y = mean, fill = group),
+           width = 0.7, color = "grey25", linewidth = 0.3) +
+  geom_errorbar(data = summ, aes(x = group, ymin = pmax(0, mean - sd), ymax = mean + sd),
+                width = 0.2, linewidth = 0.4) +
+  geom_jitter(data = d, aes(x = group, y = val), width = 0.12, height = 0,
+              size = 1.8, alpha = 0.85, color = "grey20", stroke = 0)
+if (!is.null(brackets))
+  p <- p + ggprism::add_pvalue(brackets, label = "p.label", tip.length = 0.01, label.size = 3.2)
+
+ylab <- if (nzchar(unit)) paste0("Thickness (", unit, ")") else "Thickness"
+w <- max(900, 150 * nlevels(d$group) + 360)
+p <- p +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+  theme_prism(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 14, margin = margin(b = 6)),
+        plot.subtitle = element_text(size = 9, color = "grey30", margin = margin(b = 8)),
+        axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1, size = 10),
+        plot.margin = margin(t = 18, r = 18, b = 26, l = 22)) +
+  labs(x = NULL, y = ylab, title = "Curved-surface thickness by group", subtitle = aov_txt)
+
+mpfig_plot("thickness_anova.png", width = w, height = 1000, res = 300)
+print(p)
+mpfig_data("summary", "group,mean,sd,n", as.character(summ$group), summ$mean, summ$sd, summ$n)
+`;
+
+function buildThicknessAnovaWorkflow(): SavedWorkflow {
+  const srcId = "source", rId = "thickness_anova";
+  const nodes: Node<NodeData>[] = [
+    {
+      id: srcId, type: "source", position: { x: 40, y: 60 },
+      data: {
+        label: "Source — drag your curved-surface measurements here",
+        kind: "source", sources: [], status: "ok",
+      } as NodeData,
+      draggable: true, deletable: false,
+    },
+    {
+      id: rId, type: "r", position: { x: 420, y: 60 },
+      data: {
+        label: "Thickness ANOVA + bar/scatter", kind: "r", code: THICKNESS_ANOVA_R,
+        outputs: [], inputs: [], status: "idle", currentPreset: "custom",
+      } as NodeData,
+    },
+  ];
+  // Deliberately NO pre-wired edge: a Source node has no 📋
+  // (out_table_measurements) port until measurements are actually dropped on
+  // it, so an edge authored here would dangle. The canvas auto-wires the first
+  // source → downstream edge once the user drops a table.
+  return {
+    id: "builtin:thickness_anova",
+    name: "Curved-surface thickness — ANOVA across groups",
+    nodes,
+    edges: [],
+    createdAt: 0,
+  };
+}
+
 const BUILTIN_WORKFLOWS: SavedWorkflow[] = [
   buildCornealHazeWorkflow(),
   buildIntensityWorkflow(),
   buildNucleiCountWorkflow(),
   buildWesternBlotWorkflow(),
   buildCellCharacteristicsWorkflow(),
+  buildThicknessAnovaWorkflow(),
 ];
 
 // ── Workflow tabs (in-session) ──────────────────────────────
