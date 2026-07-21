@@ -4676,7 +4676,8 @@ if (length(usable) >= 2) {
           y.position = ymax_v + step * length(out), stringsAsFactors = FALSE)
       }
       if (length(out) > 0) brackets <- do.call(rbind, out)
-      mpfig_data("posthoc", "group1,group2,p_adj", bk$group1, bk$group2, bk$p.adj)
+      mpfig_data(data.frame(group1 = bk$group1, group2 = bk$group2,
+                            p_adj = bk$p.adj, stringsAsFactors = FALSE), "posthoc")
     }
   }
 }
@@ -4693,7 +4694,13 @@ if (!is.null(brackets))
   p <- p + ggprism::add_pvalue(brackets, label = "p.label", tip.length = 0.01, label.size = 3.2)
 
 ylab <- if (nzchar(unit)) paste0("Thickness (", unit, ")") else "Thickness"
-w <- max(900, 150 * nlevels(d$group) + 360)
+# Canvas is sized in PIXELS but text is sized in POINTS, so what matters
+# is the physical width (px / res). Keep it >= 6in at 300 dpi, otherwise
+# the title and ANOVA subtitle are wider than the figure and get clipped.
+res_v <- 300
+w <- max(1800, 320 * nlevels(d$group) + 900)
+h <- 1500
+w_in <- w / res_v
 p <- p +
   scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
   theme_prism(base_size = 12) +
@@ -4702,11 +4709,15 @@ p <- p +
         plot.subtitle = element_text(size = 9, color = "grey30", margin = margin(b = 8)),
         axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1, size = 10),
         plot.margin = margin(t = 18, r = 18, b = 26, l = 22)) +
-  labs(x = NULL, y = ylab, title = "Curved-surface thickness by group", subtitle = aov_txt)
+  labs(x = NULL, y = ylab,
+       # Wrap rather than clip: bold 14pt fits ~7 chars/in, 9pt grey ~13.
+       title = .mpfig_fit("Curved-surface thickness by group", width_in = w_in, cpi = 7),
+       subtitle = .mpfig_fit(aov_txt, width_in = w_in, cpi = 13))
 
-mpfig_plot("thickness_anova.png", width = w, height = 1000, res = 300)
+mpfig_plot("thickness_anova.png", width = w, height = h, res = res_v)
 print(p)
-mpfig_data("summary", "group,mean,sd,n", as.character(summ$group), summ$mean, summ$sd, summ$n)
+mpfig_data(data.frame(group = as.character(summ$group), mean = summ$mean,
+                      sd = summ$sd, n = summ$n, stringsAsFactors = FALSE), "summary")
 `;
 
 function buildThicknessAnovaWorkflow(): SavedWorkflow {
@@ -7011,11 +7022,22 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         // R script that defines `inputs <- list(...)` from the
         // upstream CSVs, then appends the user's code.
         const tables = extra.filter((x) => x.kind === "table");
+        // R is usually spawned without LANG/LC_ALL (a Tauri app launched
+        // from Finder inherits no locale), so it runs under LC_CTYPE=C.
+        // In that locale read.csv(text=) TRANSLITERATES any non-ASCII
+        // byte into literal escape text — "µm" becomes the 9-character
+        // string "<c2><b5>m", which then draws as garbage in every plot
+        // label.  Marking the CSV string as UTF-8 *before* parsing is the
+        // only thing that survives: passing encoding="UTF-8" to read.csv
+        // has no effect on the text= path, and re-marking afterwards is
+        // too late because the character is already destroyed.
+        const csvHelper =
+          '.mpfig_csv <- function(s) { Encoding(s) <- "UTF-8"; read.csv(text = s, stringsAsFactors = FALSE) }\n';
         const inputsAssign = tables.map((t, i) =>
-          `  ${JSON.stringify(t.label || `t${i}`)} = read.csv(text = ${JSON.stringify(t.csv || "")}, stringsAsFactors = FALSE)`
+          `  ${JSON.stringify(t.label || `t${i}`)} = .mpfig_csv(${JSON.stringify(t.csv || "")})`
         ).join(",\n");
         const prelude = tables.length > 0
-          ? `inputs <- list(\n${inputsAssign}\n)\n# Convenience: \`data\` aliases the first input table.\nif (length(inputs) > 0) data <- inputs[[1]] else data <- data.frame()\n\n`
+          ? `${csvHelper}inputs <- list(\n${inputsAssign}\n)\n# Convenience: \`data\` aliases the first input table.\nif (length(inputs) > 0) data <- inputs[[1]] else data <- data.frame()\n\n`
           : `inputs <- list()\ndata <- data.frame()\n\n`;
         const fullCode = prelude + (node.data.code || R_DEFAULT);
         rExecutedCode = fullCode;

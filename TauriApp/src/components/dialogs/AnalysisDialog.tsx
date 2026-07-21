@@ -1374,7 +1374,14 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
 library(ggplot2)
 library(ggprism)
 
-data <- read.csv(text = "${escapedCsv}", stringsAsFactors = FALSE)
+#  Encoding() is set before parsing because R usually runs with no
+#  LANG set (LC_CTYPE=C), and read.csv(text=) then mangles non-ASCII
+#  text such as "µm" into the literal string "<c2><b5>m".
+data <- local({
+  .s <- "${escapedCsv}"
+  Encoding(.s) <- "UTF-8"
+  read.csv(text = .s, stringsAsFactors = FALSE)
+})
 
 mpfig_plot("${tbl.name}.png")
 ggplot(data, aes(x = ${stringCol}, y = ${yCol})) +

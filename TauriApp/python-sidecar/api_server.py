@@ -154,7 +154,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.389"  # CI re-syncs this from the release tag (build-sidecar)
+SIDECAR_BUILD = "0.1.390"  # CI re-syncs this from the release tag (build-sidecar)
 
 
 @app.get("/api/version")
@@ -6067,7 +6067,11 @@ def run_r_code(body: RAnalysisRequest):
         script += f'for (.pkg in c({_pkgs})) {{\n'
         script += '  if (!requireNamespace(.pkg, quietly=TRUE)) install.packages(.pkg, repos="https://cloud.r-project.org", quiet=TRUE)\n'
         script += '}\n\n'
-        script += f'# Auto-generated data loading\ndata <- read.csv("{data_path.replace(chr(92), "/")}")\n\n'
+        # encoding="UTF-8" matters: R is typically spawned with no LANG set
+        # (so LC_CTYPE=C), and without this any non-ASCII text in the data —
+        # "µm", "°C", accented group names — is read as unmarked bytes and
+        # renders as missing glyphs in every plot label.
+        script += f'# Auto-generated data loading\ndata <- read.csv("{data_path.replace(chr(92), "/")}", encoding = "UTF-8")\n\n'
         script += f'# Set plot output directory\n.plot_dir <- "{plot_dir.replace(chr(92), "/")}"\n'
         script += '.plot_count <- 0\n'
         # Per-plot capture list — drives the text-override block's
