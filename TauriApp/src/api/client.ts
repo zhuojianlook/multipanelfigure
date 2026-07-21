@@ -550,7 +550,16 @@ class ApiClient {
 
   // ── Measurements ────────────────────────────────────────
 
-  async getMeasurements(): Promise<{ measurements: Array<{ panel: string; name: string; type: string; value: string; numeric?: number; unit?: string }> }> {
+  /** All line / area / curved-surface measurements for the active figure.
+   *  `annotation` + `ann_index` + `reading_index` address a row back to the
+   *  annotation (and, for a curved surface, the individual reading) it came
+   *  from, so the Analysis tile can group and drag them individually — `name`
+   *  stays the composed display string ("Curved surface 1 #3"). */
+  async getMeasurements(): Promise<{ measurements: Array<{
+    panel: string; name: string; type: string; value: string;
+    numeric?: number; unit?: string; custom_scale?: boolean;
+    annotation?: string; ann_index?: number; reading_index?: number | null;
+  }> }> {
     return apiJson("/api/measurements");
   }
 

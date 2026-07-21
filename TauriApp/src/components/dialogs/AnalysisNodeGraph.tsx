@@ -971,7 +971,14 @@ export function figureLabels(docs: Array<{ id: string; name: string }>): Record<
    That has always resolved to Panel. Prepending Figure would silently switch
    every bar / box / violin plot's x-axis from Panel to Figure. Appending keeps
    the existing contract intact while still attributing every row. */
-export const MEAS_CSV_HEADER = "Panel,Name,Group,Value,Unit,Figure";
+/* Type is inserted BEFORE Figure, not appended after it: `Figure` being the
+   LAST column is an asserted contract (figureIdentity.test.ts). Inserting a
+   CHARACTER column here is safe for the positional selectors above — Panel is
+   still the first non-numeric column and Value is still the first numeric one.
+   Without Type, an R script cannot tell a curved-surface reading from a line
+   length: the backend tags every row ("line" | "area" | "curved_surface") but
+   that tag used to be dropped right here. */
+export const MEAS_CSV_HEADER = "Panel,Name,Group,Value,Unit,Type,Figure";
 
 /** Rows -> CSV. `figure` is the document the rows came from.
  *
@@ -984,7 +991,7 @@ export function measArrToCsv(rows: Array<Record<string, unknown>>, figure = ""):
   const q = (c: unknown) => `"${String(c ?? "").replace(/"/g, '""')}"`;
   const body = (rows || []).map((m) => {
     const value = m.numeric != null ? String(m.numeric) : String(m.value ?? "");
-    return [m.panel, m.name, m.panel, value, m.unit ?? "", figure].map(q).join(",");
+    return [m.panel, m.name, m.panel, value, m.unit ?? "", m.type ?? "", figure].map(q).join(",");
   }).join("\n");
   return body ? `${header}\n${body}` : `${header}\n`;
 }

@@ -3578,7 +3578,7 @@ def _collect_measurements():
             # Line measurements. Gated on measure_in_analysis (default True),
             # NOT show_measure — hiding a label on the figure must not silently
             # drop the number from the data.
-            for line in (panel.lines or []):
+            for li, line in enumerate(panel.lines or []):
                 if getattr(line, 'measure_in_analysis', True) and len(line.points) >= 2:
                     unit = getattr(line, 'measure_unit', 'um')
                     lt = effective_line_type(line)
@@ -3592,9 +3592,17 @@ def _collect_measurements():
                         line.points, iw, ih, lmpp, unit, lt)
                     results.append({"panel": label, "name": line.name, "type": "line",
                                     "value": text, "numeric": round(numeric, 4),
-                                    "unit": unit_label(unit, squared=False)})
+                                    "unit": unit_label(unit, squared=False),
+                                    # Addressing fields — let the Analysis UI group
+                                    # and drag rows per annotation / per reading.
+                                    # Derived at read time (array positions), so
+                                    # nothing is stored and no .mpf migration is
+                                    # needed.
+                                    "annotation": line.name,
+                                    "ann_index": li,
+                                    "reading_index": None})
             # Area measurements — see the note on lines above.
-            for area in (panel.areas or []):
+            for ai, area in enumerate(panel.areas or []):
                 if getattr(area, 'measure_in_analysis', True) and len(area.points) >= 2:
                     unit = getattr(area, 'measure_unit', 'um')
                     # Honour a per-area custom scale (see AreaAnnotation.effective_mpp).
@@ -3608,10 +3616,13 @@ def _collect_measurements():
                         area.points, area.shape, iw, ih, ampp, unit)
                     results.append({"panel": label, "name": area.name, "type": "area",
                                     "value": text, "numeric": round(numeric, 4),
-                                    "unit": unit_label(unit, squared=True)})
+                                    "unit": unit_label(unit, squared=True),
+                                    "annotation": area.name,
+                                    "ann_index": ai,
+                                    "reading_index": None})
             # Curved surface measurements — one row per reading (hidden
             # readings excluded). Gated on measure_in_analysis, not show_measure.
-            for tm in (getattr(panel, 'thickness_measurements', None) or []):
+            for ti, tm in enumerate(getattr(panel, 'thickness_measurements', None) or []):
                 if not getattr(tm, 'measure_in_analysis', True):
                     continue
                 unit = getattr(tm, 'measure_unit', 'um')
@@ -3641,7 +3652,15 @@ def _collect_measurements():
                                     "unit": ulabel,
                                     # Flags a reading measured with a scale that
                                     # differs from the image's own bar.
-                                    "custom_scale": custom})
+                                    "custom_scale": custom,
+                                    # `name` stays the composed display string
+                                    # ("Curved surface 1 #3") for back-compat;
+                                    # these let the Analysis UI address the
+                                    # annotation and the individual reading
+                                    # without regex-parsing that suffix.
+                                    "annotation": tm.name or "Curved surface",
+                                    "ann_index": ti,
+                                    "reading_index": ri + 1})
     return results
 
 
