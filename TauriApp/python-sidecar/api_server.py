@@ -154,7 +154,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.390"  # CI re-syncs this from the release tag (build-sidecar)
+SIDECAR_BUILD = "0.1.391"  # CI re-syncs this from the release tag (build-sidecar)
 
 
 @app.get("/api/version")
@@ -5824,6 +5824,30 @@ class RAnalysisRequest(BaseModel):
     emit_labels: bool = False
 
 
+def _r_env() -> dict:
+    """Environment for the Rscript child process.
+
+    R inherits the sidecar's environment, and a desktop app launched from
+    Finder / the Start menu has no LANG or LC_ALL set — so R runs under
+    LC_CTYPE=C.  In that locale R does not merely mislabel non-ASCII text,
+    it TRANSLITERATES it: "µm" read out of a CSV becomes the literal
+    9-character ASCII string "<c2><b5>m", and write.csv() re-escapes it the
+    same way on the way back out.  Declaring a UTF-8 locale fixes both
+    directions at once, which per-call encoding arguments cannot do.
+
+    Windows is deliberately left alone: R >= 4.2 is UTF-8-native there via
+    UCRT, and these POSIX locale names are invalid for it — R would warn on
+    stderr, which the analysis UI shows the user.
+    """
+    env = os.environ.copy()
+    if os.name == "nt" or env.get("LC_ALL"):
+        return env
+    # C.UTF-8 is the portable choice on glibc; macOS only ships en_US.UTF-8.
+    env["LC_ALL"] = "C.UTF-8" if _sys.platform.startswith("linux") else "en_US.UTF-8"
+    env.setdefault("LANG", env["LC_ALL"])
+    return env
+
+
 def _find_rscript(custom_path: Optional[str] = None) -> Optional[str]:
     """Find Rscript binary — checks custom path, PATH, and common install locations."""
     # 1. User-specified custom path
@@ -6046,7 +6070,11 @@ def run_r_code(body: RAnalysisRequest):
 
     with tempfile.TemporaryDirectory(prefix="mpfig_r_") as tmpdir:
         data_path = os.path.join(tmpdir, "data.csv")
-        with open(data_path, "w") as f:
+        # encoding is explicit: the generated R declares this file UTF-8, and
+        # Python's default here is the locale codepage (cp1252 on Windows),
+        # which would both make that declaration a lie and raise
+        # UnicodeEncodeError on any character outside it.
+        with open(data_path, "w", encoding="utf-8") as f:
             csv_text = body.data_csv.rstrip() + "\n"  # ensure trailing newline
             f.write(csv_text)
 
@@ -6244,14 +6272,20 @@ def run_r_code(body: RAnalysisRequest):
             )
 
         script_path = os.path.join(tmpdir, "analysis.R")
-        with open(script_path, "w") as f:
+        # UTF-8 explicitly: generated source carries inlined data and labels
+        # that may be non-ASCII, and R/Python both read it back as UTF-8.
+        with open(script_path, "w", encoding="utf-8") as f:
             f.write(script)
 
         try:
             result = subprocess.run(
                 [rscript, script_path],
                 capture_output=True, text=True, timeout=120,
-                cwd=tmpdir
+                cwd=tmpdir, env=_r_env(),
+                # Decode R's output as UTF-8 explicitly rather than by the
+                # locale default (which is cp1252 on Windows, and would
+                # raise UnicodeDecodeError on any non-ASCII output).
+                encoding="utf-8", errors="replace",
             )
         except subprocess.TimeoutExpired:
             return {"success": False, "stdout": "", "stderr": "R script timed out after 120 seconds (may be installing packages — try again).", "plots": [], "tables": []}
@@ -6341,12 +6375,15 @@ def run_r_console(body: RConsoleRequest):
         script = ('options(repos = c(CRAN = "https://cloud.r-project.org"))\n'
                   + cmd + "\n")
         script_path = os.path.join(tmpdir, "console.R")
-        with open(script_path, "w") as f:
+        # UTF-8 explicitly: generated source carries inlined data and labels
+        # that may be non-ASCII, and R/Python both read it back as UTF-8.
+        with open(script_path, "w", encoding="utf-8") as f:
             f.write(script)
         try:
             result = subprocess.run(
                 [rscript, script_path],
                 capture_output=True, text=True, timeout=600, cwd=tmpdir,
+                env=_r_env(), encoding="utf-8", errors="replace",
             )
             return {"success": result.returncode == 0,
                     "stdout": result.stdout, "stderr": result.stderr}
@@ -8371,25 +8408,25 @@ def mpfig_data(rows, name="table"):
     if isinstance(rows, dict):
         keys = list(rows.keys())
         n = max((len(v) for v in rows.values()), default=0)
-        with open(path, "w", newline="") as f:
+        with open(path, "w", newline="", encoding="utf-8") as f:
             w = _csv.writer(f)
             w.writerow(keys)
             for i in range(n):
                 w.writerow([rows[k][i] if i < len(rows[k]) else "" for k in keys])
     elif isinstance(rows, (list, tuple)) and rows and isinstance(rows[0], dict):
         keys = list(rows[0].keys())
-        with open(path, "w", newline="") as f:
+        with open(path, "w", newline="", encoding="utf-8") as f:
             w = _csv.writer(f)
             w.writerow(keys)
             for r in rows:
                 w.writerow([r.get(k, "") for k in keys])
     elif isinstance(rows, (list, tuple)):
-        with open(path, "w", newline="") as f:
+        with open(path, "w", newline="", encoding="utf-8") as f:
             w = _csv.writer(f)
             for r in rows:
                 w.writerow(r if isinstance(r, (list, tuple)) else [r])
     else:
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(str(rows))
 
 def mpfig_image(arr, name="image"):
@@ -8425,7 +8462,9 @@ except Exception:
             .replace("__USER_CODE__", _textwrap.indent(code, "    "))
         )
         script_path = os.path.join(tmpdir, "pipeline.py")
-        with open(script_path, "w") as f:
+        # UTF-8 explicitly: generated source carries inlined data and labels
+        # that may be non-ASCII, and R/Python both read it back as UTF-8.
+        with open(script_path, "w", encoding="utf-8") as f:
             f.write(harness)
 
         # Resolve which Python binary to use.  User override wins
@@ -9255,7 +9294,9 @@ end
         )
 
         script_path = os.path.join(tmpdir, "pipeline.m")
-        with open(script_path, "w") as f:
+        # UTF-8 explicitly: generated source carries inlined data and labels
+        # that may be non-ASCII, and R/Python both read it back as UTF-8.
+        with open(script_path, "w", encoding="utf-8") as f:
             f.write(harness)
 
         try:

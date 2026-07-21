@@ -140,8 +140,14 @@ function parseDeclaredOutputs(code: string): DeclaredOutput[] {
   // name arg lands there in every flavour we ship).
   const patterns: Array<{ kind: DataKind; re: RegExp }> = [
     { kind: "plot",  re: /mpfig_plot\s*\(\s*["']([^"']+?)\.?(?:png|pdf|svg)?["']/g },
-    { kind: "table", re: /mpfig_data\s*\(\s*(?:[^()"',]+,\s*)*?(?:name\s*=\s*)?["']([^"']+)["']/g },
-    { kind: "image", re: /mpfig_image\s*\(\s*(?:[^()"',]+,\s*)*?(?:name\s*=\s*)?["']([^"']+)["']/g },
+    // The leading-arg skip must tolerate parentheses and newlines: the R
+    // form passes a constructed frame first, e.g.
+    //   mpfig_data(data.frame(a = x,
+    //                         b = y), "posthoc")
+    // An [^()"',] class cannot cross that, so the call parsed as having no
+    // declared name and the node silently lost its output chips.
+    { kind: "table", re: /mpfig_data\s*\(\s*(?:[^"']*?,\s*)*?(?:name\s*=\s*)?["']([^"']+)["']/g },
+    { kind: "image", re: /mpfig_image\s*\(\s*(?:[^"']*?,\s*)*?(?:name\s*=\s*)?["']([^"']+)["']/g },
   ];
   for (const { kind, re } of patterns) {
     let m: RegExpExecArray | null;
@@ -4661,10 +4667,22 @@ if (length(usable) >= 2) {
     tk <- tryCatch(TukeyHSD(aov_res), error = function(e) NULL)
     tk_mat <- if (!is.null(tk)) tk[["group"]] else NULL
     if (!is.null(tk_mat) && nrow(tk_mat) > 0) {
-      prs <- strsplit(rownames(tk_mat), "-", fixed = TRUE)
-      bk <- data.frame(group1 = vapply(prs, function(p) p[2], character(1)),
-                       group2 = vapply(prs, function(p) p[1], character(1)),
+      # TukeyHSD names its rows "B-A", but a group name may itself contain a
+      # hyphen ("Anti-VEGF", "IL-6"), and splitting on "-" then yields
+      # fragments — phantom x-axis categories and brackets drawn against
+      # groups that do not exist. Match each row name against the actual
+      # level pairs instead of parsing it.
+      lev <- levels(sub2$group)
+      pr <- do.call(rbind, lapply(rownames(tk_mat), function(rn) {
+        for (a in lev) for (b in lev) {
+          if (!identical(a, b) && identical(rn, paste0(a, "-", b)))
+            return(data.frame(group1 = b, group2 = a, stringsAsFactors = FALSE))
+        }
+        data.frame(group1 = NA_character_, group2 = NA_character_, stringsAsFactors = FALSE)
+      }))
+      bk <- data.frame(group1 = pr$group1, group2 = pr$group2,
                        p.adj  = tk_mat[, "p adj"], stringsAsFactors = FALSE)
+      bk <- bk[!is.na(bk$group1), , drop = FALSE]
       if (nzchar(CONTROL)) bk <- bk[bk$group1 == CONTROL | bk$group2 == CONTROL, , drop = FALSE]
       bk <- bk[order(bk$p.adj), , drop = FALSE]
       step <- 0.13 * ymax_v; out <- list()
