@@ -121,14 +121,25 @@ function downloadCsv(csv: string, basename: string) {
   URL.revokeObjectURL(url);
 }
 
-interface Measurement {
+/* A type alias, NOT an interface, on purpose: only type aliases get an
+   implicit index signature, which is what makes `Measurement[]` assignable to
+   the node graph's `measurements?: Array<Record<string, unknown>>` prop. As an
+   interface this fails to compile ("Index signature for type 'string' is
+   missing"). The backend also sends annotation / ann_index / reading_index /
+   custom_scale; they're read dynamically downstream and listed here so the
+   shape isn't misleading. */
+type Measurement = {
   panel: string;
   name: string;
   type: string;
   value: string;            // display string (may be a user override)
   numeric?: number;         // computed numeric value
   unit?: string;            // unit label, e.g. "µm" / "µm²"
-}
+  annotation?: string;      // owning annotation's name
+  ann_index?: number;       // its position in the panel's array
+  reading_index?: number | null;  // 1-based reading no. (curved surfaces)
+  custom_scale?: boolean;
+};
 
 interface Props {
   open: boolean;
@@ -1854,7 +1865,12 @@ ggplot(data, aes(x = ${stringCol}, y = ${yCol})) +
         <IconButton onClick={onClose} size="small"><CloseIcon /></IconButton>
       </DialogTitle>
       <DialogContent sx={{ p: 0, display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
-        <AnalysisNodeGraph open={open} measurementsCsv={buildCsv()} />
+        {/* `measurements` matters as well as the CSV: without the raw rows the
+            Sources panel renders no measurements folder at all (it filters on
+            rows.length), so the per-panel / per-measurement / per-reading drag
+            targets were invisible in this dialog path — only the AnalysisView
+            path passed them. */}
+        <AnalysisNodeGraph open={open} measurementsCsv={buildCsv()} measurements={measurements} />
       </DialogContent>
 
       {/* Plot preview modal — opens on thumbnail click */}

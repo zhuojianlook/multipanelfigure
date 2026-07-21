@@ -1017,21 +1017,78 @@ function MeasurementFigureFolder({
   defaultOpen: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
-  const byPanel = useMemo(() => {
-    const m = new Map<string, Array<Record<string, unknown>>>();
-    for (const r of rows || []) {
-      const k = String(r.panel ?? "—");
-      if (!m.has(k)) m.set(k, []);
-      m.get(k)!.push(r);
-    }
-    return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-  }, [rows]);
+  /** "" = every type. Lets a workflow that only wants curved-surface readings
+   *  (e.g. the thickness ANOVA template) grab exactly those in one drag. */
+  const [typeFilter, setTypeFilter] = useState("");
+  /** Ephemeral multi-select, keyed by the row's index in `rows`. Deliberately
+   *  NOT persisted — it's a selection basket for building one drag, not a
+   *  saved grouping. */
+  const [sel, setSel] = useState<Set<string>>(new Set());
 
-  const dragFigure = (e: React.DragEvent) => {
-    const ref: MeasurementRef = { mpfId: docId, mpf: docName, label: `${docName} — measurements`, csv };
+  /** Rows paired with a stable key so selection survives regrouping/filtering. */
+  const keyed = useMemo(
+    () => (rows || []).map((r, i) => ({ r, key: String(i) })),
+    [rows],
+  );
+  /** Which measurement types this figure actually has — the filter row only
+   *  appears when there's more than one, so simple figures stay uncluttered. */
+  const presentTypes = useMemo(() => {
+    const s = new Set<string>();
+    for (const { r } of keyed) if (r.type) s.add(String(r.type));
+    return [...s].sort();
+  }, [keyed]);
+  const visible = useMemo(
+    () => (typeFilter ? keyed.filter(({ r }) => String(r.type ?? "") === typeFilter) : keyed),
+    [keyed, typeFilter],
+  );
+
+  /** panel -> annotation -> rows. The annotation level only renders when it
+   *  holds more than one row (a curved surface's readings); a line/area is a
+   *  single row and would otherwise gain a pointless nesting level. */
+  const byPanel = useMemo(() => {
+    const m = new Map<string, Map<string, Array<{ r: Record<string, unknown>; key: string }>>>();
+    for (const item of visible) {
+      const p = String(item.r.panel ?? "—");
+      const a = `${item.r.ann_index ?? "?"}|${String(item.r.annotation ?? item.r.name ?? "—")}`;
+      if (!m.has(p)) m.set(p, new Map());
+      const inner = m.get(p)!;
+      if (!inner.has(a)) inner.set(a, []);
+      inner.get(a)!.push(item);
+    }
+    return [...m.entries()]
+      .sort((x, y) => x[0].localeCompare(y[0]))
+      .map(([p, inner]) => [p, [...inner.entries()]] as const);
+  }, [visible]);
+
+  const selectedRows = useMemo(
+    () => keyed.filter(({ key }) => sel.has(key)).map(({ r }) => r),
+    [keyed, sel],
+  );
+
+  /** One emitter for every drag level — the payload is just a CSV, so any row
+   *  subset flows downstream with no changes to the Source node or its port. */
+  const emitDrag = (
+    e: React.DragEvent, items: Array<Record<string, unknown>>, label: string, preCsv?: string,
+  ) => {
+    const ref: MeasurementRef = {
+      mpfId: docId, mpf: docName, label,
+      csv: preCsv ?? measArrToCsv(items, docName),
+    };
     e.dataTransfer.setData("application/x-mpfig-measurements", JSON.stringify(ref));
     e.dataTransfer.effectAllowed = "copy";
   };
+
+  const toggle = (keys: string[], on: boolean) => setSel((prev) => {
+    const next = new Set(prev);
+    for (const k of keys) { if (on) next.add(k); else next.delete(k); }
+    return next;
+  });
+
+  const dragFigure = (e: React.DragEvent) => emitDrag(
+    e, visible.map((v) => v.r), `${docName} — measurements`,
+    // Unfiltered = the caller's prebuilt table, byte-identical to before.
+    typeFilter ? undefined : csv,
+  );
 
   return (
     <Box sx={{ mb: 0.5, border: "1px dashed", borderColor: "divider", borderRadius: 0.5, bgcolor: "action.hover" }}>
@@ -1055,42 +1112,149 @@ function MeasurementFigureFolder({
       </Tooltip>
       {open && (
         <Box sx={{ px: 0.5, pb: 0.5 }}>
-          {byPanel.map(([panel, items]) => {
-            const panelCsv = measArrToCsv(items, docName);
+          {/* Type filter — only when this figure has more than one kind. */}
+          {presentTypes.length > 1 && (
+            <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.25, ml: 1, mb: 0.35 }}>
+              {["", ...presentTypes].map((t) => (
+                <Box
+                  key={t || "all"}
+                  onClick={() => setTypeFilter(t)}
+                  sx={{
+                    px: 0.5, py: 0.05, borderRadius: 3, cursor: "pointer", userSelect: "none",
+                    fontSize: "0.46rem", lineHeight: 1.5, border: "1px solid", borderColor: "divider",
+                    bgcolor: typeFilter === t ? "primary.main" : "transparent",
+                    color: typeFilter === t ? "primary.contrastText" : "text.secondary",
+                    "&:hover": { borderColor: "text.disabled" },
+                  }}
+                >
+                  {t === "" ? "all" : t === "curved_surface" ? "curved surface" : t}
+                </Box>
+              ))}
+            </Box>
+          )}
+
+          {/* Selection basket — drag an arbitrary set of readings as one table. */}
+          {sel.size > 0 && (
+            <Tooltip placement="right" title="Drag these selected measurements onto a Source node as a single table.">
+              <Box
+                draggable
+                onDragStart={(e) => emitDrag(e, selectedRows, `${docName} — ${selectedRows.length} selected`)}
+                sx={{
+                  display: "flex", alignItems: "center", gap: 0.5, ml: 1, mb: 0.35, px: 0.5, py: 0.2,
+                  borderRadius: 0.5, cursor: "grab", bgcolor: "primary.main", color: "primary.contrastText",
+                  "&:active": { cursor: "grabbing" },
+                }}
+              >
+                <Box component="span" sx={{ fontSize: 10, lineHeight: 1 }}>⇢</Box>
+                <Typography variant="caption" sx={{ fontSize: "0.5rem", fontWeight: 700, flex: 1 }}>
+                  drag {sel.size} selected
+                </Typography>
+                <Box
+                  component="span"
+                  onClick={(e) => { e.stopPropagation(); setSel(new Set()); }}
+                  sx={{ fontSize: "0.5rem", px: 0.3, cursor: "pointer", opacity: 0.85, "&:hover": { opacity: 1 } }}
+                >
+                  clear
+                </Box>
+              </Box>
+            </Tooltip>
+          )}
+
+          {byPanel.map(([panel, anns]) => {
+            const panelItems = anns.flatMap(([, items]) => items);
+            const panelKeys = panelItems.map((i) => i.key);
+            const allPanelSel = panelKeys.length > 0 && panelKeys.every((k) => sel.has(k));
             return (
               <Box key={`${docId}_${panel}`} sx={{ ml: 1, mb: 0.25, borderLeft: "1px solid", borderColor: "divider", pl: 0.75 }}>
-                <Tooltip placement="right" title={`Just ${panel}'s measurements. Drag onto a Source node to wire this panel alone.`}>
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
                   <Box
-                    draggable
-                    onDragStart={(e) => {
-                      const ref: MeasurementRef = {
-                        mpfId: docId, mpf: docName,
-                        label: `${docName} · ${panel}`, csv: panelCsv,
-                      };
-                      e.dataTransfer.setData("application/x-mpfig-measurements", JSON.stringify(ref));
-                      e.dataTransfer.effectAllowed = "copy";
-                    }}
-                    sx={{ display: "flex", alignItems: "center", gap: 0.5, cursor: "grab", py: 0.15, "&:active": { cursor: "grabbing" }, "&:hover": { bgcolor: "action.selected" } }}
+                    component="span"
+                    onClick={() => toggle(panelKeys, !allPanelSel)}
+                    title={allPanelSel ? "Deselect this panel" : "Select this panel"}
+                    sx={{ fontSize: "0.55rem", lineHeight: 1, cursor: "pointer", color: allPanelSel ? "primary.main" : "text.disabled" }}
                   >
-                    <Box component="span" sx={{ fontSize: 10, lineHeight: 1 }}>🗂</Box>
-                    <Typography variant="caption" sx={{ fontSize: "0.56rem", fontWeight: 700 }}>
-                      {panel}
-                    </Typography>
-                    <Typography variant="caption" sx={{ fontSize: "0.48rem", color: "text.disabled" }}>
-                      ({items.length})
-                    </Typography>
+                    {allPanelSel ? "☑" : "☐"}
                   </Box>
-                </Tooltip>
-                {items.map((m, k) => (
-                  <Box key={`${docId}_${panel}_${k}`} sx={{ display: "flex", gap: 0.5, ml: 1.25, alignItems: "baseline" }}>
-                    <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {String(m.name ?? "")}
-                    </Typography>
-                    <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.primary", fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>
-                      {String(m.value ?? "")}
-                    </Typography>
-                  </Box>
-                ))}
+                  <Tooltip placement="right" title={`Just ${panel}'s measurements. Drag onto a Source node to wire this panel alone.`}>
+                    <Box
+                      draggable
+                      onDragStart={(e) => emitDrag(e, panelItems.map((i) => i.r), `${docName} · ${panel}`)}
+                      sx={{ display: "flex", alignItems: "center", gap: 0.5, cursor: "grab", py: 0.15, flex: 1, minWidth: 0, "&:active": { cursor: "grabbing" }, "&:hover": { bgcolor: "action.selected" } }}
+                    >
+                      <Box component="span" sx={{ fontSize: 10, lineHeight: 1 }}>🗂</Box>
+                      <Typography variant="caption" sx={{ fontSize: "0.56rem", fontWeight: 700 }}>
+                        {panel}
+                      </Typography>
+                      <Typography variant="caption" sx={{ fontSize: "0.48rem", color: "text.disabled" }}>
+                        ({panelItems.length})
+                      </Typography>
+                    </Box>
+                  </Tooltip>
+                </Box>
+
+                {anns.map(([annKey, items]) => {
+                  const annName = annKey.slice(annKey.indexOf("|") + 1);
+                  const annKeys = items.map((i) => i.key);
+                  const allAnnSel = annKeys.length > 0 && annKeys.every((k) => sel.has(k));
+                  // A line/area is one row — showing an annotation header for it
+                  // would just repeat the row, so collapse to the rows directly.
+                  const grouped = items.length > 1;
+                  return (
+                    <Box key={`${docId}_${panel}_${annKey}`} sx={{ ml: grouped ? 0.75 : 0 }}>
+                      {grouped && (
+                        <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                          <Box
+                            component="span"
+                            onClick={() => toggle(annKeys, !allAnnSel)}
+                            title={allAnnSel ? "Deselect this measurement" : "Select this measurement"}
+                            sx={{ fontSize: "0.55rem", lineHeight: 1, cursor: "pointer", color: allAnnSel ? "primary.main" : "text.disabled" }}
+                          >
+                            {allAnnSel ? "☑" : "☐"}
+                          </Box>
+                          <Tooltip placement="right" title={`All ${items.length} readings of "${annName}". Drag onto a Source node to wire this one measurement.`}>
+                            <Box
+                              draggable
+                              onDragStart={(e) => emitDrag(e, items.map((i) => i.r), `${docName} · ${panel} · ${annName}`)}
+                              sx={{ display: "flex", alignItems: "center", gap: 0.5, cursor: "grab", py: 0.1, flex: 1, minWidth: 0, "&:active": { cursor: "grabbing" }, "&:hover": { bgcolor: "action.selected" } }}
+                            >
+                              <Box component="span" sx={{ fontSize: 9, lineHeight: 1 }}>📐</Box>
+                              <Typography variant="caption" sx={{ fontSize: "0.52rem", fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                {annName}
+                              </Typography>
+                              <Typography variant="caption" sx={{ fontSize: "0.46rem", color: "text.disabled" }}>
+                                ({items.length})
+                              </Typography>
+                            </Box>
+                          </Tooltip>
+                        </Box>
+                      )}
+                      {items.map(({ r: m, key }) => (
+                        <Tooltip key={`${docId}_${panel}_${key}`} placement="right" title="Drag this single reading onto a Source node.">
+                          <Box
+                            draggable
+                            onDragStart={(e) => emitDrag(e, [m], `${docName} · ${panel} · ${String(m.name ?? "")}`)}
+                            sx={{ display: "flex", gap: 0.5, ml: grouped ? 1.5 : 1.25, alignItems: "center", cursor: "grab", "&:active": { cursor: "grabbing" }, "&:hover": { bgcolor: "action.selected" } }}
+                          >
+                            <Box
+                              component="span"
+                              onClick={(e) => { e.stopPropagation(); toggle([key], !sel.has(key)); }}
+                              onDragStart={(e) => e.stopPropagation()}
+                              sx={{ fontSize: "0.5rem", lineHeight: 1, cursor: "pointer", color: sel.has(key) ? "primary.main" : "text.disabled" }}
+                            >
+                              {sel.has(key) ? "☑" : "☐"}
+                            </Box>
+                            <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {String(m.name ?? "")}
+                            </Typography>
+                            <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.primary", fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>
+                              {String(m.value ?? "")}
+                            </Typography>
+                          </Box>
+                        </Tooltip>
+                      ))}
+                    </Box>
+                  );
+                })}
               </Box>
             );
           })}
