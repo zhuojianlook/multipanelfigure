@@ -1014,12 +1014,20 @@ export const MEAS_CSV_HEADER = "Panel,Name,Group,Value,Unit,Type,Figure";
  *  grid coordinates), so wiring two figures' tables into one script yields rows
  *  that cannot be told apart and a naive group-by silently merges unrelated
  *  panels across figures. */
-export function measArrToCsv(rows: Array<Record<string, unknown>>, figure = ""): string {
+export function measArrToCsv(
+  rows: Array<Record<string, unknown>>,
+  figure = "",
+  /** Resolves a row's user-assigned group label. Omitted (or returning "")
+   *  keeps the historical behaviour of Group === Panel, so every existing
+   *  call site and the seeded templates are unaffected. */
+  groupOf?: (row: Record<string, unknown>) => string,
+): string {
   const header = MEAS_CSV_HEADER;
   const q = (c: unknown) => `"${String(c ?? "").replace(/"/g, '""')}"`;
   const body = (rows || []).map((m) => {
     const value = m.numeric != null ? String(m.numeric) : String(m.value ?? "");
-    return [m.panel, m.name, m.panel, value, m.unit ?? "", m.type ?? "", figure].map(q).join(",");
+    const group = (groupOf?.(m) || "") || m.panel;
+    return [m.panel, m.name, group, value, m.unit ?? "", m.type ?? "", figure].map(q).join(",");
   }).join("\n");
   return body ? `${header}\n${body}` : `${header}\n`;
 }
@@ -1036,10 +1044,13 @@ export function measArrToCsv(rows: Array<Record<string, unknown>>, figure = ""):
    filtering it back out downstream.
    ────────────────────────────────────────────────────────────── */
 function MeasurementFigureFolder({
-  docId, docName, rows, csv, defaultOpen,
+  docId, docName, figKeyStr, rows, csv, defaultOpen,
 }: {
   docId: string;
   docName: string;
+  /** Stable figure identity — namespaces persisted group labels so they
+   *  survive a restart and never collide between figures. */
+  figKeyStr: string;
   rows: Array<Record<string, unknown>>;
   csv: string;
   defaultOpen: boolean;
@@ -1093,14 +1104,40 @@ function MeasurementFigureFolder({
     [keyed, sel],
   );
 
+  /** User-assigned group labels for this figure's rows (persisted). */
+  const [groupMap, setGroupMap] = useState<MeasGroupMap>(() => loadMeasGroups());
+  const groupOf = useCallback(
+    (r: Record<string, unknown>) => groupMap[measRowKey(figKeyStr, r)] || "",
+    [groupMap, figKeyStr],
+  );
+  const [groupDraft, setGroupDraft] = useState("");
+  const assignGroup = (label: string) => {
+    const keys = keyed.filter(({ key }) => sel.has(key));
+    if (!keys.length) return;
+    setGroupMap((prev) => {
+      const next = { ...prev };
+      for (const { r } of keys) {
+        const k = measRowKey(figKeyStr, r);
+        if (label) next[k] = label; else delete next[k];
+      }
+      saveMeasGroups(next);
+      return next;
+    });
+  };
+
   /** One emitter for every drag level — the payload is just a CSV, so any row
-   *  subset flows downstream with no changes to the Source node or its port. */
+   *  subset flows downstream with no changes to the Source node or its port.
+   *  Group labels are resolved here so the CSV's Group column carries the
+   *  user's conditions rather than a copy of Panel. */
   const emitDrag = (
     e: React.DragEvent, items: Array<Record<string, unknown>>, label: string, preCsv?: string,
   ) => {
+    const anyGrouped = items.some((r) => groupOf(r));
     const ref: MeasurementRef = {
       mpfId: docId, mpf: docName, label,
-      csv: preCsv ?? measArrToCsv(items, docName),
+      // preCsv (the caller's prebuilt table) is only safe to reuse when no
+      // group labels apply — otherwise rebuild so Group is correct.
+      csv: (!anyGrouped && preCsv) ? preCsv : measArrToCsv(items, docName, groupOf),
     };
     e.dataTransfer.setData("application/x-mpfig-measurements", JSON.stringify(ref));
     e.dataTransfer.effectAllowed = "copy";
@@ -1186,6 +1223,38 @@ function MeasurementFigureFolder({
                 </Box>
               </Box>
             </Tooltip>
+          )}
+
+          {/* Assign a condition to the selected rows. This is what fills the
+              CSV's Group column — statistical tests compare THESE, not panels. */}
+          {sel.size > 0 && (
+            <Box sx={{ display: "flex", alignItems: "center", gap: 0.3, ml: 1, mb: 0.4 }}>
+              <Box
+                component="input"
+                value={groupDraft}
+                placeholder="group e.g. Control"
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setGroupDraft(e.target.value)}
+                onKeyDown={(e: React.KeyboardEvent) => {
+                  if (e.key === "Enter") { assignGroup(groupDraft.trim()); setGroupDraft(""); }
+                }}
+                sx={{
+                  flex: 1, minWidth: 0, fontSize: "0.5rem", px: 0.4, py: 0.15,
+                  color: "text.primary", bgcolor: "background.paper",
+                  border: "1px solid", borderColor: "divider", borderRadius: "3px", outline: "none",
+                }}
+              />
+              <Box
+                component="span"
+                onClick={() => { assignGroup(groupDraft.trim()); setGroupDraft(""); }}
+                sx={{ fontSize: "0.46rem", px: 0.4, py: 0.15, borderRadius: "3px", cursor: "pointer", border: "1px solid", borderColor: "divider", "&:hover": { bgcolor: "action.selected" } }}
+              >set</Box>
+              <Box
+                component="span"
+                onClick={() => assignGroup("")}
+                title="Remove the group label from the selected rows"
+                sx={{ fontSize: "0.46rem", px: 0.4, py: 0.15, borderRadius: "3px", cursor: "pointer", color: "text.disabled", "&:hover": { color: "error.main" } }}
+              >clear group</Box>
+            </Box>
           )}
 
           {byPanel.map(([panel, anns]) => {
@@ -1274,6 +1343,11 @@ function MeasurementFigureFolder({
                             <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                               {String(m.name ?? "")}
                             </Typography>
+                            {groupOf(m) && (
+                              <Typography variant="caption" sx={{ fontSize: "0.44rem", px: 0.3, borderRadius: 3, bgcolor: "primary.main", color: "primary.contrastText", flexShrink: 0, maxWidth: 60, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                {groupOf(m)}
+                              </Typography>
+                            )}
                             <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.primary", fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>
                               {String(m.value ?? "")}
                             </Typography>
@@ -2662,6 +2736,32 @@ function loadSourceGroups(): SourceGroup[] {
 }
 function saveSourceGroups(gs: SourceGroup[]) {
   try { localStorage.setItem(SOURCE_GROUPS_KEY, JSON.stringify(gs)); } catch { /* ignore */ }
+}
+
+/* ── Measurement group labels ────────────────────────────────────────────
+   The measurements CSV has always had a `Group` column, but it was just a
+   copy of `Panel` — so "compare Control vs Treated" was impossible: every
+   group WAS a panel, and nothing let a user say these three panels are one
+   condition. These labels are the missing piece; they fill that column.
+
+   Stored as a flat rowKey -> label map (not groups-with-members like
+   SourceGroup) because the only lookup we ever do is "what group is this
+   row in?" while building a CSV. Keyed by figKey so a label survives a
+   restart and doesn't collide across figures. */
+const MEAS_GROUPS_KEY = "mpfig.measurement_groups";
+type MeasGroupMap = Record<string, string>;
+function loadMeasGroups(): MeasGroupMap {
+  try { return JSON.parse(localStorage.getItem(MEAS_GROUPS_KEY) || "{}") || {}; }
+  catch { return {}; }
+}
+function saveMeasGroups(m: MeasGroupMap) {
+  try { localStorage.setItem(MEAS_GROUPS_KEY, JSON.stringify(m)); } catch { /* ignore */ }
+}
+/** Stable cross-session identity for one measurement row. Uses the annotation
+ *  and reading indices the backend now emits rather than the display name, so
+ *  renaming an annotation doesn't orphan its group label. */
+export function measRowKey(fig: string, r: Record<string, unknown>): string {
+  return `${fig}|${String(r.panel ?? "")}|${String(r.ann_index ?? "")}|${String(r.reading_index ?? "")}`;
 }
 
 // Analysis-tab uploads (standalone images dropped directly onto the Analysis
@@ -7364,6 +7464,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                 key={`meas_${d.id}`}
                 docId={d.id}
                 docName={labels[d.id] || d.name}
+                figKeyStr={figKey(d)}
                 rows={rows}
                 csv={csv}
                 // Expand the figure you're working on; leave the others folded
