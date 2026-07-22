@@ -6354,6 +6354,164 @@ class RConsoleRequest(BaseModel):
     rscript_path: Optional[str] = None
 
 
+# Every R package the built-in analyses can require. Kept here (not only in the
+# generated script) so the UI can report what's missing BEFORE a run fails.
+R_REQUIRED_PACKAGES = ["ggplot2", "ggprism", "rstatix", "dplyr", "car", "svglite"]
+
+# Build tools some CRAN sources need. Only relevant when R can't use binaries:
+# Homebrew's R reports pkgType "source" and refuses type="binary" outright, so
+# EVERY package is compiled locally and a missing tool becomes a hard failure.
+# The canonical trap is nloptr -> lme4 -> pbkrtest -> car -> rstatix: nloptr's
+# configure aborts with "CMAKE NOT FOUND", and the user just sees five
+# "had non-zero exit status" warnings with no hint that ONE missing tool caused
+# all of them.
+_R_BUILD_TOOLS = {
+    "cmake": {"brew": "cmake", "why": "compiles nloptr (needed by car / rstatix)"},
+    "gfortran": {"brew": "gcc", "why": "compiles Fortran sources (lme4, Matrix)"},
+}
+
+
+def _which_tool(prog: str) -> str:
+    """Absolute path to PROG, searching the same PATH R itself will see."""
+    env = _r_env()
+    for d in (env.get("PATH") or os.environ.get("PATH", "")).split(os.pathsep):
+        if not d:
+            continue
+        p = os.path.join(d, prog)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return ""
+
+
+def _r_pkg_status(rscript: str) -> dict:
+    """Ask R which of R_REQUIRED_PACKAGES load, and whether it can use
+    binaries. One Rscript call — this runs whenever the Analysis tab opens."""
+    probe = (
+        'cat(getOption("pkgType"), "\\n"); '
+        'for (p in c(%s)) cat(p, requireNamespace(p, quietly=TRUE), "\\n")'
+        % ", ".join('"%s"' % p for p in R_REQUIRED_PACKAGES)
+    )
+    try:
+        r = subprocess.run([rscript, "-e", probe], capture_output=True, text=True,
+                           timeout=120, env=_r_env(), encoding="utf-8", errors="replace")
+    except Exception:
+        return {"pkg_type": "", "missing": list(R_REQUIRED_PACKAGES)}
+    lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+    pkg_type = lines[0] if lines else ""
+    missing = []
+    for ln in lines[1:]:
+        parts = ln.split()
+        if len(parts) >= 2 and parts[1].upper() != "TRUE":
+            missing.append(parts[0])
+    return {"pkg_type": pkg_type, "missing": missing}
+
+
+@app.get("/api/analysis/r-deps")
+def check_r_deps(rscript_path: Optional[str] = None):
+    """What's missing before an R analysis can run: packages, and — when R must
+    build from source — the system tools those builds need."""
+    rscript = _find_rscript(rscript_path)
+    if not rscript:
+        return {"r_installed": False, "missing_packages": list(R_REQUIRED_PACKAGES),
+                "missing_tools": [], "source_only": False,
+                "can_auto_install": False, "brew": ""}
+    st = _r_pkg_status(rscript)
+    source_only = (st.get("pkg_type") or "").lower() == "source"
+    missing_tools = []
+    if source_only:
+        for tool, meta in _R_BUILD_TOOLS.items():
+            if not _which_tool(tool):
+                missing_tools.append({"tool": tool, "brew": meta["brew"], "why": meta["why"]})
+    brew = _which_tool("brew") or ("/opt/homebrew/bin/brew"
+                                   if os.path.isfile("/opt/homebrew/bin/brew") else "")
+    return {
+        "r_installed": True,
+        "missing_packages": st.get("missing", []),
+        "missing_tools": missing_tools,
+        "source_only": source_only,
+        # Tools need Homebrew; packages never do.
+        "can_auto_install": bool(brew) or not missing_tools,
+        "brew": brew,
+    }
+
+
+class RDepsInstallRequest(BaseModel):
+    rscript_path: Optional[str] = None
+    # Install these instead of the auto-detected set (lets the UI retry one).
+    packages: Optional[List[str]] = None
+
+
+@app.post("/api/analysis/r-deps/install")
+def install_r_deps(body: RDepsInstallRequest):
+    """One-click: install the missing build tools (via Homebrew, no sudo) and
+    then the missing R packages. Returns a transcript plus the re-checked
+    state, so the UI can show exactly what happened."""
+    rscript = _find_rscript(body.rscript_path)
+    if not rscript:
+        return {"success": False,
+                "log": "R is not installed. Install R from https://cran.r-project.org/ first.",
+                "missing_packages": list(R_REQUIRED_PACKAGES), "missing_tools": []}
+    log: List[str] = []
+    pre = check_r_deps(body.rscript_path)
+
+    # 1) System build tools FIRST. A package install that needs cmake fails in a
+    #    way that looks like a package problem, so fixing the tool afterwards
+    #    would force the user to press the button twice.
+    if pre.get("missing_tools"):
+        brew = pre.get("brew") or ""
+        if not brew:
+            names = ", ".join(t["tool"] for t in pre["missing_tools"])
+            log.append(f"Missing build tools: {names} — and Homebrew wasn't found, so they "
+                       f"can't be installed automatically.\nInstall Homebrew from "
+                       f"https://brew.sh then press this button again.")
+        else:
+            for t in pre["missing_tools"]:
+                log.append(f"Installing {t['tool']} ({t['why']})…")
+                try:
+                    r = subprocess.run([brew, "install", t["brew"]], capture_output=True,
+                                       text=True, timeout=1800, env=_r_env(),
+                                       encoding="utf-8", errors="replace")
+                    tail = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-6:]
+                    if tail:
+                        log.append("\n".join(tail))
+                    log.append(f"{t['tool']}: {'OK' if _which_tool(t['tool']) else 'still missing'}")
+                except subprocess.TimeoutExpired:
+                    log.append(f"{t['tool']}: timed out after 30 min.")
+                except Exception as e:
+                    log.append(f"{t['tool']}: {e}")
+
+    # 2) R packages, one at a time so a single failure doesn't hide which
+    #    package broke.
+    pkgs = body.packages if body.packages is not None else (pre.get("missing_packages") or [])
+    for p in pkgs:
+        log.append(f"Installing R package '{p}'…")
+        code = (
+            'options(repos = c(CRAN = "https://cloud.r-project.org"))\n'
+            f'install.packages("{p}", quiet = TRUE)\n'
+            f'cat("RESULT {p}:", requireNamespace("{p}", quietly = TRUE), "\\n")\n'
+        )
+        try:
+            r = subprocess.run([rscript, "-e", code], capture_output=True, text=True,
+                               timeout=3600, env=_r_env(), encoding="utf-8", errors="replace")
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+            ok = f"RESULT {p}: TRUE" in out
+            log.append(f"'{p}': {'installed' if ok else 'FAILED'}")
+            if not ok:
+                log.append("\n".join(out.splitlines()[-12:]))
+        except subprocess.TimeoutExpired:
+            log.append(f"'{p}': timed out after 60 min.")
+        except Exception as e:
+            log.append(f"'{p}': {e}")
+
+    post = check_r_deps(body.rscript_path)
+    ok = not post.get("missing_packages")
+    log.append("All required R packages are installed." if ok
+               else "Still missing: " + ", ".join(post.get("missing_packages") or []))
+    return {"success": ok, "log": "\n".join(log),
+            "missing_packages": post.get("missing_packages", []),
+            "missing_tools": post.get("missing_tools", [])}
+
+
 @app.post("/api/analysis/run-console")
 def run_r_console(body: RConsoleRequest):
     """Run a RAW R command — no data-loading / plot boilerplate.

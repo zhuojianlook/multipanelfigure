@@ -11,6 +11,8 @@ import type {
   ImagesListResponse,
   PreviewResponse,
   ProjectLoadResponse,
+  RDepsStatus,
+  RDepTool,
 } from "./types";
 
 /** Backend origin for the browser-fetch path (dev only — the packaged app
@@ -568,6 +570,27 @@ class ApiClient {
   async checkR(customPath?: string): Promise<{ installed: boolean; version: string }> {
     const params = customPath ? `?rscript_path=${encodeURIComponent(customPath)}` : "";
     return apiJson(`/api/analysis/check-r${params}`);
+  }
+
+  /** What's missing before an R analysis can run — packages, plus the system
+   *  build tools those packages need when R can only install from source
+   *  (Homebrew's R refuses binaries). Lets the UI warn BEFORE a run fails. */
+  async checkRDeps(customPath?: string): Promise<RDepsStatus> {
+    const params = customPath ? `?rscript_path=${encodeURIComponent(customPath)}` : "";
+    return apiJson(`/api/analysis/r-deps${params}`);
+  }
+
+  /** One-click install of the missing build tools + R packages. Slow — a
+   *  from-source CRAN build runs for minutes — so callers must show progress. */
+  async installRDeps(
+    rscriptPath?: string,
+    packages?: string[],
+  ): Promise<{ success: boolean; log: string; missing_packages: string[]; missing_tools: RDepTool[] }> {
+    return apiJson(
+      "/api/analysis/r-deps/install",
+      "POST",
+      JSON.stringify({ rscript_path: rscriptPath || null, packages: packages ?? null }),
+    );
   }
 
   async runR(

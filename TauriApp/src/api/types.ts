@@ -457,3 +457,23 @@ export interface ImageGroup {
   name: string;
   imageNames: string[];
 }
+
+/** A system build tool an R source-install needs (cmake, gfortran …). */
+export interface RDepTool {
+  tool: string;   // executable name, e.g. "cmake"
+  brew: string;   // Homebrew formula that provides it, e.g. "gcc" for gfortran
+  why: string;    // human reason, e.g. "compiles nloptr (needed by car / rstatix)"
+}
+
+/** Result of GET /api/analysis/r-deps — everything the Analysis UI needs to
+ *  tell the user what's missing before an R run, and whether one click can
+ *  fix it. `source_only` is true for R installs that can't use CRAN binaries
+ *  (Homebrew's R), which is what makes the build tools matter at all. */
+export interface RDepsStatus {
+  r_installed: boolean;
+  missing_packages: string[];
+  missing_tools: RDepTool[];
+  source_only: boolean;
+  can_auto_install: boolean;
+  brew: string;
+}

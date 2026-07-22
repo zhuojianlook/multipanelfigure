@@ -81,6 +81,7 @@ import { StreamLanguage } from "@codemirror/language";
 import { r as cmR } from "@codemirror/legacy-modes/mode/r";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { api } from "../../api/client";
+import type { RDepsStatus } from "../../api/types";
 import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
 import { switchToDocument } from "../../utils/projectNav";
@@ -5411,6 +5412,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   // auto-detected default.
   const [enginePaths, setEnginePaths] = useState<EnginePaths>(() => loadEnginePaths());
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Missing R packages / build tools + the one-click installer's state.
+  const [rDeps, setRDeps] = useState<RDepsStatus | null>(null);
+  const [installingDeps, setInstallingDeps] = useState(false);
 
   // Measurements present? Falsy CSV (empty / null) hides the
   // measurements port on every source node + any related hints.
@@ -5681,7 +5685,43 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         });
       })
       .catch(() => { setCellposeKind(""); setCellposeVersions({ v3: { installed: false }, v4: { installed: false } }); });
+    // Which R packages / build tools are missing. Checked on open so the
+    // warning is visible BEFORE the user builds a graph and waits for a run.
+    api.checkRDeps(enginePaths.r || undefined)
+      .then(setRDeps)
+      .catch(() => setRDeps(null));
   }, [open, enginePaths, openDocs, activeDocId]);
+
+  /** One-click: install missing build tools (Homebrew) + R packages, then
+   *  re-check. Slow — a from-source CRAN build runs for minutes — so the
+   *  transcript goes to the console panel and the button shows a spinner. */
+  const installRDeps = useCallback(async () => {
+    setInstallingDeps(true);
+    consoleRef.current += `\n──────────── INSTALL R DEPENDENCIES ────────────\n`;
+    // Say what's about to happen up front: this request runs for minutes with
+    // no intermediate output (Homebrew's R compiles every CRAN package from
+    // source), so without this the console sits blank and looks hung.
+    if (rDeps?.missing_tools?.length) {
+      consoleRef.current += `Build tools: ${rDeps.missing_tools.map((t) => t.tool).join(", ")} (via Homebrew)\n`;
+    }
+    if (rDeps?.missing_packages?.length) {
+      consoleRef.current += `R packages: ${rDeps.missing_packages.join(", ")}\n`;
+    }
+    consoleRef.current += `Compiling from source — this can take several minutes; output appears when it finishes.\n`;
+    setConsoleOut(consoleRef.current);
+    try {
+      const res = await api.installRDeps(enginePaths.r || undefined);
+      consoleRef.current += `${res.log}\n`;
+      setConsoleOut(consoleRef.current);
+      const fresh = await api.checkRDeps(enginePaths.r || undefined);
+      setRDeps(fresh);
+    } catch (e) {
+      consoleRef.current += `Install failed: ${String(e)}\n`;
+      setConsoleOut(consoleRef.current);
+    } finally {
+      setInstallingDeps(false);
+    }
+  }, [enginePaths.r, rDeps]);
 
   // ── Graph handlers ─────────────────────────────────────────
 
@@ -8274,6 +8314,41 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                 sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25 }}>
                 Delete ({rfSelection.nodeIds.size + rfSelection.edgeIds.size})
               </Button>
+            </Tooltip>
+          )}
+          {/* ── Missing R dependencies → one-click fix ──────────────────
+              Only appears when something is actually missing, so a healthy
+              install sees no extra chrome. Before this, a missing package
+              surfaced as five "had non-zero exit status" warnings buried in a
+              node's console AFTER a long run — with no hint that they all
+              trace to one missing build tool. */}
+          {rDeps && rDeps.r_installed &&
+            (rDeps.missing_packages.length > 0 || rDeps.missing_tools.length > 0) && (
+            <Tooltip
+              placement="bottom"
+              title={
+                (rDeps.missing_packages.length
+                  ? `Missing R packages: ${rDeps.missing_packages.join(", ")}. `
+                  : "") +
+                (rDeps.missing_tools.length
+                  ? `Missing build tools: ${rDeps.missing_tools.map((t) => `${t.tool} (${t.why})`).join("; ")}. `
+                  : "") +
+                (rDeps.can_auto_install
+                  ? "Click to install everything now."
+                  : "Homebrew wasn't found — install it from brew.sh first.")
+              }
+            >
+              <span>
+                <Button size="small" variant="outlined" color="warning"
+                  disabled={installingDeps}
+                  startIcon={installingDeps ? <CircularProgress size={12} /> : undefined}
+                  onClick={installRDeps}
+                  sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25 }}>
+                  {installingDeps
+                    ? "Installing R packages…"
+                    : `⚠ Install R deps (${rDeps.missing_packages.length + rDeps.missing_tools.length})`}
+                </Button>
+              </span>
             </Tooltip>
           )}
           <Tooltip placement="bottom" title="Custom paths for Python / R / MATLAB / ImageJ binaries">
