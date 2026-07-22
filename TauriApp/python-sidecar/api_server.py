@@ -6368,7 +6368,37 @@ R_REQUIRED_PACKAGES = ["ggplot2", "ggprism", "rstatix", "dplyr", "car", "svglite
 _R_BUILD_TOOLS = {
     "cmake": {"brew": "cmake", "why": "compiles nloptr (needed by car / rstatix)"},
     "gfortran": {"brew": "gcc", "why": "compiles Fortran sources (lme4, Matrix)"},
+    # svglite -> textshaping needs pkg-config to FIND harfbuzz/fribidi, and
+    # those libs to build against. Same failure shape as the cmake trap: one
+    # missing locator tool takes out the whole SVG-rendering chain.
+    "pkg-config": {"brew": "pkgconf", "why": "locates harfbuzz / fribidi (needed by svglite)"},
 }
+
+# Homebrew formulae that aren't executables, so `_which_tool` can't see them —
+# probed with `pkg-config --exists` instead. Same one-click install path.
+_R_BUILD_LIBS = {
+    "harfbuzz": {"brew": "harfbuzz", "why": "text shaping (needed by svglite)"},
+    "fribidi": {"brew": "fribidi", "why": "bidirectional text (needed by svglite)"},
+}
+
+
+def _missing_build_libs() -> list:
+    """Which _R_BUILD_LIBS pkg-config can't find. Empty when pkg-config itself
+    is absent — the tool check reports that first, and guessing at libs we
+    can't probe would just produce noise."""
+    pc = _which_tool("pkg-config")
+    if not pc:
+        return []
+    out = []
+    for lib, meta in _R_BUILD_LIBS.items():
+        try:
+            r = subprocess.run([pc, "--exists", lib], capture_output=True,
+                               timeout=30, env=_r_env())
+            if r.returncode != 0:
+                out.append({"tool": lib, "brew": meta["brew"], "why": meta["why"]})
+        except Exception:
+            pass
+    return out
 
 
 def _which_tool(prog: str) -> str:
@@ -6422,6 +6452,7 @@ def check_r_deps(rscript_path: Optional[str] = None):
         for tool, meta in _R_BUILD_TOOLS.items():
             if not _which_tool(tool):
                 missing_tools.append({"tool": tool, "brew": meta["brew"], "why": meta["why"]})
+        missing_tools.extend(_missing_build_libs())
     brew = _which_tool("brew") or ("/opt/homebrew/bin/brew"
                                    if os.path.isfile("/opt/homebrew/bin/brew") else "")
     return {
