@@ -30,7 +30,10 @@ jobs:
         # Yet" while per-panel (PIL) renders still worked. Pin to the last
         # known-good set (the versions that shipped in v0.1.357). Bump these
         # deliberately, not by accident. Server/build tools stay unpinned.
-        run: pip install 'pillow==12.2.0' 'numpy==2.4.6' 'scipy==1.17.1' 'matplotlib==3.10.9' 'opencv-python-headless==4.13.0.92' fastapi uvicorn python-multipart nibabel tifffile pyinstaller
+        # nd2 = Nikon .nd2 reader (pure-Python; pulls dask/ome-types/xsdata at
+        # install time but the upload path uses only numpy — those are excluded
+        # from the frozen binary below to keep it lean).
+        run: pip install 'pillow==12.2.0' 'numpy==2.4.6' 'scipy==1.17.1' 'matplotlib==3.10.9' 'opencv-python-headless==4.13.0.92' fastapi uvicorn python-multipart nibabel tifffile nd2 pyinstaller
       - name: Sync SIDECAR_BUILD to release tag
         # api_server.py's SIDECAR_BUILD stamps the provenance watermark embedded
         # in every exported figure/collage. CI force-syncs package.json +
@@ -66,6 +69,9 @@ jobs:
             --hidden-import=wb_detect \
             --collect-all PIL --collect-all matplotlib --collect-all cv2 \
             --collect-all tifffile --collect-all nibabel --collect-all scipy \
+            --collect-all nd2 \
+            --exclude-module dask --exclude-module ome_types \
+            --exclude-module xsdata --exclude-module resource_backed_dask_array \
             --noconfirm api_server.py
         shell: bash
       - name: Copy sidecar binary
