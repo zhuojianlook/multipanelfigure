@@ -4429,6 +4429,13 @@ if (!"source" %in% names(data)) data$source <- "input"
 data$group  <- factor(data$group,  levels = unique(data$group))
 data$source <- factor(data$source, levels = unique(data$source))
 group_levels <- levels(data$group)
+# One uploaded image => one group/source. This is a group-COMPARISON layout,
+# so a single group has no pairwise test (combn(1, 2) errors out and used to
+# crash the whole plot) and its lone x label is the entire filename sprawling
+# under every panel. Detect it and degrade gracefully to a single-sample
+# distribution view: bar + per-cell jitter, no comparison, no giant label.
+one_group  <- length(group_levels) < 2
+one_source <- nlevels(data$source) < 2
 
 # Per-image counts.
 counts <- aggregate(rep(1, nrow(data)) ~ source + group, data = data, FUN = sum)
@@ -4451,6 +4458,7 @@ make_pvals <- function(yvar) {
   vals <- data[[yvar]]
   ok <- is.finite(vals)
   if (sum(ok) < 4) return(NULL)
+  if (one_group) return(NULL)   # no pairwise comparison possible with one group
   d2 <- data.frame(y = vals[ok], group = data$group[ok])
   pairs <- combn(group_levels, 2, simplify = FALSE)
   rows <- list()
@@ -4517,6 +4525,10 @@ metric_plot <- function(yvar, ylab, ytitle = ylab) {
     scale_x_discrete(labels = function(z) .mpfig_wrap(z, 12)) +
     labs(x = NULL, y = .mpfig_wrap(ylab, 22), title = .mpfig_wrap(ytitle, 24)) +
     common_theme
+  # Single group: the x tick is just the (long) image name repeated under
+  # every panel — drop it; the per-image identity is shown once in the
+  # overall subtitle instead.
+  if (one_group) g <- g + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
   add_brackets(g, yvar, pvals)
 }
 
@@ -4540,6 +4552,10 @@ p_count <- ggplot(counts, aes(x = source, y = n_cells, fill = group)) +
   labs(x = NULL, y = "Cells per image", title = "Cell count per image") +
   common_theme +
   theme(axis.text.x = element_text(angle = 35, hjust = 1, size = 7))
+# One image: the single x tick is the whole filename — drop it (title +
+# subtitle already say which image this is).
+if (one_source) p_count <- p_count +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
 
 # Filter out NULL panels, append the count chart at the end.
 panels <- Filter(Negate(is.null), p_list)
@@ -4552,15 +4568,23 @@ if (length(panels) >= 1) {
   tryCatch({
     if (requireNamespace("patchwork", quietly = TRUE)) {
       pp <- patchwork::wrap_plots(panels, ncol = 3) +
-            patchwork::plot_annotation(title = "Cell shape characteristics",
-                                       theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 13)))
+            patchwork::plot_annotation(
+              title = "Cell shape characteristics",
+              # Single image: name it + its cell count in one readable line
+              # (replaces the giant per-panel x labels we blanked above).
+              subtitle = if (one_source)
+                .mpfig_wrap(paste0(as.character(levels(data$source)[1]), "  ·  ", nrow(data), " cells"), 72)
+                else NULL,
+              theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 13),
+                            plot.subtitle = element_text(hjust = 0.5, size = 9, colour = "grey40")))
       print(pp); ok <- TRUE
     }
   }, error = function(e) message("patchwork layout failed: ", conditionMessage(e)))
   if (!ok) {
     tryCatch({
       if (requireNamespace("gridExtra", quietly = TRUE)) {
-        do.call(gridExtra::grid.arrange, c(panels, list(ncol = 3, top = "Cell shape characteristics")))
+        top_lbl <- if (one_source) paste0("Cell shape characteristics — ", as.character(levels(data$source)[1])) else "Cell shape characteristics"
+        do.call(gridExtra::grid.arrange, c(panels, list(ncol = 3, top = top_lbl)))
         ok <- TRUE
       }
     }, error = function(e) message("gridExtra layout failed: ", conditionMessage(e)))
