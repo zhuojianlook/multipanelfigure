@@ -99,6 +99,11 @@ import IntensityPickerDialog, {
   generateFluorCode,
   emptyFluorConfig,
 } from "./IntensityPickerDialog";
+import CellposeSegDialog, {
+  type CellposeSegConfig,
+  cellposeSegToJson,
+  cellposeSegFromJson,
+} from "./CellposeSegDialog";
 
 // ── Helper: base64 PNG → File (for main-timeline + collage uploads) ──
 function b64ToFile(b64: string, filename: string): File {
@@ -1624,16 +1629,22 @@ export interface NodeData {
   /** When true, the user has explicitly removed the node from
    *  the canvas — used to no-op stale auto-edges. */
   deleted?: boolean;
-  /** Marks a specialised interactive Python node:
-   *    "wb_bands"        → western-blot band picker.
-   *    "fluor_intensity" → fluorescence channel intensity picker.
+  /** Marks a specialised interactive node:
+   *    "wb_bands"        → western-blot band picker (Python).
+   *    "fluor_intensity" → fluorescence channel intensity picker (Python).
+   *    "cellpose_seg"    → Cellpose segmentation config + preview (Cellpose).
    *  The node's `code` is auto-generated from the config (`roi` /
-   *  `intensity`) — manual edits are overwritten on the next save. */
-  interactive?: "wb_bands" | "fluor_intensity";
+   *  `intensity` / `cellposeSeg`) — manual edits are overwritten on the
+   *  next save. Unlike the two Python markers, "cellpose_seg" sits on a
+   *  `kind:"cellpose"` node: it configures the JSON that node runs and does
+   *  NOT change the engine or the downstream (labels → ImageJ → plot). */
+  interactive?: "wb_bands" | "fluor_intensity" | "cellpose_seg";
   /** Band-picker ROI config (only when interactive === "wb_bands"). */
   roi?: BandPickerConfig;
   /** Fluorescence-intensity config (only when interactive === "fluor_intensity"). */
   intensity?: FluorIntensityConfig;
+  /** Cellpose segmentation config (only when interactive === "cellpose_seg"). */
+  cellposeSeg?: CellposeSegConfig;
   [key: string]: unknown;  // index signature for ReactFlow's Record
 }
 
@@ -4574,7 +4585,14 @@ function buildCellCharacteristicsWorkflow(): SavedWorkflow {
     },
     {
       id: cpId, type: "cellpose", position: { x: 360, y: 60 },
-      data: { label: "Cellpose (cpsam)", kind: "cellpose", code: CELLPOSE_CYTO_FOR_CELLCHAR,
+      // interactive:"cellpose_seg" gives this node the "Configure segmentation…"
+      // button + live-preview modal (like the fluorescence picker). It stays a
+      // kind:"cellpose" node, so its output (labels) still feeds the ImageJ
+      // shape-metrics node downstream — the per-cell morphology is unchanged.
+      // No structured `cellposeSeg` is seeded, so the FIRST run opens the picker
+      // to guide the user; the JSON `code` supplies the defaults meanwhile.
+      data: { label: "Cellpose (cpsam)", kind: "cellpose", interactive: "cellpose_seg",
+              code: CELLPOSE_CYTO_FOR_CELLCHAR,
               outputs: [], inputs: [], status: "idle", currentPreset: "custom" } as NodeData,
     },
     {
@@ -5233,6 +5251,14 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     open: boolean; nodeId: string | null; images: FluorPickerImage[]; cfg: FluorIntensityConfig | null;
   }>(() => ({ open: false, nodeId: null, images: [], cfg: null }));
   const intensityPickerResolveRef = useRef<((cfg: FluorIntensityConfig | null) => void) | null>(null);
+  // Cellpose segmentation picker modal state — same shape/lifecycle as the
+  // intensity picker, but drives the interactive Cellpose node in the
+  // "Cell characteristics" workflow. `images` reuses the SAME builder so the
+  // wired-inset resolution / full-res re-extract descriptors are identical.
+  const [cellposePicker, setCellposePicker] = useState<{
+    open: boolean; nodeId: string | null; images: FluorPickerImage[]; cfg: CellposeSegConfig | null;
+  }>(() => ({ open: false, nodeId: null, images: [], cfg: null }));
+  const cellposePickerResolveRef = useRef<((cfg: CellposeSegConfig | null) => void) | null>(null);
   // Set of currently-selected node ids + edge ids — populated by
   // React Flow's onSelectionChange.  Drives the visible "Delete
   // selected" affordance in the canvas toolbar (the only reliable
@@ -6817,7 +6843,12 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   // see only the previously-wired one in the picker — the new inset has
   // its own out_image_<i> handle but no edge until they manually draw one.
   // Match the user's mental model ("adding an inset means include it").
-  const openIntensityPicker = useCallback((nodeId: string) => {
+  // Resolve the full upstream image-input set for an interactive node:
+  // auto-wire any not-yet-wired source insets, then build the picker image
+  // list (label + thumbnail + full-res source descriptor). Shared by BOTH
+  // the intensity picker and the Cellpose picker so the tricky inset-key
+  // namespacing (the source of earlier 0.1.330-era bugs) lives in ONE place.
+  const buildPickerImages = useCallback((nodeId: string): FluorPickerImage[] => {
     // 1) Find every source node already connected to this picker via ANY
     //    out_image_* handle. Those are the sources the user has opted in.
     const connectedSourceIds = new Set<string>();
@@ -6991,10 +7022,25 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         im.label = `${im.label} #${n}`;
       }
     }
-    const node = nm.get(nodeId);
-    const initialCfg = (node?.data.intensity as FluorIntensityConfig | undefined) || emptyFluorConfig();
-    setIntensityPicker({ open: true, nodeId, images: pickerImages, cfg: initialCfg });
+    return pickerImages;
   }, [nodes, edges, collectInputs]);
+
+  const openIntensityPicker = useCallback((nodeId: string) => {
+    const images = buildPickerImages(nodeId);
+    const node = nodes.find((n) => n.id === nodeId);
+    const initialCfg = (node?.data.intensity as FluorIntensityConfig | undefined) || emptyFluorConfig();
+    setIntensityPicker({ open: true, nodeId, images, cfg: initialCfg });
+  }, [buildPickerImages, nodes]);
+
+  const openCellposePicker = useCallback((nodeId: string) => {
+    const images = buildPickerImages(nodeId);
+    const node = nodes.find((n) => n.id === nodeId);
+    const existing = node?.data.cellposeSeg as CellposeSegConfig | undefined;
+    // Restore the structured config; fall back to parsing the node's saved
+    // JSON so nodes that predate the structured field still round-trip.
+    const initialCfg = existing || cellposeSegFromJson(node?.data.code as string | undefined);
+    setCellposePicker({ open: true, nodeId, images, cfg: initialCfg });
+  }, [buildPickerImages, nodes]);
 
   const saveIntensityPicker = useCallback((cfg: FluorIntensityConfig) => {
     setIntensityPicker((ip) => {
@@ -7019,6 +7065,33 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     openIntensityPicker(nodeId);
     return new Promise((resolve) => { intensityPickerResolveRef.current = resolve; });
   }, [openIntensityPicker]);
+
+  const saveCellposePicker = useCallback((cfg: CellposeSegConfig) => {
+    setCellposePicker((cp) => {
+      if (cp.nodeId) {
+        // Write BOTH the structured config (for reopening) and the serialised
+        // JSON into the node's `code` — the `kind:"cellpose"` run reads `code`,
+        // so the downstream labels → ImageJ → plot pipeline is unchanged.
+        setNodes((cur) => cur.map((n) => n.id === cp.nodeId
+          ? { ...n, data: { ...n.data, cellposeSeg: cfg, code: cellposeSegToJson(cfg), status: "idle" as const } }
+          : n));
+      }
+      return { open: false, nodeId: null, images: [], cfg: null };
+    });
+    const r = cellposePickerResolveRef.current; cellposePickerResolveRef.current = null;
+    if (r) r(cfg);
+  }, [setNodes]);
+
+  const closeCellposePicker = useCallback(() => {
+    setCellposePicker({ open: false, nodeId: null, images: [], cfg: null });
+    const r = cellposePickerResolveRef.current; cellposePickerResolveRef.current = null;
+    if (r) r(null);
+  }, []);
+
+  const openCellposePickerAndWait = useCallback((nodeId: string): Promise<CellposeSegConfig | null> => {
+    openCellposePicker(nodeId);
+    return new Promise((resolve) => { cellposePickerResolveRef.current = resolve; });
+  }, [openCellposePicker]);
 
   const runNode = useCallback(async (node: Node<NodeData>, nodeMap: Map<string, Node<NodeData>>) => {
     const engine = node.data.kind as EngineKind;
@@ -7099,6 +7172,25 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         }
         node = { ...node, data: { ...node.data, intensity: picked, code: generateFluorCode(picked) } };
       }
+    }
+    // Interactive Cellpose node: on the FIRST run (no structured config saved
+    // yet) open the segmentation picker so the user can preview + confirm the
+    // model/diameter/channels — same "guide on first run" flow as the
+    // intensity picker. The node's `code` already carries a sensible default,
+    // so cancelling just proceeds with that; only a hard cancel that clears
+    // the config aborts.
+    if (node.data.interactive === "cellpose_seg" && !node.data.cellposeSeg) {
+      consoleRef.current += `\n=== ${node.data.label}: configure Cellpose first — opening the segmentation picker (model, diameter, channel; preview the outlines) ===\n`;
+      setConsoleOut(consoleRef.current);
+      setNodes((cur) => cur.map((n) => n.id === node.id ? { ...n, data: { ...n.data, status: "idle" } } : n));
+      const picked = await openCellposePickerAndWait(node.id);
+      if (!picked) {
+        consoleRef.current += `=== ${node.data.label}: segmentation not configured — run stopped ===\n`;
+        setConsoleOut(consoleRef.current);
+        runAbortRef.current = true;
+        return;
+      }
+      node = { ...node, data: { ...node.data, cellposeSeg: picked, code: cellposeSegToJson(picked) } };
     }
     // Parse a `# @name: <label>` / `// @name: <label>` marker from the
     // first 20 lines so users can name a node from within the code.
@@ -8508,6 +8600,23 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
               </Box>
             );
           })()}
+          {selectedNode.data.interactive === "cellpose_seg" && (() => {
+            const cc = selectedNode.data.cellposeSeg as CellposeSegConfig | undefined;
+            const summary = cc
+              ? `${cc.model} · ${cc.autoDiameter ? "auto Ø" : `Ø ${cc.diameter}px`} · ${cc.cellposeVersion}`
+              : "not configured yet";
+            return (
+              <Box sx={{ display: "flex", alignItems: "center", gap: 1, px: 1, py: 0.75, borderBottom: "1px solid", borderColor: "divider", bgcolor: "action.hover" }}>
+                <Button size="small" variant="contained" onClick={() => openCellposePicker(selectedNode.id)}
+                  sx={{ textTransform: "none", fontSize: "0.7rem" }}>
+                  🔬 Configure segmentation…
+                </Button>
+                <Typography variant="caption" sx={{ color: "text.secondary", lineHeight: 1.3 }}>
+                  {summary} · preview outlines · masks feed the shape metrics
+                </Typography>
+              </Box>
+            );
+          })()}
           {/* Layer-1 preset selector — built-in snippets + user-
               saved presets stored per-engine in localStorage.  The
               Select is controlled by the node's currentPreset field
@@ -9158,6 +9267,16 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         initial={intensityPicker.cfg}
         onClose={closeIntensityPicker}
         onSave={saveIntensityPicker}
+      />
+      {/* Cellpose segmentation picker — model/diameter/channel controls +
+          live outline preview. Configures the kind:"cellpose" node's run
+          JSON (labels → ImageJ shape metrics → plot). */}
+      <CellposeSegDialog
+        open={cellposePicker.open}
+        images={cellposePicker.images}
+        initial={cellposePicker.cfg}
+        onClose={closeCellposePicker}
+        onSave={saveCellposePicker}
       />
 
       {/* ── Per-element R-plot text editor ────────────────────────

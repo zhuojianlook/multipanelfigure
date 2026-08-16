@@ -9025,6 +9025,116 @@ def run_cellpose_pipeline(body: CellposeAnalysisRequest):
     return cellpose_plugin.run(images_in, cfg_dict, body.timeout_sec)
 
 
+class CellposePreviewRequest(BaseModel):
+    # The SAME JSON string the interactive Cellpose node saves (may carry
+    # `//` and `#` comment lines — stripped before json.loads).
+    config: str = "{}"
+    # Dual input, same pattern as fluor-preview-segment: prefer a `source`
+    # descriptor (re-extract full-res in-sidecar), else a base64 PNG.
+    source: Optional[Dict[str, object]] = None
+    image_b64: str = ""
+    cellpose_version: str = "v4"
+    # Cap the longer edge so slider tweaks re-preview quickly (the model
+    # load dominates the first call regardless).
+    preview_max_w: int = 768
+    timeout_sec: int = 600
+
+
+@app.post("/api/analysis/cellpose-preview")
+def cellpose_preview(body: CellposePreviewRequest):
+    """Single-image Cellpose segmentation preview for the interactive Cellpose
+    node dialog.  Feeds the SAME config dict the node's run uses into the SAME
+    cellpose_plugin.run(), so what the user previews is exactly what the run
+    produces.  Returns an outline overlay + cell count.
+
+    Shape: { success, overlay_b64, n_cells?, error?, stdout? }
+    """
+    import numpy as _np
+    import io as _io
+    import re as _re
+    import json as _json
+    import base64 as _b64
+    import sys as _sys
+
+    # 1) Parse the node's JSON config (strip // and # comment lines, exactly
+    #    like run-cellpose does).
+    raw = body.config or "{}"
+    raw = "\n".join(l for l in raw.splitlines() if not _re.match(r"\s*(//|#)", l))
+    try:
+        cfg = _json.loads(raw or "{}")
+        if not isinstance(cfg, dict):
+            raise ValueError("config must be a JSON object")
+    except Exception as e:
+        return {"success": False, "overlay_b64": "", "error": f"Cellpose config is not valid JSON: {e}"}
+
+    # 2) Materialise ONE image: source re-extract (full-res, lossless) first,
+    #    else the base64 fallback.
+    arr = None
+    if body.source:
+        try:
+            _did = str(body.source.get("mpf_doc_id") or "")
+            _proj = str(body.source.get("project_path") or "")
+            with _project_context(_did, _proj):
+                ex = _extract_source_image(body.source)
+            if ex is not None:
+                arr = _np.asarray(ex.convert("RGB"))
+        except Exception as _e:
+            print(f"[cellpose-preview] source extract failed: {_e}", file=_sys.stderr, flush=True)
+    if arr is None and body.image_b64:
+        try:
+            rawb = _b64.b64decode(str(body.image_b64).split(",")[-1])
+            arr = _np.asarray(Image.open(_io.BytesIO(rawb)).convert("RGB"))
+        except Exception as e:
+            return {"success": False, "overlay_b64": "", "error": f"image decode failed: {e}"}
+    if arr is None:
+        return {"success": False, "overlay_b64": "",
+                "error": "No preview image — wire a source inset or an upstream image output into this node first."}
+
+    # 3) Downsample to the preview cap (cv2 if available; otherwise run full-res).
+    try:
+        import cv2 as _cv2
+        h0, w0 = arr.shape[:2]
+        PW = max(64, int(body.preview_max_w or 768))
+        if w0 > PW:
+            ph = max(1, int(round(h0 * PW / w0)))
+            arr = _cv2.resize(arr, (PW, ph), interpolation=_cv2.INTER_AREA)
+    except Exception:
+        pass
+    arr_u8 = _np.clip(arr, 0, 255).astype(_np.uint8)
+
+    # 4) Route the venv version (top-level field wins) and run the plugin.
+    cfg = {**cfg}
+    if body.cellpose_version:
+        cfg["cellpose_version"] = str(body.cellpose_version)
+    cfg.setdefault("cellpose_version", "v4")
+    try:
+        res = cellpose_plugin.run([("preview", arr_u8)], cfg, int(body.timeout_sec or 600))
+    except Exception as e:
+        return {"success": False, "overlay_b64": "", "error": f"cellpose invocation failed: {e}"}
+    if not res.get("success"):
+        return {"success": False, "overlay_b64": "",
+                "error": (res.get("stderr") or "cellpose failed").strip() or "cellpose failed"}
+
+    # 5) Prefer the outlines overlay (original + object contours); fall back
+    #    to the palette mask.  Cell count comes from the counts table.
+    imgs = res.get("images") or []
+    overlay = next((im.get("image") for im in imgs if str(im.get("name", "")).endswith("_outlines")), None)
+    if not overlay:
+        overlay = next((im.get("image") for im in imgs if str(im.get("name", "")).endswith("_mask")), None)
+    n_cells = None
+    for t in (res.get("tables") or []):
+        rows = [r for r in (t.get("csv") or "").splitlines() if r.strip()]
+        if len(rows) >= 2:
+            parts = rows[1].split(",")
+            if len(parts) >= 2:
+                try:
+                    n_cells = int(float(parts[1]))
+                except Exception:
+                    pass
+    return {"success": True, "overlay_b64": overlay or "", "n_cells": n_cells,
+            "stdout": (res.get("stdout") or "")[-2000:]}
+
+
 class ImageJAnalysisRequest(BaseModel):
     code: str
     sources: List[Dict[str, object]] = []

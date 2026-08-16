@@ -164,7 +164,15 @@ class ApiClient {
         files: filesData,
         fieldName: "files",
       }) as string;
-      return JSON.parse(text) as UploadResponse;
+      const parsed = JSON.parse(text) as UploadResponse & { detail?: string };
+      // The Rust proxy returns the raw body regardless of HTTP status, so a
+      // backend error arrives as {detail: "..."}. Surface it as a clean
+      // Error instead of letting the caller iterate an undefined `names`
+      // (which threw a confusing TypeError banner for e.g. .nd2 uploads).
+      if (parsed && parsed.detail && !parsed.names) {
+        throw new Error(parsed.detail);
+      }
+      return parsed as UploadResponse;
     }
     // Fallback: browser fetch with FormData
     const form = new FormData();

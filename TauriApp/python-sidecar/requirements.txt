@@ -17,3 +17,10 @@ tifffile>=2023.0
 # /{name}/nifti endpoint hard-requires this; without it the 3D Volume
 # View button fails with "nibabel not bundled".
 nibabel>=5.0
+# Nikon .nd2 microscopy files (upload_images -> _load_nd2).  Modern nd2
+# (>=0.10) reads the format in pure Python — no Nikon SDK needed.  Its
+# `import nd2` + `.asarray()` path pulls in ONLY numpy at runtime; the
+# heavy declared deps (dask, ome-types, pydantic, xsdata) are lazy and
+# used only by .to_dask()/.ome_metadata(), which we never call — so the
+# PyInstaller spec excludes them to keep the binary lean.
+nd2>=0.10

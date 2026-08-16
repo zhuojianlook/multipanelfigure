@@ -373,8 +373,14 @@ export function AppShell() {
         </div>
       )}
       {/* ── API Error Banner ────────────────────────────── */}
+      {/* Dismissable: passing onClose makes MUI render the × button, and the
+          user can clear a stuck error (e.g. a failed .nd2 upload) that would
+          otherwise sit pinned over the tab bar until the next success. */}
       {apiError && (
-        <Alert severity="error" sx={{ position: "fixed", top: 0, left: 0, right: 0, zIndex: 9999, borderRadius: 0 }}>
+        <Alert
+          severity="error"
+          onClose={() => useFigureStore.setState({ apiError: null })}
+          sx={{ position: "fixed", top: 0, left: 0, right: 0, zIndex: 9999, borderRadius: 0 }}>
           {apiError}
         </Alert>
       )}
