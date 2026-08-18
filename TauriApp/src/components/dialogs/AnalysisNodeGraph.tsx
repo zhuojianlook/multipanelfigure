@@ -7062,14 +7062,35 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   }, [buildPickerImages, nodes]);
 
   const openCellposePicker = useCallback((nodeId: string) => {
-    const images = buildPickerImages(nodeId);
+    let images = buildPickerImages(nodeId);
+    // If nothing is wired into this node yet, fall back to the images sitting
+    // in the SOURCES panel so the user can preview + tune the detection RIGHT
+    // AWAY — without first dragging the upload onto a Source node and wiring
+    // it. Each carries a source descriptor so the preview re-extracts full
+    // resolution (a direct upload resolves by `name` from loaded_images).
+    if (images.length === 0 && insetSources.length > 0) {
+      images = insetSources
+        .filter((s) => s.thumbnail || s.name)
+        .map((s) => ({
+          id: s.runKey || s.rawKey || s.key,
+          label: displayName(s, sourceNameOverrides),
+          image_b64: s.thumbnail || "",
+          source: {
+            key: s.rawKey || s.key,
+            row: s.row, col: s.col, inset_index: s.inset_index,
+            ...(s.name ? { name: s.name } : {}),
+            ...(s.mpfId && s.mpfId !== "__active__" && s.mpfId !== activeDocId
+              ? { mpf_doc_id: s.mpfId } : {}),
+          } as unknown as FluorImageSource,
+        }));
+    }
     const node = nodes.find((n) => n.id === nodeId);
     const existing = node?.data.cellposeSeg as CellposeSegConfig | undefined;
     // Restore the structured config; fall back to parsing the node's saved
     // JSON so nodes that predate the structured field still round-trip.
     const initialCfg = existing || cellposeSegFromJson(node?.data.code as string | undefined);
     setCellposePicker({ open: true, nodeId, images, cfg: initialCfg });
-  }, [buildPickerImages, nodes]);
+  }, [buildPickerImages, nodes, insetSources, sourceNameOverrides, activeDocId]);
 
   const saveIntensityPicker = useCallback((cfg: FluorIntensityConfig) => {
     setIntensityPicker((ip) => {

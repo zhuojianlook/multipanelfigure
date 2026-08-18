@@ -219,6 +219,20 @@ export default function CellposeSegDialog(props: Props) {
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
+  // Auto-run the detection ONCE when the dialog opens with an image available,
+  // so the segmentation "shows up" immediately instead of the user having to
+  // hunt for the Preview button. A ref guards it so parameter tweaks / image
+  // cycling don't retrigger a fresh (10-15 s) run — after the first, the user
+  // re-previews explicitly.
+  const autoRanRef = useRef(false);
+  useEffect(() => { if (!open) autoRanRef.current = false; }, [open]);
+  useEffect(() => {
+    if (open && selected && !autoRanRef.current) {
+      autoRanRef.current = true;
+      void runPreview();
+    }
+  }, [open, selected, runPreview]);
+
   const overlaySrc = useMemo(() => (overlay ? `data:image/png;base64,${overlay}` : ""), [overlay]);
   const baseSrc = useMemo(
     () => (selected?.image_b64 ? `data:image/png;base64,${selected.image_b64.split(",").pop()}` : ""),
