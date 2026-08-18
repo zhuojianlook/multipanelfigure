@@ -2629,7 +2629,7 @@ const CELLPOSE_DEFAULT = `{
   "flow_threshold": 0.4,
   "cellprob_threshold": 0.0,
   "min_size": 15,
-  "use_gpu": false
+  "use_gpu": true
 }
 // model: Cellpose 4.x ships only "cpsam" (the SAM-based segmenter)
 //        as a built-in.  Earlier names ("cyto3", "cyto2", "nuclei",
@@ -2651,7 +2651,7 @@ const CELLPOSE_NUCLEI = `{
   "flow_threshold": 0.4,
   "cellprob_threshold": 0.0,
   "min_size": 10,
-  "use_gpu": false
+  "use_gpu": true
 }
 // Tuned for DAPI / Hoechst nuclei: small diameter prior, lower
 // min_size.  Under Cellpose 4 the model is always "cpsam".`;
@@ -4280,7 +4280,7 @@ const CELLPOSE_CYTO_FOR_CELLCHAR = `{
   "flow_threshold": 0.4,
   "cellprob_threshold": 0.0,
   "min_size": 15,
-  "use_gpu": false
+  "use_gpu": true
 }
 // Drop your brightfield / phase / DAPI insets into the source
 // node and wire them into this Cellpose node.  Use null diameter

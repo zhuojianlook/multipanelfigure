@@ -161,7 +161,11 @@ def main():
     flow_threshold = float(cfg.get("flow_threshold", 0.4))
     cellprob_threshold = float(cfg.get("cellprob_threshold", 0.0))
     min_size = int(cfg.get("min_size", 15))
-    use_gpu = bool(cfg.get("use_gpu", False))
+    # GPU on by default. cellpose-pytorch picks the best available backend
+    # (CUDA / Apple MPS) and cleanly falls back to CPU when neither is present,
+    # so this is safe even on machines without a GPU. Callers still pass an
+    # explicit use_gpu; this default only covers a config that omits the flag.
+    use_gpu = bool(cfg.get("use_gpu", True))
     # Dendrite reconnection.  cellpose's flow model slices a long thin
     # process into many separate basins, so a dendrite comes back as
     # "lots of little cells" instead of one cell.  When merge_fragments
