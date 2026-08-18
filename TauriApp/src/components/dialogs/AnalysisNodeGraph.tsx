@@ -2494,10 +2494,15 @@ for (i = 0; i < n_inputs; i++) {
   path  = input_paths[i];
   label = input_labels[i];
 
-  // Skip inputs that aren't *_labels — outline / mask variants
-  // also come down the pipe but only the labels image has the
-  // grayscale per-cell IDs we need.
-  if (indexOf(label, "_labels") < 0 && indexOf(input_keys[i], "_labels") < 0) {
+  // Keep ONLY the 8-bit *_labels image (pixel value = per-cell ID).
+  // The Cellpose node's aggregated out_image handle also carries the
+  // RGBA-packed 16-bit *_labels16 variant — and "_labels16" CONTAINS
+  // "_labels", so a substring test used to accept it too. Measuring the
+  // packed image as if it were 8-bit IDs invented phantom cells AND a
+  // phantom "…16" source/group, corrupting every downstream plot. Match
+  // the SUFFIX so _labels16 (and _mask / _outlines / _flows_rgb /
+  // _cellprob / _show_segmentation) are all excluded.
+  if (!endsWith(label, "_labels") && !endsWith(input_keys[i], "_labels")) {
     print("skipping non-labels input: " + label);
     continue;
   }
