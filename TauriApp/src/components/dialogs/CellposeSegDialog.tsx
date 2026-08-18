@@ -56,6 +56,17 @@ export type CellposeSegConfig = {
   cellprobThreshold: number;
   minSize: number;
   useGpu: boolean;
+  /** Dendrite / thin-process capture (marker-controlled watershed): after
+   *  cellpose finds each cell body, flood it OUTWARD along the real signal so
+   *  long thin processes are absorbed into their soma instead of dropped or
+   *  shattered into fragments. Best lever for dendritic / stellate cells.
+   *  Serialises to `expand_processes`. */
+  captureProcesses: boolean;
+  /** Reconnect over-split process slices back into their nearest cell body
+   *  (cellpose's flow model can cut one dendrite into many little "cells").
+   *  Serialises to `merge_fragments`. Ignored when captureProcesses is on
+   *  (the watershed already keeps processes attached). */
+  mergeFragments: boolean;
 };
 
 export function emptyCellposeSegConfig(): CellposeSegConfig {
@@ -71,6 +82,8 @@ export function emptyCellposeSegConfig(): CellposeSegConfig {
     cellprobThreshold: 0.0,
     minSize: 15,
     useGpu: true,
+    captureProcesses: false,
+    mergeFragments: false,
   };
 }
 
@@ -90,6 +103,8 @@ export function cellposeSegToJson(c: CellposeSegConfig): string {
     cellprob_threshold: c.cellprobThreshold,
     min_size: Math.max(0, Math.round(c.minSize)),
     use_gpu: c.useGpu,
+    expand_processes: c.captureProcesses,
+    merge_fragments: c.mergeFragments,
     cellpose_version: c.cellposeVersion,
   };
   return (
@@ -126,6 +141,8 @@ export function cellposeSegFromJson(code: string | undefined): CellposeSegConfig
       cellprobThreshold: typeof o.cellprob_threshold === "number" ? o.cellprob_threshold : base.cellprobThreshold,
       minSize: typeof o.min_size === "number" ? o.min_size : base.minSize,
       useGpu: typeof o.use_gpu === "boolean" ? o.use_gpu : base.useGpu,
+      captureProcesses: typeof o.expand_processes === "boolean" ? o.expand_processes : base.captureProcesses,
+      mergeFragments: typeof o.merge_fragments === "boolean" ? o.merge_fragments : base.mergeFragments,
     };
   } catch {
     return base;
@@ -312,6 +329,9 @@ export default function CellposeSegDialog(props: Props) {
               <Typography variant="body2">Cell-probability threshold: {cfg.cellprobThreshold.toFixed(1)}</Typography>
               <Slider size="small" min={-6} max={6} step={0.5} value={cfg.cellprobThreshold}
                 onChange={(_, v) => patch({ cellprobThreshold: v as number })} />
+              <Typography variant="caption" color="text.secondary">
+                Lower / negative grows masks into faint peripheral pixels (dendrites).
+              </Typography>
             </Box>
 
             <Stack direction="row" spacing={1} alignItems="center">
@@ -321,6 +341,28 @@ export default function CellposeSegDialog(props: Props) {
                 inputProps={{ min: 0, step: 1, style: { width: 90 } }} />
             </Stack>
 
+            <Divider flexItem />
+            <Typography variant="caption" sx={{ fontWeight: 600 }}>
+              Dendrites / thin processes
+            </Typography>
+            <FormControlLabel
+              control={<Switch size="small" checked={cfg.captureProcesses}
+                onChange={(e) => patch({ captureProcesses: e.target.checked })} />}
+              label="Capture thin processes (dendrites)" />
+            <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+              Floods each detected cell body outward along the real signal so dendrites/axons
+              are absorbed into their soma instead of dropped. Best lever for dendritic cells.
+            </Typography>
+            <FormControlLabel
+              control={<Switch size="small" checked={cfg.mergeFragments} disabled={cfg.captureProcesses}
+                onChange={(e) => patch({ mergeFragments: e.target.checked })} />}
+              label="Reconnect split fragments" />
+            <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+              Re-merges over-split process slices into their nearest cell.
+              {cfg.captureProcesses ? " (Not needed while capture is on.)" : ""}
+            </Typography>
+
+            <Divider flexItem />
             <FormControlLabel
               control={<Switch size="small" checked={cfg.useGpu}
                 onChange={(e) => patch({ useGpu: e.target.checked })} />}
