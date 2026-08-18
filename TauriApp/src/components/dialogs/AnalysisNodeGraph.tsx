@@ -7436,6 +7436,25 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       // font size). Capture it on each plot output as re-run provenance.
       const rFullCode = engine === "r" ? rExecutedCode : null;
       const rInterp = engine === "r" ? (enginePaths.r || null) : null;
+      // Cellpose emits SEVEN images per input — mask, labels, labels16,
+      // outlines, flows_rgb, cellprob, and a stitched "show_segmentation"
+      // COLLAGE. Most are technical or redundant and just clutter the output
+      // gallery. Surface only the pertinent ones, ordered outlines-first:
+      //   • *_outlines — the segmentation drawn over the cells (the useful view)
+      //   • *_mask     — the coloured per-cell mask
+      //   • *_labels   — kept because the downstream ImageJ shape-metrics node
+      //                  measures it (suffix match, so *_labels16 is excluded)
+      // Everything else (labels16 / flows_rgb / cellprob / the collage) is
+      // dropped. Other engines are untouched.
+      const orderedImages = (() => {
+        const imgs = result.images || [];
+        if (engine !== "cellpose") return imgs;
+        const rank = (n: string) =>
+          /_outlines$/.test(n) ? 0 : /_mask$/.test(n) ? 1 : /_labels$/.test(n) ? 2 : -1;
+        return imgs
+          .filter((im) => rank(im.name || "") >= 0)
+          .sort((a, b) => rank(a.name || "") - rank(b.name || ""));
+      })();
       // Convert result into NodeOutputs.
       const newOutputs: NodeOutput[] = [
         ...result.plots.map((b64, i) => ({
@@ -7443,7 +7462,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           ...(rFullCode ? { rCode: rFullCode, rInterpreter: rInterp, rPlotIndex: i } : {}),
         })),
         ...result.tables.map((t) => ({ id: `out_table_${t.name}`, kind: "table" as DataKind, name: t.name, payload: t.csv })),
-        ...((result.images || []).map((im, i) => ({ id: `out_image_${i}`, kind: "image" as DataKind, name: im.name, payload: im.image }))),
+        ...(orderedImages.map((im, i) => ({ id: `out_image_${i}`, kind: "image" as DataKind, name: im.name, payload: im.image }))),
       ];
       const stdout = (result.stdout || "") + (result.stderr ? `\n${result.stderr}` : "");
       // Per-node consoleOut: the detail panel renders this directly
