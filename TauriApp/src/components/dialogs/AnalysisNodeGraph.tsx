@@ -5912,6 +5912,13 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           inputs: [],
           status: "idle",
           currentPreset: `b:${presetIdx}`,
+          // A Cellpose node — however it's created — gets the interactive
+          // segmentation config: the "Configure segmentation…" button + the
+          // first-run picker with a live outline preview. Without this flag a
+          // hand-added Cellpose node was just a raw JSON editor with no popup
+          // (only the Cell-characteristics TEMPLATE set it), so building a
+          // multi-image pipeline by adding Cellpose nodes lost the modal.
+          ...(engine === "cellpose" ? { interactive: "cellpose_seg" as const } : {}),
         } as NodeData,
       },
     ]);
@@ -7229,7 +7236,11 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     // intensity picker. The node's `code` already carries a sensible default,
     // so cancelling just proceeds with that; only a hard cancel that clears
     // the config aborts.
-    if (node.data.interactive === "cellpose_seg" && !node.data.cellposeSeg) {
+    // ANY cellpose node (template, hand-added, or restored from a saved
+    // workflow that predates the interactive flag) opens the segmentation
+    // picker on its first run — keyed on the engine, not the flag, so no
+    // cellpose node is ever left as a bare JSON editor with no popup.
+    if (node.data.kind === "cellpose" && !node.data.cellposeSeg) {
       consoleRef.current += `\n=== ${node.data.label}: configure Cellpose first — opening the segmentation picker (model, diameter, channel; preview the outlines) ===\n`;
       setConsoleOut(consoleRef.current);
       setNodes((cur) => cur.map((n) => n.id === node.id ? { ...n, data: { ...n.data, status: "idle" } } : n));
@@ -8669,7 +8680,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
               </Box>
             );
           })()}
-          {selectedNode.data.interactive === "cellpose_seg" && (() => {
+          {selectedNode.data.kind === "cellpose" && (() => {
             const cc = selectedNode.data.cellposeSeg as CellposeSegConfig | undefined;
             const summary = cc
               ? `${cc.model} · ${cc.autoDiameter ? "auto Ø" : `Ø ${cc.diameter}px`} · ${cc.cellposeVersion}`
