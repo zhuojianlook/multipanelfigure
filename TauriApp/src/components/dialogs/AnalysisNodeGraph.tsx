@@ -7363,6 +7363,11 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         // path as Python.
         const sources = buildSources();
         const extras = extra.filter((x) => !x.key.startsWith("inset_"));
+        // User-corrected masks from the segmentation dialog (keyed by image
+        // label). Sent as a TOP-LEVEL body field — run-cellpose substitutes
+        // them per image and SKIPS the model for those, so the user's edits
+        // survive into the shape metrics. Unedited images still run cellpose.
+        const editedMasks = (node.data.cellposeSeg as CellposeSegConfig | undefined)?.editedMasks;
         try {
           const resp = await fetch(`${apiBase}/api/analysis/run-cellpose`, {
             method: "POST",
@@ -7371,6 +7376,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
               // 600 s — first-run model download (~100 MB) needs room.
               config: node.data.code || CELLPOSE_DEFAULT,
               sources, extra_inputs: extras, timeout_sec: 600,
+              ...(editedMasks && Object.keys(editedMasks).length ? { edited_masks: editedMasks } : {}),
             }),
           });
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);

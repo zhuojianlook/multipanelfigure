@@ -22,6 +22,8 @@ import {
   Typography, Select, MenuItem, FormControlLabel, Switch, Slider, TextField,
   CircularProgress, Alert, IconButton, Divider,
 } from "@mui/material";
+import MaskEditorCanvas from "./MaskEditorCanvas";
+import { decodeRgbaLabels, encodeRgbaLabels, relabelContiguous } from "../../utils/maskEdit";
 
 /** One wired input image the dialog can preview. `source` (when present) lets
  *  the sidecar re-extract the full-res inset losslessly; otherwise the base64
@@ -67,6 +69,12 @@ export type CellposeSegConfig = {
    *  Serialises to `merge_fragments`. Ignored when captureProcesses is on
    *  (the watershed already keeps processes attached). */
   mergeFragments: boolean;
+  /** User-corrected cell masks, keyed by image label → RGBA-packed PNG data
+   *  URL (R = label low byte, G = high byte). When present for an image, the
+   *  run substitutes this mask and SKIPS the cellpose model for it. NOT baked
+   *  into the run JSON — the node sends it as the top-level `edited_masks`
+   *  body field at run time. */
+  editedMasks?: Record<string, string>;
 };
 
 export function emptyCellposeSegConfig(): CellposeSegConfig {
@@ -172,6 +180,9 @@ export default function CellposeSegDialog(props: Props) {
   const [err, setErr] = useState<string>("");
   const [notInstalled, setNotInstalled] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  // Editable label rasters decoded from each preview, keyed by image label.
+  const [editedByImage, setEditedByImage] = useState<Record<string, { labels: Int32Array; w: number; h: number; edited: boolean }>>({});
+  const [editMode, setEditMode] = useState(false);
 
   // Re-seed when (re)opened for a different node.
   useEffect(() => {
@@ -182,6 +193,8 @@ export default function CellposeSegDialog(props: Props) {
       setNCells(null);
       setErr("");
       setNotInstalled(false);
+      setEditedByImage({});
+      setEditMode(false);
     }
   }, [open, initial]);
 
@@ -222,6 +235,18 @@ export default function CellposeSegDialog(props: Props) {
         setOverlay(j.overlay_b64 || "");
         setNCells(typeof j.n_cells === "number" ? j.n_cells : null);
         if (!j.overlay_b64) setErr("Segmentation ran but returned no overlay image.");
+        // Decode the raw labels so the mask editor can edit this detection.
+        // A fresh preview REPLACES any prior edits for this image (re-running
+        // the model is an explicit "start over").
+        if (j.cell_labels_b64 && selected) {
+          const dec = await decodeRgbaLabels(String(j.cell_labels_b64));
+          if (dec) {
+            setEditedByImage((cur) => ({
+              ...cur,
+              [selected.label]: { labels: dec.labels, w: dec.w, h: dec.h, edited: false },
+            }));
+          }
+        }
       } else {
         const msg = String(j.error || "Preview failed.");
         setErr(msg);
@@ -255,6 +280,32 @@ export default function CellposeSegDialog(props: Props) {
     () => (selected?.image_b64 ? `data:image/png;base64,${selected.image_b64.split(",").pop()}` : ""),
     [selected],
   );
+
+  // The editable label raster for the current image (present after a preview).
+  const curEdit = selected ? editedByImage[selected.label] : undefined;
+
+  const onLabelsChange = useCallback((next: Int32Array) => {
+    if (!selected) return;
+    setEditedByImage((cur) => {
+      const e = cur[selected.label];
+      if (!e) return cur;
+      return { ...cur, [selected.label]: { ...e, labels: next, edited: true } };
+    });
+  }, [selected]);
+
+  // Save: encode every EDITED image's mask into cfg.editedMasks (merged over
+  // any previously-saved edits so re-saving without touching an image keeps
+  // its correction). Only edited images are sent, so unedited ones still run
+  // the model at run time.
+  const handleSave = useCallback(() => {
+    const em: Record<string, string> = { ...(cfg.editedMasks || {}) };
+    for (const [label, e] of Object.entries(editedByImage)) {
+      // Relabel to contiguous 1..N so deletes/merges don't leave ID gaps that
+      // inflate the backend's max(id)-based cell count.
+      if (e.edited) em[label] = encodeRgbaLabels(relabelContiguous(e.labels), e.w, e.h);
+    }
+    onSave({ ...cfg, editedMasks: Object.keys(em).length ? em : undefined });
+  }, [cfg, editedByImage, onSave]);
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="lg" fullWidth>
@@ -379,6 +430,12 @@ export default function CellposeSegDialog(props: Props) {
               {nCells != null && !previewing && (
                 <Typography variant="body2" color="text.secondary">{nCells} cell{nCells === 1 ? "" : "s"}</Typography>
               )}
+              {curEdit && !previewing && (
+                <Button size="small" variant={editMode ? "contained" : "outlined"}
+                  onClick={() => setEditMode((m) => !m)} sx={{ textTransform: "none" }}>
+                  {editMode ? "Done editing" : "Edit masks"}
+                </Button>
+              )}
               <Box sx={{ flex: 1 }} />
               {images.length > 1 && (
                 <Stack direction="row" spacing={0.5} alignItems="center">
@@ -399,25 +456,36 @@ export default function CellposeSegDialog(props: Props) {
               </Alert>
             )}
             {err && !notInstalled && <Alert severity="error" sx={{ py: 0 }} onClose={() => setErr("")}>{err}</Alert>}
-            <Box sx={{
-              border: "1px solid", borderColor: "divider", borderRadius: 1, overflow: "hidden",
-              minHeight: 240, display: "flex", alignItems: "center", justifyContent: "center",
-              background: "#111",
-            }}>
-              {overlaySrc
-                ? <img src={overlaySrc} alt="segmentation preview" style={{ maxWidth: "100%", maxHeight: 460, display: "block" }} />
-                : baseSrc
-                  ? <img src={baseSrc} alt="input" style={{ maxWidth: "100%", maxHeight: 460, display: "block", opacity: 0.65 }} />
-                  : <Typography variant="body2" color="text.secondary" sx={{ p: 3 }}>
-                      Wire a source inset into this node, then click “Preview segmentation”.
-                    </Typography>}
-            </Box>
+            {editMode && curEdit && selected ? (
+              <MaskEditorCanvas
+                key={selected.label}
+                baseImageB64={selected.image_b64 || ""}
+                labels={curEdit.labels}
+                width={curEdit.w}
+                height={curEdit.h}
+                onChange={onLabelsChange}
+              />
+            ) : (
+              <Box sx={{
+                border: "1px solid", borderColor: "divider", borderRadius: 1, overflow: "hidden",
+                minHeight: 240, display: "flex", alignItems: "center", justifyContent: "center",
+                background: "#111",
+              }}>
+                {overlaySrc
+                  ? <img src={overlaySrc} alt="segmentation preview" style={{ maxWidth: "100%", maxHeight: 460, display: "block" }} />
+                  : baseSrc
+                    ? <img src={baseSrc} alt="input" style={{ maxWidth: "100%", maxHeight: 460, display: "block", opacity: 0.65 }} />
+                    : <Typography variant="body2" color="text.secondary" sx={{ p: 3 }}>
+                        Wire a source inset into this node, then click “Preview segmentation”.
+                      </Typography>}
+              </Box>
+            )}
           </Stack>
         </Box>
       </DialogContent>
       <DialogActions>
         <Button onClick={onClose} sx={{ textTransform: "none" }}>Cancel</Button>
-        <Button variant="contained" onClick={() => onSave(cfg)} sx={{ textTransform: "none" }}>
+        <Button variant="contained" onClick={handleSave} sx={{ textTransform: "none" }}>
           Save configuration
         </Button>
       </DialogActions>

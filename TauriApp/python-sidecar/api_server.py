@@ -9121,6 +9121,14 @@ def cellpose_preview(body: CellposePreviewRequest):
     overlay = next((im.get("image") for im in imgs if str(im.get("name", "")).endswith("_outlines")), None)
     if not overlay:
         overlay = next((im.get("image") for im in imgs if str(im.get("name", "")).endswith("_mask")), None)
+    # The RGBA-packed 16-bit labels (R = low byte, G = high byte, one ID per
+    # cell) so the client's mask editor can decode them to an editable
+    # Int32 raster. Prefer *_labels16; fall back to the 8-bit *_labels
+    # (caps at 255 cells) for older runners. This is the ONLY thing the
+    # editor needs beyond the overlay.
+    cell_labels_b64 = next((im.get("image") for im in imgs if str(im.get("name", "")).endswith("_labels16")), None)
+    if not cell_labels_b64:
+        cell_labels_b64 = next((im.get("image") for im in imgs if str(im.get("name", "")).endswith("_labels")), None)
     n_cells = None
     for t in (res.get("tables") or []):
         rows = [r for r in (t.get("csv") or "").splitlines() if r.strip()]
@@ -9132,6 +9140,7 @@ def cellpose_preview(body: CellposePreviewRequest):
                 except Exception:
                     pass
     return {"success": True, "overlay_b64": overlay or "", "n_cells": n_cells,
+            "cell_labels_b64": cell_labels_b64 or "",
             "stdout": (res.get("stdout") or "")[-2000:]}
 
 
