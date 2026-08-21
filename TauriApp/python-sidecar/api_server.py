@@ -9129,6 +9129,12 @@ def cellpose_preview(body: CellposePreviewRequest):
     cell_labels_b64 = next((im.get("image") for im in imgs if str(im.get("name", "")).endswith("_labels16")), None)
     if not cell_labels_b64:
         cell_labels_b64 = next((im.get("image") for im in imgs if str(im.get("name", "")).endswith("_labels")), None)
+    # Extra inspection views the dialog can toggle between, mirroring the
+    # fluorescence segmentation picker: the coloured per-cell mask, the cellpose
+    # flow field (HSV of the gradient — shows how the model traced boundaries),
+    # and the cell-probability heatmap (helps tune cellprob_threshold).
+    def _pick(suffix):
+        return next((im.get("image") for im in imgs if str(im.get("name", "")).endswith(suffix)), None)
     n_cells = None
     for t in (res.get("tables") or []):
         rows = [r for r in (t.get("csv") or "").splitlines() if r.strip()]
@@ -9141,6 +9147,9 @@ def cellpose_preview(body: CellposePreviewRequest):
                     pass
     return {"success": True, "overlay_b64": overlay or "", "n_cells": n_cells,
             "cell_labels_b64": cell_labels_b64 or "",
+            "mask_b64": _pick("_mask") or "",
+            "flows_b64": _pick("_flows_rgb") or "",
+            "cellprob_b64": _pick("_cellprob") or "",
             "stdout": (res.get("stdout") or "")[-2000:]}
 
 

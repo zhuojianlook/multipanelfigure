@@ -20,7 +20,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Dialog, DialogTitle, DialogContent, DialogActions, Button, Box, Stack,
   Typography, Select, MenuItem, FormControlLabel, Switch, Slider, TextField,
-  CircularProgress, Alert, IconButton, Divider,
+  CircularProgress, Alert, IconButton, Divider, ToggleButton, ToggleButtonGroup,
 } from "@mui/material";
 import MaskEditorCanvas from "./MaskEditorCanvas";
 import { decodeRgbaLabels, encodeRgbaLabels, relabelContiguous } from "../../utils/maskEdit";
@@ -98,6 +98,15 @@ export function emptyCellposeSegConfig(): CellposeSegConfig {
 const V4_MODELS = ["cpsam"];
 const V3_MODELS = ["cyto3", "cyto2", "nuclei"];
 const CHANNEL_LABELS: Record<number, string> = { 0: "Grayscale (all)", 1: "Red", 2: "Green", 3: "Blue" };
+
+/** Which preview layer to show (mirrors the fluorescence picker's view modes). */
+type ViewMode = "outlines" | "mask" | "flows" | "cellprob";
+const VIEW_LABELS: { id: ViewMode; label: string }[] = [
+  { id: "outlines", label: "Outlines" },
+  { id: "mask", label: "Mask" },
+  { id: "flows", label: "Flows" },
+  { id: "cellprob", label: "Cell prob." },
+];
 
 /** Serialise to the exact JSON the `kind:"cellpose"` node runs. The trailing
  *  comment lines are stripped by the run/preview parsers (they drop `//`/`#`
@@ -183,6 +192,11 @@ export default function CellposeSegDialog(props: Props) {
   // Editable label rasters decoded from each preview, keyed by image label.
   const [editedByImage, setEditedByImage] = useState<Record<string, { labels: Int32Array; w: number; h: number; edited: boolean }>>({});
   const [editMode, setEditMode] = useState(false);
+  // Inspection views (like the fluorescence segmentation picker): the coloured
+  // mask, cellpose flow field, and cell-probability heatmap for the current
+  // preview. Empty until a preview returns them.
+  const [views, setViews] = useState<{ mask: string; flows: string; cellprob: string }>({ mask: "", flows: "", cellprob: "" });
+  const [viewMode, setViewMode] = useState<ViewMode>("outlines");
 
   // Re-seed when (re)opened for a different node.
   useEffect(() => {
@@ -195,6 +209,8 @@ export default function CellposeSegDialog(props: Props) {
       setNotInstalled(false);
       setEditedByImage({});
       setEditMode(false);
+      setViews({ mask: "", flows: "", cellprob: "" });
+      setViewMode("outlines");
     }
   }, [open, initial]);
 
@@ -234,6 +250,7 @@ export default function CellposeSegDialog(props: Props) {
       if (j.success) {
         setOverlay(j.overlay_b64 || "");
         setNCells(typeof j.n_cells === "number" ? j.n_cells : null);
+        setViews({ mask: j.mask_b64 || "", flows: j.flows_b64 || "", cellprob: j.cellprob_b64 || "" });
         if (!j.overlay_b64) setErr("Segmentation ran but returned no overlay image.");
         // Decode the raw labels so the mask editor can edit this detection.
         // A fresh preview REPLACES any prior edits for this image (re-running
@@ -280,6 +297,12 @@ export default function CellposeSegDialog(props: Props) {
     () => (selected?.image_b64 ? `data:image/png;base64,${selected.image_b64.split(",").pop()}` : ""),
     [selected],
   );
+  // The image shown for the current view mode. Outlines is the default; the
+  // others come from the extra preview layers (empty until a preview returns).
+  const viewRaw = viewMode === "outlines" ? overlay
+    : viewMode === "mask" ? views.mask
+      : viewMode === "flows" ? views.flows : views.cellprob;
+  const viewSrc = viewRaw ? `data:image/png;base64,${viewRaw}` : overlaySrc;
 
   // The editable label raster for the current image (present after a preview).
   const curEdit = selected ? editedByImage[selected.label] : undefined;
@@ -437,18 +460,39 @@ export default function CellposeSegDialog(props: Props) {
                 </Button>
               )}
               <Box sx={{ flex: 1 }} />
-              {images.length > 1 && (
-                <Stack direction="row" spacing={0.5} alignItems="center">
-                  <IconButton size="small" onClick={() => { setImgIdx((i) => (i - 1 + images.length) % images.length); setOverlay(""); }}>‹</IconButton>
-                  <Typography variant="caption">{Math.min(imgIdx, images.length - 1) + 1}/{images.length}</Typography>
-                  <IconButton size="small" onClick={() => { setImgIdx((i) => (i + 1) % images.length); setOverlay(""); }}>›</IconButton>
-                </Stack>
-              )}
+              {images.length > 1 && (() => {
+                const cycle = (d: number) => {
+                  setImgIdx((i) => (i + d + images.length) % images.length);
+                  setOverlay(""); setViews({ mask: "", flows: "", cellprob: "" });
+                  setViewMode("outlines"); setEditMode(false);
+                };
+                return (
+                  <Stack direction="row" spacing={0.5} alignItems="center">
+                    <IconButton size="small" onClick={() => cycle(-1)}>‹</IconButton>
+                    <Typography variant="caption">{Math.min(imgIdx, images.length - 1) + 1}/{images.length}</Typography>
+                    <IconButton size="small" onClick={() => cycle(1)}>›</IconButton>
+                  </Stack>
+                );
+              })()}
             </Stack>
             {selected && (
               <Typography variant="caption" color="text.secondary" noWrap title={selected.label}>
                 {selected.label}
               </Typography>
+            )}
+            {overlay && !editMode && (
+              <ToggleButtonGroup size="small" exclusive value={viewMode}
+                onChange={(_, v) => { if (v) setViewMode(v as ViewMode); }} sx={{ alignSelf: "flex-start" }}>
+                {VIEW_LABELS.map((v) => {
+                  const has = v.id === "outlines" ? !!overlay
+                    : v.id === "mask" ? !!views.mask
+                      : v.id === "flows" ? !!views.flows : !!views.cellprob;
+                  return (
+                    <ToggleButton key={v.id} value={v.id} disabled={!has}
+                      sx={{ textTransform: "none", py: 0.25, px: 1 }}>{v.label}</ToggleButton>
+                  );
+                })}
+              </ToggleButtonGroup>
             )}
             {notInstalled && (
               <Alert severity="warning" sx={{ py: 0 }}>
@@ -471,8 +515,8 @@ export default function CellposeSegDialog(props: Props) {
                 minHeight: 240, display: "flex", alignItems: "center", justifyContent: "center",
                 background: "#111",
               }}>
-                {overlaySrc
-                  ? <img src={overlaySrc} alt="segmentation preview" style={{ maxWidth: "100%", maxHeight: 460, display: "block" }} />
+                {viewSrc
+                  ? <img src={viewSrc} alt={`segmentation ${viewMode}`} style={{ maxWidth: "100%", maxHeight: 460, display: "block" }} />
                   : baseSrc
                     ? <img src={baseSrc} alt="input" style={{ maxWidth: "100%", maxHeight: 460, display: "block", opacity: 0.65 }} />
                     : <Typography variant="body2" color="text.secondary" sx={{ p: 3 }}>
