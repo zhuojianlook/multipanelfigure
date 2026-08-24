@@ -402,9 +402,12 @@ export default function CellposeSegDialog(props: Props) {
             <Box>
               <Typography variant="body2">Cell-probability threshold: {cfg.cellprobThreshold.toFixed(1)}</Typography>
               <Slider size="small" min={-6} max={6} step={0.5} value={cfg.cellprobThreshold}
-                onChange={(_, v) => patch({ cellprobThreshold: v as number })} />
+                onChange={(_, v) => patch({ cellprobThreshold: v as number })}
+                marks={[{ value: -6, label: "grow" }, { value: 0, label: "0" }, { value: 6, label: "tighten" }]} />
               <Typography variant="caption" color="text.secondary">
-                Lower / negative grows masks into faint peripheral pixels (dendrites).
+                <b>Raise it to tighten masks to the cell core</b> — the fix when the detection
+                over-estimates the boundary. Lower / negative grows masks into faint peripheral
+                pixels (e.g. dendrites).
               </Typography>
             </Box>
 
