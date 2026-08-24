@@ -22,6 +22,7 @@ import {
   Typography, Select, MenuItem, FormControlLabel, Switch, Slider, TextField,
   CircularProgress, Alert, IconButton, Divider, ToggleButton, ToggleButtonGroup,
 } from "@mui/material";
+import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import MaskEditorCanvas from "./MaskEditorCanvas";
 import { decodeRgbaLabels, encodeRgbaLabels, relabelContiguous } from "../../utils/maskEdit";
 
@@ -75,7 +76,17 @@ export type CellposeSegConfig = {
    *  into the run JSON — the node sends it as the top-level `edited_masks`
    *  body field at run time. */
   editedMasks?: Record<string, string>;
+  /** Experimental groups (Control / Treated / …), like the fluorescence
+   *  picker. Each holds the picker image ids assigned to it. NOT in the run
+   *  JSON — at run time buildSources relabels each grouped image to
+   *  "<group>_<n>", which the ImageJ shape-metrics node's filename inference
+   *  turns back into the `group` column the R plot compares. */
+  groups?: CellposeGroup[];
 };
+
+/** One experimental group — mirrors the fluorescence picker's FluorGroup.
+ *  `images` holds picker image ids (single membership across groups). */
+export type CellposeGroup = { id: string; name: string; images: string[] };
 
 export function emptyCellposeSegConfig(): CellposeSegConfig {
   return {
@@ -92,12 +103,16 @@ export function emptyCellposeSegConfig(): CellposeSegConfig {
     useGpu: true,
     captureProcesses: false,
     mergeFragments: false,
+    groups: [],
   };
 }
 
 const V4_MODELS = ["cpsam"];
 const V3_MODELS = ["cyto3", "cyto2", "nuclei"];
 const CHANNEL_LABELS: Record<number, string> = { 0: "Grayscale (all)", 1: "Red", 2: "Green", 3: "Blue" };
+
+let _grpSeq = 0;
+const grpUid = () => `grp_${Date.now().toString(36)}_${(_grpSeq++).toString(36)}`;
 
 /** Which preview layer to show (mirrors the fluorescence picker's view modes). */
 type ViewMode = "outlines" | "mask" | "flows" | "cellprob";
@@ -224,6 +239,35 @@ export default function CellposeSegDialog(props: Props) {
 
   const patch = useCallback((p: Partial<CellposeSegConfig>) => setCfg((c) => ({ ...c, ...p })), []);
 
+  // ── Group picker (mirrors the fluorescence segmentation picker) ──────────
+  const addGroup = useCallback(() => {
+    setCfg((c) => {
+      const groups = c.groups || [];
+      const used = new Set(groups.map((g) => g.name));
+      let n = 1; while (used.has(`Group ${n}`)) n++;
+      return { ...c, groups: [...groups, { id: grpUid(), name: `Group ${n}`, images: [] }] };
+    });
+  }, []);
+  const renameGroup = useCallback((id: string, name: string) => {
+    setCfg((c) => ({ ...c, groups: (c.groups || []).map((g) => (g.id === id ? { ...g, name } : g)) }));
+  }, []);
+  const deleteGroup = useCallback((id: string) => {
+    setCfg((c) => ({ ...c, groups: (c.groups || []).filter((g) => g.id !== id) }));
+  }, []);
+  const toggleImageInGroup = useCallback((gid: string, imageId: string) => {
+    setCfg((c) => ({
+      ...c,
+      groups: (c.groups || []).map((g) => {
+        if (g.id === gid) {
+          const has = g.images.includes(imageId);
+          return { ...g, images: has ? g.images.filter((x) => x !== imageId) : [...g.images, imageId] };
+        }
+        // Single membership — dropping the image from any other group.
+        return { ...g, images: g.images.filter((x) => x !== imageId) };
+      }),
+    }));
+  }, []);
+
   const selected = images[Math.min(imgIdx, Math.max(0, images.length - 1))];
 
   const runPreview = useCallback(async () => {
@@ -278,19 +322,9 @@ export default function CellposeSegDialog(props: Props) {
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
-  // Auto-run the detection ONCE when the dialog opens with an image available,
-  // so the segmentation "shows up" immediately instead of the user having to
-  // hunt for the Preview button. A ref guards it so parameter tweaks / image
-  // cycling don't retrigger a fresh (10-15 s) run — after the first, the user
-  // re-previews explicitly.
-  const autoRanRef = useRef(false);
-  useEffect(() => { if (!open) autoRanRef.current = false; }, [open]);
-  useEffect(() => {
-    if (open && selected && !autoRanRef.current) {
-      autoRanRef.current = true;
-      void runPreview();
-    }
-  }, [open, selected, runPreview]);
+  // Preview does NOT auto-run — the user sets up the image + parameters (and
+  // groups) first, then clicks "Preview segmentation" (matching the
+  // fluorescence segmentation picker, which never runs on open).
 
   const overlaySrc = useMemo(() => (overlay ? `data:image/png;base64,${overlay}` : ""), [overlay]);
   const baseSrc = useMemo(
@@ -340,9 +374,10 @@ export default function CellposeSegDialog(props: Props) {
         </Typography>
       </DialogTitle>
       <DialogContent dividers>
-        <Box sx={{ display: "flex", gap: 2, flexWrap: "wrap" }}>
-          {/* ── Controls ── */}
-          <Stack spacing={1.5} sx={{ flex: "1 1 320px", minWidth: 300 }}>
+        <Box sx={{ display: "flex", gap: 2, flexWrap: "wrap", alignItems: "flex-start" }}>
+          {/* ── Controls (RIGHT — options + groups, mirrors the fluorescence
+              segmentation picker) ── */}
+          <Stack spacing={1.5} sx={{ flex: "1 1 300px", minWidth: 280, order: 2 }}>
             <Stack direction="row" spacing={1} alignItems="center">
               <Typography sx={{ width: 130 }} variant="body2">Cellpose version</Typography>
               <Select size="small" value={cfg.cellposeVersion}
@@ -444,10 +479,56 @@ export default function CellposeSegDialog(props: Props) {
               control={<Switch size="small" checked={cfg.useGpu}
                 onChange={(e) => patch({ useGpu: e.target.checked })} />}
               label="Use GPU when available (MPS / CUDA)" />
+
+            {/* ── Groups (compare cell shape across conditions in the plot) ── */}
+            <Divider flexItem />
+            <Box>
+              <Stack direction="row" spacing={1} alignItems="center">
+                <Typography variant="body2" sx={{ fontWeight: 600 }}>Groups</Typography>
+                <Typography variant="caption" color="text.secondary">· {images.length} image{images.length === 1 ? "" : "s"}</Typography>
+                <Box sx={{ flex: 1 }} />
+                <Button size="small" variant="outlined" onClick={addGroup} disabled={images.length === 0}
+                  sx={{ textTransform: "none", py: 0, minWidth: 0, px: 1 }}>+ Group</Button>
+              </Stack>
+              <Typography variant="caption" color="text.secondary">
+                Assign images to experimental groups (e.g. Control / Treated) to compare cell shape
+                across conditions in the plot. Unassigned images fall back to their filename.
+              </Typography>
+              <Stack spacing={0.75} sx={{ mt: 0.75 }}>
+                {(cfg.groups || []).map((g) => (
+                  <Box key={g.id} sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1, p: 0.75 }}>
+                    <Stack direction="row" spacing={0.5} alignItems="center">
+                      <TextField size="small" value={g.name} onChange={(e) => renameGroup(g.id, e.target.value)}
+                        sx={{ flex: 1 }} inputProps={{ style: { fontSize: "0.8rem", padding: "4px 8px" } }} />
+                      <IconButton size="small" onClick={() => deleteGroup(g.id)}><DeleteOutlineIcon fontSize="small" /></IconButton>
+                    </Stack>
+                    <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, mt: 0.5 }}>
+                      {images.map((im) => {
+                        const on = g.images.includes(im.id);
+                        return (
+                          <Box key={im.id} onClick={() => toggleImageInGroup(g.id, im.id)} title={im.label}
+                            sx={{ cursor: "pointer", px: 0.75, py: 0.25, borderRadius: 1, fontSize: "0.7rem",
+                              bgcolor: on ? "primary.main" : "action.hover", color: on ? "primary.contrastText" : "text.primary",
+                              border: "1px solid", borderColor: on ? "primary.main" : "divider",
+                              maxWidth: 150, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {im.label}
+                          </Box>
+                        );
+                      })}
+                    </Box>
+                  </Box>
+                ))}
+                {(cfg.groups || []).length === 0 && (
+                  <Typography variant="caption" color="text.secondary" sx={{ fontStyle: "italic" }}>
+                    No groups — the plot compares by filename (e.g. “Control_1” → Control).
+                  </Typography>
+                )}
+              </Stack>
+            </Box>
           </Stack>
 
-          {/* ── Preview ── */}
-          <Stack spacing={1} sx={{ flex: "1 1 360px", minWidth: 320 }}>
+          {/* ── Preview (LEFT — the image, like the fluorescence picker) ── */}
+          <Stack spacing={1} sx={{ flex: "1.5 1 400px", minWidth: 360, order: 1 }}>
             <Stack direction="row" spacing={1} alignItems="center">
               <Button variant="contained" size="small" onClick={runPreview} disabled={previewing || !selected}>
                 {previewing ? "Segmenting…" : "Preview segmentation"}

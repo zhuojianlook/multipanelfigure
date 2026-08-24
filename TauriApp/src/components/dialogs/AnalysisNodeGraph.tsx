@@ -7079,7 +7079,11 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       images = insetSources
         .filter((s) => s.thumbnail || s.name)
         .map((s) => ({
-          id: s.runKey || s.rawKey || s.key,
+          // id must match what buildSources looks a group up by at run time:
+          // the runtime key (rtKey) or the namespaced inset key (s.key). NOT
+          // the bare rawKey — that matches neither, so a group assignment made
+          // on an unwired source would silently miss.
+          id: s.runKey || s.key,
           label: displayName(s, sourceNameOverrides),
           image_b64: s.thumbnail || "",
           source: {
@@ -7286,7 +7290,26 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       // (the api.* wrappers don't expose it).  The sidecar treats
       // an empty/missing path as "auto-detect like before".
       const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
-      const buildSources = () => extra
+      const buildSources = () => {
+        // For a Cellpose node with experimental groups, relabel each grouped
+        // image to "<group>_<n>" so the downstream ImageJ shape-metrics node's
+        // filename→group inference produces the `group` column the plot compares
+        // — no macro/R/endpoint changes needed. Keyed by the picker image id,
+        // which equals the runtime key (base.key) in-session, or the namespaced
+        // inset key (insetKey) in the fallback. A miss just leaves the filename.
+        const groupRelabel = new Map<string, string>();
+        if (engine === "cellpose") {
+          for (const g of ((node.data.cellposeSeg as CellposeSegConfig | undefined)?.groups || [])) {
+            const nm = (g.name || "").trim();
+            if (!nm) continue;
+            g.images.forEach((imgId, j) => groupRelabel.set(imgId, `${nm}_${j + 1}`));
+          }
+        }
+        const relabelFor = (...keys: string[]): string | undefined => {
+          for (const k of keys) { const v = groupRelabel.get(k); if (v) return v; }
+          return undefined;
+        };
+        return extra
         .filter((x) => x.kind === "image" && x.key.startsWith("inset_"))
         .map((x) => {
           const insetKey = x.key.replace(/^inset_\d+_/, "");
@@ -7305,7 +7328,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
             // Standalone upload — belongs to no figure; the backend resolves
             // the whole image by name.
             return { key: src.key, row: src.row, col: src.col, inset_index: src.inset_index,
-                     label: displayName(src, sourceNameOverrides), name: src.name };
+                     label: relabelFor(insetKey, src.key) ?? displayName(src, sourceNameOverrides), name: src.name };
           }
           // Resolve the source to the figure it was ATTACHED from, by stable
           // identity. A source from a non-active figure carries that figure's
@@ -7316,9 +7339,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           const owner = src.figKey
             ? openDocs.find((d) => figKey(d) === src.figKey)
             : openDocs.find((d) => d.id === src.mpfId);
+          const rtKey = runtimeKeyFor(src, owner?.id, activeDocId);
           const base: { key: string; row: number; col: number; inset_index: number; label: string; name?: string; project_path?: string; mpf_doc_id?: string } =
-            { key: runtimeKeyFor(src, owner?.id, activeDocId), row: src.row, col: src.col,
-              inset_index: src.inset_index, label: displayName(src, sourceNameOverrides) };
+            { key: rtKey, row: src.row, col: src.col,
+              inset_index: src.inset_index, label: relabelFor(rtKey, insetKey) ?? displayName(src, sourceNameOverrides) };
           if (!owner) {
             // The figure this source came from is closed (or was an Untitled
             // whose session ended). Refuse the run: every fallback from here
@@ -7336,6 +7360,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           return base;
         })
         .filter((s): s is { key: string; row: number; col: number; inset_index: number; label: string; name?: string; project_path?: string; mpf_doc_id?: string } => !!s);
+      };
 
       if (engine === "python") {
         const sources = buildSources();
