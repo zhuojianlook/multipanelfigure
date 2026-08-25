@@ -5237,6 +5237,34 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     }
   }, [workflowTabs]);
 
+  // Drag soft-lock guard (WKWebView). A native HTML5 drag of a source /
+  // measurement / output chip hangs the whole app — the cursor stays stuck
+  // dragging the ghost, clicks dead — when it is DROPPED on an element that
+  // doesn't accept it: the canvas background (only source NODES are drop
+  // targets), or through the pointer-events:none hover preview onto it. WebKit
+  // only ends a drag session when the drop lands on a target that called
+  // preventDefault on dragover; a rejected drop leaves the session open forever
+  // (Chromium quietly recovers, which is why the dev browser never shows it).
+  // So accept mpfig drags EVERYWHERE at the document level — the drop then
+  // always resolves and the session ends. Gated strictly on the mpfig data
+  // types, so OS file-drops (image uploads) are left completely alone. Capture
+  // phase, so it still fires for a real drop target that stops propagation
+  // (that target's own onDrop does the actual work; this is a no-op safety net).
+  useEffect(() => {
+    const isMpfig = (dt: DataTransfer | null) =>
+      !!dt && (dt.types.includes("application/x-mpfig-source")
+        || dt.types.includes("application/x-mpfig-measurements")
+        || dt.types.includes("application/x-mpfig-output"));
+    const onOver = (e: DragEvent) => { if (isMpfig(e.dataTransfer)) e.preventDefault(); };
+    const onDrop = (e: DragEvent) => { if (isMpfig(e.dataTransfer)) e.preventDefault(); };
+    document.addEventListener("dragover", onOver, true);
+    document.addEventListener("drop", onDrop, true);
+    return () => {
+      document.removeEventListener("dragover", onOver, true);
+      document.removeEventListener("drop", onDrop, true);
+    };
+  }, []);
+
   // Saved workflow library (localStorage).
   const [savedWorkflows, setSavedWorkflows] = useState<SavedWorkflow[]>(() => loadSavedWorkflows());
 
