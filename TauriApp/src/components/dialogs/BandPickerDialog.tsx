@@ -26,6 +26,7 @@ import {
 } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AutoFixHighIcon from "@mui/icons-material/AutoFixHigh";
+import { getApiBase } from "../../api/client";
 
 // ── Types (shared with AnalysisNodeGraph via import) ──────────
 export interface BandRoi {
@@ -917,7 +918,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
     (async () => {
       try {
         const b64 = imageSrc ? (imageSrc.startsWith("data:") ? imageSrc.split(",")[1] : imageSrc) : "";
-        const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
+        const apiBase = getApiBase();
         const resp = await fetch(`${apiBase}/api/analysis/wb-preview`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ image_b64: b64, source: source ?? undefined }),
@@ -1308,7 +1309,7 @@ export default function BandPickerDialog(props: BandPickerDialogProps) {
       if (imageSrc || source) {
         try {
           const b64 = imageSrc ? (imageSrc.startsWith("data:") ? imageSrc.split(",")[1] : imageSrc) : "";
-          const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
+          const apiBase = getApiBase();
           const resp = await fetch(`${apiBase}/api/analysis/wb-detect-bands`, {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ image_b64: b64, source: source ?? undefined }),

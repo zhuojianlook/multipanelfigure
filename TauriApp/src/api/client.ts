@@ -15,18 +15,31 @@ import type {
   RDepTool,
 } from "./types";
 
-/** Backend origin for the browser-fetch path (dev only — the packaged app
- *  goes through the Tauri IPC proxy below and never reads this).
+/** Backend origin — the ONE place the sidecar's base URL is decided.
+ *
+ *  apiRequest/apiJson below only read it on the browser-fetch path (the
+ *  packaged app routes those through the Tauri IPC proxy), but several
+ *  dialogs must call fetch() directly (streamed responses, long timeouts,
+ *  bodies the api.* wrappers don't expose). Those MUST build their URL from
+ *  getApiBase() too — never a hard-coded "http://127.0.0.1:8765".
  *
  *  Overridable via VITE_API_BASE so a dev frontend can be pointed at its OWN
  *  throwaway sidecar. Without this, `npm run dev` always targets 8765 — the
  *  same port the INSTALLED app's sidecar listens on — so testing against a
- *  running app would silently mutate the user's open figure. Defaults to 8765,
- *  so nothing changes for a normal dev run or for the shipped build. */
+ *  running app would silently mutate the user's open figure. VITE_API is
+ *  honoured as a legacy alias (some dialogs used to read it instead), so a
+ *  dev setup that only sets one of the two still redirects every request.
+ *  Defaults to 8765, so nothing changes for a normal dev run or for the
+ *  shipped build. */
 // Cast: this project doesn't pull in vite/client's ImportMeta augmentation.
-const DEFAULT_BASE =
-  ((import.meta as unknown as { env?: Record<string, string | undefined> }).env
-    ?.VITE_API_BASE) || "http://127.0.0.1:8765";
+const _env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
+const DEFAULT_BASE = _env?.VITE_API_BASE || _env?.VITE_API || "http://127.0.0.1:8765";
+
+/** Sidecar origin (no trailing slash) for code that has to call fetch()
+ *  directly instead of going through apiJson/apiRequest. */
+export function getApiBase(): string {
+  return DEFAULT_BASE;
+}
 
 /** Try to use Tauri invoke for HTTP requests; fall back to browser fetch */
 let _invoke: ((cmd: string, args: Record<string, unknown>) => Promise<unknown>) | null = null;

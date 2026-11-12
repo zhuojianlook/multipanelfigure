@@ -80,7 +80,7 @@ import { python as cmPython } from "@codemirror/lang-python";
 import { StreamLanguage } from "@codemirror/language";
 import { r as cmR } from "@codemirror/legacy-modes/mode/r";
 import { oneDark } from "@codemirror/theme-one-dark";
-import { api } from "../../api/client";
+import { api, getApiBase } from "../../api/client";
 import type { RDepsStatus } from "../../api/types";
 import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
@@ -5428,7 +5428,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     setConsoleOpen(true);
     consoleRef.current += `\n=== Install Cellpose ${version === "v3" ? "3 (cyto3 + nuclei zoo)" : "4 (cpsam)"} ===\n`;
     setConsoleOut(consoleRef.current);
-    const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
+    const apiBase = getApiBase();
     let lastRc: number | null = null;
     try {
       const resp = await fetch(`${apiBase}/api/analysis/install-cellpose-stream?version=${version}`, {
@@ -5744,7 +5744,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     // Probe MATLAB / ImageJ with the user's pinned binary (if any).
     // The sidecar accepts a `?path=` query — empty falls back to
     // its auto-detection.
-    const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
+    const apiBase = getApiBase();
     const mlPath = enginePaths.matlab;
     const ijPath = enginePaths.imagej;
     fetch(`${apiBase}/api/analysis/check-matlab${mlPath ? `?path=${encodeURIComponent(mlPath)}` : ""}`)
@@ -7317,7 +7317,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       // include the user's optional `interpreter_path` in the body
       // (the api.* wrappers don't expose it).  The sidecar treats
       // an empty/missing path as "auto-detect like before".
-      const apiBase = (import.meta as { env?: { VITE_API?: string } }).env?.VITE_API || "http://127.0.0.1:8765";
+      const apiBase = getApiBase();
       const buildSources = () => {
         // For a Cellpose node with experimental groups, relabel each grouped
         // image to "<group>_<n>" so the downstream ImageJ shape-metrics node's

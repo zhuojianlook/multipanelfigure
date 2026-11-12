@@ -46,6 +46,7 @@ import AutoFixOffIcon from "@mui/icons-material/AutoFixOff";
 import UndoIcon from "@mui/icons-material/Undo";
 import RedoIcon from "@mui/icons-material/Redo";
 import LayersClearIcon from "@mui/icons-material/LayersClear";
+import { getApiBase } from "../../api/client";
 
 // ── Types (exported so the host can persist the config on the node) ──
 export interface FluorChannels {
@@ -675,8 +676,14 @@ def _cellpose_labels_batch(items, model, channels, isolate_channel=0, diameter_o
     payload = json.dumps(payload_obj)
     print(f"[intensity] cellpose ({model}, channels={channels}): batching {len(sent)} image(s) into one model load "
           f"(cap {CELLPOSE_MAX_EDGE}px per edge)")
+    # Call back into the sidecar that is RUNNING this script (it exports its
+    # own origin as MPF_SIDECAR_BASE), not a fixed port: a dev sidecar on
+    # another port must not push work to the installed app's sidecar.
+    # 8765 is only the fallback for sidecars built before that export.
+    _sidecar_base = (__import__("os").environ.get("MPF_SIDECAR_BASE")
+                     or "http://127.0.0.1:8765").rstrip("/")
     try:
-        req = _ur.Request("http://127.0.0.1:8765/api/analysis/run-cellpose",
+        req = _ur.Request(_sidecar_base + "/api/analysis/run-cellpose",
                           data=payload.encode("utf-8"),
                           headers={"Content-Type": "application/json"})
         with _ur.urlopen(req, timeout=600) as resp:
@@ -1525,7 +1532,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    fetch("http://127.0.0.1:8765/api/version")
+    fetch(`${getApiBase()}/api/version`)
       .then((r) => r.ok ? r.json() : null)
       .then((d) => { if (!cancelled && d?.build) setSidecarBuild(String(d.build)); })
       .catch(() => { /* not critical — leave null */ });
@@ -1534,7 +1541,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     // cost (which would otherwise blow past the simple-mode timeout
     // AND can manifest as "Failed to fetch" if the socket drops mid-
     // import on macOS). We keep the promise so fetchPreview can await.
-    warmupRef.current = fetch("http://127.0.0.1:8765/api/analysis/warmup", { method: "POST" })
+    warmupRef.current = fetch(`${getApiBase()}/api/analysis/warmup`, { method: "POST" })
       .then(() => undefined)
       .catch(() => undefined);
     return () => { cancelled = true; };
@@ -1565,7 +1572,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       // use — so a v3 user doesn't accidentally get v4 reinstalled
       // and lose their cyto3 + nuclei model zoo.
       const ver = cfg.cellpose.cellposeVersion || "v4";
-      const resp = await fetch(`http://127.0.0.1:8765/api/analysis/install-cellpose-stream?version=${ver}`, {
+      const resp = await fetch(`${getApiBase()}/api/analysis/install-cellpose-stream?version=${ver}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
       });
@@ -1662,7 +1669,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
             preview_max_w: 1024,
             composite_only: true,
           };
-          const resp = await fetch("http://127.0.0.1:8765/api/analysis/fluor-preview-segment", {
+          const resp = await fetch(`${getApiBase()}/api/analysis/fluor-preview-segment`, {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
           });
@@ -1819,7 +1826,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
       // the sidecar is doing a heavy import (cv2/scipy) right as we POST.
       // The retry waits 600 ms and tries once more; if it still fails we
       // surface the real error.
-      const doFetch = () => fetch("http://127.0.0.1:8765/api/analysis/fluor-preview-segment", {
+      const doFetch = () => fetch(`${getApiBase()}/api/analysis/fluor-preview-segment`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
