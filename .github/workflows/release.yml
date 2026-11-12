@@ -12,7 +12,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-14       # Apple Silicon
+          - os: macos-15       # Apple Silicon
             triple: aarch64-apple-darwin
           - os: windows-latest
             triple: x86_64-pc-windows-msvc
@@ -94,7 +94,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             triple: aarch64-apple-darwin
           - os: windows-latest
             triple: x86_64-pc-windows-msvc
@@ -312,7 +312,7 @@ jobs:
           DMG_DIR="$WS/TauriApp/src-tauri/target/release/bundle/dmg"
           mkdir -p "$DMG_DIR"
           VERSION=$(node -p "require('$WS/TauriApp/package.json').version")
-          ARCH_TAG="aarch64"   # macos-14 runners are arm64
+          ARCH_TAG="aarch64"   # macos-15 runners are arm64
           DMG_NAME="Multi-Panel Figure Builder_${VERSION}_${ARCH_TAG}.dmg"
           # If Tauri ever resumes building one, replace it for consistency.
           rm -f "$DMG_DIR/$DMG_NAME"
