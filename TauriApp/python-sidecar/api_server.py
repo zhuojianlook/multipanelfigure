@@ -9724,6 +9724,13 @@ def main():
                 s.bind(("", 0))
                 port = s.getsockname()[1]
 
+        # Advertise our own origin to child processes (run-python scripts
+        # inherit os.environ). Generated analysis code that calls back into
+        # the sidecar reads this instead of assuming port 8765, so a dev
+        # sidecar on another port never routes work to the installed app's.
+        _cb_host = args.host if args.host not in ("", "0.0.0.0", "::") else "127.0.0.1"
+        os.environ["MPF_SIDECAR_BASE"] = f"http://{_cb_host}:{port}"
+
         print(f"READY:{port}", flush=True)
 
         # Detect PyInstaller / frozen-binary context — reload watchers

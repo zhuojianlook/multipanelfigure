@@ -25,6 +25,7 @@ import {
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import MaskEditorCanvas from "./MaskEditorCanvas";
 import { decodeRgbaLabels, encodeRgbaLabels, relabelContiguous } from "../../utils/maskEdit";
+import { getApiBase } from "../../api/client";
 
 /** One wired input image the dialog can preview. `source` (when present) lets
  *  the sidecar re-extract the full-res inset losslessly; otherwise the base64
@@ -181,11 +182,6 @@ export function cellposeSegFromJson(code: string | undefined): CellposeSegConfig
   }
 }
 
-function apiBase(): string {
-  const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
-  return env?.VITE_API_BASE || env?.VITE_API || "http://127.0.0.1:8765";
-}
-
 type Props = {
   open: boolean;
   images: CellposePickerImage[];
@@ -232,7 +228,7 @@ export default function CellposeSegDialog(props: Props) {
   // Warm the heavy scientific imports so the first preview isn't a cold start.
   useEffect(() => {
     if (!open) return;
-    fetch(`${apiBase()}/api/analysis/warmup`, { method: "POST" }).catch(() => {});
+    fetch(`${getApiBase()}/api/analysis/warmup`, { method: "POST" }).catch(() => {});
   }, [open]);
 
   const models = cfg.cellposeVersion === "v3" ? V3_MODELS : V4_MODELS;
@@ -279,7 +275,7 @@ export default function CellposeSegDialog(props: Props) {
     setErr("");
     setNotInstalled(false);
     try {
-      const resp = await fetch(`${apiBase()}/api/analysis/cellpose-preview`, {
+      const resp = await fetch(`${getApiBase()}/api/analysis/cellpose-preview`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
