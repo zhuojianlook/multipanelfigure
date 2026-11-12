@@ -5,7 +5,7 @@
    Includes collapsible media groups below the timeline.
    ────────────────────────────────────────────────────────── */
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { Tooltip, IconButton, CircularProgress } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
@@ -16,6 +16,8 @@ import { useFigureStore } from "../../store/figureStore";
 import type { LoadedImage } from "../../store/figureStore";
 import type { ImageGroup } from "../../api/types";
 import { sectionsOf, type SectionTarget } from "../../utils/imageGroups";
+import { imageUsage, type ImageUsage } from "../../utils/figures";
+import { confirm } from "../shared/ConfirmDialog";
 import type { DragEvent as ReactDragEvent } from "react";
 import { ImageLightbox } from "./ImageLightbox";
 import { resolveTileClick, tileClickMemory } from "./lightboxLogic";
@@ -75,27 +77,60 @@ function LoadingTile({ name }: { name: string }) {
 /** Reusable image thumbnail tile (timeline AND group drawers).
  *  Click toggles the click-to-assign selection; double-click opens the
  *  image large in a lightbox; drag carries it to a panel / group. */
-function ImageTile({ img, inUse, isSelected, onRemove }: {
+/** How a tile shows where its image is used. An image can sit in panels of
+ *  several figure tabs, so "used" has two flavours:
+ *    - in THIS figure → solid green border (as before figure tabs);
+ *    - only in OTHER figures → dashed accent border;
+ *  and, once the project has more than one figure, a corner pill with the
+ *  number of figures that use it (filled = includes this one). The tooltip
+ *  names them. A single-figure project looks exactly as it always did. */
+interface TileUsageProps {
+  usage: ImageUsage | undefined;
+  /** The project has more than one figure tab. */
+  multiFigure: boolean;
+  currentFigureName: string;
+}
+
+function usageLines(u: ImageUsage | undefined, currentFigureName: string): string[] {
+  if (!u) return [];
+  const panels = (n: number) => `${n} panel${n === 1 ? "" : "s"}`;
+  const parts: string[] = [];
+  if (u.inCurrent > 0) parts.push(`${currentFigureName} (this figure, ${panels(u.inCurrent)})`);
+  for (const o of u.others) parts.push(`${o.name} (${panels(o.count)})`);
+  return parts;
+}
+
+function ImageTile({ img, usage, multiFigure, currentFigureName, isSelected, onRemove }: TileUsageProps & {
   img: LoadedImage;
-  inUse: boolean;
   isSelected: boolean;
   onRemove: () => void;
 }) {
   // Lightbox state is local to the tile: nothing else needs to know a
   // preview is open, so no global store change.
   const [lightboxOpen, setLightboxOpen] = useState(false);
+  const inCurrent = (usage?.inCurrent ?? 0) > 0;
+  const inOthers = (usage?.others.length ?? 0) > 0;
+  const figureCount = (inCurrent ? 1 : 0) + (usage?.others.length ?? 0);
+  const where = usageLines(usage, currentFigureName);
+  const tooltip = multiFigure && where.length > 0 ? (
+    <span style={{ display: "block" }}>
+      <span style={{ display: "block", fontWeight: 600 }}>{img.name}</span>
+      <span style={{ display: "block" }}>Used in: {where.join(" · ")}</span>
+    </span>
+  ) : img.name;
   return (
     <>
     {/* Empty title while the lightbox is up: MUI renders no tooltip for an
         empty title, and tooltips (z 1500) would otherwise float over the
         lightbox if the pointer was still over the tile when it opened. */}
-    <Tooltip title={lightboxOpen ? "" : img.name} placement="bottom" arrow enterDelay={200}>
+    <Tooltip title={lightboxOpen ? "" : tooltip} placement="bottom" arrow enterDelay={200}>
       <div
         className="relative flex-none flex flex-col items-center gap-0.5 rounded border p-1 group"
         style={{
-          borderColor: isSelected ? "#2196f3" : inUse ? "var(--c-green)" : "var(--c-border)",
+          borderColor: isSelected ? "#2196f3" : inCurrent ? "var(--c-green)" : inOthers ? "var(--c-accent)" : "var(--c-border)",
           backgroundColor: isSelected ? "rgba(33,150,243,0.15)" : "var(--c-surface)",
-          borderWidth: isSelected ? 3 : inUse ? 2 : 1,
+          borderWidth: isSelected ? 3 : (inCurrent || inOthers) ? 2 : 1,
+          borderStyle: !isSelected && !inCurrent && inOthers ? "dashed" : "solid",
           cursor: "pointer",
           transition: "border-color 0.15s, background-color 0.15s",
         }}
@@ -135,6 +170,17 @@ function ImageTile({ img, inUse, isSelected, onRemove }: {
         >
           {img.name}
         </span>
+        {multiFigure && figureCount > 0 && (
+          <div
+            aria-label={`Used in ${figureCount} figure${figureCount === 1 ? "" : "s"}`}
+            className="absolute -bottom-1.5 -left-1.5 min-w-[14px] h-[14px] px-[3px] rounded-full flex items-center justify-center text-[8px] font-bold leading-none pointer-events-none"
+            style={inCurrent
+              ? { backgroundColor: "var(--c-green)", color: "#ffffff" }
+              : { backgroundColor: "var(--c-surface)", color: "var(--c-accent)", border: "1px solid var(--c-accent)" }}
+          >
+            {figureCount}
+          </div>
+        )}
         {isSelected && (
           <div
             className="absolute -top-1 left-1/2 -translate-x-1/2 text-[8px] px-1 rounded-b"
@@ -279,6 +325,8 @@ export function ImageStrip() {
   const renameGroupDivider = useFigureStore((s) => s.renameGroupDivider);
   const deleteGroupDivider = useFigureStore((s) => s.deleteGroupDivider);
   const pendingUploads = useFigureStore((s) => s.pendingUploads);
+  const figures = useFigureStore((s) => s.figures);
+  const activeFigureId = useFigureStore((s) => s.activeFigureId);
   const selectedImage = useSelectedImage();
   const [groupsExpanded, setGroupsExpanded] = useState(true);
   const [timelineDragOver, setTimelineDragOver] = useState(false);
@@ -291,15 +339,29 @@ export function ImageStrip() {
   const loadedNames = new Set(entries.map((e) => e.name));
   const visiblePendingUploads = pendingUploads.filter((n) => !loadedNames.has(n));
 
-  const usedNames = new Set<string>();
-  if (config) {
-    for (let r = 0; r < config.rows; r++) {
-      for (let c = 0; c < config.cols; c++) {
-        const name = config.panels[r]?.[c]?.image_name;
-        if (name) usedNames.add(name);
-      }
+  // Where each image is used — in this figure and in the project's other
+  // figure tabs (an image can be in several figures at once).
+  const usage = useMemo(() => imageUsage(figures, activeFigureId, config), [figures, activeFigureId, config]);
+  const tileUsage = {
+    multiFigure: figures.length > 1,
+    currentFigureName: figures.find((f) => f.id === activeFigureId)?.name ?? "This figure",
+  };
+  // Removing an image clears it from EVERY figure that shows it — say so
+  // first when that includes figures other than the one on screen.
+  const requestRemove = async (name: string) => {
+    const others = usage.get(name)?.others ?? [];
+    if (others.length > 0) {
+      const ok = await confirm({
+        title: "Remove image from the project?",
+        body: `"${name}" is also used in ${others.map((o) => o.name).join(", ")}. `
+          + "Removing it clears it from every figure in this project.",
+        confirmLabel: "Remove from all figures",
+        destructive: true,
+      });
+      if (!ok) return;
     }
-  }
+    await removeImage(name);
+  };
 
   if (entries.length === 0 && visiblePendingUploads.length === 0) {
     return (
@@ -346,9 +408,10 @@ export function ImageStrip() {
               <ImageTile
                 key={img.name}
                 img={img}
-                inUse={usedNames.has(img.name)}
+                usage={usage.get(img.name)}
+                {...tileUsage}
                 isSelected={selectedImage === img.name}
-                onRemove={() => removeImage(img.name)}
+                onRemove={() => { void requestRemove(img.name); }}
               />
             ))}
             {visiblePendingUploads.map((name, i) => (
@@ -396,7 +459,8 @@ export function ImageStrip() {
             key={group.id}
             group={group}
             loadedImages={loadedImages}
-            usedNames={usedNames}
+            usage={usage}
+            tileUsage={tileUsage}
             selectedImage={selectedImage}
             onRename={(name) => renameImageGroup(group.id, name)}
             onDelete={() => deleteImageGroup(group.id)}
@@ -404,7 +468,7 @@ export function ImageStrip() {
             onAddDivider={(opts) => addGroupDivider(group.id, opts)}
             onRenameDivider={(dividerId, name) => renameGroupDivider(group.id, dividerId, name)}
             onDeleteDivider={(dividerId) => deleteGroupDivider(group.id, dividerId)}
-            onRemoveImage={removeImage}
+            onRemoveImage={requestRemove}
           />
         ))}
       </div>
@@ -497,12 +561,13 @@ function DividerHeader({ name, autoEdit, onRename, onDelete, onEditEnd }: {
  *  on the name area and on collapsed rows (=> unsectioned) — must not ALSO
  *  fire, or the image would be moved twice. */
 function GroupRow({
-  group, loadedImages, usedNames, selectedImage, onRename, onDelete,
+  group, loadedImages, usage, tileUsage, selectedImage, onRename, onDelete,
   onMoveImage, onAddDivider, onRenameDivider, onDeleteDivider, onRemoveImage,
 }: {
   group: ImageGroup;
   loadedImages: Record<string, LoadedImage>;
-  usedNames: Set<string>;
+  usage: Map<string, ImageUsage>;
+  tileUsage: Omit<TileUsageProps, "usage">;
   selectedImage: string | null;
   onRename: (name: string) => void;
   onDelete: () => void;
@@ -701,7 +766,8 @@ function GroupRow({
                       )}
                       <ImageTile
                         img={loadedImages[name]}
-                        inUse={usedNames.has(name)}
+                        usage={usage.get(name)}
+                        {...tileUsage}
                         isSelected={selectedImage === name}
                         onRemove={() => onRemoveImage(name)}
                       />

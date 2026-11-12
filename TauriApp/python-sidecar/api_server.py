@@ -51,6 +51,7 @@ from models import (
     FigureConfig, PanelInfo, AxisLabel, HeaderLevel, HeaderGroup,
     StyledSegment, save_config, load_config, save_project, load_project,
     _to_dict, _from_dict,
+    DEFAULT_FIGURE_ID, active_figure_id, iter_figures, resolve_figure_config,
 )
 from image_processing import process_panel
 from figure_builder import assemble_figure
@@ -154,7 +155,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.411"  # CI re-syncs this from the release tag (build-sidecar)
+SIDECAR_BUILD = "0.1.412"  # CI re-syncs this from the release tag (build-sidecar)
 
 
 @app.get("/api/version")
@@ -1141,7 +1142,15 @@ class ConfigUpdate(BaseModel):
 @app.put("/api/config")
 def put_config(body: ConfigUpdate):
     global cfg
+    prev = cfg
     cfg = _from_dict(FigureConfig, body.config)
+    # Figure tabs: a caller that PUTs a bare figure config (no `figures`
+    # key — e.g. a sidebar tweak built from the active figure alone) must
+    # not wipe the project's other figures. An explicit `figures: []`
+    # (File > New) does reset them.
+    if "figures" not in body.config:
+        cfg.figures = prev.figures
+        cfg.active_figure_id = prev.active_figure_id
     cfg.ensure_grid()
     return _cfg_json()
 
@@ -1216,6 +1225,44 @@ def patch_background(body: BackgroundUpdate):
     return {"ok": True}
 
 
+# ── Figure-tab helpers ────────────────────────────────────────────────────
+# Parked figures are opaque dicts in cfg.figures (models.FigureConfig.figures);
+# these walk their panel grids without materializing a FigureConfig.
+
+def _parked_figure_panels():
+    """Yield every panel dict of every PARKED figure (the live figure is cfg)."""
+    for entry in (cfg.figures or []):
+        if not isinstance(entry, dict):
+            continue
+        sub = entry.get("config")
+        if not isinstance(sub, dict) or not isinstance(sub.get("panels"), list):
+            continue
+        for row in sub["panels"]:
+            if not isinstance(row, list):
+                continue
+            for p in row:
+                if isinstance(p, dict):
+                    yield p
+
+
+def _parked_figure_image_names() -> set:
+    return {p.get("image_name") for p in _parked_figure_panels() if p.get("image_name")}
+
+
+def _figure_name_suffix() -> str:
+    """Suffix for images generated per PANEL (volume renders), so the same
+    row/col in two figure tabs doesn't overwrite one image. Empty for the
+    project's first figure, so single-figure projects keep today's names."""
+    fid = active_figure_id(cfg)
+    return "" if fid == DEFAULT_FIGURE_ID else f"_{fid}"
+
+
+def _strip_image_from_parked_figures(name: str) -> None:
+    for p in _parked_figure_panels():
+        if p.get("image_name") == name:
+            p["image_name"] = ""
+
+
 # ── Image Endpoints ────────────────────────────────────────────────────────
 
 @app.get("/api/images")
@@ -1226,6 +1273,8 @@ def list_images():
             name = cfg.panels[r][c].image_name
             if name:
                 used.add(name)
+    # …and every parked figure tab of the project.
+    used.update(_parked_figure_image_names())
     # Filter out panel-internal (hidden) images from the timeline listing.
     visible_names = [n for n in loaded_images.keys() if n not in hidden_images]
     return {
@@ -2906,13 +2955,15 @@ def save_canvas_as_panel(body: CanvasAsPanelRequest):
     """
     data = base64.b64decode(body.data_b64)
     img = Image.open(io.BytesIO(data)).convert("RGB")
-    panel_name = f"volume_3d_{body.image_name}_r{body.row}c{body.col}.png"
+    panel_name = f"volume_3d_{body.image_name}_r{body.row}c{body.col}{_figure_name_suffix()}.png"
 
     # If this panel already had a hidden panel-internal image, clean it up so
-    # we don't accumulate stale entries each time the user re-renders.
+    # we don't accumulate stale entries each time the user re-renders —
+    # unless another figure tab still shows it.
     if body.row < cfg.rows and body.col < cfg.cols:
         prev_name = cfg.panels[body.row][body.col].image_name
-        if prev_name and prev_name in hidden_images and prev_name != panel_name:
+        if (prev_name and prev_name in hidden_images and prev_name != panel_name
+                and prev_name not in _parked_figure_image_names()):
             loaded_images.pop(prev_name, None)
             hidden_images.discard(prev_name)
 
@@ -2935,7 +2986,7 @@ def use_volume_as_panel(name: str, body: ZStackVolumeAsPanelRequest):
 
     img = _render_volume_to_pil(name, body)
     # Create a unique image name for this volume render
-    volume_name = f"volume_{name}_r{body.row}c{body.col}_{body.method}.png"
+    volume_name = f"volume_{name}_r{body.row}c{body.col}_{body.method}{_figure_name_suffix()}.png"
     loaded_images[volume_name] = img
     # Assign to panel
     if body.row < cfg.rows and body.col < cfg.cols:
@@ -2981,11 +3032,13 @@ def delete_image(name: str):
             del loaded_zstacks[name]
             zstack_frames.pop(name, None)
             zstack_counts.pop(name, None)
-        # Clear panel assignments
+        # Clear panel assignments — in the live figure and in every parked
+        # figure tab, so no figure keeps pointing at an image that's gone.
         for r in range(cfg.rows):
             for c in range(cfg.cols):
                 if cfg.panels[r][c].image_name == name:
                     cfg.panels[r][c].image_name = ""
+        _strip_image_from_parked_figures(name)
         _recalc_min_dims()
         return {"ok": True}
     raise HTTPException(404, f"Image '{name}' not found")
@@ -3679,8 +3732,9 @@ def _collect_measurements():
 
 @app.get("/api/measurements")
 def get_measurements():
-    """All line/area measurements for the active figure."""
-    return {"measurements": _collect_measurements()}
+    """All line/area measurements of every figure tab of the active document
+    (rows carry figure_id / figure_name when there is more than one)."""
+    return {"measurements": _collect_measurements_all_figures()}
 
 
 # ── Preview Endpoint ───────────────────────────────────────────────────────
@@ -5028,6 +5082,8 @@ _COLLAGE_STASH_DIR = Path.home() / ".multipanelfigure" / "collage_stash"
 
 class CollageFigureRenderRequest(BaseModel):
     project_path: str
+    """Figure tab of the project to render ("" = legacy item → first figure)."""
+    figure_id: str = ""
     """Target visual point size for headers / labels in the collage
     (pre-export-DPI). Pass null to render without any override
     (i.e., as-saved)."""
@@ -5062,6 +5118,7 @@ class CollageFigureRenderRequest(BaseModel):
 
 class CollageFigureElementsRequest(BaseModel):
     project_path: str
+    figure_id: str = ""
 
 
 # Per-process cache of decoded .mpf data, keyed by (absolute path, mtime).
@@ -5293,6 +5350,11 @@ def collage_figure_elements(body: "CollageFigureElementsRequest"):
     if not os.path.isfile(path):
         raise HTTPException(404, f"Project file not found: {path}")
     loaded_cfg, local_images = _load_collage_mpf(path)
+    # Figure tab of the project ("" = a collage item made before figure
+    # tabs → the project's first figure, which is what it showed then).
+    loaded_cfg = resolve_figure_config(loaded_cfg, body.figure_id, legacy_default=True)
+    if loaded_cfg is None:
+        raise HTTPException(404, f"Figure '{body.figure_id}' not found in {path}")
     elements = [
         {"id": e["id"], "type": e["type"], "text": e["text"], "font_size": e["font_size"],
          "font_name": e["font_name"], "color": e["color"],
@@ -5385,6 +5447,11 @@ def render_collage_figure(body: CollageFigureRenderRequest):
     if not os.path.isfile(path):
         raise HTTPException(404, f"Project file not found: {path}")
     loaded_cfg, local_images = _load_collage_mpf(path)
+    # Figure tab of the project ("" = a collage item made before figure
+    # tabs → the project's first figure, which is what it showed then).
+    loaded_cfg = resolve_figure_config(loaded_cfg, body.figure_id, legacy_default=True)
+    if loaded_cfg is None:
+        raise HTTPException(404, f"Figure '{body.figure_id}' not found in {path}")
 
     # Output DPI for the final raster (measurement passes stay at 150 so
     # header sizing is unchanged; raising this only adds pixels).
@@ -5654,6 +5721,7 @@ def convert_collage(body: CollageConvertRequest):
 
 class CollageDecomposeRequest(BaseModel):
     project_path: str
+    figure_id: str = ""
 
 
 @app.post("/api/collage/decompose")
@@ -5683,6 +5751,11 @@ def decompose_collage_figure(body: CollageDecomposeRequest):
     if not os.path.isfile(path):
         raise HTTPException(404, f"Project file not found: {path}")
     loaded_cfg, local_images = _load_collage_mpf(path)
+    # Figure tab of the project ("" = a collage item made before figure
+    # tabs → the project's first figure, which is what it showed then).
+    loaded_cfg = resolve_figure_config(loaded_cfg, body.figure_id, legacy_default=True)
+    if loaded_cfg is None:
+        raise HTTPException(404, f"Figure '{body.figure_id}' not found in {path}")
 
     rows, cols = loaded_cfg.rows, loaded_cfg.cols
     if local_images:
@@ -7242,12 +7315,14 @@ def list_inset_analysis_sources():
     flag is set. The Analysis tab uses this to populate its source
     selector — running a Python pipeline lets the user pick any of
     these regions as the input dataset."""
-    return {"sources": _collect_analysis_insets()}
+    sources, figures = _collect_sources_all_figures()
+    return {"sources": sources, "figures": figures}
 
 
 # Serialises the temporary global-state swap used to collect sources from a
-# non-active .mpf (see below).
-_source_swap_lock = _threading.Lock()
+# non-active .mpf (see below). Re-entrant: a figure-tab swap
+# (_figure_context) nests inside a document swap (_doc_context).
+_source_swap_lock = _threading.RLock()
 
 
 class InsetSourcesForRequest(BaseModel):
@@ -7280,12 +7355,12 @@ def list_inset_sources_for(body: InsetSourcesForRequest):
             loaded_zstacks = {}
             channel_groups = {}
             _recalc_min_dims()
-            sources = _collect_analysis_insets(include_thumbnails=True)
-            measurements = _collect_measurements()
+            sources, figures = _collect_sources_all_figures()
+            measurements = _collect_measurements_all_figures()
         finally:
             (cfg, loaded_images, loaded_videos, video_frames,
              loaded_zstacks, channel_groups, min_dims) = saved
-    return {"sources": sources, "measurements": measurements}
+    return {"sources": sources, "measurements": measurements, "figures": figures}
 
 
 @app.post("/api/analysis/inset-sources-for-doc")
@@ -7309,20 +7384,20 @@ def list_inset_sources_for_doc(body: DocStateRequest):
                  zstack_counts, channel_groups)
         try:
             _apply_doc_state(st)
-            sources = _collect_analysis_insets(include_thumbnails=True)
-            measurements = _collect_measurements()
+            sources, figures = _collect_sources_all_figures()
+            measurements = _collect_measurements_all_figures()
         finally:
             (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
              loaded_videos, video_frames, loaded_zstacks, zstack_frames,
              zstack_counts, channel_groups) = saved
-    return {"sources": sources, "measurements": measurements}
+    return {"sources": sources, "measurements": measurements, "figures": figures}
 
 
 import contextlib as _contextlib
 
 
 @_contextlib.contextmanager
-def _project_context(doc_id="", project_path=""):
+def _doc_context(doc_id="", project_path=""):
     """Temporarily make the global figure state point at a DIFFERENT figure so
     inset extraction (`_extract_source_image` / `_extract_inset_image`, which
     read the module globals) pulls pixels from that figure instead of the
@@ -7382,23 +7457,121 @@ def _project_context(doc_id="", project_path=""):
              loaded_zstacks, channel_groups, min_dims) = saved
 
 
+def _empty_figure_cfg() -> FigureConfig:
+    """A config with no panels. Swapped in for a figure tab that can't be
+    resolved, so row/col extraction finds nothing instead of silently reading
+    the live figure's pixels."""
+    return FigureConfig(rows=0, cols=0, panels=[])
+
+
+@_contextlib.contextmanager
+def _figure_context(figure_id=""):
+    """Temporarily make `cfg` the figure tab `figure_id` of the CURRENT
+    document (see models.resolve_figure_config). No id, or the active
+    figure's id, is a no-op. Images are project-level, so only `cfg` swaps."""
+    global cfg
+    fid = str(figure_id or "").strip()
+    if not fid:
+        yield
+        return
+    with _source_swap_lock:
+        saved = cfg
+        try:
+            sub = resolve_figure_config(cfg, fid)
+            cfg = sub if sub is not None else _empty_figure_cfg()
+            yield
+        finally:
+            cfg = saved
+
+
+@_contextlib.contextmanager
+def _project_context(doc_id="", project_path="", figure_id=""):
+    """Swap the globals to document `doc_id` / `project_path` (see
+    _doc_context) and, inside it, to its figure tab `figure_id`."""
+    with _doc_context(doc_id, project_path):
+        with _figure_context(figure_id):
+            yield
+
+
+def _source_ctx(source):
+    """_project_context for one analysis source descriptor (a dict carrying
+    optional mpf_doc_id / project_path / figure_id)."""
+    s = source if isinstance(source, dict) else {}
+    return _project_context(str(s.get("mpf_doc_id") or ""),
+                            str(s.get("project_path") or ""),
+                            str(s.get("figure_id") or ""))
+
+
+def _for_each_figure(collector):
+    """Run `collector()` once per figure tab of the CURRENT document (cfg
+    swapped to each in turn) and return [(figure_id, figure_name, result)]
+    in tab order. Used to list analysis sources / measurements from every
+    figure of a project, not only the active one."""
+    global cfg
+    out = []
+    with _source_swap_lock:
+        base = cfg
+        try:
+            for fid, fname, is_active in iter_figures(base):
+                sub = base if is_active else resolve_figure_config(base, fid)
+                if sub is None:
+                    continue
+                cfg = sub
+                out.append((fid, fname, collector()))
+        finally:
+            cfg = base
+    return out
+
+
+def _collect_sources_all_figures():
+    """_collect_analysis_insets over every figure tab, each row tagged with
+    figure_id / figure_name. Also returns the figure list for the UI."""
+    rows = []
+    figures = []
+    for fid, fname, srcs in _for_each_figure(lambda: _collect_analysis_insets(include_thumbnails=True)):
+        figures.append({"id": fid, "name": fname})
+        for src in (srcs or []):
+            if isinstance(src, dict):
+                src["figure_id"] = fid
+                src["figure_name"] = fname
+            rows.append(src)
+    return rows, figures
+
+
+def _collect_measurements_all_figures():
+    """_collect_measurements over every figure tab. Rows gain figure_id /
+    figure_name only when the project has more than one figure, so the
+    measurements of a single-figure project stay exactly as before."""
+    per = _for_each_figure(_collect_measurements)
+    multi = len(per) > 1
+    rows = []
+    for fid, fname, ms in per:
+        for m in (ms or []):
+            if multi and isinstance(m, dict):
+                m["figure_id"] = fid
+                m["figure_name"] = fname
+            rows.append(m)
+    return rows
+
+
 def _group_sources_by_project(sources):
     """Stable partition of a source list by their source figure — keyed by
-    (mpf_doc_id, project_path).  Missing both = the active doc (grouped under
-    ('','')) so it extracts with no swap.  Returns an ordered list of
-    (doc_id, project_path, [sources]) so each other figure is swapped in once
-    for all of its sources."""
+    (mpf_doc_id, project_path, figure_id).  Missing all = the active figure
+    of the active doc (grouped under ('','','')) so it extracts with no swap.
+    Returns an ordered list of (doc_id, project_path, figure_id, [sources])
+    so each other figure is swapped in once for all of its sources."""
     order = []
     buckets = {}
     for s in (sources or []):
         did = str(s.get("mpf_doc_id") or "").strip()
         pp = str(s.get("project_path") or "").strip()
-        k = (did, pp)
+        fid = str(s.get("figure_id") or "").strip()
+        k = (did, pp, fid)
         if k not in buckets:
             buckets[k] = []
             order.append(k)
         buckets[k].append(s)
-    return [(k[0], k[1], buckets[k]) for k in order]
+    return [(k[0], k[1], k[2], buckets[k]) for k in order]
 
 
 class WbPreviewRequest(BaseModel):
@@ -7425,7 +7598,8 @@ def wb_preview(body: WbPreviewRequest):
     raw_depth = False
     if body.source:
         try:
-            arr = _extract_source_raw(body.source)
+            with _source_ctx(body.source):
+                arr = _extract_source_raw(body.source)
         except Exception:
             arr = None
         if arr is not None:
@@ -7439,7 +7613,8 @@ def wb_preview(body: WbPreviewRequest):
                 raw_depth = bool(_np.asarray(arr).dtype != _np.uint8)
         if rgb is None:
             try:
-                ex = _extract_source_image(body.source)
+                with _source_ctx(body.source):
+                    ex = _extract_source_image(body.source)
                 if ex is not None:
                     rgb = _np.asarray(ex.convert("RGB")).astype(_np.float32)
                     used_source = True
@@ -7545,7 +7720,8 @@ def wb_detect_bands(body: WbBandDetectRequest):
         # so contrast_scale's percentile stretch operates on the real dynamic
         # range — exactly like the reference script reading the raw TIFF.
         try:
-            arr = _extract_source_raw(body.source)
+            with _source_ctx(body.source):
+                arr = _extract_source_raw(body.source)
         except Exception as _e:
             print(f"[wb-detect] raw extract failed: {_e}", file=__s.stderr, flush=True)
             arr = None
@@ -7564,7 +7740,8 @@ def wb_detect_bands(body: WbBandDetectRequest):
         if rgb is None:
             # Raw unavailable / unsupported geometry → 8-bit display image.
             try:
-                ex = _extract_source_image(body.source)
+                with _source_ctx(body.source):
+                    ex = _extract_source_image(body.source)
                 if ex is not None:
                     rgb = _np.asarray(ex.convert("RGB")).astype(_np.float32)
                     used_source = True
@@ -7872,7 +8049,8 @@ def fluor_preview_segment(body: FluorPreviewRequest):
     rgb = None
     if body.source:
         try:
-            ex = _extract_source_image(body.source)
+            with _source_ctx(body.source):
+                ex = _extract_source_image(body.source)
             if ex is not None:
                 rgb = _np.asarray(ex.convert("RGB")).astype(_np.float32)
         except Exception as _e:
@@ -8496,8 +8674,8 @@ def run_python_pipeline(body: PyAnalysisRequest):
         # Group by source MPF so a workflow mixing insets from TWO different
         # .mpf files extracts each from ITS OWN project (sources with no
         # project_path use the active doc — exactly as before).
-        for _did, _proj, _grp in _group_sources_by_project(sources_in):
-            with _project_context(_did, _proj):
+        for _did, _proj, _fid, _grp in _group_sources_by_project(sources_in):
+            with _project_context(_did, _proj, _fid):
                 for s in _grp:
                     try:
                         _materialise_py_source(s)
@@ -8998,8 +9176,8 @@ def run_cellpose_pipeline(body: CellposeAnalysisRequest):
     images_in: List[Tuple[str, _np.ndarray]] = []
     # Group by source MPF so a workflow mixing insets from two different .mpf
     # files extracts each from its own project (no project_path = active doc).
-    for _did, _proj, _grp in _group_sources_by_project(body.sources or []):
-        with _project_context(_did, _proj):
+    for _did, _proj, _fid, _grp in _group_sources_by_project(body.sources or []):
+        with _project_context(_did, _proj, _fid):
             for s in _grp:
                 try:
                     arr = _extract_source_image(s)  # dispatches: inset / panel / area
@@ -9085,9 +9263,7 @@ def cellpose_preview(body: CellposePreviewRequest):
     arr = None
     if body.source:
         try:
-            _did = str(body.source.get("mpf_doc_id") or "")
-            _proj = str(body.source.get("project_path") or "")
-            with _project_context(_did, _proj):
+            with _source_ctx(body.source):
                 ex = _extract_source_image(body.source)
             if ex is not None:
                 arr = _np.asarray(ex.convert("RGB"))
@@ -9223,7 +9399,8 @@ def run_imagej_pipeline(body: ImageJAnalysisRequest):
             key = str(s.get("key") or "")
             label = str(s.get("label") or key)
             try:
-                arr = _extract_source_image(s)  # dispatches: inset / panel / area
+                with _source_ctx(s):
+                    arr = _extract_source_image(s)  # dispatches: inset / panel / area
                 if arr is None:
                     continue
                 fpath = _os.path.join(out_dir, f"{key}.png")
@@ -9447,7 +9624,8 @@ def run_matlab_pipeline(body: MatlabAnalysisRequest):
                 r = int(s.get("row", -1)); c = int(s.get("col", -1))
                 if not orig or r < 0 or c < 0:
                     continue
-                img = _extract_source_image(s)  # dispatches: inset / panel / area
+                with _source_ctx(s):
+                    img = _extract_source_image(s)  # dispatches: inset / panel / area
                 if img is None:
                     continue
                 arr = _np.asarray(img.convert("RGB"))

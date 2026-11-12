@@ -242,7 +242,7 @@ function CollageSidebar() {
     if (elements[it.id] || elemLoading[it.id]) return;
     setElemLoading((m) => ({ ...m, [it.id]: true }));
     try {
-      const { elements: els } = await api.getFigureElements(it.projectPath!);
+      const { elements: els } = await api.getFigureElements(it.projectPath!, it.figureId);
       setElemList(it.id, els);
     } catch (e) {
       console.error("[collage] load elements failed for", it.name, e);
@@ -307,7 +307,7 @@ function CollageSidebar() {
           let els = useCollageStore.getState().elemListByItem[it.id];
           if (!els) {
             try {
-              const r = await api.getFigureElements(it.projectPath);
+              const r = await api.getFigureElements(it.projectPath, it.figureId);
               setElemList(it.id, r.elements);
               els = r.elements;
             } catch (e) {
@@ -329,7 +329,7 @@ function CollageSidebar() {
         try {
           const resp = await api.renderCollageFigure(
             it.projectPath, applySize ? targetPt : null, Math.max(0.001, scale), it.w, elementIds,
-            overrides as Record<string, unknown> | null,
+            overrides as Record<string, unknown> | null, undefined, it.figureId,
           );
           if (resp?.image && resp.width && resp.height) {
             const newAspect = resp.width / resp.height;

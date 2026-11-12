@@ -409,6 +409,27 @@ export interface FigureConfig {
   image_groups?: ImageGroup[];
   show_column_labels?: boolean;
   show_row_labels?: boolean;
+  /** Every figure of the project in tab order (see utils/figures.ts). The
+   *  ACTIVE figure's entry has no `config` — its config is this object's
+   *  top level. Absent on projects saved before figure tabs, which load as
+   *  one figure. Stored opaquely by the sidecar. */
+  figures?: unknown;
+  /** Id of the figure whose config is this object's top level. */
+  active_figure_id?: string;
+}
+
+/** One figure tab of a project. Every figure shares the project's uploaded
+ *  images and image groups; everything else in FigureConfig is per-figure. */
+export interface FigureTab {
+  /** Unique within the project. Letters, digits and "-" only — it is
+   *  embedded in analysis runtime keys and file names. */
+  id: string;
+  name: string;
+  /** The figure's parked config; null for the ACTIVE figure, whose config
+   *  lives in the store's `config`. */
+  config: FigureConfig | null;
+  /** Unknown keys from newer builds round-trip untouched. */
+  [k: string]: unknown;
 }
 
 // ── API response types ───────────────────────────────────

@@ -69,8 +69,29 @@ async function getInvoke() {
   return _invoke;
 }
 
+/** In-flight writes to the live figure config (PUT/PATCH /api/config…).
+ *  A figure-tab switch waits for these first, so a late fire-and-forget
+ *  patch of the outgoing figure can't land in the incoming figure's cells. */
+const pendingConfigWrites = new Set<Promise<unknown>>();
+
+/** Resolves once every config write in flight right now has settled. */
+export async function settleConfigWrites(): Promise<void> {
+  await Promise.allSettled([...pendingConfigWrites]);
+}
+
 /** Make an API request — uses Tauri proxy if available, else browser fetch */
 async function apiRequest(path: string, method: string = "GET", body?: string): Promise<string> {
+  if (method !== "GET" && (path.startsWith("/api/config") || path.startsWith("/api/panel-patch-preview"))) {
+    const p = apiRequestRaw(path, method, body);
+    pendingConfigWrites.add(p);
+    const done = () => { pendingConfigWrites.delete(p); };
+    p.then(done, done);
+    return p;
+  }
+  return apiRequestRaw(path, method, body);
+}
+
+async function apiRequestRaw(path: string, method: string, body?: string): Promise<string> {
   const invoke = await getInvoke();
   if (invoke) {
     // Use Rust-side proxy to bypass WebView restrictions
@@ -499,9 +520,12 @@ class ApiClient {
     elementIds?: string[] | null,
     elementOverrides?: Record<string, unknown> | null,
     dpi?: number,
+    /** Figure tab of the project; omitted = a legacy item → first figure. */
+    figureId?: string,
   ): Promise<{ image: string; width: number; height: number }> {
     return apiJson("/api/collage/render-figure", "POST", JSON.stringify({
       project_path: projectPath,
+      figure_id: figureId ?? "",
       header_pt: headerPt,
       scale,
       item_w: itemW ?? null,
@@ -556,12 +580,14 @@ class ApiClient {
    *  element's geometry (for on-figure hotspots) and current style. */
   async getFigureElements(
     projectPath: string,
+    figureId?: string,
   ): Promise<{ elements: Array<import("../store/collageStore").CollageFigElement & {
     font_name?: string | null; color?: string | null;
     font_style?: string[]; styled_segments?: import("./types").StyledSegment[];
   }> }> {
     return apiJson("/api/collage/figure-elements", "POST", JSON.stringify({
       project_path: projectPath,
+      figure_id: figureId ?? "",
     }));
   }
 
@@ -571,6 +597,7 @@ class ApiClient {
    *  instantly without re-rendering the figure through matplotlib. */
   async decomposeCollageFigure(
     projectPath: string,
+    figureId?: string,
   ): Promise<{
     image: string;
     width: number;
@@ -579,6 +606,7 @@ class ApiClient {
   }> {
     return apiJson("/api/collage/decompose", "POST", JSON.stringify({
       project_path: projectPath,
+      figure_id: figureId ?? "",
     }));
   }
 
@@ -593,6 +621,8 @@ class ApiClient {
     panel: string; name: string; type: string; value: string;
     numeric?: number; unit?: string; custom_scale?: boolean;
     annotation?: string; ann_index?: number; reading_index?: number | null;
+    /** Set when the project has more than one figure tab. */
+    figure_id?: string; figure_name?: string;
   }> }> {
     return apiJson("/api/measurements");
   }
@@ -712,7 +742,12 @@ class ApiClient {
       natural_height: number;
       /** Base64 PNG (no data: prefix). Up to 256 px on the long edge. */
       thumbnail: string;
+      /** Figure tab the source belongs to. */
+      figure_id?: string;
+      figure_name?: string;
     }>;
+    /** Every figure tab of the project, in tab order. */
+    figures?: Array<{ id: string; name: string }>;
   }> {
     return apiJson("/api/analysis/inset-sources");
   }
@@ -722,6 +757,7 @@ class ApiClient {
   async listInsetAnalysisSourcesFor(projectPath: string): Promise<{
     sources: Array<Record<string, unknown>>;
     measurements?: Array<Record<string, unknown>>;
+    figures?: Array<{ id: string; name: string }>;
   }> {
     return apiJson("/api/analysis/inset-sources-for", "POST", JSON.stringify({ project_path: projectPath }));
   }
@@ -733,6 +769,7 @@ class ApiClient {
   async listInsetAnalysisSourcesForDoc(docId: string): Promise<{
     sources: Array<Record<string, unknown>>;
     measurements?: Array<Record<string, unknown>>;
+    figures?: Array<{ id: string; name: string }>;
   }> {
     return apiJson("/api/analysis/inset-sources-for-doc", "POST", JSON.stringify({ doc_id: docId }));
   }

@@ -126,6 +126,11 @@ export type CollageItem = {
    *  editor. Doubles as a uniqueness key — a single .mpf can appear
    *  at most once in the collage. Null for image-kind items. */
   projectPath: string | null;
+  /** Figure tab of that .mpf this item shows (utils/figures.ts). Absent on
+   *  items added before figure tabs = the project's first figure, which is
+   *  the only figure such a project had. With projectPath it is the item's
+   *  uniqueness key: one collage item per (.mpf, figure). */
+  figureId?: string;
   /** True when this item was an analysis plot moved here from the
    *  Analysis dialog. The collage builder doesn't yet save to disk,
    *  so on app-close we warn the user to download any such plots. */

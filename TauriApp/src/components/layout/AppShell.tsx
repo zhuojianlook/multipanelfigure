@@ -10,6 +10,7 @@ import { useCollageStore } from "../../store/collageStore";
 import { Sidebar } from "./Sidebar";
 import { Toolbar } from "./Toolbar";
 import { DocumentTabs } from "./DocumentTabs";
+import { FigureTabs } from "./FigureTabs";
 import { ImageStrip } from "../image-strip/ImageStrip";
 import { PanelGrid } from "../grid/PanelGrid";
 import { PreviewPane } from "../preview/PreviewPane";
@@ -41,6 +42,10 @@ function CenterPane({
     <>
       {/* Image strip */}
       <ImageStrip />
+
+      {/* Figure tabs of this document — directly under the groups, since
+          every figure uses the images above. */}
+      <FigureTabs />
 
       {/* Horizontal splitter: grid (left) | divider | preview (right) */}
       <div className="flex flex-1 min-h-0 min-w-0 relative">

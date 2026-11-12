@@ -13,8 +13,9 @@ import type {
   HeaderGroup,
   PanelInfo,
   ImageGroup,
+  FigureTab,
 } from "../api/types";
-import { api, checkHealth, lastHealthError } from "../api/client";
+import { api, checkHealth, lastHealthError, settleConfigWrites } from "../api/client";
 import { niceScaleBarUm } from "../utils/scaleBarRounding";
 import {
   normalizeImageGroups,
@@ -26,6 +27,19 @@ import {
   deleteDividerFromGroup,
   type SectionTarget,
 } from "../utils/imageGroups";
+import {
+  DEFAULT_FIGURE_ID,
+  normalizeFigures,
+  serializeFigures,
+  switchActiveFigure,
+  addFigure as addFigureState,
+  duplicateFigure as duplicateFigureState,
+  deleteFigure as deleteFigureState,
+  renameFigure as renameFigureList,
+  moveFigure as moveFigureList,
+  stripImageFromFigures,
+  type FiguresState,
+} from "../utils/figures";
 
 // ── Loaded image metadata kept client-side ───────────────
 
@@ -61,6 +75,10 @@ interface FigureState {
   drawerPanels: PanelInfo[];
   drawerThumbnails: Record<number, string>;  // drawerIdx → processed base64 PNG
   imageGroups: ImageGroup[];
+  /** Figure tabs of the project (utils/figures.ts). `config` is always the
+   *  ACTIVE figure; the others are parked in `figures`. */
+  figures: FigureTab[];
+  activeFigureId: string;
   pendingUploads: string[];  // filenames currently being uploaded/processed
 
   // ── actions ────────────────────────────────────────────
@@ -194,6 +212,17 @@ interface FigureState {
    *  a page reload and without touching the collage. Deletes loaded
    *  images on the backend, resets cfg, clears the project path. */
   newBlankFigure: () => Promise<void>;
+
+  // ── Figure tabs ── Call these through utils/projectNav (switchFigure,
+  // addFigure, …), which serializes them with document switch/save/open.
+  _switchFigure: (id: string) => Promise<boolean>;
+  _addFigure: (opts?: { name?: string }) => Promise<void>;
+  _duplicateFigure: (id: string) => Promise<void>;
+  _deleteFigure: (id: string) => Promise<void>;
+  _renameFigure: (id: string, name: string) => Promise<void>;
+  _moveFigure: (id: string, dir: -1 | 1) => Promise<void>;
+  /** Commit a figure-tab state computed by utils/figures (internal). */
+  _applyFigureState: (next: FiguresState, opts: { dirty: boolean }) => Promise<void>;
   saveFigure: (path: string, format?: string, background?: string, dpi?: number) => Promise<void>;
 
   // Check if reducing grid would lose images
@@ -480,6 +509,32 @@ const PREVIEW_MAX_RETRIES = 4;
 // scan can exceed the initial window), cleared once it recovers.
 let backendRecoveryActive = false;
 
+/** A config as held in the store: the figure-list keys are dropped (the
+ *  store's `figures` / `activeFigureId` are their source of truth), so a
+ *  caller that PUTs `{...config}` directly can never resend a stale list —
+ *  the sidecar keeps its own copy when `figures` is absent. */
+function withoutFigureKeys(cfg: FigureConfig): FigureConfig {
+  if (!("figures" in cfg) && !("active_figure_id" in cfg)) return cfg;
+  const { figures: _f, active_figure_id: _a, ...rest } = cfg;
+  return rest as FigureConfig;
+}
+
+/** Store fields for a config fresh from the backend (load / restore /
+ *  fetch): the active figure's config plus the project's figure tabs. */
+function docFigureFields(cfg: FigureConfig): { config: FigureConfig; figures: FigureTab[]; activeFigureId: string } {
+  const { figures, activeFigureId } = normalizeFigures(cfg.figures, cfg.active_figure_id);
+  return { config: withoutFigureKeys(cfg), figures, activeFigureId };
+}
+
+function defaultFigureTabs(): FigureTab[] {
+  return [{ id: DEFAULT_FIGURE_ID, name: "Figure 1", config: null }];
+}
+
+/** The figure-tab slice of the store, for the pure helpers. */
+function figuresStateOf(s: { config: FigureConfig | null; figures: FigureTab[]; activeFigureId: string }): FiguresState | null {
+  return s.config ? { config: s.config, figures: s.figures, activeFigureId: s.activeFigureId } : null;
+}
+
 // ── Store ────────────────────────────────────────────────
 
 export const useFigureStore = create<FigureState>()(
@@ -498,6 +553,8 @@ export const useFigureStore = create<FigureState>()(
     drawerPanels: [],
     drawerThumbnails: {},
     imageGroups: [],
+    figures: defaultFigureTabs(),
+    activeFigureId: DEFAULT_FIGURE_ID,
     pendingUploads: [],
 
     // ── Fetch initial state from backend ──────────────────
@@ -540,7 +597,14 @@ export const useFigureStore = create<FigureState>()(
               // Recovered — load config + assets and clear the error.
               try {
                 const cfg = await api.getConfig();
-                set((s) => { s.config = cfg; s.apiError = null; });
+                const doc = docFigureFields(cfg);
+                set((s) => {
+                  s.config = doc.config;
+                  s.figures = doc.figures;
+                  s.activeFigureId = doc.activeFigureId;
+                  s.imageGroups = normalizeImageGroups(cfg.image_groups);
+                  s.apiError = null;
+                });
               } catch {
                 set((s) => { s.apiError = null; });
               }
@@ -556,8 +620,15 @@ export const useFigureStore = create<FigureState>()(
       }
       try {
         const cfg = await api.getConfig();
+        // Re-hydrate the project-level state the backend still holds (it
+        // outlives a webview reload): without this the first sync after a
+        // reload would wipe the parked figure tabs and the image groups.
+        const doc = docFigureFields(cfg);
         set((s) => {
-          s.config = cfg;
+          s.config = doc.config;
+          s.figures = doc.figures;
+          s.activeFigureId = doc.activeFigureId;
+          s.imageGroups = normalizeImageGroups(cfg.image_groups);
           s.apiError = null;
         });
       } catch (err) {
@@ -619,7 +690,7 @@ export const useFigureStore = create<FigureState>()(
 
     setConfig: (cfg) => {
       set((s) => {
-        s.config = cfg;
+        s.config = withoutFigureKeys(cfg);
         s.configDirty = true; s.unsaved = true;
       });
       get().syncToBackend();
@@ -652,7 +723,7 @@ export const useFigureStore = create<FigureState>()(
         // up-to-date letters.
         _renumberAllAutoLetters(cfg as unknown as Parameters<typeof _renumberAllAutoLetters>[0]);
         set((s) => {
-          s.config = cfg;
+          s.config = withoutFigureKeys(cfg);
           s.panelThumbnails = {};
           s.configDirty = true; s.unsaved = true;
         });
@@ -1677,6 +1748,8 @@ export const useFigureStore = create<FigureState>()(
           // no divider keeps listing an image the project no longer has. The
           // helper is immutable, so feed it the committed (non-draft) state.
           s.imageGroups = stripImageFromGroups(get().imageGroups, name);
+          // …and from every parked figure tab (the backend did the same).
+          s.figures = stripImageFromFigures(get().figures, name);
           if (s.config) {
             for (let r = 0; r < s.config.rows; r++) {
               for (let c = 0; c < s.config.cols; c++) {
@@ -1851,9 +1924,16 @@ export const useFigureStore = create<FigureState>()(
       const cfg = get().config;
       if (!cfg) return;
       try {
-        // Carry the user-defined image groups along with the config so they're
-        // serialized into the .mpf on save and captured in tab snapshots.
-        await api.updateConfig({ ...cfg, image_groups: get().imageGroups });
+        // Carry the project-level state along with the active figure's config
+        // — the image groups and every figure tab — so it is serialized into
+        // the .mpf on save and captured in document-tab snapshots.
+        const { imageGroups, figures, activeFigureId } = get();
+        await api.updateConfig({
+          ...cfg,
+          image_groups: imageGroups,
+          figures: serializeFigures(figures, activeFigureId),
+          active_figure_id: activeFigureId,
+        });
       } catch (err) {
         console.error("Sync failed", err);
       }
@@ -1905,6 +1985,8 @@ export const useFigureStore = create<FigureState>()(
         s.loadedImages = {};
         s.panelThumbnails = {};
         s.imageGroups = [];
+        s.figures = defaultFigureTabs();
+        s.activeFigureId = DEFAULT_FIGURE_ID;
         s.currentProjectPath = null;
         s.configDirty = false;
         s.unsaved = false;
@@ -1916,8 +1998,11 @@ export const useFigureStore = create<FigureState>()(
     loadProject: async (path) => {
       try {
         const resp = await api.loadProject(path);
+        const doc = docFigureFields(resp.config);
         set((s) => {
-          s.config = resp.config;
+          s.config = doc.config;
+          s.figures = doc.figures;
+          s.activeFigureId = doc.activeFigureId;
           s.loadedImages = {};
           s.panelThumbnails = {};
           for (const name of resp.image_names) {
@@ -1981,8 +2066,11 @@ export const useFigureStore = create<FigureState>()(
       // a single global, not yet per-document). The restored doc is marked
       // unsaved because a snapshot is only ever taken for a dirty tab.
       const resp = await api.restoreProject(blob);
+      const doc = docFigureFields(resp.config);
       set((s) => {
-        s.config = resp.config;
+        s.config = doc.config;
+        s.figures = doc.figures;
+        s.activeFigureId = doc.activeFigureId;
         s.loadedImages = {};
         s.panelThumbnails = {};
         for (const name of resp.image_names) {
@@ -2015,8 +2103,11 @@ export const useFigureStore = create<FigureState>()(
       // (no image re-encode/decode). Apply the returned config + thumbnails
       // exactly like restoreDoc. Throws (404) if the cache entry is gone.
       const resp = await api.activateState(docId);
+      const doc = docFigureFields(resp.config);
       set((s) => {
-        s.config = resp.config;
+        s.config = doc.config;
+        s.figures = doc.figures;
+        s.activeFigureId = doc.activeFigureId;
         s.loadedImages = {};
         s.panelThumbnails = {};
         for (const name of resp.image_names) {
@@ -2039,6 +2130,98 @@ export const useFigureStore = create<FigureState>()(
           }
         }
       }
+    },
+
+    // ── Figure tabs ──────────────────────────────────────
+
+    _applyFigureState: async (next, opts) => {
+      const switched = next.activeFigureId !== get().activeFigureId;
+      if (switched) {
+        // Writes for the OUTGOING figure must land before the incoming one
+        // becomes the backend's live config. Deferred header/label edits are
+        // already in `config` (parked with it below), so a pending debounce
+        // is dropped rather than fired after the switch.
+        get().flushHeaderEdits();
+        if (syncTimer) { clearTimeout(syncTimer); syncTimer = null; }
+        await settleConfigWrites();
+      }
+      set((s) => {
+        s.config = next.config;
+        s.figures = next.figures;
+        s.activeFigureId = next.activeFigureId;
+        if (opts.dirty) s.unsaved = true;
+        if (switched) {
+          // Per-cell caches belong to the outgoing figure's grid.
+          s.panelThumbnails = {};
+          s.panelProcessedSizes = {};
+          s.previewImageB64 = null;
+          s.configDirty = false;
+        }
+      });
+      await get().syncToBackend();
+      if (switched) {
+        get().requestPreview();
+        const cfg = get().config;
+        if (cfg) {
+          for (let r = 0; r < cfg.rows; r++) {
+            for (let c = 0; c < cfg.cols; c++) {
+              if (cfg.panels[r]?.[c]?.image_name) {
+                get().refreshPanelThumbnail(r, c).catch(console.error);
+              }
+            }
+          }
+        }
+      }
+    },
+
+    _switchFigure: async (id) => {
+      const cur = figuresStateOf(get());
+      if (!cur || id === cur.activeFigureId) return false;
+      const next = switchActiveFigure(cur, id);
+      if (next === cur) return false;
+      // A switch changes which figure the .mpf opens on, not its content —
+      // it does not mark the document unsaved.
+      await get()._applyFigureState(next, { dirty: false });
+      return true;
+    },
+
+    _addFigure: async (opts) => {
+      const cur = figuresStateOf(get());
+      if (!cur) return;
+      const next = addFigureState(cur, { config: buildDefaultConfig(2, 2), name: opts?.name });
+      await get()._applyFigureState(next, { dirty: true });
+    },
+
+    _duplicateFigure: async (id) => {
+      const cur = figuresStateOf(get());
+      if (!cur) return;
+      const next = duplicateFigureState(cur, id);
+      if (next === cur) return;
+      await get()._applyFigureState(next, { dirty: true });
+    },
+
+    _deleteFigure: async (id) => {
+      const cur = figuresStateOf(get());
+      if (!cur) return;
+      const next = deleteFigureState(cur, id);
+      if (next === cur) return;
+      await get()._applyFigureState(next, { dirty: true });
+    },
+
+    _renameFigure: async (id, name) => {
+      const cur = figuresStateOf(get());
+      if (!cur) return;
+      const figures = renameFigureList(cur.figures, id, name);
+      if (figures === cur.figures) return;
+      await get()._applyFigureState({ ...cur, figures }, { dirty: true });
+    },
+
+    _moveFigure: async (id, dir) => {
+      const cur = figuresStateOf(get());
+      if (!cur) return;
+      const figures = moveFigureList(cur.figures, id, dir);
+      if (figures === cur.figures) return;
+      await get()._applyFigureState({ ...cur, figures }, { dirty: true });
     },
 
     saveFigure: async (path, format = "TIFF", background?: string, dpi = 300) => {

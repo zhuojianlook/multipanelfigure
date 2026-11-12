@@ -511,7 +511,7 @@ export function CollageView() {
     try {
       const resp = await api.renderCollageFigure(
         it.projectPath, pt ?? null, Math.max(0.001, scale), it.w, elementIds,
-        overrides as Record<string, unknown> | null,
+        overrides as Record<string, unknown> | null, undefined, it.figureId,
       );
       if (resp?.image && resp.width && resp.height) {
         updateItem(itemId, {
@@ -538,7 +538,7 @@ export function CollageView() {
     if (it && it.kind === "figure" && it.projectPath) {
       setElemSyncItem(it.id);
       if (!elemListByItem[it.id]) {
-        api.getFigureElements(it.projectPath)
+        api.getFigureElements(it.projectPath, it.figureId)
           .then(({ elements }) => setElemList(it.id, elements))
           .catch((e) => console.error("[collage] load elements (select) failed", e));
       }

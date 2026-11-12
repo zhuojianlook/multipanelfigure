@@ -100,7 +100,11 @@ export interface BandPickerImage {
   id: string;
   label: string;
   image_b64: string;
-  source?: { key: string; name?: string; row?: number; col?: number; inset_index?: number };
+  source?: {
+    key: string; name?: string; row?: number; col?: number; inset_index?: number;
+    /** Document / figure-tab provenance (absent = the live figure). */
+    mpf_doc_id?: string; project_path?: string; figure_id?: string;
+  };
 }
 
 export interface BandPickerConfig {

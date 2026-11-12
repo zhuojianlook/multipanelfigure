@@ -608,6 +608,16 @@ class FigureConfig:
     # files without this default to no groups.
     image_groups: List[dict] = field(default_factory=list)
 
+    # Figure tabs: several figures built from this project's images. Stored
+    # OPAQUELY as the frontend's shape [{id, name, config?}, ...] in tab
+    # order (see src/utils/figures.ts). The top-level fields of this config
+    # are always the ACTIVE figure (`active_figure_id`), whose entry carries
+    # no `config`; every other entry holds its full parked config. Empty on
+    # projects saved before figure tabs (= one figure, DEFAULT_FIGURE_ID).
+    # Builds that predate this ignore both keys and show the active figure.
+    figures: List[dict] = field(default_factory=list)
+    active_figure_id: str = ""
+
     # Show primary labels toggle
     show_column_labels: bool = True
     show_row_labels: bool = True
@@ -918,6 +928,7 @@ _FIELD_TYPE_MAP = {
     'scale_definitions': ('list', ScaleDefinition),
     'parked_panels': ('list', ParkedPanel),
     'image_groups': ('plain', None),  # opaque list of {id,name,imageNames}
+    'figures': ('plain', None),  # opaque list of {id,name,config?} figure tabs
     'panel': ('dataclass', PanelInfo),
     'measure_font_style': ('plain', None),
     'label_font_path': ('plain', None),
@@ -967,6 +978,98 @@ def _from_dict(cls, d):
         else:
             kwargs[k] = v
     return cls(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Figure tabs (several figures per project; see FigureConfig.figures)
+# ---------------------------------------------------------------------------
+DEFAULT_FIGURE_ID = "fig-1"
+
+# Keys that belong to the PROJECT, not to one figure: a non-active figure is
+# materialized with the live config's values for these.
+SHARED_FIGURE_KEYS = ("resolution_entries", "scale_definitions", "image_groups")
+
+
+def _usable_figure_config(v) -> bool:
+    return (isinstance(v, dict) and isinstance(v.get("rows"), int)
+            and isinstance(v.get("cols"), int) and isinstance(v.get("panels"), list))
+
+
+def _figure_entries(base: "FigureConfig") -> List[dict]:
+    figs = base.figures if isinstance(base.figures, list) else []
+    return [f for f in figs if isinstance(f, dict) and isinstance(f.get("id"), str) and f.get("id")]
+
+
+def active_figure_id(base: "FigureConfig") -> str:
+    """Id of the figure whose config is `base`'s top level."""
+    entries = _figure_entries(base)
+    if not entries:
+        return DEFAULT_FIGURE_ID
+    ids = [e["id"] for e in entries]
+    if base.active_figure_id in ids:
+        return base.active_figure_id
+    for e in entries:
+        if not _usable_figure_config(e.get("config")):
+            return e["id"]
+    return base.active_figure_id or DEFAULT_FIGURE_ID
+
+
+def iter_figures(base: "FigureConfig") -> List[Tuple[str, str, bool]]:
+    """[(figure_id, name, is_active)] in tab order. A project saved before
+    figure tabs is one active figure, DEFAULT_FIGURE_ID."""
+    entries = _figure_entries(base)
+    active = active_figure_id(base)
+    if not entries:
+        return [(DEFAULT_FIGURE_ID, "Figure 1", True)]
+    out = []
+    for e in entries:
+        fid = e["id"]
+        is_active = fid == active
+        if not is_active and not _usable_figure_config(e.get("config")):
+            continue
+        name = e.get("name") if isinstance(e.get("name"), str) and e.get("name") else fid
+        out.append((fid, name, is_active))
+    if not any(a for _, _, a in out):
+        out.insert(0, (active, "Figure", True))
+    return out
+
+
+def resolve_figure_config(base: "FigureConfig", figure_id: Optional[str],
+                          legacy_default: bool = False) -> Optional["FigureConfig"]:
+    """The config of figure `figure_id` of the project whose live config is
+    `base`.
+
+    - "" / None: `base` itself (today's behaviour, so a caller that sends no
+      figure id keeps reading the live figure) — unless `legacy_default`,
+      which targets DEFAULT_FIGURE_ID (else the first figure). Collage items
+      saved before figure tabs use that, so they keep showing the figure
+      they were made from.
+    - The active figure's id: `base`.
+    - A parked figure: a fresh FigureConfig built from its stored config,
+      carrying `base`'s project-shared keys.
+    - Unknown id / unusable config: None. Callers must NOT fall back to the
+      live figure — that would silently read the wrong figure's pixels.
+    """
+    import copy as _copy
+    fid = (figure_id or "").strip()
+    entries = _figure_entries(base)
+    if not fid:
+        if not legacy_default or not entries:
+            return base
+        ids = [e["id"] for e in entries]
+        fid = DEFAULT_FIGURE_ID if DEFAULT_FIGURE_ID in ids else ids[0]
+    if fid == active_figure_id(base):
+        return base
+    entry = next((e for e in entries if e["id"] == fid), None)
+    if entry is None or not _usable_figure_config(entry.get("config")):
+        return None
+    sub = _from_dict(FigureConfig, _copy.deepcopy(entry["config"]))
+    for k in SHARED_FIGURE_KEYS:
+        setattr(sub, k, getattr(base, k))
+    sub.figures = []
+    sub.active_figure_id = ""
+    sub.ensure_grid()
+    return sub
 
 
 def load_config(path: str) -> FigureConfig:

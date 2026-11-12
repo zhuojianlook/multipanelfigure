@@ -179,6 +179,7 @@ import { useFigureStore } from "../../store/figureStore";
 import { SaveFigureDialog } from "../dialogs/SaveFigureDialog";
 import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 import { ensureProjectSaved } from "../../utils/projectNav";
+import { DEFAULT_FIGURE_ID } from "../../utils/figures";
 
 /** CRC-32 (PNG polynomial) over a byte array — used to checksum the pHYs
  *  chunk we splice into the exported PNG. */
@@ -586,7 +587,7 @@ function SaveCollageButton() {
           const dpi = Math.max(200, Math.min(1200, Math.round(150 * (it.w * factor * SS) / Math.max(1, it.naturalW))));
           const resp = await api.renderCollageFigure(
             it.projectPath, pt ?? null, Math.max(0.001, scale), it.w, elementIds,
-            overrides as Record<string, unknown> | null, dpi,
+            overrides as Record<string, unknown> | null, dpi, it.figureId,
           );
           if (resp?.image) hiRes.set(it.id, `data:image/png;base64,${resp.image}`);
         } catch (e) {
@@ -1100,10 +1101,13 @@ function CollageWorkspaceControls() {
     }
     if (!projectPath) return; // user cancelled the save dialog
 
-    // Uniqueness check — the same .mpf can appear at most once in a
-    // collage. If a duplicate exists, offer to refresh that item
-    // (re-render with the latest state) instead of adding a second.
-    const existing = useCollageStore.getState().items.find((i) => i.projectPath === projectPath);
+    // Uniqueness check — each figure tab of an .mpf can appear at most once
+    // in a collage. If a duplicate exists, offer to refresh that item
+    // (re-render with the latest state) instead of adding a second. Items
+    // added before figure tabs carry no figureId = the first figure.
+    const { activeFigureId, figures } = useFigureStore.getState();
+    const existing = useCollageStore.getState().items.find((i) =>
+      i.projectPath === projectPath && (i.figureId ?? DEFAULT_FIGURE_ID) === activeFigureId);
 
     try {
       // Capture the figure as a baked raster (headers included), exactly
@@ -1144,10 +1148,14 @@ function CollageWorkspaceControls() {
       const w = aspect >= 1 ? targetMax : targetMax * aspect;
       const h = aspect >= 1 ? targetMax / aspect : targetMax;
       const offset = itemCount * 24;
+      const fileName = projectPath.split("/").pop()?.replace(/\.mpf$/i, "") || `Figure ${itemCount + 1}`;
+      const figureName = figures.find((f) => f.id === activeFigureId)?.name;
       addItem({
         kind: "figure",
         src: `data:image/png;base64,${resp.image}`,
-        name: projectPath.split("/").pop()?.replace(/\.mpf$/i, "") || `Figure ${itemCount + 1}`,
+        // Several figures can come from one .mpf — name the figure too.
+        name: figures.length > 1 && figureName ? `${fileName} – ${figureName}` : fileName,
+        figureId: activeFigureId,
         x: 40 + offset,
         y: 40 + offset,
         w,
@@ -1385,6 +1393,9 @@ export function Toolbar() {
                 ] as never,
                 column_headers: [], row_headers: [],
                 resolution_entries: savedScales, dpi: 300,
+                // A fresh project has one figure and no groups. Explicit
+                // keys: a PUT without `figures` keeps the old project's tabs.
+                figures: [], active_figure_id: "", image_groups: [],
               });
               // Delete all loaded images
               const imgs = await api.listImages();

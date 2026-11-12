@@ -156,6 +156,11 @@ export interface FluorImageSource {
   inset_index?: number;
   /** Optional human label. */
   name?: string;
+  /** Which document / figure tab the source lives in, so the sidecar
+   *  extracts it from THAT figure (absent = the live figure). */
+  mpf_doc_id?: string;
+  project_path?: string;
+  figure_id?: string;
 }
 
 export interface FluorPickerImage {
@@ -1661,10 +1666,9 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
         try {
           const body: Record<string, unknown> = {
             image_b64: img.image_b64 || "",
-            source: img.source ? {
-              key: img.source.key, row: img.source.row, col: img.source.col,
-              inset_index: img.source.inset_index, name: img.source.name,
-            } : undefined,
+            // Whole descriptor, so the doc / figure-tab provenance reaches the
+            // sidecar (it extracts from that figure, not the live one).
+            source: img.source ? { ...img.source } : undefined,
             strategy: "simple",   // ignored — composite_only short-circuits
             preview_max_w: 1024,
             composite_only: true,
@@ -1758,15 +1762,7 @@ export default function IntensityPickerDialog(props: IntensityPickerDialogProps)
     try {
       const body: Record<string, unknown> = {
         image_b64: img.image_b64 || "",
-        source: img.source
-          ? {
-              key: img.source.key,
-              row: img.source.row,
-              col: img.source.col,
-              inset_index: img.source.inset_index,
-              name: img.source.name,
-            }
-          : undefined,
+        source: img.source ? { ...img.source } : undefined,
         strategy: cfg.mode,
         rolling_radius: cfg.rollingRadius,
         preview_max_w: 1024,

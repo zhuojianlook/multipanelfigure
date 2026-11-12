@@ -559,3 +559,37 @@ async function closeDocImpl(docId: string): Promise<boolean> {
 export function closeDoc(docId: string): Promise<boolean> {
   return serializeDocOp(() => closeDocImpl(docId));
 }
+
+/* ── Figure tabs (several figures inside ONE document) ──────────────────
+   Each op swaps the backend's live config (switch/add/duplicate/delete PUT
+   a different figure), so it joins the same queue as document switch, save,
+   open and close: a figure switch can never interleave with a stash or a
+   save of the document it belongs to. */
+
+/** Make figure `figureId` of the active document the one being edited. */
+export function switchFigure(figureId: string): Promise<boolean> {
+  return serializeDocOp(() => useFigureStore.getState()._switchFigure(figureId));
+}
+
+/** Add a blank figure tab to the active document and switch to it. */
+export function addFigure(name?: string): Promise<void> {
+  return serializeDocOp(() => useFigureStore.getState()._addFigure({ name }));
+}
+
+/** Copy figure `figureId` into a new tab next to it and switch to the copy. */
+export function duplicateFigure(figureId: string): Promise<void> {
+  return serializeDocOp(() => useFigureStore.getState()._duplicateFigure(figureId));
+}
+
+/** Remove figure `figureId` (never the last one). */
+export function deleteFigure(figureId: string): Promise<void> {
+  return serializeDocOp(() => useFigureStore.getState()._deleteFigure(figureId));
+}
+
+export function renameFigure(figureId: string, name: string): Promise<void> {
+  return serializeDocOp(() => useFigureStore.getState()._renameFigure(figureId, name));
+}
+
+export function moveFigure(figureId: string, dir: -1 | 1): Promise<void> {
+  return serializeDocOp(() => useFigureStore.getState()._moveFigure(figureId, dir));
+}

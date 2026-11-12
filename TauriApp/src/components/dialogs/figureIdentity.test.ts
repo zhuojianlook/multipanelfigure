@@ -6,7 +6,7 @@
 import { describe, it, expect } from "vitest";
 import {
   figKey, rawKeyOf, nsKey, figureLabels, migrateLegacySource, measArrToCsv,
-  runtimeKeyFor,
+  runtimeKeyFor, sourceProvenance, measRowKey,
   type InsetSource,
 } from "./AnalysisNodeGraph";
 
@@ -216,5 +216,75 @@ describe("measArrToCsv — figure attribution", () => {
 
   it("emits a header-only table for no rows", () => {
     expect(measArrToCsv([], "fig1")).toBe(`${measArrToCsv([], "").split("\n")[0]}\n`);
+  });
+});
+
+/* Figure tabs: one .mpf can hold several figures built from the same images.
+ * Sources saved before figure tabs carry no figure id and must keep binding to
+ * the project's first figure ("fig-1"), the only figure such a project had. */
+describe("figure tabs inside one document", () => {
+  const A = doc("d1", "A", "/exp/A.mpf");
+  const B = doc("d2", "B", "/exp/B.mpf");
+
+  it("figKey: the first figure keeps the legacy key; other tabs append their id", () => {
+    expect(figKey(A, "fig-1")).toBe(figKey(A));
+    expect(figKey(A, undefined)).toBe("p:/exp/A.mpf");
+    expect(figKey(A, "fig-x")).toBe("p:/exp/A.mpf#fig-x");
+    expect(figKey(A, "fig-x")).not.toBe(figKey(A, "fig-y"));
+  });
+
+  it("namespaced keys of two tabs at the same grid coords never collide", () => {
+    expect(nsKey(figKey(A, "fig-1"), "r0c0_i0")).not.toBe(nsKey(figKey(A, "fig-x"), "r0c0_i0"));
+    expect(rawKeyOf({ key: nsKey(figKey(A, "fig-x"), "r0c0_i0") })).toBe("r0c0_i0");
+  });
+
+  it("runtimeKeyFor: bare only for the figure on screen of the active doc", () => {
+    const s = (figureId?: string) => ({ key: "k", rawKey: "r0c0_i0", figureId });
+    expect(runtimeKeyFor(s(), "d1", "d1")).toBe("r0c0_i0");                     // legacy, unchanged
+    expect(runtimeKeyFor(s("fig-1"), "d1", "d1", "fig-1")).toBe("r0c0_i0");
+    expect(runtimeKeyFor(s("fig-x"), "d1", "d1", "fig-x")).toBe("r0c0_i0");
+    expect(runtimeKeyFor(s("fig-1"), "d1", "d1", "fig-x")).toBe("fig-1__r0c0_i0");
+    expect(runtimeKeyFor(s("fig-x"), "d1", "d1", "fig-1")).toBe("fig-x__r0c0_i0");
+    expect(runtimeKeyFor(s(), "d2", "d1")).toBe("d2__r0c0_i0");                  // legacy, unchanged
+    expect(runtimeKeyFor(s("fig-x"), "d2", "d1")).toBe("d2-fig-x__r0c0_i0");
+    const all = [
+      runtimeKeyFor(s("fig-1"), "d1", "d1", "fig-x"), runtimeKeyFor(s("fig-x"), "d1", "d1", "fig-x"),
+      runtimeKeyFor(s("fig-1"), "d2", "d1", "fig-x"), runtimeKeyFor(s("fig-x"), "d2", "d1", "fig-x"),
+    ];
+    expect(new Set(all).size).toBe(all.length);
+    for (const k of all) { expect(k).not.toContain("/"); expect(k).not.toContain(":"); }
+    // Routing suffixes survive.
+    expect(runtimeKeyFor({ key: "k", rawKey: "r0c0_panel", figureId: "fig-x" }, "d2", "d1")).toMatch(/_panel$/);
+  });
+
+  it("sourceProvenance: resolves the owner by figKey and always names the figure", () => {
+    const docs = [A, B];
+    const own = sourceProvenance({ figKey: figKey(A, "fig-x"), figureId: "fig-x" }, docs, "d1");
+    expect(own.owner?.id).toBe("d1");
+    expect(own.fields).toEqual({ figure_id: "fig-x" });
+    const other = sourceProvenance({ figKey: figKey(B, "fig-x"), figureId: "fig-x" }, docs, "d1");
+    expect(other.fields).toEqual({ figure_id: "fig-x", mpf_doc_id: "d2", project_path: "/exp/B.mpf" });
+    // Legacy binding (no figure id) → the project's first figure.
+    const legacy = sourceProvenance({ figKey: figKey(B) }, docs, "d1");
+    expect(legacy.owner?.id).toBe("d2");
+    expect(legacy.fields.figure_id).toBe("fig-1");
+    // A figKey whose figure id doesn't match resolves to no owner (stale).
+    expect(sourceProvenance({ figKey: figKey(B, "fig-x") }, docs, "d1").owner).toBeUndefined();
+    // Standalone uploads carry nothing.
+    expect(sourceProvenance({ name: "blot.png" }, docs, "d1").fields).toEqual({});
+  });
+
+  it("measurements: the Figure column and group keys separate tabs", () => {
+    const rows = [
+      { panel: "R1C1", name: "Line 1", value: "1", figure_id: "fig-1", figure_name: "Main" },
+      { panel: "R1C1", name: "Line 1", value: "2", figure_id: "fig-x", figure_name: "WB" },
+    ];
+    const csv = measArrToCsv(rows, "A").split("\n");
+    expect(csv[1]).toContain('"A › Main"');
+    expect(csv[2]).toContain('"A › WB"');
+    expect(measRowKey("p:/exp/A.mpf", rows[0])).toBe(measRowKey("p:/exp/A.mpf", { panel: "R1C1" }));
+    expect(measRowKey("p:/exp/A.mpf", rows[0])).not.toBe(measRowKey("p:/exp/A.mpf", rows[1]));
+    // Single-figure rows (no figure keys) are exactly as before.
+    expect(measArrToCsv([{ panel: "R1C1", name: "L", value: "1" }], "A")).not.toContain("›");
   });
 });
