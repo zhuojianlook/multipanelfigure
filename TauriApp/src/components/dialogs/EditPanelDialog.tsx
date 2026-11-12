@@ -62,18 +62,27 @@ import RedoIcon from "@mui/icons-material/Redo";
 import VisibilityIcon from "@mui/icons-material/Visibility";
 import VisibilityOffIcon from "@mui/icons-material/VisibilityOff";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
+import StraightenIcon from "@mui/icons-material/Straighten";
 import { VolumeViewerDialog } from "./VolumeViewer";
 import { useFigureStore } from "../../store/figureStore";
 import { api } from "../../api/client";
 import { niceScaleBarUm } from "../../utils/scaleBarRounding";
 import { computeScaleBarRect } from "../../utils/scaleBarGeometry";
-import { lineAutoLabel, areaAutoLabel } from "../../utils/lineMeasure";
+import { lineAutoLabel, areaAutoLabel, unitLabelFor } from "../../utils/lineMeasure";
+import {
+  SCALE_UNITS, MIN_MEASURE_PX,
+  clampPct, barAxisPixelDistance, parseAspectRatio, preResizeDims,
+  umPerPixel, perPixelInUnit, formatPerPixel, parseDistance,
+  calibrationIssue, scaleEntryKey, parseScaleEntryKey, scaleEntryNameIssue,
+  withScaleEntry, scaleFromEntry, scaleBarAutoLabel,
+} from "../../utils/scaleCalibration";
+import type { PctPt } from "../../utils/scaleCalibration";
 import {
   computeThicknessReadings, readingValue, normalizeCount, maxSpacingFor,
   snapToCurve, paramOnCurve, pointOnCurve,
 } from "../../utils/thicknessGeometry";
 import type { Pt as ThickPt, ThicknessReadingData } from "../../utils/thicknessGeometry";
-import { alert as alertDialog, confirmThree } from "../shared/ConfirmDialog";
+import { alert as alertDialog, confirm as confirmDialog, confirmThree } from "../shared/ConfirmDialog";
 import { StyledTextField } from "../shared/StyledTextField";
 import { ColorPickerButton } from "../shared/ColorPickerButton";
 import type {
@@ -2409,6 +2418,195 @@ function ZStackFrameSelector({ imageName, onFrameChange, onFrameImage, frame, se
 }
 
 
+/* ── Scale Bar → "Measure" ──────────────────────────────────────────
+   Calibrate the image scale bar from two clicked points of known distance.
+   null in the dialog = not measuring. The whole flow lives in ONE object so a
+   phase change and its points can never be observed half-updated. Nothing
+   here is persisted: Apply / Save write ordinary scale_bar fields and an
+   ordinary resolution_entries row, so .mpfs files are unaffected. */
+interface ScaleMeasureState {
+  /** "picking" = waiting for clicks (A, then B); "review" = both placed. */
+  phase: "picking" | "review";
+  a: PctPt | null;
+  b: PctPt | null;
+  /** Raw "Known distance" text, parsed on use — so typing "0." or clearing
+   *  the field isn't fought by a controlled number round-trip. */
+  distance: string;
+  unit: string;
+  /** Non-null while the inline "name this entry" row is open. */
+  saveName: string | null;
+}
+
+/* The picker's preview overlay. It sits INSIDE the preview's zoom/pan wrapper
+   like every other overlay, so it moves and scales with the image, and it
+   converts pointer events via the <img>'s getBoundingClientRect() — the same
+   conversion as the label / scale-bar drags, exact at any zoom.
+
+   The rubber-band hover point is state of THIS component on purpose: pointer
+   moves then re-render only this small overlay, not the ~10k-line dialog.
+
+   Drawing: the SVG's user units are the wrapper's LAYOUT pixels (read via a
+   ResizeObserver; layout size ignores the CSS transform), and every stroke /
+   radius / font size is divided by the zoom. That keeps the marks a constant,
+   crisp on-screen size under zoom in every engine. vector-effect:
+   non-scaling-stroke can't be relied on for this: whether it also cancels an
+   ANCESTOR's CSS transform differs between WebKit (the Tauri webview) and
+   Blink, and points/text aren't strokes anyway. */
+function ScaleMeasureOverlay({
+  picking, a, b, calW, calH, pre, zoom, onPoint, onDragPoint,
+}: {
+  picking: boolean;
+  a: PctPt | null;
+  b: PctPt | null;
+  /** Calibration space (the processed image the bar is drawn in) — only used
+   *  for the "123.4 px" readout, which must match the panel's readout. */
+  calW: number;
+  calH: number;
+  /** Pre-final_resize size, when the panel has one (see barAxisPixelDistance). */
+  pre: { w: number; h: number } | null;
+  zoom: number;
+  onPoint: (p: PctPt) => void;
+  onDragPoint: (which: "a" | "b", p: PctPt) => void;
+}) {
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  const [hover, setHover] = useState<PctPt | null>(null);
+  const [size, setSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+
+  useLayoutEffect(() => {
+    const el = boxRef.current;
+    if (!el) return;
+    const read = () => setSize((prev) =>
+      (prev.w === el.clientWidth && prev.h === el.clientHeight) ? prev : { w: el.clientWidth, h: el.clientHeight });
+    read();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(read);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Drop the rubber band as soon as picking ends (B placed / re-measure).
+  useEffect(() => { if (!picking) setHover(null); }, [picking]);
+
+  const pctFromClient = (clientX: number, clientY: number): PctPt | null => {
+    const imgEl = boxRef.current?.parentElement?.querySelector('img[alt="Panel preview"]') as HTMLImageElement | null;
+    if (!imgEl) return null;
+    const r = imgEl.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return null;
+    return clampPct([((clientX - r.left) / r.width) * 100, ((clientY - r.top) / r.height) * 100]);
+  };
+
+  // Endpoint drag (review phase) — fine-tune A or B without re-measuring.
+  const beginDrag = (which: "a" | "b") => (e: React.MouseEvent) => {
+    if (e.button !== 0 || e.shiftKey) return;
+    // preventDefault also stops WebKit starting a native drag of the SVG.
+    e.preventDefault();
+    e.stopPropagation();
+    const onMove = (ev: MouseEvent) => {
+      ev.preventDefault();
+      const p = pctFromClient(ev.clientX, ev.clientY);
+      if (p) onDragPoint(which, p);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  const s = 1 / Math.max(zoom, 0.01);
+  const X = (p: PctPt) => (p[0] / 100) * size.w;
+  const Y = (p: PctPt) => (p[1] / 100) * size.h;
+  const end = b ?? (picking ? hover : null);
+  const px = a && end ? barAxisPixelDistance(a, end, calW, calH, pre) : 0;
+  const MARK = "#FFD54F";      // amber reads on bright-field AND fluorescence
+  const HALO = "rgba(0,0,0,0.75)";
+
+  return (
+    <Box
+      ref={boxRef}
+      data-testid="scale-measure-overlay"
+      aria-label={picking ? (a ? "Click the second point" : "Click the first point") : "Measured distance"}
+      sx={{
+        position: "absolute", inset: 0,
+        // Above the labels (≤10) and the scale-bar grab hitbox (10) so a
+        // pick can never start a bar / label drag underneath.
+        zIndex: 30,
+        cursor: picking ? "crosshair" : "default",
+        // Only swallow the pointer while picking. In review the overlay is
+        // see-through except for the two endpoint handles.
+        pointerEvents: picking ? "auto" : "none",
+        userSelect: "none",
+      }}
+      onMouseDown={(e) => {
+        if (!picking) return;
+        // Shift-drag / middle-drag remain the preview's PAN gesture — let
+        // them bubble to the pane so you can pan while picking.
+        if (e.shiftKey || e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const p = pctFromClient(e.clientX, e.clientY);
+        if (p) onPoint(p);
+      }}
+      onClick={(e) => { if (picking) e.stopPropagation(); }}
+      onMouseMove={(e) => {
+        if (!picking || !a) return;
+        setHover(pctFromClient(e.clientX, e.clientY));
+      }}
+      onMouseLeave={() => setHover(null)}
+    >
+      {size.w > 0 && size.h > 0 && (
+        <svg
+          width="100%" height="100%"
+          viewBox={`0 0 ${size.w} ${size.h}`}
+          style={{ position: "absolute", inset: 0, overflow: "visible", pointerEvents: "none" }}
+        >
+          {a && end && (
+            <>
+              <line x1={X(a)} y1={Y(a)} x2={X(end)} y2={Y(end)}
+                stroke={HALO} strokeWidth={4 * s} strokeLinecap="round" />
+              <line x1={X(a)} y1={Y(a)} x2={X(end)} y2={Y(end)}
+                stroke={MARK} strokeWidth={1.75 * s} strokeLinecap="round"
+                // Dashed while it's still following the cursor.
+                strokeDasharray={b ? undefined : `${6 * s} ${4 * s}`} />
+            </>
+          )}
+          {(["a", "b"] as const).map((which) => {
+            const p = which === "a" ? a : b;
+            if (!p) return null;
+            return (
+              <g key={which}>
+                <circle cx={X(p)} cy={Y(p)} r={4.5 * s} fill={MARK} stroke={HALO} strokeWidth={1.5 * s} />
+                {!picking && (
+                  // Larger invisible grab target (fill must not be "none"
+                  // or it isn't hit-testable).
+                  <circle
+                    cx={X(p)} cy={Y(p)} r={10 * s} fill="transparent"
+                    data-testid={`scale-measure-handle-${which}`}
+                    style={{ pointerEvents: "auto", cursor: "move" }}
+                    onMouseDown={beginDrag(which)}
+                  />
+                )}
+              </g>
+            );
+          })}
+          {a && end && px > 0 && (
+            <text
+              x={(X(a) + X(end)) / 2} y={(Y(a) + Y(end)) / 2 - 9 * s}
+              textAnchor="middle" fontSize={11 * s} fontWeight={600}
+              fill="#fff" stroke={HALO} strokeWidth={3 * s} paintOrder="stroke"
+              style={{ fontFamily: "system-ui, sans-serif" }}
+            >
+              {px.toFixed(1)} px
+            </text>
+          )}
+        </svg>
+      )}
+    </Box>
+  );
+}
+
+
 // Persist last-used tab across dialog opens
 let _lastTabIdx = 0;
 
@@ -3113,6 +3311,52 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   // tell whether it actually changed (and offer to undo).
   const mppAtFocusRef = useRef<number>(0);
 
+  /* ── Scale Bar → Measure: state + lifetime ──────────────────────
+     See ScaleMeasureState. Handlers and the inline panel live further down
+     (after the early return); only hooks belong up here. */
+  const [scaleMeasure, setScaleMeasure] = useState<ScaleMeasureState | null>(null);
+  // True while the overwrite confirm is up, so ITS Esc closes it instead of
+  // abandoning the measurement underneath.
+  const scaleMeasureBusyRef = useRef(false);
+  // Measuring only makes sense on the Scale Bar tab, with a bar, on a CUSTOM
+  // scale (a predefined one is read-only). Leaving any of those — switching
+  // tab, closing the dialog, choosing a saved scale in Source (including our
+  // own Save, which does exactly that), disabling the bar, or an undo that
+  // does one of those — ends the measurement.
+  const scaleMeasureAllowed = open && tabIdx === TAB_SCALE
+    && !!local?.add_scale_bar && !!local?.scale_bar && !local.scale_bar.scale_name;
+  useEffect(() => {
+    if (!scaleMeasureAllowed) setScaleMeasure(null);
+  }, [scaleMeasureAllowed]);
+  // The dialog stays mounted per cell and is reused across opens — never
+  // carry picked points over to a different panel.
+  useEffect(() => { setScaleMeasure(null); }, [row, col]);
+  const scaleMeasureActive = scaleMeasure !== null;
+  useEffect(() => {
+    if (!scaleMeasureActive) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || scaleMeasureBusyRef.current) return;
+      // Anything layered over the dialog — an MUI menu / listbox, popover,
+      // popper (colour picker, autocomplete), or a separate dialog — handles
+      // its own Esc first. Without this, Esc meant to dismiss e.g. a colour
+      // popover would cancel the measurement and leave the popover open.
+      const t = e.target as Element | null;
+      if (t?.closest?.('[role="listbox"],[role="menu"],.MuiPopover-root,.MuiPopper-root,.MuiAutocomplete-popper')) return;
+      const dlg = t?.closest?.(".MuiDialog-root");
+      if (dlg && !dlg.hasAttribute("data-edit-panel-dialog")) return;
+      // Window CAPTURE runs before React's delegated listeners, so stopping
+      // here keeps MUI's Dialog from reading this Esc as "close the whole
+      // Edit Panel" — which would throw away every unsaved edit, not just
+      // the measurement. Esc backs out one level: the name row, then the
+      // measurement.
+      e.preventDefault();
+      e.stopPropagation();
+      setScaleMeasure((m) => (m && m.saveName !== null ? { ...m, saveName: null } : null));
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [scaleMeasureActive]);
+
   /* ── Preview zoom / pan ─────────────────────────────────────────
      A CSS transform on the aspect wrapper. Everything inside (the <img> and
      every % -positioned overlay) scales together, and because drag handlers
@@ -3147,7 +3391,17 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
       try {
         const resp = await api.patchPanelAndPreview(row, col, cur as unknown as Record<string, unknown>);
         // Only apply if this is still the latest request (no newer request was sent)
-        if (seq === previewSeqRef.current && resp.image) setPreviewB64(resp.image);
+        if (seq === previewSeqRef.current && resp.image) {
+          setPreviewB64(resp.image);
+          // Keep the PROCESSED size current as well. It was only read once,
+          // on open, so after a crop / rotate / final-resize edit it went
+          // stale — and it is the space the scale bar is calibrated and drawn
+          // in (scaleBarRect, and the Measure tool's pixel distances).
+          if (resp.processed_width && resp.processed_height) {
+            setProcessedW(resp.processed_width);
+            setProcessedH(resp.processed_height);
+          }
+        }
       } catch {
         // ignore preview errors
       }
@@ -3892,8 +4146,344 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     // "tertiary" → keep their allocated scales: nothing to do.
   };
 
+  /* ── Scale Bar → Measure: handlers + inline panel ───────────────
+     Pixel distances are taken in the space the bar is DRAWN in: the backend
+     computes bar_length_px = bar_length_microns / micron_per_pixel on the
+     process_panel OUTPUT (post-crop, post-rotate, post-final-resize — see
+     figure_builder._add_panel_scale_bars), and both preview endpoints
+     report exactly that image's size as processed_width / processed_height
+     (`proc_w, proc_h = processed.size`, taken before the thumbnail shrink).
+     The preview <img> shows that same image, so percent → processed pixels
+     measures in bar space. The line annotations' svgDims (crop / original
+     size) is only a fallback for the instant before the first preview
+     answers; it differs from the processed size whenever final_resize or a
+     rotation changes the output dimensions. */
+  const measureDims = processedW > 0 && processedH > 0
+    ? { w: processedW, h: processedH }
+    : svgDims;
+  // A non-uniform final_resize (legacy files only — there is no UI for it)
+  // makes output pixels rectangular, so the chord has to be taken in the
+  // bar's horizontal axis, which needs the size BEFORE that resize. Zoom
+  // targets are synthesised by the backend from another panel, so their
+  // final_resize (if any) isn't derivable here; they keep the plain chord.
+  const measureFinalResize = !!local?.final_resize && !isZoomTarget;
+  const measurePre = measureFinalResize
+    ? preResizeDims({
+        origW: origFullW, origH: origFullH,
+        rotationDeg: local?.rotation ?? 0,
+        crop: local?.crop ?? null,
+        cropImage: !!local?.crop_image,
+        aspect: parseAspectRatio(local?.aspect_ratio_str),
+      })
+    : null;
+  // Until the source size is known the correction can't be computed; Apply
+  // is blocked rather than silently calibrating with square pixels.
+  const measurePreUnknown = measureFinalResize && !measurePre;
+  const measurePx = scaleMeasure?.a && scaleMeasure?.b
+    ? barAxisPixelDistance(scaleMeasure.a, scaleMeasure.b, measureDims.w, measureDims.h, measurePre)
+    : 0;
+
+  const startScaleMeasure = () => {
+    setScaleMeasure({
+      phase: "picking", a: null, b: null, distance: "",
+      unit: localRef.current?.scale_bar?.unit || "um",
+      saveName: null,
+    });
+  };
+  const cancelScaleMeasure = () => setScaleMeasure(null);
+  // Keeps the typed distance / unit — only the points are re-picked.
+  const remeasureScale = () =>
+    setScaleMeasure((m) => (m ? { ...m, phase: "picking", a: null, b: null, saveName: null } : m));
+  const onScaleMeasurePoint = (p: PctPt) =>
+    setScaleMeasure((m) => {
+      if (!m || m.phase !== "picking") return m;
+      if (!m.a) return { ...m, a: p };
+      return { ...m, b: p, phase: "review" };
+    });
+  const onScaleMeasureDrag = (which: "a" | "b", p: PctPt) =>
+    setScaleMeasure((m) => (m && m.phase === "review" ? { ...m, [which]: p } : m));
+
+  /** Write a calibration into the image scale bar, end the measurement, then
+   *  run the same "update annotations?" reconcile every other µm/px edit
+   *  runs (it can also undo the change). */
+  const commitMeasuredScale = async (patch: { micron_per_pixel: number; unit: string; scale_name: string }) => {
+    const sbNow = localRef.current?.scale_bar;
+    if (!sbNow) return;
+    const prevMpp = sbNow.micron_per_pixel;
+    const oldUnit = sbNow.unit || "um";
+    // Same rule as the Unit toggle: a label that is empty or still the auto
+    // text follows the new unit; a hand-written label is kept as is.
+    const labelIsAuto = !sbNow.label || sbNow.label === scaleBarAutoLabel(sbNow.bar_length_microns, oldUnit);
+    updateLocal({
+      scale_bar: {
+        ...sbNow, ...patch,
+        label: patch.unit !== oldUnit && labelIsAuto ? "" : sbNow.label,
+      },
+    });
+    setScaleMeasure(null);
+    // maybeReconcileAnnotationScales reads localRef, which the setLocal
+    // updater refreshes during React's next render. Let that render happen
+    // first — otherwise it compares the OLD value with itself and stays
+    // silent exactly when the scale changed.
+    await new Promise((r) => setTimeout(r, 0));
+    await maybeReconcileAnnotationScales(prevMpp);
+  };
+
+  /** The validated calibration (µm/px) for the current measurement, or NaN. */
+  const measuredUmPerPx = (m: ScaleMeasureState): number => {
+    const dist = parseDistance(m.distance);
+    if (m.phase !== "review" || measurePreUnknown || calibrationIssue(measurePx, dist)) return NaN;
+    return umPerPixel(dist, m.unit, measurePx);
+  };
+
+  /** Why "Save as scale bar entry" is unavailable for this panel, or null.
+   *  A saved entry is a SOURCE-image scale reused across panels, but on these
+   *  panels a measured pixel isn't a source pixel: a zoom target is a
+   *  magnified crop of another panel, and a final_resize rescales the image.
+   *  Saving would put a wrong value in the global list, so only Apply (this
+   *  panel only) is offered. */
+  const scaleSaveBlocked: string | null = isZoomTarget
+    ? "This panel is a zoom view, so its scale isn't the source image's — Apply sets it for this panel only."
+    : local?.final_resize
+      ? "This panel is resized, so its scale isn't the source image's — Apply sets it for this panel only."
+      : null;
+
+  const applyScaleMeasure = async () => {
+    const m = scaleMeasure;
+    if (!m) return;
+    const mpp = measuredUmPerPx(m);
+    if (!Number.isFinite(mpp) || mpp <= 0) return;
+    // A one-off calibration: stays a Custom scale (scale_name "").
+    await commitMeasuredScale({ micron_per_pixel: mpp, unit: m.unit, scale_name: "" });
+  };
+
+  const saveScaleMeasure = async () => {
+    const m = scaleMeasure;
+    if (!m || m.saveName === null || scaleMeasureBusyRef.current || scaleSaveBlocked) return;
+    const mpp = measuredUmPerPx(m);
+    if (!Number.isFinite(mpp) || mpp <= 0 || scaleEntryNameIssue(m.saveName)) return;
+    const name = m.saveName.trim();
+    const key = scaleEntryKey(name, m.unit);
+    // Read the store fresh (not the render's `config`): the confirm below is
+    // async, and the entries must be current when we write them back.
+    const existing = useFigureStore.getState().config?.resolution_entries ?? {};
+    if (Object.prototype.hasOwnProperty.call(existing, key)) {
+      scaleMeasureBusyRef.current = true;
+      let ok = false;
+      try {
+        ok = await confirmDialog({
+          title: "Replace saved scale bar?",
+          body: `"${name}" (${unitLabelFor(m.unit)}) is already saved as ${formatPerPixel(existing[key], m.unit, 6)}. `
+            + `Replace it with the measured ${formatPerPixel(mpp, m.unit, 6)}? `
+            + `Panels that already use it keep their current value until it is re-selected.`,
+          confirmLabel: "Replace",
+          destructive: true,
+        });
+      } finally {
+        scaleMeasureBusyRef.current = false;
+      }
+      if (!ok) return;
+    }
+    const cfgNow = useFigureStore.getState().config;
+    if (!cfgNow) return;
+    // Same key format and µm/px value convention as the Sidebar's Scale Bars
+    // → add, so the entry lists, edits and deletes there like a hand-typed
+    // one, and api.updateResolutions persists it globally
+    // (~/.multipanelfigure/scale_bars.json) and sets the backend's
+    // cfg.resolution_entries. Deliberately NOT setConfig, as the Sidebar
+    // uses: that PUTs the WHOLE store config, whose copy of this panel is
+    // stale while the dialog holds unsaved edits — it would briefly revert
+    // the backend's panel underneath the open dialog.
+    const entries = withScaleEntry(cfgNow.resolution_entries, key, mpp);
+    useFigureStore.getState().setResolutionEntries(entries);
+    api.updateResolutions(entries).catch(console.error);
+    // …then point THIS panel at it, exactly as picking it in Source would.
+    await commitMeasuredScale({ micron_per_pixel: mpp, unit: m.unit, scale_name: key });
+  };
+
+  /** The inline Measure panel under the Scale Bar tab's "Measurement"
+   *  heading (an inline row — never window.prompt, which Tauri's webview
+   *  doesn't reliably support). */
+  const renderScaleMeasurePanel = () => {
+    const m = scaleMeasure;
+    if (!m) return null;
+    const btnSx = { fontSize: "0.65rem", textTransform: "none", py: 0.25, px: 1, minWidth: 0 } as const;
+    const boxSx = {
+      display: "flex", flexDirection: "column", gap: 0.75,
+      p: 1, borderRadius: 1, border: "1px solid", borderColor: "primary.main", bgcolor: "action.hover",
+    } as const;
+
+    if (m.phase === "picking") {
+      return (
+        <Box data-testid="scale-measure-panel" sx={boxSx}>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+            <Typography variant="caption" sx={{ flex: 1, fontSize: "0.7rem" }}>
+              {m.a
+                ? "Point A placed — now click point B."
+                : "Click two points on the image whose real distance you know."}
+              <Box component="span" sx={{ display: "block", color: "text.secondary", fontSize: "0.62rem" }}>
+                Scroll to zoom and shift-drag to pan for precision. Esc cancels.
+              </Box>
+            </Typography>
+            <Button size="small" onClick={cancelScaleMeasure} data-testid="scale-measure-cancel" sx={btnSx}>
+              Cancel
+            </Button>
+          </Box>
+        </Box>
+      );
+    }
+
+    const dist = parseDistance(m.distance);
+    const issue = calibrationIssue(measurePx, dist);
+    const mpp = issue ? NaN : umPerPixel(dist, m.unit, measurePx);
+    const naming = m.saveName !== null;
+    const nameIssue = naming ? scaleEntryNameIssue(m.saveName ?? "") : null;
+    const trimmed = (m.saveName ?? "").trim();
+    const willReplace = naming && !nameIssue && !!config
+      && Object.prototype.hasOwnProperty.call(config.resolution_entries ?? {}, scaleEntryKey(trimmed, m.unit));
+    return (
+      <Box data-testid="scale-measure-panel" sx={boxSx}>
+        <Typography variant="caption" sx={{ fontSize: "0.7rem" }}>
+          Measured{" "}
+          <Box component="span" data-testid="scale-measure-px" sx={{ fontWeight: 700 }}>{measurePx.toFixed(1)} px</Box>
+          <Box component="span" sx={{ color: "text.secondary" }}> — drag A or B on the image to fine-tune</Box>
+        </Typography>
+        <Box sx={{ display: "flex", gap: 1 }}>
+          <TextField
+            label="Known distance"
+            type="number"
+            size="small"
+            autoFocus
+            value={m.distance}
+            onChange={(e) => {
+              const v = e.target.value;
+              setScaleMeasure((prev) => (prev ? { ...prev, distance: v } : prev));
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !issue && !naming) { e.preventDefault(); void applyScaleMeasure(); }
+            }}
+            inputProps={{ min: 0, step: "any", "aria-label": "Known distance", "data-testid": "scale-measure-distance" }}
+            sx={{ flex: 1, "& input": { fontSize: "0.75rem" } }}
+          />
+          {/* Native select: no popover portal to fight the Esc handling,
+              and it's trivially scriptable in e2e. */}
+          <TextField
+            select
+            label="Unit"
+            size="small"
+            value={m.unit}
+            onChange={(e) => {
+              const v = e.target.value;
+              setScaleMeasure((prev) => (prev ? { ...prev, unit: v } : prev));
+            }}
+            SelectProps={{ native: true }}
+            inputProps={{ "aria-label": "Distance unit", "data-testid": "scale-measure-unit" }}
+            sx={{ width: 84, "& select": { fontSize: "0.75rem" } }}
+          >
+            {SCALE_UNITS.map((u) => <option key={u} value={u}>{unitLabelFor(u)}</option>)}
+          </TextField>
+        </Box>
+        <Typography
+          variant="caption"
+          data-testid="scale-measure-result"
+          sx={{ fontSize: "0.72rem", fontWeight: 600, color: issue ? "text.disabled" : "text.primary" }}
+        >
+          = {formatPerPixel(mpp, m.unit)}
+          {!issue && m.unit !== "um" && (
+            <Box component="span" sx={{ fontWeight: 400, color: "text.secondary" }}> ({formatPerPixel(mpp, "um")})</Box>
+          )}
+        </Typography>
+        {issue && (
+          // A still-empty distance field is the normal next step, not an
+          // error — only warn once something unusable was typed (or the
+          // points are too close, which no distance can fix).
+          <Typography
+            variant="caption"
+            data-testid="scale-measure-issue"
+            sx={{
+              fontSize: "0.65rem",
+              color: issue === "bad-distance" && m.distance.trim() === "" ? "text.secondary" : "warning.main",
+            }}
+          >
+            {issue === "too-short"
+              ? `The points are less than ${MIN_MEASURE_PX} px apart — Re-measure with them further apart.`
+              : m.distance.trim() === ""
+                ? "Enter the real distance between A and B."
+                : "The distance must be a number greater than 0."}
+          </Typography>
+        )}
+        {!naming ? (
+          <Box sx={{ display: "flex", gap: 0.5, flexWrap: "wrap" }}>
+            <Button size="small" variant="contained" disabled={!!issue || measurePreUnknown}
+              data-testid="scale-measure-apply" onClick={() => void applyScaleMeasure()} sx={btnSx}>
+              Apply
+            </Button>
+            <Button size="small" variant="outlined" disabled={!!issue || !!scaleSaveBlocked}
+              data-testid="scale-measure-save"
+              onClick={() => setScaleMeasure((prev) => (prev ? { ...prev, saveName: "" } : prev))}
+              sx={btnSx}>
+              Save as scale bar entry
+            </Button>
+            <Button size="small" data-testid="scale-measure-remeasure" onClick={remeasureScale} sx={btnSx}>
+              Re-measure
+            </Button>
+            <Button size="small" data-testid="scale-measure-cancel" onClick={cancelScaleMeasure} sx={btnSx}>
+              Cancel
+            </Button>
+            {/* A disabled button's tooltip is easy to miss, so say why inline. */}
+            {(measurePreUnknown || scaleSaveBlocked) && (
+              <Typography variant="caption" data-testid="scale-measure-save-blocked"
+                sx={{ fontSize: "0.65rem", color: "text.secondary", flexBasis: "100%" }}>
+                {measurePreUnknown
+                  ? "Image size still loading — try again in a moment."
+                  : scaleSaveBlocked}
+              </Typography>
+            )}
+          </Box>
+        ) : (
+          <Box sx={{ display: "flex", gap: 0.5, alignItems: "flex-start" }}>
+            <TextField
+              label="Entry name"
+              size="small"
+              autoFocus
+              value={m.saveName ?? ""}
+              placeholder="e.g. Confocal 63x"
+              onChange={(e) => {
+                const v = e.target.value;
+                setScaleMeasure((prev) => (prev ? { ...prev, saveName: v } : prev));
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !issue && !nameIssue) { e.preventDefault(); void saveScaleMeasure(); }
+              }}
+              // Only nag about an empty name once something was typed.
+              error={!!nameIssue && trimmed.length > 0}
+              helperText={
+                nameIssue && trimmed.length > 0 ? nameIssue
+                  : willReplace ? `Replaces the saved "${trimmed}" (${unitLabelFor(m.unit)})`
+                    : "Saved scales appear under Source and in the sidebar"
+              }
+              inputProps={{ maxLength: 80, "aria-label": "Scale bar entry name", "data-testid": "scale-measure-name" }}
+              FormHelperTextProps={{ sx: { fontSize: "0.6rem", mx: 0 } }}
+              sx={{ flex: 1, "& input": { fontSize: "0.75rem" } }}
+            />
+            <Button size="small" variant="contained" disabled={!!issue || !!nameIssue}
+              data-testid="scale-measure-save-confirm" onClick={() => void saveScaleMeasure()}
+              sx={{ ...btnSx, mt: 0.5 }}>
+              Save
+            </Button>
+            <Button size="small" data-testid="scale-measure-save-back"
+              onClick={() => setScaleMeasure((prev) => (prev ? { ...prev, saveName: null } : prev))}
+              sx={{ ...btnSx, mt: 0.5 }}>
+              Back
+            </Button>
+          </Box>
+        )}
+      </Box>
+    );
+  };
+
   return (
-    <Dialog open={open} onClose={onClose} maxWidth="lg" fullWidth>
+    <Dialog open={open} onClose={onClose} maxWidth="lg" fullWidth data-edit-panel-dialog="">
       <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", py: 1 }}>
         <Box component="span">Edit Panel R{row + 1} C{col + 1}</Box>
         {/* Undo / Redo — applies to every tab (crop, resize, adjustments,
@@ -4957,13 +5547,13 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       // can change µm/px by orders of magnitude, and it also
                       // disables the only field that WAS instrumented.
                       const prevMpp = sb.micron_per_pixel;
-                      if (name && config && config.resolution_entries[name]) {
-                        // Extract unit from predefined name (format: "name|unit")
-                        const predUnit = name.split("|")[1] || "um";
-                        const predUmPerUnit = unitToUm[predUnit] || 1;
-                        // Convert existing bar length to new unit
-                        const barInNewUnit = sb.bar_length_microns / predUmPerUnit;
-                        updateLocal({ scale_bar: { ...sb, scale_name: name, micron_per_pixel: config.resolution_entries[name], unit: predUnit } });
+                      // Stored \u00B5m/px copied verbatim + the unit from the key
+                      // ("name|unit") \u2014 scaleFromEntry is the same function
+                      // the Measure tool's save \u2192 select round-trip is
+                      // tested through, so the two can't drift apart.
+                      const picked = scaleFromEntry(config?.resolution_entries, name);
+                      if (picked) {
+                        updateLocal({ scale_bar: { ...sb, scale_name: name, micron_per_pixel: picked.micron_per_pixel, unit: picked.unit } });
                       } else {
                         updateLocal({ scale_bar: { ...sb, scale_name: "" } });
                       }
@@ -4973,18 +5563,50 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   >
                     <MenuItem value="" sx={{ fontSize: "0.75rem" }}>Custom</MenuItem>
                     {config && Object.entries(config.resolution_entries).map(([name, val]) => {
-                      const parts = name.split("|");
-                      const displayName = parts[0];
-                      const u = parts[1] || "um";
+                      const { name: displayName, unit: u } = parseScaleEntryKey(name);
                       const uDisp = unitLabels[u] || "\u00B5m";
-                      return <MenuItem key={name} value={name} sx={{ fontSize: "0.75rem" }}>{displayName} ({val} {uDisp}/px)</MenuItem>;
+                      // `val` is \u00B5m/px whatever the key's unit \u2014 show it IN
+                      // that unit (as the Sidebar list does). Printing the raw
+                      // value read "Scope|nm (0.0813 nm/px)" for an entry that
+                      // is really 81.3 nm/px.
+                      return <MenuItem key={name} value={name} sx={{ fontSize: "0.75rem" }}>{displayName} ({Number(perPixelInUnit(val, u).toPrecision(6))} {uDisp}/px)</MenuItem>;
                     })}
                   </Select>
                 </FormControl>
 
                 {/* ── Measurement ── */}
                 <Divider />
-                <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary" }}>Measurement</Typography>
+                <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 1 }}>
+                  <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary" }}>Measurement</Typography>
+                  {/* Measure — calibrate µm/px from two clicked points of a
+                      known distance. Custom scale only: a predefined scale's
+                      µm/px is read-only here (its field is disabled too). */}
+                  {!isPredefined && (
+                    <Tooltip
+                      title={scaleMeasure ? "Stop measuring" : "Click two points of known distance on the image to set the µm/px"}
+                      // Left, so it never sits on top of the inline panel
+                      // (and its Cancel) that opens right below the button.
+                      placement="left"
+                    >
+                      {/* span: a disabled button can't host a tooltip itself */}
+                      <span>
+                        <Button
+                          size="small"
+                          variant={scaleMeasure ? "contained" : "outlined"}
+                          startIcon={<StraightenIcon sx={{ fontSize: 14 }} />}
+                          data-testid="scale-measure-button"
+                          aria-pressed={!!scaleMeasure}
+                          disabled={!(previewB64 || renderedPreviewB64)}
+                          onClick={() => (scaleMeasure ? cancelScaleMeasure() : startScaleMeasure())}
+                          sx={{ fontSize: "0.65rem", textTransform: "none", py: 0, px: 1, minHeight: 0, "& .MuiButton-startIcon": { mr: 0.5 } }}
+                        >
+                          Measure
+                        </Button>
+                      </span>
+                    </Tooltip>
+                  )}
+                </Box>
+                {!isPredefined && renderScaleMeasurePanel()}
                 <Box sx={{ display: "flex", gap: 1 }}>
                   <TextField
                     label={`${unitLabel}/pixel`}
@@ -7430,6 +8052,29 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 </IconButton>
               </Box>
             )}
+            {/* Scale Bar → Measure prompt, where the user is looking while
+                picking. Outside the transformed wrapper (like the zoom
+                controls) so it stays put and readable at any zoom. */}
+            {(previewB64 || renderedPreviewB64) && scaleMeasure && scaleMeasureAllowed && scaleMeasure.phase === "picking" && (
+              <Box
+                data-testid="scale-measure-hint"
+                sx={{
+                  position: "absolute", top: 6, left: 6, zIndex: 20,
+                  display: "flex", alignItems: "center", gap: 0.75,
+                  bgcolor: "background.paper", border: "1px solid", borderColor: "primary.main",
+                  borderRadius: 1, pl: 1, pr: 0.25, py: 0.1, opacity: 0.95,
+                }}
+              >
+                <StraightenIcon sx={{ fontSize: 14, color: "primary.main" }} />
+                <Typography variant="caption" sx={{ fontSize: "0.65rem", userSelect: "none" }}>
+                  {scaleMeasure.a ? "Click the second point (B)" : "Click two points on the image"}
+                </Typography>
+                <Button size="small" onClick={cancelScaleMeasure}
+                  sx={{ fontSize: "0.6rem", textTransform: "none", minWidth: 0, py: 0, px: 0.75 }}>
+                  Cancel
+                </Button>
+              </Box>
+            )}
             {/* Adjacent-zoom target panels have no `image_name` of
                 their own, so `previewB64` (which is fetched from the
                 base /api/panel-preview endpoint, gated on
@@ -7898,6 +8543,22 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     />
                   );
                 })()}
+                {/* Scale Bar → Measure: the two picked points + the line
+                    between them. On top of every other overlay while
+                    picking so a click can't start a bar / label drag. */}
+                {scaleMeasure && scaleMeasureAllowed && (
+                  <ScaleMeasureOverlay
+                    picking={scaleMeasure.phase === "picking"}
+                    a={scaleMeasure.a}
+                    b={scaleMeasure.b}
+                    calW={measureDims.w}
+                    calH={measureDims.h}
+                    pre={measurePre}
+                    zoom={previewZoom}
+                    onPoint={onScaleMeasurePoint}
+                    onDragPoint={onScaleMeasureDrag}
+                  />
+                )}
                 {/* Line annotation overlays */}
                 {tabIdx === TAB_ANNOT && (local.lines ?? []).length > 0 && (() => {
                   const lnVbW = svgDims.w || 1000;

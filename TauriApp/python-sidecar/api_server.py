@@ -154,7 +154,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.392"  # CI re-syncs this from the release tag (build-sidecar)
+SIDECAR_BUILD = "0.1.410"  # CI re-syncs this from the release tag (build-sidecar)
 
 
 @app.get("/api/version")
@@ -2992,10 +2992,23 @@ def delete_image(name: str):
 
 
 @app.get("/api/images/{name}/thumb")
-def get_thumb(name: str):
+def get_thumb(name: str, max_side: int = 256):
+    """Base64 PNG of the loaded image, long edge capped at `max_side`.
+
+    `max_side` is an optional query param so the media-strip lightbox
+    (double-click a tile) can ask for a screen-sized preview through the
+    SAME endpoint. The default is exactly the 256 px the strip tiles have
+    always used, so a request without the param — every older frontend —
+    gets a byte-identical response; the response shape never changes.
+    Clamped to [64, 4096]: below 64 is useless, and above 4096 the PNG
+    encode + base64 + Tauri IPC round-trip gets slow for no visible gain
+    on any real display. PIL's thumbnail() only ever shrinks, so an
+    original smaller than `max_side` comes back at its native size.
+    A non-integer value is rejected with FastAPI's usual 422."""
     if name not in loaded_images:
         raise HTTPException(404, f"Image '{name}' not found")
-    return {"thumbnail": _thumb_b64(loaded_images[name])}
+    side = max(64, min(4096, max_side))
+    return {"thumbnail": _thumb_b64(loaded_images[name], side)}
 
 
 @app.get("/api/images/{name}/info")

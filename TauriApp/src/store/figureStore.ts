@@ -16,6 +16,16 @@ import type {
 } from "../api/types";
 import { api, checkHealth, lastHealthError } from "../api/client";
 import { niceScaleBarUm } from "../utils/scaleBarRounding";
+import {
+  normalizeImageGroups,
+  newImageGroupId,
+  stripImageFromGroups,
+  moveImageToSection,
+  addDividerToGroup,
+  renameDividerInGroup,
+  deleteDividerFromGroup,
+  type SectionTarget,
+} from "../utils/imageGroups";
 
 // ── Loaded image metadata kept client-side ───────────────
 
@@ -59,6 +69,12 @@ interface FigureState {
   fetchImages: () => Promise<void>;
 
   setConfig: (cfg: FigureConfig) => void;
+  /** Store-only update of the saved scale-bar entries — no syncToBackend, no
+   *  preview. The caller persists them with api.updateResolutions (which also
+   *  sets the backend's cfg.resolution_entries). For use while the Edit Panel
+   *  dialog is open, where setConfig's full-config PUT would overwrite the
+   *  backend's copy of the panel being edited with the store's stale one. */
+  setResolutionEntries: (entries: Record<string, number>) => void;
   updateGridSize: (rows: number, cols: number) => Promise<void>;
   setSpacing: (spacing: number) => void;
   setBackground: (bg: string) => void;
@@ -142,8 +158,21 @@ interface FigureState {
   createImageGroup: (name: string) => void;
   renameImageGroup: (groupId: string, name: string) => void;
   deleteImageGroup: (groupId: string) => void;
-  moveImageToGroup: (imageName: string, groupId: string) => void;
+  /** Move an image into a group. With no `target` (the original 2-arg form)
+   *  it lands in the group's unsectioned area; `target.dividerId` picks a
+   *  subgroup and `target.beforeImage` an insertion point within it. Always
+   *  removes the image from every other group and divider first. Dropping
+   *  an image into the section it's already in (no beforeImage) is a no-op. */
+  moveImageToGroup: (imageName: string, groupId: string, target?: SectionTarget) => void;
   moveImageToTimeline: (imageName: string) => void;
+  /** Place a named subgroup divider in a group drawer: appended empty, or —
+   *  with `splitBeforeImage` — splitting that image's section so it and the
+   *  images after it start the new subgroup. Returns the new divider's id
+   *  ("" when the group doesn't exist). */
+  addGroupDivider: (groupId: string, opts?: { name?: string; splitBeforeImage?: string }) => string;
+  renameGroupDivider: (groupId: string, dividerId: string, name: string) => void;
+  /** Remove a divider; its images merge into the section above it. */
+  deleteGroupDivider: (groupId: string, dividerId: string) => void;
 
   requestPreview: () => void;
   syncToBackend: () => Promise<void>;
@@ -595,6 +624,15 @@ export const useFigureStore = create<FigureState>()(
       });
       get().syncToBackend();
       get().requestPreview();
+    },
+
+    setResolutionEntries: (entries) => {
+      set((s) => {
+        if (!s.config) return;
+        s.config.resolution_entries = entries;
+        // Entries are saved inside the .mpf, so the document is now unsaved.
+        s.unsaved = true;
+      });
     },
 
     updateGridSize: async (rows, cols) => {
@@ -1635,10 +1673,10 @@ export const useFigureStore = create<FigureState>()(
         await api.deleteImage(name);
         set((s) => {
           delete s.loadedImages[name];
-          // Remove from any image group
-          s.imageGroups.forEach(g => {
-            g.imageNames = g.imageNames.filter(n => n !== name);
-          });
+          // Remove from any image group — and from its subgroup divider, so
+          // no divider keeps listing an image the project no longer has. The
+          // helper is immutable, so feed it the committed (non-draft) state.
+          s.imageGroups = stripImageFromGroups(get().imageGroups, name);
           if (s.config) {
             for (let r = 0; r < s.config.rows; r++) {
               for (let c = 0; c < s.config.cols; c++) {
@@ -1660,7 +1698,7 @@ export const useFigureStore = create<FigureState>()(
     createImageGroup: (name) => {
       set((s) => {
         s.imageGroups.push({
-          id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+          id: newImageGroupId(),
           name,
           imageNames: [],
         });
@@ -1686,25 +1724,65 @@ export const useFigureStore = create<FigureState>()(
       void get().syncToBackend();
     },
 
-    moveImageToGroup: (imageName, groupId) => {
+    // The group / divider mutations below are computed by the immutable
+    // helpers in utils/imageGroups.ts from the COMMITTED state (outside the
+    // immer recipe), then assigned. A helper hands back the very same array
+    // when nothing changed (e.g. an image re-dropped onto its own section),
+    // and then we skip both the unsaved flag and the backend sync — a no-op
+    // drag must not mark the document dirty.
+
+    moveImageToGroup: (imageName, groupId, target) => {
+      const prev = get().imageGroups;
+      // Strips the image from every group + divider first (single-location
+      // invariant), then inserts it into the requested section.
+      const next = moveImageToSection(prev, imageName, groupId, target);
+      if (next === prev) return;
       set((s) => {
-        // Remove from any existing group first (single-location invariant)
-        s.imageGroups.forEach(g => {
-          g.imageNames = g.imageNames.filter(n => n !== imageName);
-        });
-        // Add to target group
-        const target = s.imageGroups.find(g => g.id === groupId);
-        if (target) target.imageNames.push(imageName);
+        s.imageGroups = next;
         s.unsaved = true;
       });
       void get().syncToBackend();
     },
 
     moveImageToTimeline: (imageName) => {
+      const prev = get().imageGroups;
+      const next = stripImageFromGroups(prev, imageName);
+      if (next === prev) return;
       set((s) => {
-        s.imageGroups.forEach(g => {
-          g.imageNames = g.imageNames.filter(n => n !== imageName);
-        });
+        s.imageGroups = next;
+        s.unsaved = true;
+      });
+      void get().syncToBackend();
+    },
+
+    addGroupDivider: (groupId, opts) => {
+      const { groups, dividerId } = addDividerToGroup(get().imageGroups, groupId, opts);
+      if (!dividerId) return "";
+      set((s) => {
+        s.imageGroups = groups;
+        s.unsaved = true;
+      });
+      void get().syncToBackend();
+      return dividerId;
+    },
+
+    renameGroupDivider: (groupId, dividerId, name) => {
+      const prev = get().imageGroups;
+      const next = renameDividerInGroup(prev, groupId, dividerId, name);
+      if (next === prev) return;
+      set((s) => {
+        s.imageGroups = next;
+        s.unsaved = true;
+      });
+      void get().syncToBackend();
+    },
+
+    deleteGroupDivider: (groupId, dividerId) => {
+      const prev = get().imageGroups;
+      const next = deleteDividerFromGroup(prev, groupId, dividerId);
+      if (next === prev) return;
+      set((s) => {
+        s.imageGroups = next;
         s.unsaved = true;
       });
       void get().syncToBackend();
@@ -1851,10 +1929,11 @@ export const useFigureStore = create<FigureState>()(
           // Restore this project's image groups (and reset to []' for projects
           // saved before groups were persisted) so groups don't leak between
           // documents. Drop names whose images aren't in the project.
+          // normalizeImageGroups also sanitizes subgroup dividers (and never
+          // throws on a malformed file); for groups without dividers it gives
+          // exactly what the old inline `{...g, imageNames: filtered}` did.
           const valid = new Set(resp.image_names);
-          s.imageGroups = (resp.config.image_groups ?? []).map((g) => ({
-            ...g, imageNames: (g.imageNames ?? []).filter((n) => valid.has(n)),
-          }));
+          s.imageGroups = normalizeImageGroups(resp.config.image_groups, valid);
           s.currentProjectPath = path;
           s.configDirty = false;
           s.unsaved = false;
@@ -1913,9 +1992,7 @@ export const useFigureStore = create<FigureState>()(
           };
         }
         const valid = new Set(resp.image_names);
-        s.imageGroups = (resp.config.image_groups ?? []).map((g) => ({
-          ...g, imageNames: (g.imageNames ?? []).filter((n) => valid.has(n)),
-        }));
+        s.imageGroups = normalizeImageGroups(resp.config.image_groups, valid);
         s.currentProjectPath = opts.path;
         s.configDirty = false;
         s.unsaved = true;
@@ -1946,9 +2023,7 @@ export const useFigureStore = create<FigureState>()(
           s.loadedImages[name] = { name, thumbnailB64: resp.thumbnails[name] ?? "" };
         }
         const valid = new Set(resp.image_names);
-        s.imageGroups = (resp.config.image_groups ?? []).map((g) => ({
-          ...g, imageNames: (g.imageNames ?? []).filter((n) => valid.has(n)),
-        }));
+        s.imageGroups = normalizeImageGroups(resp.config.image_groups, valid);
         s.currentProjectPath = opts.path;
         s.configDirty = false;
         // A dirty stash carried unsaved edits → keep it dirty. A clean perf

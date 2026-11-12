@@ -452,10 +452,28 @@ export interface AnalysisPayload {
   tables: Record<string, string>;  // {id: CSV text}
 }
 
-export interface ImageGroup {
+/** A named subgroup divider inside an image group's drawer. Its images are
+ *  shown right after its header, in this order. Every name here is ALSO in
+ *  the owning group's `imageNames` (and in at most one divider). */
+export interface ImageGroupDivider {
   id: string;
   name: string;
   imageNames: string[];
+}
+
+export interface ImageGroup {
+  id: string;
+  name: string;
+  /** The group's COMPLETE flat membership — unsectioned images AND every
+   *  divider's images. Kept complete on purpose: builds that predate
+   *  dividers ignore the `dividers` key, but still find every image of the
+   *  group here, so a newer .mpf opened in an older build loses nothing. */
+  imageNames: string[];
+  /** Optional named subgroups, in display order. Absent (not `[]`) on groups
+   *  that never used them, so re-saving an old project keeps its shape.
+   *  Display order: unsectioned images (imageNames minus every divider's
+   *  images) first, then each divider's header followed by its images. */
+  dividers?: ImageGroupDivider[];
 }
 
 /** A system build tool an R source-install needs (cmake, gfortran …). */

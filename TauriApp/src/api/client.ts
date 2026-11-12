@@ -231,6 +231,17 @@ class ApiClient {
     return apiJson<{ thumbnail: string }>(`/api/images/${encodeURIComponent(name)}/thumb`);
   }
 
+  /** A larger base64 PNG of a loaded image for the media-strip lightbox —
+   *  the same /thumb endpoint with an explicit long-edge cap. The backend
+   *  clamps `maxSide` to [64, 4096] and never upscales, so a small original
+   *  comes back at its native size. */
+  async getImagePreview(name: string, maxSide: number): Promise<{ thumbnail: string }> {
+    const side = Math.round(maxSide);
+    return apiJson<{ thumbnail: string }>(
+      `/api/images/${encodeURIComponent(name)}/thumb?max_side=${side}`,
+    );
+  }
+
   async getImageInfo(name: string): Promise<{ width: number; height: number }> {
     return apiJson<{ width: number; height: number }>(`/api/images/${encodeURIComponent(name)}/info`);
   }
