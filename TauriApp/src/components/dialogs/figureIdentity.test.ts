@@ -6,7 +6,7 @@
 import { describe, it, expect } from "vitest";
 import {
   figKey, rawKeyOf, nsKey, figureLabels, migrateLegacySource, measArrToCsv,
-  runtimeKeyFor, sourceProvenance, measRowKey,
+  runtimeKeyFor, sourceProvenance, measRowKey, sourceOriginLabel,
   type InsetSource,
 } from "./AnalysisNodeGraph";
 
@@ -286,5 +286,18 @@ describe("figure tabs inside one document", () => {
     expect(measRowKey("p:/exp/A.mpf", rows[0])).not.toBe(measRowKey("p:/exp/A.mpf", rows[1]));
     // Single-figure rows (no figure keys) are exactly as before.
     expect(measArrToCsv([{ panel: "R1C1", name: "L", value: "1" }], "A")).not.toContain("›");
+  });
+});
+
+describe("sourceOriginLabel — which document and figure a source came from", () => {
+  it("is the document name alone for a single-figure document", () => {
+    expect(sourceOriginLabel("A.mpf", "Figure 1", 1)).toBe("A.mpf");
+    expect(sourceOriginLabel("A.mpf", undefined, 0)).toBe("A.mpf");
+  });
+  it("names the figure once the document has several, even if only one has sources", () => {
+    expect(sourceOriginLabel("A.mpf", "Blots", 2)).toBe("A.mpf › Blots");
+  });
+  it("falls back to the document name when the figure name is missing", () => {
+    expect(sourceOriginLabel("A.mpf", undefined, 3)).toBe("A.mpf");
   });
 });

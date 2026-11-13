@@ -86,6 +86,10 @@ import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
 import { switchToDocument } from "../../utils/projectNav";
 import { DEFAULT_FIGURE_ID } from "../../utils/figures";
+import { figKey, nsKey } from "../../utils/analysisKeys";
+import { useSourceEditStore } from "../../store/sourceEditStore";
+import { computeStale, ranWithFor, sourcesWithResults, upstreamSourceKeys } from "../../utils/analysisStale";
+export { figKey, nsKey };
 import BandPickerDialog, {
   type BandPickerConfig,
   type BandImageConfig,
@@ -537,6 +541,14 @@ function SourceLibraryRow({ source, isUngrouped, onRemoveFromGroup, onDelete }: 
           <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", lineHeight: 1 }}>
             R{source.row + 1}C{source.col + 1}·{source.inset_index + 1} · {source.natural_width}×{source.natural_height}
           </Typography>
+          {/* A user group mixes sources from any document / figure and has
+              no per-document folder header, so name the origin here. */}
+          {!isUngrouped && !source.name && source.mpf && (
+            <Typography variant="caption" title={source.mpf}
+              sx={{ fontSize: "0.5rem", color: "text.secondary", display: "block", lineHeight: 1.1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {source.mpf}
+            </Typography>
+          )}
         </Box>
         <Box
           component="span"
@@ -591,6 +603,7 @@ function SourceHoverPreview({ source, name }: { source: InsetSource; name: strin
         {name}
       </Typography>
       <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", display: "block", mb: 0.75 }}>
+        {!source.name && source.mpf ? `${source.mpf} · ` : ""}
         Panel R{source.row + 1} C{source.col + 1}
         {source.inset_index >= 0 ? ` · inset ${source.inset_index + 1}` : ""}
         {` · ${source.natural_width}×${source.natural_height} px`}
@@ -885,28 +898,8 @@ function measIndexFromHandle(handle: string | null | undefined): number {
 /** The parts of a collageStore DocTab this module binds against. */
 type DocTabLike = { id: string; name: string; path?: string | null };
 
-/** Stable identity for the figure a source or measurement belongs to.
- *
- *  A doc id is only meaningful within one session: saved workflows persist to
- *  localStorage but `openDocs` does not (collageStore's `Persisted` omits it),
- *  so ids are re-minted on every launch. A path survives a restart; an Untitled
- *  figure has no durable identity at all, and a binding to one is deliberately
- *  allowed to go stale rather than silently resolve to a different figure.
- *
- *  Paths are compared as the raw strings the store holds. Two strings can name
- *  one file (bare "x.mpf" vs "~/Documents/x.mpf" — see docEnsure), which splits
- *  one figure into two identities. That over-separates, which is the safe way to
- *  be wrong here: it can strand a binding, never cross-bind it.
- *
- *  A document can hold several figure tabs (utils/figures.ts). Every figure but
- *  the project's first (DEFAULT_FIGURE_ID) appends `#<figureId>`, so bindings
- *  made before figure tabs — which carry no figure id — keep resolving to the
- *  first figure, which is the only figure those projects had. */
-export function figKey(d: { id: string; path?: string | null }, figureId?: string): string {
-  const p = (d.path || "").trim();
-  const doc = p ? `p:${p}` : `d:${d.id}`;
-  return figureId && figureId !== DEFAULT_FIGURE_ID ? `${doc}#${figureId}` : doc;
-}
+/* figKey / nsKey live in utils/analysisKeys (re-exported below) so the
+   figure store can key source edits without importing this component. */
 
 /** The backend's own key for an inset — bare grid coords, e.g. "r0c0_i0".
  *  Unique within a figure and identical ACROSS figures, which is why every
@@ -924,13 +917,6 @@ export function rawKeyOf(s: { key: string; rawKey?: string; name?: string }): st
   // contains one (r{r}c{c}_i{n} / _panel / _area{n}).
   const i = s.key.lastIndexOf("__");
   return i >= 0 ? s.key.slice(i + 2) : s.key;
-}
-
-/** Globally unique source key: which figure, then which inset inside it.
- *  FRONTEND ONLY — it embeds a path, so it must never reach the sidecar
- *  (see runtimeKeyFor). */
-export function nsKey(fig: string, raw: string): string {
-  return `${fig}::${raw}`;
 }
 
 /** The key the sidecar exposes a source under in the user's `inputs` dict.
@@ -1024,6 +1010,13 @@ export function sourceProvenance(
     if (owner.path) fields.project_path = owner.path;
   }
   return { owner, fields };
+}
+
+/** Where an analysis source came from, as shown on its card / node / folder:
+ *  the document's display label, plus "› figure" when the document holds more
+ *  than one figure (a single-figure document reads exactly as before). */
+export function sourceOriginLabel(docLabel: string, figureName: string | undefined, figureCount: number): string {
+  return figureCount > 1 && figureName ? `${docLabel} › ${figureName}` : docLabel;
 }
 
 /** Unique, human-readable label per open figure, keyed by doc id.
@@ -1490,6 +1483,10 @@ interface GraphCallbacks {
    *  the live edge set via useMemo so node cards can render a
    *  non-zero in-count the moment the user wires an edge. */
   inputCountsByNode: Map<string, { image: number; table: number }>;
+  /** Process nodes whose results predate an Edit Panel change to a source
+   *  they read, and those sources (utils/analysisStale). */
+  staleNodeIds: Set<string>;
+  staleSourceKeys: Set<string>;
   /** Per-node declared outputs (parsed from code).  Surfaced as
    *  outlined chips on the node card BEFORE the first run lands. */
   declaredByNode: Map<string, DeclaredOutput[]>;
@@ -1650,6 +1647,10 @@ export interface NodeData {
    *  knows what to feed in. */
   inputs?: { name: string; sourceNodeId: string; sourceOutputId: string; kind: DataKind }[];
   status?: "idle" | "running" | "ok" | "error" | "stale";
+  /** Revision of each upstream image source when this node last ran
+   *  successfully (store/sourceEditStore). A source edited in Edit Panel
+   *  since then makes this node's results stale (utils/analysisStale). */
+  ranWith?: Record<string, number>;
   /** Last error message (when status === "error"). */
   error?: string;
   /** Per-node combined stdout / stderr from the most recent run.
@@ -1788,6 +1789,25 @@ function StatusPip({ status }: { status?: NodeData["status"] }) {
   );
 }
 
+/** Marks an image, node or output whose results predate an Edit Panel
+ *  change to the pixels they were computed from (utils/analysisStale). It
+ *  clears when the node runs again. */
+function StaleBadge({ title }: { title: string }) {
+  return (
+    <Tooltip placement="top" title={title}>
+      <Box component="span" data-testid="stale-badge" sx={{
+        fontSize: "0.5rem", fontWeight: 700, lineHeight: 1.4, px: 0.5, borderRadius: 0.5,
+        bgcolor: "warning.main", color: "rgba(0,0,0,0.87)", textTransform: "uppercase",
+        letterSpacing: 0.3, flexShrink: 0, whiteSpace: "nowrap",
+      }}>
+        stale
+      </Box>
+    </Tooltip>
+  );
+}
+const STALE_SOURCE_TIP = "Edited in Edit Panel after results were computed from it — re-run the pipeline to update them.";
+const STALE_NODE_TIP = "An image this reads was edited in Edit Panel after it ran — these results come from the old pixels. Re-run to update.";
+
 /** Source node — exposes inset thumbnails as draggable output ports.
  *  Accepts inset drops from the left-hand library panel (drag a thumb
  *  onto a source node to attach it). Measurements port is exposed
@@ -1911,7 +1931,16 @@ function SourceNode({ data, id }: NodeCardProps) {
                 <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", lineHeight: 1 }}>
                   R{s.row + 1}C{s.col + 1}·{s.inset_index + 1}
                 </Typography>
+                {/* Which document (and figure, when it has several) the
+                    image came from — a node can mix sources of many. */}
+                {!s.name && s.mpf && (
+                  <Typography variant="caption" title={s.mpf} data-testid="source-origin"
+                    sx={{ fontSize: "0.5rem", color: "text.secondary", display: "block", lineHeight: 1.1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {s.mpf}
+                  </Typography>
+                )}
               </Box>
+              {cbs?.staleSourceKeys.has(s.key) && <StaleBadge title={STALE_SOURCE_TIP} />}
               <Box
                 component="span"
                 onClick={(e) => { e.stopPropagation(); cbs?.removeSourceFromNode(id, idx); }}
@@ -2004,6 +2033,7 @@ function ProcessNode({ data, id }: NodeCardProps) {
           {KIND_ICON[engine]} {data.label}
         </Typography>
         <Box sx={{ flex: 1 }} />
+        {data.status !== "running" && cbs?.staleNodeIds.has(id) && <StaleBadge title={STALE_NODE_TIP} />}
         <StatusPip status={data.status} />
       </Box>
       <Box sx={{ display: "flex" }}>
@@ -5083,6 +5113,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   // last tab switch — they live in component-local state, so without this
   // the user's uploaded files disappear every time the tab is left.
   const [insetSources, setInsetSources] = useState<InsetSource[]>(() => loadAnalysisUploads());
+  // True once the live source list has arrived — an "Update" re-run
+  // requested from the Edit Panel waits for it (utils/analysisStale).
+  const [sourcesLoaded, setSourcesLoaded] = useState(false);
   // Skeleton placeholders shown while an Analysis upload is in flight.
   // Each entry is a (best-effort) basename so the user sees WHICH file is
   // still landing — analysis-image reads (esp. 16-bit TIFFs) can take a few
@@ -5715,9 +5748,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     const _activeFig = activeFigureId;
     // Each row names the figure TAB it came from (a document can hold
     // several); that id joins the binding key, the runtime key and — when
-    // the document has more than one figure — the folder label.
-    const _tag = (arr: Array<Record<string, unknown>>, d: DocTabLike) => {
-      const multiFig = new Set(arr.map((s) => String(s.figure_id ?? ""))).size > 1;
+    // the DOCUMENT has more than one figure (`figureCount`, from the
+    // response's figure list — not just figures that happen to have
+    // sources) — the origin label "doc › figure".
+    const _tag = (arr: Array<Record<string, unknown>>, d: DocTabLike, figureCount: number) => {
       return arr.map((s) => {
         const src = s as unknown as InsetSource & { figure_id?: unknown; figure_name?: unknown };
         const fid = typeof src.figure_id === "string" && src.figure_id ? src.figure_id : undefined;
@@ -5730,7 +5764,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           ...rest, key: nsKey(fk, raw), rawKey: raw, figKey: fk,
           figureId: fid, figureName: fname,
           runKey: runtimeKeyFor({ ...rest, rawKey: raw, figureId: fid }, d.id, _active, _activeFig),
-          mpfId: d.id, mpf: multiFig && fname ? `${docLabel} › ${fname}` : docLabel,
+          mpfId: d.id, mpf: sourceOriginLabel(docLabel, fname, figureCount),
         } as InsetSource;
       });
     };
@@ -5738,18 +5772,18 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     // return this figure's measurements too; record them so the Sources
     // panel can offer a draggable Measurements tile for EACH open figure.
     const _measAccum: Record<string, { csv: string; rows: number; items: Array<Record<string, unknown>> }> = {};
-    const _capMeas = (r: { sources?: Array<Record<string, unknown>>; measurements?: Array<Record<string, unknown>> }, d: DocTabLike) => {
+    const _capMeas = (r: { sources?: Array<Record<string, unknown>>; measurements?: Array<Record<string, unknown>>; figures?: unknown[] }, d: DocTabLike) => {
       const m = r.measurements || [];
       // Tag with the DISAMBIGUATED label, not d.name — two tabs can share a
       // name, and the Figure column is the only thing separating their rows.
       if (m.length) _measAccum[d.id] = { csv: measArrToCsv(m, _labels[d.id] || d.name), rows: m.length, items: m };
-      return _tag(r.sources || [], d);
+      return _tag(r.sources || [], d, r.figures?.length ?? 0);
     };
     const _activeDoc = _docs.find((d) => d.id === _active);
     const tasks: Promise<InsetSource[]>[] = [
       api.listInsetAnalysisSources()
         .then((r) => (_activeDoc
-          ? _tag((r.sources || []) as Array<Record<string, unknown>>, _activeDoc)
+          ? _tag((r.sources || []) as Array<Record<string, unknown>>, _activeDoc, (r as { figures?: unknown[] }).figures?.length ?? 0)
           : ([] as InsetSource[])))
         .catch(() => [] as InsetSource[]),
     ];
@@ -5784,6 +5818,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           const uploads = prev.filter((s) => s.name && !liveKeys.has(s.key));
           return [...uploads, ...list];
         });
+        setSourcesLoaded(true);
         setExtraMeasurements(_measAccum);
         // Do NOT auto-populate the Source node — the user picks
         // which insets to attach by dragging from the library
@@ -7372,6 +7407,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     }
     // Mark running
     setNodes((cur) => cur.map((n) => n.id === node.id ? { ...n, data: { ...n.data, status: "running", error: undefined } } : n));
+    // Which version of each upstream source this run reads — taken at the
+    // START, so an Edit Panel change made while it runs still marks it stale.
+    const ranWith = ranWithFor(node.id, [...nodeMap.values()], edges, useSourceEditStore.getState().revs);
     consoleRef.current += `\n=== Run ${node.data.label} (${engine}) ===\n`;
     setConsoleOut(consoleRef.current);
 
@@ -7676,6 +7714,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
             status: result.success ? "ok" : "error",
             error: result.success ? undefined : (result.stderr || "Run failed").slice(0, 200),
             consoleOut: nodeOut,
+            ranWith: result.success ? ranWith : n.data.ranWith,
           },
         };
       }));
@@ -7689,11 +7728,15 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       } : n));
     }
   }, [collectInputs, insetSources, enginePaths, setNodes, sourceNameOverrides, openBandPickerAndWait,
-      openDocs, activeDocId, activeFigureId, figureTabs]);
+      openDocs, activeDocId, activeFigureId, figureTabs, edges]);
 
-  const runGraph = useCallback(async () => {
+  /** Run the active workflow's process nodes in dependency order — all of
+   *  them, or only those in `only` (the Edit Panel's "Update" re-run). */
+  const runOrdered = useCallback(async (only?: ReadonlySet<string>) => {
     setRunningGraph(true);
-    consoleRef.current += `\n──────────── RUN GRAPH ────────────\n`;
+    consoleRef.current += only
+      ? `\n──────────── RE-RUN (edited in Edit Panel) ────────────\n`
+      : `\n──────────── RUN GRAPH ────────────\n`;
     setConsoleOut(consoleRef.current);
     // Take a fresh snapshot of nodes — we'll be updating state in
     // the loop and need to look up upstream outputs as they land.
@@ -7711,6 +7754,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       const node = snapshot.get(id);
       if (!node) continue;
       if (node.data.kind === "source") continue;
+      if (only && !only.has(id)) continue;
       await runNode(node, snapshot);
       // A node may have requested the run stop (e.g. band picking cancelled, or
       // the interactive picker is gating the rest of the pipeline).
@@ -7718,6 +7762,31 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     }
     setRunningGraph(false);
   }, [topoOrder, runNode]);
+  const runGraph = useCallback(() => runOrdered(), [runOrdered]);
+
+  // ── Results made stale by Edit Panel changes (utils/analysisStale) ──
+  const sourceRevs = useSourceEditStore((s) => s.revs);
+  const stale = useMemo(() => computeStale(nodes, edges, sourceRevs), [nodes, edges, sourceRevs]);
+  // Tell the Edit Panel which sources feed results, so it knows when to
+  // warn. Published to a store because this view is unmounted in Builder.
+  useEffect(() => {
+    useSourceEditStore.getState().publishWithResults(sourcesWithResults(workflowTabs));
+  }, [workflowTabs]);
+  // "Update" chosen in the Edit Panel: once the sources are loaded, re-run
+  // just the stale nodes that read an updated source, upstream first. Only
+  // the active workflow tab can run; stale nodes in other tabs keep their
+  // badge until run.
+  const rerunRequest = useSourceEditStore((s) => s.rerun);
+  useEffect(() => {
+    const keys = new Set(Object.keys(rerunRequest));
+    if (!keys.size || !sourcesLoaded || runningGraph) return;
+    useSourceEditStore.getState().clearRerun();
+    const ids = new Set(nodes
+      .filter((n) => stale.nodeIds.has(n.id) && upstreamSourceKeys(n.id, nodes, edges).some((k) => keys.has(k)))
+      .map((n) => n.id));
+    if (ids.size) void runOrdered(ids);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rerunRequest, sourcesLoaded, runningGraph]);
 
   const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedNodeId) || null, [nodes, selectedNodeId]);
 
@@ -8127,6 +8196,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         insetSources, sourceNameOverrides, renameSource: renameSourceHandler,
         hasMeasurements, highlightedUpstreamIds,
         inputCountsByNode, declaredByNode,
+        staleNodeIds: stale.nodeIds, staleSourceKeys: stale.sourceKeys,
       }}>
       <Box sx={{ flex: 1, display: "flex", minHeight: 0, position: "relative" }}>
       {/* Far left: source library panel.  Lists every flagged inset
@@ -8738,7 +8808,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                       R{s.row + 1}C{s.col + 1} · inset {s.inset_index + 1}
                     </Typography>
                     <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>
-                      {s.label} · {s.natural_width}×{s.natural_height}
+                      {!s.name && s.mpf ? `${s.mpf} · ` : ""}{s.label} · {s.natural_width}×{s.natural_height}
                     </Typography>
                   </Box>
                   <IconButton size="small" onClick={() => removeSourceFromNode(selectedNode.id, idx)} title="Detach this inset">
@@ -9209,9 +9279,12 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                           <IconButton size="small" onClick={() => togglePin(o.nodeId, o.outputId)} sx={{ position: "absolute", top: 2, right: 2, p: 0 }}>
                             {o.pinned ? <StarIcon sx={{ fontSize: 14, color: "warning.main" }} /> : <StarBorderIcon sx={{ fontSize: 14 }} />}
                           </IconButton>
-                          <Typography variant="caption" sx={{ fontSize: "0.55rem", fontWeight: 600, color: "text.secondary", pl: 2.5, lineHeight: 1.2 }}>
-                            {o.nodeLabel}
-                          </Typography>
+                          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, pl: 2.5, pr: 2, minWidth: 0 }}>
+                            <Typography variant="caption" sx={{ fontSize: "0.55rem", fontWeight: 600, color: "text.secondary", lineHeight: 1.2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {o.nodeLabel}
+                            </Typography>
+                            {stale.nodeIds.has(o.nodeId) && <StaleBadge title={STALE_NODE_TIP} />}
+                          </Box>
                           <Typography variant="caption" sx={{ fontSize: "0.65rem", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", pr: 2 }}>
                             {o.name}
                           </Typography>

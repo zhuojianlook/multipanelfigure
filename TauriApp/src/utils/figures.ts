@@ -49,6 +49,19 @@ export interface ImageUsage {
   inCurrent: number;
   /** Other figures that show it, in tab order. */
   others: { id: string; name: string; count: number }[];
+  /** Every figure that shows it, active one included, in tab order — what
+   *  the image strip draws as one numbered marker per figure. */
+  byFigure: FigureUse[];
+}
+
+/** One figure that shows an image. `index` is the 1-based tab position, the
+ *  number the figure tab and the image tile's marker both display. */
+export interface FigureUse {
+  id: string;
+  name: string;
+  index: number;
+  count: number;
+  current: boolean;
 }
 
 type Obj = Record<string, unknown>;
@@ -275,16 +288,20 @@ export function imageUsage(
   const usage = new Map<string, ImageUsage>();
   const entry = (name: string) => {
     let u = usage.get(name);
-    if (!u) { u = { inCurrent: 0, others: [] }; usage.set(name, u); }
+    if (!u) { u = { inCurrent: 0, others: [], byFigure: [] }; usage.set(name, u); }
     return u;
   };
-  for (const [name, n] of countPanels(activeConfig)) entry(name).inCurrent = n;
-  for (const f of figures) {
-    if (f.id === activeFigureId) continue;
-    for (const [name, count] of countPanels(f.config)) {
-      entry(name).others.push({ id: f.id, name: f.name, count });
+  // The active figure's panels live in the store's config, not its tab entry.
+  const activeCounts = countPanels(activeConfig);
+  for (const [name, n] of activeCounts) entry(name).inCurrent = n;
+  figures.forEach((f, i) => {
+    const current = f.id === activeFigureId;
+    for (const [name, count] of current ? activeCounts : countPanels(f.config)) {
+      const u = entry(name);
+      u.byFigure.push({ id: f.id, name: f.name, index: i + 1, count, current });
+      if (!current) u.others.push({ id: f.id, name: f.name, count });
     }
-  }
+  });
   return usage;
 }
 

@@ -40,6 +40,47 @@ import {
   stripImageFromFigures,
   type FiguresState,
 } from "../utils/figures";
+import { analysisSourceSigs, changedSourceRawKeys } from "../utils/analysisStale";
+import { figKey, nsKey } from "../utils/analysisKeys";
+import { useCollageStore } from "./collageStore";
+import { useSourceEditStore } from "./sourceEditStore";
+
+/** Analysis keys (figKey::raw, as the graph binds them) of the ON-SCREEN
+ *  figure's sources whose pixels change when panel (row, col) goes from
+ *  `before` to `after`. [] when nothing analysable changed. */
+export function editedSourceKeys(
+  row: number, col: number, before: PanelInfo | null | undefined, after: PanelInfo | null | undefined,
+): string[] {
+  const raw = changedSourceRawKeys(before, after, row, col);
+  if (!raw.length) return [];
+  const cs = useCollageStore.getState();
+  const doc = cs.openDocs.find((d) => d.id === cs.activeDocId);
+  if (!doc) return [];
+  const fk = figKey(doc, useFigureStore.getState().activeFigureId);
+  return raw.map((k) => nsKey(fk, k));
+}
+
+/** Analysis keys of every source, in every figure of the open document,
+ *  whose panel shows `imageName` — for image-level edits (channel tints /
+ *  levels) that change the pixels of all of them at once. */
+export function sourceKeysForImage(imageName: string): string[] {
+  const cs = useCollageStore.getState();
+  const doc = cs.openDocs.find((d) => d.id === cs.activeDocId);
+  if (!doc || !imageName) return [];
+  const st = useFigureStore.getState();
+  const keys: string[] = [];
+  const scan = (cfg: FigureConfig | null | undefined, figureId: string) => {
+    if (!cfg || !Array.isArray(cfg.panels)) return;
+    const fk = figKey(doc, figureId);
+    cfg.panels.forEach((rowPanels, r) => (rowPanels || []).forEach((p, c) => {
+      if (p?.image_name !== imageName) return;
+      for (const raw of Object.keys(analysisSourceSigs(p, r, c))) keys.push(nsKey(fk, raw));
+    }));
+  };
+  scan(st.config, st.activeFigureId);
+  for (const f of st.figures) if (f.id !== st.activeFigureId) scan(f.config, f.id);
+  return keys;
+}
 
 // ── Loaded image metadata kept client-side ───────────────
 
@@ -887,6 +928,9 @@ export const useFigureStore = create<FigureState>()(
       // their backend state pushed AND their PanelGrid thumbnails
       // refreshed.
       const cascadedScaleBar: Array<{ r: number; c: number }> = [];
+      // Immer snapshot (never mutated) — compared below to tell Analysis
+      // which of its sources this edit changed.
+      const panelBefore = get().config?.panels[row]?.[col];
 
       set((s) => {
         if (s.config && s.config.panels[row] && s.config.panels[row][col]) {
@@ -1000,6 +1044,11 @@ export const useFigureStore = create<FigureState>()(
           .then(() => get().refreshPanelThumbnail(row, col))
           .catch(console.error);
       }
+      // A change to the pixels an Analysis source extracts makes results
+      // computed from it stale (utils/analysisStale). Every panel edit —
+      // the Edit Panel's Save and its apply-to-row/column buttons alike —
+      // lands here, so this is the one place that records it.
+      useSourceEditStore.getState().bump(editedSourceKeys(row, col, panelBefore, panel));
       // Push label fixups for any neighbouring panels the relabel pass
       // touched (newly-promoted zoom targets). Fire in parallel; their
       // thumbnails get refreshed when the patch resolves.

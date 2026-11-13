@@ -245,10 +245,23 @@ describe("imageUsage / stripImageFromFigures", () => {
   it("counts the active figure and lists the other figures", () => {
     const s = twoFigures();
     const u = imageUsage(s.figures, s.activeFigureId, s.config);
-    expect(u.get("a.png")).toEqual({ inCurrent: 1, others: [] });
-    expect(u.get("b.png")).toEqual({ inCurrent: 1, others: [{ id: "fig-x", name: "WB", count: 2 }] });
-    expect(u.get("c.png")).toEqual({ inCurrent: 0, others: [{ id: "fig-x", name: "WB", count: 1 }] });
+    expect(u.get("a.png")).toMatchObject({ inCurrent: 1, others: [] });
+    expect(u.get("b.png")).toMatchObject({ inCurrent: 1, others: [{ id: "fig-x", name: "WB", count: 2 }] });
+    expect(u.get("c.png")).toMatchObject({ inCurrent: 0, others: [{ id: "fig-x", name: "WB", count: 1 }] });
     expect(u.has("")).toBe(false);
+  });
+
+  it("lists every figure using an image in tab order, numbered by tab position", () => {
+    const s = twoFigures();
+    const u = imageUsage(s.figures, s.activeFigureId, s.config);
+    const marks = (n: string) => u.get(n)?.byFigure.map((f) => [f.index, f.current, f.count]);
+    const activeIdx = s.figures.findIndex((f) => f.id === s.activeFigureId) + 1;
+    const otherIdx = s.figures.findIndex((f) => f.id === "fig-x") + 1;
+    expect(marks("a.png")).toEqual([[activeIdx, true, 1]]);
+    expect(marks("b.png")).toEqual(
+      [[activeIdx, true, 1], [otherIdx, false, 2]].sort((p, q) => (p[0] as number) - (q[0] as number)),
+    );
+    expect(marks("c.png")).toEqual([[otherIdx, false, 1]]);
   });
 
   it("blanks an image in parked figures only", () => {

@@ -64,8 +64,10 @@ import VisibilityOffIcon from "@mui/icons-material/VisibilityOff";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import StraightenIcon from "@mui/icons-material/Straighten";
 import { VolumeViewerDialog } from "./VolumeViewer";
-import { useFigureStore } from "../../store/figureStore";
-import { api } from "../../api/client";
+import { useFigureStore, editedSourceKeys, sourceKeysForImage } from "../../store/figureStore";
+import { api, settleConfigWrites } from "../../api/client";
+import { useSourceEditStore } from "../../store/sourceEditStore";
+import { describeSourceKey } from "../../utils/analysisStale";
 import { niceScaleBarUm } from "../../utils/scaleBarRounding";
 import { computeScaleBarRect } from "../../utils/scaleBarGeometry";
 import { lineAutoLabel, areaAutoLabel, unitLabelFor } from "../../utils/lineMeasure";
@@ -712,6 +714,11 @@ interface CropCanvasProps {
 }
 
 const HANDLE_SIZE = 10;
+/** Gap between the crop box's frame and the image. The frame clips its
+ *  contents (overflow: hidden), and the image used to fill it edge to edge, so
+ *  a handle on a crop edge lying on the image boundary was cut in half — and
+ *  its outer half couldn't be grabbed. The margin keeps every handle whole. */
+const CROP_PAD = HANDLE_SIZE / 2 + 3;
 
 type DragMode = "none" | "move" | "nw" | "ne" | "sw" | "se" | "n" | "s" | "e" | "w";
 
@@ -786,9 +793,13 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
   const { rotW, rotH } = computeRotatedDims(imgNatW, imgNatH, rotation);
   const rad = (rotation || 0) * Math.PI / 180;
 
-  // Computed scale (fit rotated image into measured canvas width)
-  const scale = rotW > 0 ? canvasW / rotW : 1;
-  const canvasH = Math.max(1, Math.round(rotH * scale));
+  // Computed scale: fit the rotated image into the measured width minus the
+  // CROP_PAD margin on each side. The "stage" is the image area; the canvas
+  // (event layer) and the frame are the stage plus the margin all round.
+  const stageW = Math.max(1, canvasW - 2 * CROP_PAD);
+  const scale = rotW > 0 ? stageW / rotW : 1;
+  const stageH = Math.max(1, Math.round(rotH * scale));
+  const canvasH = stageH + 2 * CROP_PAD;
 
   // Keep refs for values needed in window event listeners (avoid stale closures)
   const scaleRef = useRef(scale);
@@ -905,6 +916,10 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
     ctx.drawImage(img, -displayW / 2, -displayH / 2, displayW, displayH);
     ctx.restore();
 
+    // Everything below is in stage space (rotated image space × scale).
+    ctx.save();
+    ctx.translate(CROP_PAD, CROP_PAD);
+
     // Darken outside crop rect (in rotated space = canvas space)
     ctx.fillStyle = "rgba(0,0,0,0.5)";
     const rx = cropRect.x * scale;
@@ -913,13 +928,13 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
     const rh = cropRect.h * scale;
 
     // Top
-    ctx.fillRect(0, 0, canvasW, ry);
+    ctx.fillRect(0, 0, stageW, ry);
     // Bottom
-    ctx.fillRect(0, ry + rh, canvasW, canvasH - ry - rh);
+    ctx.fillRect(0, ry + rh, stageW, stageH - ry - rh);
     // Left
     ctx.fillRect(0, ry, rx, rh);
     // Right
-    ctx.fillRect(rx + rw, ry, canvasW - rx - rw, rh);
+    ctx.fillRect(rx + rw, ry, stageW - rx - rw, rh);
 
     // Crop rectangle border. strokeRect centers the line on the path, so when
     // an edge sits exactly on the canvas boundary (e.g. a full-height/width
@@ -934,8 +949,8 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
       let sx = rx, sy = ry, sw = rw, sh = rh;
       if (sx < half) { sw -= half - sx; sx = half; }
       if (sy < half) { sh -= half - sy; sy = half; }
-      if (sx + sw > canvasW - half) sw = canvasW - half - sx;
-      if (sy + sh > canvasH - half) sh = canvasH - half - sy;
+      if (sx + sw > stageW - half) sw = stageW - half - sx;
+      if (sy + sh > stageH - half) sh = stageH - half - sy;
       ctx.strokeRect(sx, sy, Math.max(0, sw), Math.max(0, sh));
     }
 
@@ -963,6 +978,7 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
     for (const [ex, ey] of edges) {
       ctx.fillRect(ex, ey, ehs, ehs);
     }
+    ctx.restore();
   };
 
   // Trigger 1 — synchronous after every render (catches the common case
@@ -1047,10 +1063,11 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
     const canvas = canvasRef.current;
     if (!canvas) return { mx: 0, my: 0 };
     const rect = canvas.getBoundingClientRect();
-    // Canvas logical size matches CSS size (no maxWidth scaling needed)
+    // Canvas logical size matches CSS size (no maxWidth scaling needed).
+    // Returned in stage space: the image's top-left is CROP_PAD in.
     return {
-      mx: (e.clientX - rect.left) * (canvas.width / rect.width),
-      my: (e.clientY - rect.top) * (canvas.height / rect.height),
+      mx: (e.clientX - rect.left) * (canvas.width / rect.width) - CROP_PAD,
+      my: (e.clientY - rect.top) * (canvas.height / rect.height) - CROP_PAD,
     };
   };
 
@@ -1175,6 +1192,10 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
         userSelect: "none",
       }}
     >
+      {/* The stage: the image area, CROP_PAD in from the frame on every
+          side, so handles on the image boundary stay whole. Overflow is
+          visible here; the frame above does the clipping. */}
+      <div style={{ position: "absolute", left: CROP_PAD + "px", top: CROP_PAD + "px", width: stageW + "px", height: stageH + "px", pointerEvents: "none" }}>
       {/* Always-visible HTML image, rotated/flipped via CSS. This is the
           definitive source of pixels the user sees — never subject to any
           canvas-bitmap timing issue. */}
@@ -1203,11 +1224,11 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
           {/* top */}
           <div style={{ position: "absolute", top: 0, left: 0, width: "100%", height: Math.max(0, oy) + "px", backgroundColor: "rgba(0,0,0,0.5)", pointerEvents: "none" }} />
           {/* bottom */}
-          <div style={{ position: "absolute", top: (oy + oh) + "px", left: 0, width: "100%", height: Math.max(0, canvasH - oy - oh) + "px", backgroundColor: "rgba(0,0,0,0.5)", pointerEvents: "none" }} />
+          <div style={{ position: "absolute", top: (oy + oh) + "px", left: 0, width: "100%", height: Math.max(0, stageH - oy - oh) + "px", backgroundColor: "rgba(0,0,0,0.5)", pointerEvents: "none" }} />
           {/* left */}
           <div style={{ position: "absolute", top: oy + "px", left: 0, width: Math.max(0, ox) + "px", height: oh + "px", backgroundColor: "rgba(0,0,0,0.5)", pointerEvents: "none" }} />
           {/* right */}
-          <div style={{ position: "absolute", top: oy + "px", left: (ox + ow) + "px", width: Math.max(0, canvasW - ox - ow) + "px", height: oh + "px", backgroundColor: "rgba(0,0,0,0.5)", pointerEvents: "none" }} />
+          <div style={{ position: "absolute", top: oy + "px", left: (ox + ow) + "px", width: Math.max(0, stageW - ox - ow) + "px", height: oh + "px", backgroundColor: "rgba(0,0,0,0.5)", pointerEvents: "none" }} />
           {/* Crop border */}
           <div style={{ position: "absolute", top: oy + "px", left: ox + "px", width: ow + "px", height: oh + "px", border: "2px solid #2196f3", boxSizing: "border-box", pointerEvents: "none" }} />
           {/* 4 corner handles */}
@@ -1230,6 +1251,7 @@ function CropCanvas({ imageSrc, aspectPreset, customRatio, cropRect, imgNatW, im
           ))}
         </>
       )}
+      </div>
 
       {/* The canvas is retained as an invisible event capture layer; its
           existing drag/resize hit-testing reads mouse positions relative
@@ -1973,6 +1995,11 @@ function ChannelsBlock({ imageName, panelRow, panelCol, onChange }: {
     try {
       const res = await api.updateChannels(imageName, { ...body, row: panelRow, col: panelCol });
       setInfo(prev => prev ? { ...prev, ...res } : prev);
+      // Channel tints / levels apply to the IMAGE at once (every panel that
+      // shows it), outside the panel's Save — mark Analysis results computed
+      // from it stale. Renaming a channel changes no pixels.
+      const { names: _names, row: _r, col: _c, ...pixelEdits } = body as Record<string, unknown>;
+      if (Object.keys(pixelEdits).length) useSourceEditStore.getState().bump(sourceKeysForImage(imageName));
       onChange();
     } catch (e) { console.error("[channels]", e); }
     setPending(false);
@@ -3653,8 +3680,53 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
 
   if (!local) return null;
 
-  const handleSave = () => {
+  const handleSave = async () => {
+    // Analysis extracts a source's pixels from the live panel, so saving a
+    // change to them (crop, rotation, adjustments, inset / area region)
+    // leaves results computed from the old pixels behind. Ask first when
+    // any of this panel's sources already has results.
+    const before = useFigureStore.getState().config?.panels[row]?.[col];
+    const withResults = new Set(useSourceEditStore.getState().withResults);
+    const hit = editedSourceKeys(row, col, before, local).filter((k) => withResults.has(k));
+    let rerun = false;
+    if (hit.length) {
+      const names = hit.map(describeSourceKey).join(", ");
+      const choice = await confirmThree({
+        title: "This image has Analysis results",
+        body: `${names} ${hit.length === 1 ? "has" : "have"} results in Analysis, and these changes alter `
+          + "the pixels Analysis reads (crop, rotation, adjustments or the inset / area region). "
+          + "The results no longer match until the pipeline runs again.\n\n"
+          + "Update: re-run the affected pipeline with the new pixels the next time you open Analysis.\n"
+          + "Keep: keep the current results; Analysis marks them \"stale\" until you re-run them.",
+        confirmLabel: "Update",
+        tertiaryLabel: "Keep results",
+        cancelLabel: "Back to editing",
+      });
+      if (choice === "cancel") return;
+      rerun = choice === "confirm";
+    }
+    // updatePanel records the edit for Analysis (the stale markers).
     updatePanel(row, col, local);
+    if (rerun) useSourceEditStore.getState().requestRerun(hit);
+    onClose();
+  };
+
+  // While open, the dialog pushes its UNSAVED edits to the sidecar for the
+  // live preview (patchPanelAndPreview). Closing without saving must put the
+  // committed panel back — otherwise the sidecar keeps the abandoned crop /
+  // adjustments, and Analysis (which extracts from the sidecar) or an export
+  // would use pixels the user discarded.
+  const handleCancel = () => {
+    if (previewTimerRef.current) clearTimeout(previewTimerRef.current);
+    if (renderedPreviewTimerRef.current) clearTimeout(renderedPreviewTimerRef.current);
+    previewSeqRef.current++; // ignore any preview still in flight
+    const committed = useFigureStore.getState().config?.panels[row]?.[col];
+    if (committed) {
+      void settleConfigWrites()
+        .then(() => api.patchPanel(row, col, committed as unknown as Record<string, unknown>))
+        .then(() => useFigureStore.getState().refreshPanelThumbnail(row, col))
+        .catch(console.error);
+    }
     onClose();
   };
 
@@ -4203,10 +4275,13 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   const onScaleMeasureDrag = (which: "a" | "b", p: PctPt) =>
     setScaleMeasure((m) => (m && m.phase === "review" ? { ...m, [which]: p } : m));
 
-  /** Write a calibration into the image scale bar, end the measurement, then
-   *  run the same "update annotations?" reconcile every other µm/px edit
-   *  runs (it can also undo the change). */
-  const commitMeasuredScale = async (patch: { micron_per_pixel: number; unit: string; scale_name: string }) => {
+  /** Write a calibration into the image scale bar, end the measurement
+   *  (unless `keepOpen`), then run the same "update annotations?" reconcile
+   *  every other µm/px edit runs (it can also undo the change). */
+  const commitMeasuredScale = async (
+    patch: { micron_per_pixel: number; unit: string; scale_name: string },
+    keepOpen = false,
+  ) => {
     const sbNow = localRef.current?.scale_bar;
     if (!sbNow) return;
     const prevMpp = sbNow.micron_per_pixel;
@@ -4220,7 +4295,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
         label: patch.unit !== oldUnit && labelIsAuto ? "" : sbNow.label,
       },
     });
-    setScaleMeasure(null);
+    if (!keepOpen) setScaleMeasure(null);
     // maybeReconcileAnnotationScales reads localRef, which the setLocal
     // updater refreshes during React's next render. Let that render happen
     // first — otherwise it compares the OLD value with itself and stays
@@ -4253,8 +4328,9 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     if (!m) return;
     const mpp = measuredUmPerPx(m);
     if (!Number.isFinite(mpp) || mpp <= 0) return;
-    // A one-off calibration: stays a Custom scale (scale_name "").
-    await commitMeasuredScale({ micron_per_pixel: mpp, unit: m.unit, scale_name: "" });
+    // A one-off calibration: stays a Custom scale (scale_name ""). The panel
+    // stays open, so the same measurement can still be saved as an entry.
+    await commitMeasuredScale({ micron_per_pixel: mpp, unit: m.unit, scale_name: "" }, true);
   };
 
   const saveScaleMeasure = async () => {
@@ -4341,6 +4417,17 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     const trimmed = (m.saveName ?? "").trim();
     const willReplace = naming && !nameIssue && !!config
       && Object.prototype.hasOwnProperty.call(config.resolution_entries ?? {}, scaleEntryKey(trimmed, m.unit));
+    // Apply keeps this panel open; "applied" = the bar already holds exactly
+    // this calibration as a Custom scale. Derived from the bar itself (not a
+    // flag), so moving A/B, retyping, or undoing the change clears it.
+    const sbCur = local?.scale_bar;
+    const applied = !issue && !measurePreUnknown && Number.isFinite(mpp) && !!sbCur && !sbCur.scale_name
+      && (sbCur.unit || "um") === m.unit
+      && Math.abs((sbCur.micron_per_pixel ?? NaN) - mpp) <= 1e-9 * Math.max(1, mpp);
+    // Static captions instead of MUI floating labels: in this tight inline
+    // panel the floating label, lifted onto the outline when the field is
+    // focused, collided with the field. Each input keeps its aria-label.
+    const capSx = { display: "block", fontSize: "0.62rem", color: "text.secondary", lineHeight: 1.3, mb: 0.25 } as const;
     return (
       <Box data-testid="scale-measure-panel" sx={boxSx}>
         <Typography variant="caption" sx={{ fontSize: "0.7rem" }}>
@@ -4349,8 +4436,10 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
           <Box component="span" sx={{ color: "text.secondary" }}> — drag A or B on the image to fine-tune</Box>
         </Typography>
         <Box sx={{ display: "flex", gap: 1 }}>
+          <Box sx={{ flex: 1, minWidth: 0 }}>
+          <Typography variant="caption" sx={capSx}>Known distance</Typography>
           <TextField
-            label="Known distance"
+            fullWidth
             type="number"
             size="small"
             autoFocus
@@ -4363,13 +4452,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
               if (e.key === "Enter" && !issue && !naming) { e.preventDefault(); void applyScaleMeasure(); }
             }}
             inputProps={{ min: 0, step: "any", "aria-label": "Known distance", "data-testid": "scale-measure-distance" }}
-            sx={{ flex: 1, "& input": { fontSize: "0.75rem" } }}
+            sx={{ "& input": { fontSize: "0.75rem" } }}
           />
+          </Box>
+          <Box sx={{ width: 84, flex: "none" }}>
+          <Typography variant="caption" sx={capSx}>Unit</Typography>
           {/* Native select: no popover portal to fight the Esc handling,
               and it's trivially scriptable in e2e. */}
           <TextField
             select
-            label="Unit"
+            fullWidth
             size="small"
             value={m.unit}
             onChange={(e) => {
@@ -4378,10 +4470,11 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
             }}
             SelectProps={{ native: true }}
             inputProps={{ "aria-label": "Distance unit", "data-testid": "scale-measure-unit" }}
-            sx={{ width: 84, "& select": { fontSize: "0.75rem" } }}
+            sx={{ "& select": { fontSize: "0.75rem" } }}
           >
             {SCALE_UNITS.map((u) => <option key={u} value={u}>{unitLabelFor(u)}</option>)}
           </TextField>
+          </Box>
         </Box>
         <Typography
           variant="caption"
@@ -4412,11 +4505,18 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 : "The distance must be a number greater than 0."}
           </Typography>
         )}
+        {applied && !naming && (
+          <Typography variant="caption" data-testid="scale-measure-applied"
+            sx={{ fontSize: "0.65rem", color: "success.main" }}>
+            ✓ Applied to this panel.
+            {!scaleSaveBlocked && " Save it as a scale bar entry to reuse it on other panels."}
+          </Typography>
+        )}
         {!naming ? (
           <Box sx={{ display: "flex", gap: 0.5, flexWrap: "wrap" }}>
-            <Button size="small" variant="contained" disabled={!!issue || measurePreUnknown}
+            <Button size="small" variant="contained" disabled={!!issue || measurePreUnknown || applied}
               data-testid="scale-measure-apply" onClick={() => void applyScaleMeasure()} sx={btnSx}>
-              Apply
+              {applied ? "Applied" : "Apply"}
             </Button>
             <Button size="small" variant="outlined" disabled={!!issue || !!scaleSaveBlocked}
               data-testid="scale-measure-save"
@@ -4427,8 +4527,9 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
             <Button size="small" data-testid="scale-measure-remeasure" onClick={remeasureScale} sx={btnSx}>
               Re-measure
             </Button>
+            {/* After Apply this only closes the panel — the applied value stays. */}
             <Button size="small" data-testid="scale-measure-cancel" onClick={cancelScaleMeasure} sx={btnSx}>
-              Cancel
+              {applied ? "Done" : "Cancel"}
             </Button>
             {/* A disabled button's tooltip is easy to miss, so say why inline. */}
             {(measurePreUnknown || scaleSaveBlocked) && (
@@ -4441,9 +4542,10 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
             )}
           </Box>
         ) : (
+          <Box>
+          <Typography variant="caption" sx={capSx}>Entry name</Typography>
           <Box sx={{ display: "flex", gap: 0.5, alignItems: "flex-start" }}>
             <TextField
-              label="Entry name"
               size="small"
               autoFocus
               value={m.saveName ?? ""}
@@ -4477,13 +4579,14 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
               Back
             </Button>
           </Box>
+          </Box>
         )}
       </Box>
     );
   };
 
   return (
-    <Dialog open={open} onClose={onClose} maxWidth="lg" fullWidth data-edit-panel-dialog="">
+    <Dialog open={open} onClose={handleCancel} maxWidth="lg" fullWidth data-edit-panel-dialog="">
       <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", py: 1 }}>
         <Box component="span">Edit Panel R{row + 1} C{col + 1}</Box>
         {/* Undo / Redo — applies to every tab (crop, resize, adjustments,
@@ -10563,8 +10666,8 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
         </Box>{/* end horizontal split */}
       </DialogContent>
       <DialogActions>
-        <Button onClick={onClose}>Cancel</Button>
-        <Button variant="contained" onClick={handleSave}
+        <Button onClick={handleCancel}>Cancel</Button>
+        <Button variant="contained" onClick={() => void handleSave()}
           disabled={(() => {
             if (!local?.add_zoom_inset || !local?.zoom_inset || local.zoom_inset.inset_type !== "Adjacent Panel") return false;
             const s = local.zoom_inset.side || "Right";

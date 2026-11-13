@@ -16,8 +16,9 @@ import { useFigureStore } from "../../store/figureStore";
 import type { LoadedImage } from "../../store/figureStore";
 import type { ImageGroup } from "../../api/types";
 import { sectionsOf, type SectionTarget } from "../../utils/imageGroups";
-import { imageUsage, type ImageUsage } from "../../utils/figures";
+import { imageUsage, type FigureUse, type ImageUsage } from "../../utils/figures";
 import { confirm } from "../shared/ConfirmDialog";
+import { FigureMarker } from "../shared/FigureMarker";
 import type { DragEvent as ReactDragEvent } from "react";
 import { ImageLightbox } from "./ImageLightbox";
 import { resolveTileClick, tileClickMemory } from "./lightboxLogic";
@@ -78,29 +79,46 @@ function LoadingTile({ name }: { name: string }) {
  *  Click toggles the click-to-assign selection; double-click opens the
  *  image large in a lightbox; drag carries it to a panel / group. */
 /** How a tile shows where its image is used. An image can sit in panels of
- *  several figure tabs, so "used" has two flavours:
- *    - in THIS figure → solid green border (as before figure tabs);
- *    - only in OTHER figures → dashed accent border;
- *  and, once the project has more than one figure, a corner pill with the
- *  number of figures that use it (filled = includes this one). The tooltip
- *  names them. A single-figure project looks exactly as it always did. */
+ *  several figure tabs:
+ *    - the green border highlights images used in the figure ON SCREEN
+ *      (as before figure tabs) — and only those;
+ *    - once the project has more than one figure, one numbered marker per
+ *      figure that uses the image, numbered like the figure tabs (green =
+ *      the figure on screen). The tooltip names them.
+ *  A single-figure project looks exactly as it always did. */
 interface TileUsageProps {
   usage: ImageUsage | undefined;
   /** The project has more than one figure tab. */
   multiFigure: boolean;
-  currentFigureName: string;
 }
 
-function usageLines(u: ImageUsage | undefined, currentFigureName: string): string[] {
+const panelsText = (n: number) => `${n} panel${n === 1 ? "" : "s"}`;
+
+function usageLines(u: ImageUsage | undefined): string[] {
   if (!u) return [];
-  const panels = (n: number) => `${n} panel${n === 1 ? "" : "s"}`;
-  const parts: string[] = [];
-  if (u.inCurrent > 0) parts.push(`${currentFigureName} (this figure, ${panels(u.inCurrent)})`);
-  for (const o of u.others) parts.push(`${o.name} (${panels(o.count)})`);
-  return parts;
+  return u.byFigure.map((f) =>
+    `${f.index} · ${f.name} (${f.current ? "this figure, " : ""}${panelsText(f.count)})`);
 }
 
-function ImageTile({ img, usage, multiFigure, currentFigureName, isSelected, onRemove }: TileUsageProps & {
+/** Most markers a 56px tile can show; past that the last slot reads "+n". */
+const MAX_TILE_MARKERS = 4;
+
+/** The markers to draw: every figure if they fit, otherwise the figure on
+ *  screen (if it uses the image) plus the first others, in tab order. */
+function tileMarkers(byFigure: FigureUse[]): { shown: FigureUse[]; hidden: number } {
+  if (byFigure.length <= MAX_TILE_MARKERS) return { shown: byFigure, hidden: 0 };
+  const room = MAX_TILE_MARKERS - 1;
+  const cur = byFigure.find((f) => f.current);
+  const picked = new Set<FigureUse>(cur ? [cur] : []);
+  for (const f of byFigure) {
+    if (picked.size >= room) break;
+    picked.add(f);
+  }
+  const shown = byFigure.filter((f) => picked.has(f));
+  return { shown, hidden: byFigure.length - shown.length };
+}
+
+function ImageTile({ img, usage, multiFigure, isSelected, onRemove }: TileUsageProps & {
   img: LoadedImage;
   isSelected: boolean;
   onRemove: () => void;
@@ -109,9 +127,8 @@ function ImageTile({ img, usage, multiFigure, currentFigureName, isSelected, onR
   // preview is open, so no global store change.
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const inCurrent = (usage?.inCurrent ?? 0) > 0;
-  const inOthers = (usage?.others.length ?? 0) > 0;
-  const figureCount = (inCurrent ? 1 : 0) + (usage?.others.length ?? 0);
-  const where = usageLines(usage, currentFigureName);
+  const where = usageLines(usage);
+  const markers = multiFigure && usage ? tileMarkers(usage.byFigure) : { shown: [], hidden: 0 };
   const tooltip = multiFigure && where.length > 0 ? (
     <span style={{ display: "block" }}>
       <span style={{ display: "block", fontWeight: 600 }}>{img.name}</span>
@@ -127,10 +144,10 @@ function ImageTile({ img, usage, multiFigure, currentFigureName, isSelected, onR
       <div
         className="relative flex-none flex flex-col items-center gap-0.5 rounded border p-1 group"
         style={{
-          borderColor: isSelected ? "#2196f3" : inCurrent ? "var(--c-green)" : inOthers ? "var(--c-accent)" : "var(--c-border)",
+          borderColor: isSelected ? "#2196f3" : inCurrent ? "var(--c-green)" : "var(--c-border)",
           backgroundColor: isSelected ? "rgba(33,150,243,0.15)" : "var(--c-surface)",
-          borderWidth: isSelected ? 3 : (inCurrent || inOthers) ? 2 : 1,
-          borderStyle: !isSelected && !inCurrent && inOthers ? "dashed" : "solid",
+          borderWidth: isSelected ? 3 : inCurrent ? 2 : 1,
+          borderStyle: "solid",
           cursor: "pointer",
           transition: "border-color 0.15s, background-color 0.15s",
         }}
@@ -170,15 +187,16 @@ function ImageTile({ img, usage, multiFigure, currentFigureName, isSelected, onR
         >
           {img.name}
         </span>
-        {multiFigure && figureCount > 0 && (
+        {markers.shown.length > 0 && (
           <div
-            aria-label={`Used in ${figureCount} figure${figureCount === 1 ? "" : "s"}`}
-            className="absolute -bottom-1.5 -left-1.5 min-w-[14px] h-[14px] px-[3px] rounded-full flex items-center justify-center text-[8px] font-bold leading-none pointer-events-none"
-            style={inCurrent
-              ? { backgroundColor: "var(--c-green)", color: "#ffffff" }
-              : { backgroundColor: "var(--c-surface)", color: "var(--c-accent)", border: "1px solid var(--c-accent)" }}
+            data-testid="tile-figure-markers"
+            aria-label={`Used in ${where.join("; ")}`}
+            className="absolute -bottom-1.5 left-0.5 flex gap-[1px] pointer-events-none"
           >
-            {figureCount}
+            {markers.shown.map((f) => (
+              <FigureMarker key={f.id} label={f.index} current={f.current} />
+            ))}
+            {markers.hidden > 0 && <FigureMarker label={`+${markers.hidden}`} current={false} />}
           </div>
         )}
         {isSelected && (
@@ -342,20 +360,21 @@ export function ImageStrip() {
   // Where each image is used — in this figure and in the project's other
   // figure tabs (an image can be in several figures at once).
   const usage = useMemo(() => imageUsage(figures, activeFigureId, config), [figures, activeFigureId, config]);
-  const tileUsage = {
-    multiFigure: figures.length > 1,
-    currentFigureName: figures.find((f) => f.id === activeFigureId)?.name ?? "This figure",
-  };
-  // Removing an image clears it from EVERY figure that shows it — say so
-  // first when that includes figures other than the one on screen.
+  const tileUsage = { multiFigure: figures.length > 1 };
+  // Removing an image empties every panel that shows it, in EVERY figure —
+  // so warn whenever any figure uses it (the one on screen included).
   const requestRemove = async (name: string) => {
-    const others = usage.get(name)?.others ?? [];
-    if (others.length > 0) {
+    const u = usage.get(name);
+    if (u && (u.inCurrent > 0 || u.others.length > 0)) {
+      const where = u.byFigure.length > 0
+        ? u.byFigure.map((f) => `${f.name} (${f.current ? "this figure, " : ""}${panelsText(f.count)})`)
+        : [`this figure (${panelsText(u.inCurrent)})`];
+      const several = u.byFigure.length > 1;
       const ok = await confirm({
-        title: "Remove image from the project?",
-        body: `"${name}" is also used in ${others.map((o) => o.name).join(", ")}. `
-          + "Removing it clears it from every figure in this project.",
-        confirmLabel: "Remove from all figures",
+        title: "Remove an image that is in use?",
+        body: `"${name}" is used in ${where.join(", ")}. `
+          + `Removing it empties ${several ? "those panels in every figure" : "those panels"}.`,
+        confirmLabel: several ? "Remove from all figures" : "Remove image",
         destructive: true,
       });
       if (!ok) return;

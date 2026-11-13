@@ -30,6 +30,7 @@ import {
   switchFigure, addFigure, duplicateFigure, deleteFigure, renameFigure, moveFigure,
 } from "../../utils/projectNav";
 import { confirm } from "../shared/ConfirmDialog";
+import { FigureMarker } from "../shared/FigureMarker";
 
 export function FigureTabs() {
   const figures = useFigureStore((s) => s.figures);
@@ -105,7 +106,7 @@ export function FigureTabs() {
         </span>
       </Tooltip>
 
-      {figures.map((f) => {
+      {figures.map((f, i) => {
         const active = f.id === activeFigureId;
         if (editingId === f.id) {
           return (
@@ -147,7 +148,11 @@ export function FigureTabs() {
               onDoubleClick={() => beginRename(f.id)}
               onContextMenu={(e) => openMenu(e, f.id)}
             >
-              <GridViewIcon sx={{ fontSize: 11, opacity: 0.8 }} />
+              {/* With several figures, the tab's number is the marker the
+                  image tiles show for "used in this figure". */}
+              {figures.length > 1
+                ? <FigureMarker label={i + 1} current={active} />
+                : <GridViewIcon sx={{ fontSize: 11, opacity: 0.8 }} />}
               <span className="truncate">{f.name}</span>
               {active && (
                 <IconButton
