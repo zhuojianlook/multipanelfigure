@@ -11,7 +11,7 @@ import AddIcon from "@mui/icons-material/Add";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
-import BorderVerticalIcon from "@mui/icons-material/BorderVertical";
+import CropSquareIcon from "@mui/icons-material/CropSquare";
 import { useFigureStore } from "../../store/figureStore";
 import type { LoadedImage } from "../../store/figureStore";
 import type { ImageGroup } from "../../api/types";
@@ -22,6 +22,7 @@ import { FigureMarker } from "../shared/FigureMarker";
 import type { DragEvent as ReactDragEvent } from "react";
 import { ImageLightbox } from "./ImageLightbox";
 import { resolveTileClick, tileClickMemory } from "./lightboxLogic";
+import { useDrawerState } from "./drawerState";
 
 // Global selected-image state for click-to-assign
 let _selectedImageName: string | null = null;
@@ -236,12 +237,12 @@ function ImageTile({ img, usage, multiFigure, isSelected, onRemove }: TileUsageP
 }
 
 /** Inline editable group name */
-function EditableName({ value, onChange, vertical = false, autoEdit = false, onEditEnd }: {
+function EditableName({ value, onChange, subgroup = false, autoEdit = false, onEditEnd }: {
   value: string;
   onChange: (v: string) => void;
-  /** Run the label up the side of a subgroup divider's rule (rotated text,
-   *  ellipsized) instead of the horizontal group-name style. */
-  vertical?: boolean;
+  /** The smaller label style of a subgroup box's name tag (horizontal,
+   *  ellipsized past ~18 characters) instead of the group-name style. */
+  subgroup?: boolean;
   /** Mount straight into rename mode with the text selected — used for a
    *  divider the user just placed, so typing replaces "Subgroup N". */
   autoEdit?: boolean;
@@ -280,22 +281,17 @@ function EditableName({ value, onChange, vertical = false, autoEdit = false, onE
   };
 
   if (!editing) {
-    return vertical ? (
+    return subgroup ? (
       <span
-        className="text-[9px] font-semibold cursor-pointer py-1 rounded hover:bg-white/10"
+        data-testid="subgroup-name"
+        className="text-[9px] font-semibold cursor-pointer px-0.5 rounded hover:bg-white/10"
         style={{
-          color: "var(--c-text-dim)",
-          // Reads bottom-to-top along the rule, like the panel grid's
-          // rotated row labels.
-          writingMode: "vertical-rl",
-          transform: "rotate(180deg)",
-          // 72px still fits inside a tile-height row (it doesn't grow the
-          // drawer) and shows ~13 characters — enough for "Subgroup 10+";
-          // longer names ellipsize, with the full name in the tooltip.
-          maxHeight: 72,
+          color: "var(--c-text)",
+          maxWidth: 110,
           whiteSpace: "nowrap",
           overflow: "hidden",
           textOverflow: "ellipsis",
+          lineHeight: "14px",
         }}
         onDoubleClick={begin}
         title={`${value} — double-click to rename`}
@@ -317,9 +313,9 @@ function EditableName({ value, onChange, vertical = false, autoEdit = false, onE
   return (
     <input
       ref={ref}
-      maxLength={vertical ? 60 : undefined}
-      className="text-[10px] font-semibold px-1 rounded outline-none"
-      style={{ backgroundColor: "var(--c-surface)", color: "var(--c-text)", border: "1px solid var(--c-accent)", width: vertical ? 96 : 120 }}
+      maxLength={subgroup ? 60 : undefined}
+      className={`${subgroup ? "text-[9px]" : "text-[10px]"} font-semibold px-1 rounded outline-none`}
+      style={{ backgroundColor: "var(--c-surface)", color: "var(--c-text)", border: "1px solid var(--c-accent)", width: subgroup ? 110 : 120 }}
       value={draft}
       onChange={(e) => setDraft(e.target.value)}
       onBlur={() => finish(true)}
@@ -346,7 +342,10 @@ export function ImageStrip() {
   const figures = useFigureStore((s) => s.figures);
   const activeFigureId = useFigureStore((s) => s.activeFigureId);
   const selectedImage = useSelectedImage();
-  const [groupsExpanded, setGroupsExpanded] = useState(true);
+  // The drawer's and each group's collapsed state outlive this component
+  // (see drawerState): reopening the drawer restores every group as it was.
+  const groupsExpanded = useDrawerState((s) => s.drawerOpen);
+  const setGroupsExpanded = useDrawerState((s) => s.setDrawerOpen);
   const [timelineDragOver, setTimelineDragOver] = useState(false);
 
   const entries = Object.values(loadedImages);
@@ -502,8 +501,8 @@ const IMAGE_DRAG_MIME = "application/x-image-name";
 const isImageDrag = (e: ReactDragEvent) => e.dataTransfer.types.includes(IMAGE_DRAG_MIME);
 
 /** Hover-revealed "+" in the gap between two tiles of a drawer section.
- *  Clicking it drops a subgroup divider into that gap: the tile on its
- *  right and every tile after it in the section become the new subgroup.
+ *  Clicking it starts a new subgroup at that gap: the tile on its right and
+ *  every tile after it in the section move into the new subgroup's box.
  *  It occupies only the gap itself (it IS the inter-tile spacing), never a
  *  tile, so it can't steal a tile's click, double-click or drag — and it is
  *  fully transparent until the pointer (or keyboard focus) is on it. */
@@ -516,8 +515,8 @@ function SplitHandle({ onSplit }: { onSplit: () => void }) {
         style={{ width: 8, height: 32, padding: 0, border: 0, background: "transparent", cursor: "pointer" }}
         onClick={(e) => { e.stopPropagation(); onSplit(); }}
         onDoubleClick={(e) => e.stopPropagation()}
-        title="Insert a subgroup divider here"
-        aria-label="Insert a subgroup divider here"
+        title="Start a new subgroup here"
+        aria-label="Start a new subgroup here"
       >
         <span
           aria-hidden
@@ -536,11 +535,11 @@ function SplitHandle({ onSplit }: { onSplit: () => void }) {
   );
 }
 
-/** A subgroup divider's header inside a group drawer: a slim vertical rule
- *  with the subgroup's name running up beside it (double-click to rename)
- *  and a hover-revealed delete. Deleting never loses images — they merge
- *  into the section above (see deleteDividerFromGroup). */
-function DividerHeader({ name, autoEdit, onRename, onDelete, onEditEnd }: {
+/** The name tag on a subgroup box's top edge: the subgroup's name, read
+ *  horizontally (double-click to rename), and a delete revealed while the
+ *  box is hovered. Deleting never loses images — they merge into the
+ *  section on the left (see deleteDividerFromGroup). */
+function SubgroupTag({ name, autoEdit, onRename, onDelete, onEditEnd }: {
   name: string;
   autoEdit: boolean;
   onRename: (name: string) => void;
@@ -548,32 +547,39 @@ function DividerHeader({ name, autoEdit, onRename, onDelete, onEditEnd }: {
   onEditEnd: () => void;
 }) {
   return (
-    // Named group (group/divider) so only hovering THIS header reveals its
-    // delete — a plain `group` would also light up any ImageTile's own
-    // group-hover controls if the scopes ever nested.
-    <div className="group/divider relative flex-none flex items-stretch self-stretch mr-1.5">
-      <div className="flex-none rounded-full" style={{ width: 2, backgroundColor: "var(--c-accent)", opacity: 0.7 }} />
-      <div className="flex flex-col items-center justify-between pl-0.5" style={{ minWidth: 14 }}>
-        <EditableName vertical value={name} onChange={onRename} autoEdit={autoEdit} onEditEnd={onEditEnd} />
-        <button
-          type="button"
-          className="flex items-center justify-center rounded opacity-0 group-hover/divider:opacity-100 focus-visible:opacity-100 transition-opacity hover:bg-white/10"
-          style={{ width: 14, height: 14, padding: 0, border: 0, background: "transparent", color: "var(--c-text-dim)", cursor: "pointer" }}
-          onClick={(e) => { e.stopPropagation(); onDelete(); }}
-          title="Delete divider (images move to the section above)"
-          aria-label={`Delete divider ${name}`}
-        >
-          <DeleteOutlineIcon sx={{ fontSize: 12 }} />
-        </button>
-      </div>
+    <div
+      className="flex items-center gap-0.5 self-start rounded px-1"
+      style={{
+        // Pulled up onto the box's top border, fieldset-legend style, but
+        // kept in the flow so a long name widens the box instead of
+        // overflowing it.
+        marginTop: -8,
+        marginBottom: 1,
+        height: 16,
+        backgroundColor: "var(--c-surface)",
+        border: "1px solid var(--c-accent)",
+      }}
+    >
+      <EditableName subgroup value={name} onChange={onRename} autoEdit={autoEdit} onEditEnd={onEditEnd} />
+      <button
+        type="button"
+        className="flex items-center justify-center rounded opacity-0 group-hover/subgroup:opacity-100 focus-visible:opacity-100 transition-opacity hover:bg-white/10"
+        style={{ width: 12, height: 12, padding: 0, border: 0, background: "transparent", color: "var(--c-text-dim)", cursor: "pointer" }}
+        onClick={(e) => { e.stopPropagation(); onDelete(); }}
+        title="Remove this subgroup (its images join the section on its left)"
+        aria-label={`Delete subgroup ${name}`}
+      >
+        <DeleteOutlineIcon sx={{ fontSize: 11 }} />
+      </button>
     </div>
   );
 }
 
 /** A single group row with drag-and-drop.
  *
- *  Expanded, the drawer is one horizontal run of SECTIONS: the unsectioned
- *  images, then each subgroup divider (rule + name) followed by its images.
+ *  Expanded, the drawer is one horizontal run of SECTIONS: the unsorted
+ *  images (no frame), then each subgroup as its own outlined box with its
+ *  name on the top edge, so subgrouped images read apart from unsorted ones.
  *  Every section is its own drop target (drop = append to that section) and
  *  so is every tile (drop = insert before that tile, in its section). Those
  *  handlers stopPropagation: the row-level handler — still needed for drops
@@ -601,7 +607,11 @@ function GroupRow({
   // collapsing the ones you're not working with keeps this strip short so
   // it doesn't squeeze the preview / panel planner below it. Collapsed
   // groups still accept drag-and-drop drops (the handler is on the row).
-  const [collapsed, setCollapsed] = useState(false);
+  // Stored by group id outside the row, so collapsing and reopening the
+  // whole drawer (which unmounts the rows) keeps each group as it was.
+  const collapsed = useDrawerState((s) => !!s.collapsedGroups[group.id]);
+  const setGroupCollapsed = useDrawerState((s) => s.setGroupCollapsed);
+  const setCollapsed = (c: boolean) => setGroupCollapsed(group.id, c);
   // Where a drag is hovering inside the expanded drawer: which section
   // (divider id, or "" for the unsectioned area) and, when over a tile,
   // which tile it would be inserted before. Drives the per-section
@@ -690,7 +700,7 @@ function GroupRow({
       <div className="flex items-center gap-0.5 flex-none" style={{ minWidth: 80 }}>
         <IconButton
           size="small"
-          onClick={() => setCollapsed((c) => !c)}
+          onClick={() => setCollapsed(!collapsed)}
           sx={{ p: 0.25 }}
           title={collapsed ? "Expand group" : "Collapse group"}
         >
@@ -701,9 +711,9 @@ function GroupRow({
           size="small"
           onClick={() => placeDivider()}
           sx={{ p: 0.25, opacity: 0.5, "&:hover": { opacity: 1 } }}
-          title="Add a subgroup divider (or hover the gap between two images and click +)"
+          title="Add a subgroup (or hover the gap between two images and click + to start one there)"
         >
-          <BorderVerticalIcon sx={{ fontSize: 12 }} />
+          <CropSquareIcon sx={{ fontSize: 12 }} />
         </IconButton>
         <IconButton
           size="small"
@@ -730,75 +740,102 @@ function GroupRow({
             // slim pad: no hint text, but still a drop target, so an image
             // can be dragged back out of a subgroup.
             const slimPad = sec.dividerId === null && dividerCount > 0 && tiles.length === 0;
+            const isSub = sec.dividerId !== null;
+            const last = i === sections.length - 1;
+            const content = tiles.length === 0 ? (
+              !slimPad && (
+                <span className="text-[9px] italic whitespace-nowrap px-1" style={{ color: "var(--c-text-dim)" }}>
+                  Drag images here
+                </span>
+              )
+            ) : (
+              tiles.map((name, j) => (
+                <div
+                  key={name}
+                  className="relative flex-none flex items-center self-stretch"
+                  {...dropHandlers(sec.dividerId, name)}
+                >
+                  {/* The gap before every tile but the first doubles as the
+                      split handle — so it's the inter-tile spacing too. */}
+                  {j > 0 && <SplitHandle onSplit={() => placeDivider(name)} />}
+                  {over && dropAt?.before === name && (
+                    <span
+                      aria-hidden
+                      className="pointer-events-none absolute rounded-full"
+                      style={{ left: j > 0 ? 3 : -3, top: 6, bottom: 6, width: 2, backgroundColor: "var(--c-accent)" }}
+                    />
+                  )}
+                  <ImageTile
+                    img={loadedImages[name]}
+                    usage={usage.get(name)}
+                    {...tileUsage}
+                    isSelected={selectedImage === name}
+                    onRemove={() => onRemoveImage(name)}
+                  />
+                </div>
+              ))
+            );
+            const endBar = over && dropAt?.before === null && tiles.length > 0 && (
+              <span
+                aria-hidden
+                className="pointer-events-none flex-none self-stretch rounded-full"
+                style={{ width: 2, margin: "6px 0 6px 4px", backgroundColor: "var(--c-accent)" }}
+              />
+            );
             return (
               <div
-                key={sec.dividerId === null ? "u" : `d:${sec.dividerId}`}
-                className="flex items-center py-1.5 pl-1 rounded"
+                key={isSub ? `d:${sec.dividerId}` : "u"}
+                className="flex items-center pl-1 rounded"
                 style={{
+                  // Room above a subgroup box for its name tag on the border.
+                  paddingTop: isSub ? 12 : 6,
+                  paddingBottom: 6,
                   // A real trailing drop zone (appending to the end of a
                   // middle subgroup used to be a ~4px target), and the last
                   // section also owns the row's right gutter, so a drop
                   // there lands in it rather than in the unsectioned area.
-                  paddingRight: (tiles.length > 0 ? 24 : 4) + (i === sections.length - 1 ? 12 : 0),
+                  // A subgroup box carries its trailing zone inside.
+                  paddingRight: (isSub ? 4 : tiles.length > 0 ? 24 : 4) + (last ? 12 : 0),
                   // The last section soaks up the leftover width, so a drop
                   // to the right of everything appends to the LAST section
                   // rather than falling through to the row (=> unsectioned).
-                  flex: i === sections.length - 1 ? "1 0 auto" : "0 0 auto",
+                  flex: last ? "1 0 auto" : "0 0 auto",
                   minWidth: slimPad ? 12 : undefined,
-                  backgroundColor: over ? "rgba(33,150,243,0.08)" : undefined,
+                  backgroundColor: !isSub && over ? "rgba(33,150,243,0.08)" : undefined,
                   transition: "background-color 0.1s",
                 }}
                 title={slimPad ? "Drop here to move an image out of its subgroup" : undefined}
                 {...dropHandlers(sec.dividerId, null)}
               >
-                {sec.dividerId !== null && (
-                  <DividerHeader
-                    name={sec.name ?? ""}
-                    autoEdit={renamingId === sec.dividerId}
-                    onRename={(name) => onRenameDivider(sec.dividerId!, name)}
-                    onDelete={() => onDeleteDivider(sec.dividerId!)}
-                    onEditEnd={() => setRenamingId(null)}
-                  />
-                )}
-                {tiles.length === 0 ? (
-                  !slimPad && (
-                    <span className="text-[9px] italic whitespace-nowrap" style={{ color: "var(--c-text-dim)" }}>
-                      Drag images here
-                    </span>
-                  )
-                ) : (
-                  tiles.map((name, j) => (
-                    <div
-                      key={name}
-                      className="relative flex-none flex items-center self-stretch"
-                      {...dropHandlers(sec.dividerId, name)}
-                    >
-                      {/* The gap before every tile but the first doubles as the
-                          split handle — so it's the inter-tile spacing too. */}
-                      {j > 0 && <SplitHandle onSplit={() => placeDivider(name)} />}
-                      {over && dropAt?.before === name && (
-                        <span
-                          aria-hidden
-                          className="pointer-events-none absolute rounded-full"
-                          style={{ left: j > 0 ? 3 : -3, top: 6, bottom: 6, width: 2, backgroundColor: "var(--c-accent)" }}
-                        />
-                      )}
-                      <ImageTile
-                        img={loadedImages[name]}
-                        usage={usage.get(name)}
-                        {...tileUsage}
-                        isSelected={selectedImage === name}
-                        onRemove={() => onRemoveImage(name)}
-                      />
+                {isSub ? (
+                  <div
+                    data-testid="subgroup-box"
+                    className="group/subgroup flex flex-col rounded-md"
+                    style={{
+                      border: `1px solid ${over ? "var(--c-accent)" : "rgba(79,195,247,0.5)"}`,
+                      backgroundColor: over ? "rgba(33,150,243,0.12)" : "rgba(79,195,247,0.05)",
+                      padding: "0 4px 4px 6px",
+                      minWidth: 64,
+                      transition: "background-color 0.1s, border-color 0.1s",
+                    }}
+                  >
+                    <SubgroupTag
+                      name={sec.name ?? ""}
+                      autoEdit={renamingId === sec.dividerId}
+                      onRename={(name) => onRenameDivider(sec.dividerId!, name)}
+                      onDelete={() => onDeleteDivider(sec.dividerId!)}
+                      onEditEnd={() => setRenamingId(null)}
+                    />
+                    <div className="flex items-center" style={{ paddingRight: tiles.length > 0 ? 18 : 0, minHeight: 28 }}>
+                      {content}
+                      {endBar}
                     </div>
-                  ))
-                )}
-                {over && dropAt?.before === null && tiles.length > 0 && (
-                  <span
-                    aria-hidden
-                    className="pointer-events-none flex-none self-stretch rounded-full"
-                    style={{ width: 2, margin: "6px 0 6px 4px", backgroundColor: "var(--c-accent)" }}
-                  />
+                  </div>
+                ) : (
+                  <>
+                    {content}
+                    {endBar}
+                  </>
                 )}
               </div>
             );
