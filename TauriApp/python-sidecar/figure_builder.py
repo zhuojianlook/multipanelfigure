@@ -785,6 +785,103 @@ def _inches_to_frac(inches, fig_dim):
     return inches / fig_dim if fig_dim > 0 else 0
 
 
+# Clearance kept beyond the outermost secondary header on a side that has no
+# primary label of its own — the same breathing room a primary label reserves
+# (see _label_space_by_pos in assemble_figure).
+_HEADER_OUTER_PAD = 0.06
+
+
+def _header_tier_margins(cfg, content_w, content_h, base, outer_margin):
+    """Extra margin (inches) each side needs for its secondary header tiers.
+
+    The tiers are DRAWN by _add_column_headers / _add_row_headers, stacked
+    outward from the primary labels using the FINAL figure size
+    (ref = max(fig_w, fig_h)). The margin used to be RESERVED with a fixed
+    ref of 10 in, so in any figure wider or taller than 10 in each tier was
+    drawn beyond its reservation and the excess came out of the 0.08 in outer
+    margin — the outermost header crowded (or clipped) at the canvas edge,
+    worse the wider the figure. A smaller figure got surplus space instead.
+
+    This mirrors the drawing exactly instead, and keeps the outermost text as
+    far from the edge as a primary label alone would be on that side:
+      * labels drawn on the side: clearance = base - drawn label extent,
+        i.e. identical to the labels-only figure;
+      * no label drawn on the side: clearance = outer_margin + _HEADER_OUTER_PAD.
+    A side without tiers gets 0, so labels-only figures are unchanged.
+
+    `base` maps "Top"/"Bottom"/"Left"/"Right" to the margin already reserved
+    (outer margin + primary label space). The figure size depends on the
+    margins and the drawing's ref on the figure size, so solve by iteration
+    (each tier's gap moves ~distance x ref, a small factor: converges fast).
+    """
+    show_col = getattr(cfg, 'show_column_labels', True)
+    show_row = getattr(cfg, 'show_row_labels', True)
+    col_drawn = show_col and any(l.text.strip() for l in cfg.column_labels)
+    row_drawn = show_row and any(l.text.strip() for l in cfg.row_labels)
+    sides = {
+        # side: (header levels, axis labels, labels drawn?, label default pos)
+        "Top": (cfg.column_headers, cfg.column_labels, col_drawn, "Top"),
+        "Bottom": (cfg.column_headers, cfg.column_labels, col_drawn, "Top"),
+        "Left": (cfg.row_headers, cfg.row_labels, row_drawn, "Left"),
+        "Right": (cfg.row_headers, cfg.row_labels, row_drawn, "Left"),
+    }
+
+    def block_h(fs, lines):
+        # Text-block thickness, as the drawing computes it.
+        return fs / 72.0 * (1.0 + 1.2 * (lines - 1))
+
+    def extra_for(side, ref_hdr, ref_lbl):
+        levels, labels, drawn, default_pos = sides[side]
+        # Tiers on this side — same per-level maxima as the drawing (taken
+        # over every header in the level, whatever its position).
+        tiers, n = 0.0, 0
+        for level in levels:
+            used = [h for h in level.headers if h.columns_or_rows]
+            if not any(h.position == side for h in used):
+                continue
+            max_off = max((h.distance for h in used), default=0.0)
+            max_fs = max([10] + [h.font_size for h in used])
+            lines = max((_count_header_lines(h) for h in used), default=1)
+            tiers += max(max_off * ref_hdr, 0.04) + max_fs / 72.0 * 1.2 * lines
+            n += 1
+        if n == 0:
+            return 0.0
+        on_side = [l for l in labels
+                   if l.text.strip() and getattr(l, 'position', default_pos) == side] if drawn else []
+        # Where the drawing starts the stack: past the primary label (with the
+        # drawing's own label offset + centring correction), or at the panel.
+        start = 0.0
+        if drawn and labels:
+            if on_side:
+                dist = max(l.distance for l in on_side)
+                fs = max(l.font_size for l in on_side)
+                lines = max((_count_header_lines(l) for l in on_side), default=1)
+            else:
+                dist, fs, lines = labels[0].distance, labels[0].font_size, 1
+            corr = fs / 72.0 * 0.5
+            start = dist * ref_hdr + block_h(fs, lines) + (-corr if side == "Bottom" else corr)
+        stack = start + tiers
+        if on_side:
+            label_extent = max(l.distance * ref_lbl + block_h(l.font_size, _count_header_lines(l))
+                               for l in on_side)
+            clearance = base[side] - label_extent
+        else:
+            clearance = outer_margin + _HEADER_OUTER_PAD
+        return max(0.0, stack + clearance - base[side])
+
+    extra = {s: 0.0 for s in sides}
+    for _ in range(12):
+        fw = content_w + base["Left"] + extra["Left"] + base["Right"] + extra["Right"]
+        fh = content_h + base["Top"] + extra["Top"] + base["Bottom"] + extra["Bottom"]
+        ref_hdr, ref_lbl = max(fw, fh), (fw * fh) ** 0.5
+        new = {s: extra_for(s, ref_hdr, ref_lbl) for s in sides}
+        done = max(abs(new[s] - extra[s]) for s in sides) < 1e-4
+        extra = new
+        if done:
+            break
+    return extra
+
+
 def _add_column_headers(fig, axes, header_levels: List[HeaderLevel],
                         rows: int, cols: int, has_labels: bool = False,
                         column_labels=None, draw: bool = True, collect=None):
@@ -1857,46 +1954,7 @@ def assemble_figure(cfg: FigureConfig,
     has_row_labels = any(lbl.text.strip() for lbl in cfg.row_labels)
     margin_inches = 0.08                # outer padding
 
-    # Calculate header space needed per level:
-    # Each level needs: gap (min 0.04") + font height + breathing room
-    # Use actual header font sizes when available
-    def _header_space(header_levels, ref_inches=10.0):
-        """Calculate total inches needed for header levels."""
-        total = 0.0
-        for level in header_levels:
-            max_fs = 10
-            max_dist = 0.0
-            for hdr in level.headers:
-                if hdr.columns_or_rows:
-                    max_fs = max(max_fs, hdr.font_size)
-                    max_dist = max(max_dist, hdr.distance)
-            gap = max(max_dist * ref_inches, 0.04)
-            font_h = max_fs / 72.0
-            total += gap + font_h + 0.05  # 0.05" breathing room
-        return total
-
-    ref_dim = 10.0  # approximate reference dimension for distance calc
-
-    # Split header levels by position for accurate margin calculation
-    def _header_space_by_pos(header_levels, position, ref_inches=10.0):
-        """Calculate space for headers at a specific position (Top/Bottom/Left/Right)."""
-        total = 0.0
-        for level in header_levels:
-            has_pos = any(h.position == position and h.columns_or_rows for h in level.headers)
-            if not has_pos:
-                continue
-            max_fs = 10
-            max_dist = 0.0
-            max_lines = 1
-            for hdr in level.headers:
-                if hdr.columns_or_rows and hdr.position == position:
-                    max_fs = max(max_fs, hdr.font_size)
-                    max_dist = max(max_dist, hdr.distance)
-                    max_lines = max(max_lines, _count_header_lines(hdr))
-            gap = max(max_dist * ref_inches, 0.04)
-            font_h = max_fs / 72.0 * 1.2 * max_lines
-            total += gap + font_h + 0.04
-        return total
+    ref_dim = 10.0  # approximate reference dimension for the label distance
 
     # Column/row labels can individually be at different positions.
     # Check ALL labels for each position, not just the first one.
@@ -1923,10 +1981,12 @@ def assemble_figure(cfg: FigureConfig,
     left_label_space = _label_space_by_pos(cfg.row_labels, has_row_labels, "Left")
     right_label_space = _label_space_by_pos(cfg.row_labels, has_row_labels, "Right")
 
-    top_margin_inches = margin_inches + top_label_space + _header_space_by_pos(cfg.column_headers, "Top", ref_dim)
-    bottom_margin_inches = margin_inches + bottom_label_space + _header_space_by_pos(cfg.column_headers, "Bottom", ref_dim)
-    left_margin_inches = margin_inches + left_label_space + _header_space_by_pos(cfg.row_headers, "Left", ref_dim)
-    right_margin_inches = margin_inches + right_label_space + _header_space_by_pos(cfg.row_headers, "Right", ref_dim)
+    # Secondary header tiers are added once the content size is known (they
+    # are drawn relative to the final figure size): see _header_tier_margins.
+    top_margin_inches = margin_inches + top_label_space
+    bottom_margin_inches = margin_inches + bottom_label_space
+    left_margin_inches = margin_inches + left_label_space
+    right_margin_inches = margin_inches + right_label_space
 
     # --- Mixed aspect ratio sizing (4.2) ---
     # When normalize_widths is enabled, scale smaller images to match the
@@ -2006,6 +2066,18 @@ def assemble_figure(cfg: FigureConfig,
     row_inches = [h / px_per_inch for h in row_heights]
     content_w = sum(col_inches) + (cols - 1) * gap_inches
     content_h = sum(row_inches) + (rows - 1) * gap_inches
+
+    # Room for the secondary header tiers, sized from the same final figure
+    # dimensions the drawing will use (so the outermost header keeps the same
+    # clearance from the canvas edge as a primary label alone).
+    _tier_extra = _header_tier_margins(cfg, content_w, content_h, {
+        "Top": top_margin_inches, "Bottom": bottom_margin_inches,
+        "Left": left_margin_inches, "Right": right_margin_inches,
+    }, margin_inches)
+    top_margin_inches += _tier_extra["Top"]
+    bottom_margin_inches += _tier_extra["Bottom"]
+    left_margin_inches += _tier_extra["Left"]
+    right_margin_inches += _tier_extra["Right"]
 
     # Figure dimensions: content + margins (all in inches)
     fig_w = content_w + left_margin_inches + right_margin_inches
