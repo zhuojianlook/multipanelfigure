@@ -155,7 +155,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.414"  # CI re-syncs this from the release tag (build-sidecar)
+SIDECAR_BUILD = "0.1.415"  # CI re-syncs this from the release tag (build-sidecar)
 
 
 @app.get("/api/version")
@@ -1122,6 +1122,37 @@ def _recalc_min_dims():
         ws = [img.size[0] for img in loaded_images.values()]
         hs = [img.size[1] for img in loaded_images.values()]
         min_dims = (min(ws), min(hs))
+
+
+def _grid_track_sizes(processed, rows, cols, fallback):
+    """Per-column widths and per-row heights for assembling the grid.
+
+    A track is as wide/tall as the largest processed panel in it. An EMPTY
+    track needs a stand-in size, and it must come from the same space as the
+    panels around it. It used to be min_dims — the smallest ORIGINAL upload —
+    but the panels are processed: cropped, and in the live preview also
+    downscaled to max_preview_px. With large camera photos an uncropped
+    original is several times bigger than a processed panel, so one empty
+    column or row dwarfed every populated one: the populated tracks were
+    crushed together and their labels overlapped (reported on 0.1.414 after
+    growing a 3x4 grid to 3x6 with only row 2 filled).
+
+    So an empty track takes the MEDIAN processed panel size of this figure —
+    a typical panel — and `fallback` is used only when the grid has no
+    images at all. Shared by the preview, Save Figure and video render so
+    the three can't disagree about the layout.
+    """
+    ws = sorted(processed[r][c].size[0] for r in range(rows) for c in range(cols)
+                if processed[r][c] is not None)
+    hs = sorted(processed[r][c].size[1] for r in range(rows) for c in range(cols)
+                if processed[r][c] is not None)
+    empty_w = ws[(len(ws) - 1) // 2] if ws else fallback[0]
+    empty_h = hs[(len(hs) - 1) // 2] if hs else fallback[1]
+    col_max_w = [max((processed[r][c].size[0] for r in range(rows)
+                      if processed[r][c] is not None), default=empty_w) for c in range(cols)]
+    row_max_h = [max((processed[r][c].size[1] for c in range(cols)
+                      if processed[r][c] is not None), default=empty_h) for r in range(rows)]
+    return col_max_w, row_max_h
 
 
 def _cfg_json():
@@ -3784,11 +3815,13 @@ def generate_preview():
         processed.append(row_imgs)
         scalebar_ref_sizes.append(row_refs)
 
-    # Compute per-column max width and per-row max height from actual images
-    col_max_w = [max((processed[r][c].size[0] for r in range(rows)
-                      if processed[r][c] is not None), default=min_dims[0]) for c in range(cols)]
-    row_max_h = [max((processed[r][c].size[1] for c in range(cols)
-                      if processed[r][c] is not None), default=min_dims[1]) for r in range(rows)]
+    # Per-column max width / per-row max height (empty tracks: see
+    # _grid_track_sizes). The no-images fallback gets the same preview cap.
+    _fb = min_dims
+    if max(_fb) > max_preview_px:
+        _s = max_preview_px / max(_fb)
+        _fb = (max(1, int(_fb[0] * _s)), max(1, int(_fb[1] * _s)))
+    col_max_w, row_max_h = _grid_track_sizes(processed, rows, cols, _fb)
 
     # Second pass: fill empty panels with correctly-sized placeholders
     for r in range(rows):
@@ -3872,11 +3905,9 @@ def save_figure(body: SaveFigureRequest):
                 row_imgs.append(None)
         processed.append(row_imgs)
 
-    # Compute per-column max width and per-row max height from actual images
-    col_max_w = [max((processed[r][c].size[0] for r in range(rows)
-                      if processed[r][c] is not None), default=min_dims[0]) for c in range(cols)]
-    row_max_h = [max((processed[r][c].size[1] for c in range(cols)
-                      if processed[r][c] is not None), default=min_dims[1]) for r in range(rows)]
+    # Per-column max width / per-row max height (empty tracks: see
+    # _grid_track_sizes).
+    col_max_w, row_max_h = _grid_track_sizes(processed, rows, cols, min_dims)
 
     # Second pass: fill empty panels with correctly-sized placeholders
     for r in range(rows):
@@ -4174,14 +4205,8 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
                         row_imgs.append(None)
                 processed.append(row_imgs)
 
-            col_max_w = [
-                max((processed[r][c].size[0] for r in range(rows) if processed[r][c] is not None),
-                    default=min_dims[0]) for c in range(cols)
-            ]
-            row_max_h = [
-                max((processed[r][c].size[1] for c in range(cols) if processed[r][c] is not None),
-                    default=min_dims[1]) for r in range(rows)
-            ]
+            # Empty tracks: see _grid_track_sizes (shared with preview/save).
+            col_max_w, row_max_h = _grid_track_sizes(processed, rows, cols, min_dims)
             for r in range(rows):
                 for c in range(cols):
                     if processed[r][c] is None:
