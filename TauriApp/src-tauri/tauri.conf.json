@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Multi-Panel Figure Builder",
   "mainBinaryName": "MultiPanelFigureBuilder",
-  "version": "0.1.416",
+  "version": "0.1.417",
   "identifier": "com.multipanelfigure.app",
   "build": {
     "frontendDist": "../dist",
@@ -23,7 +23,8 @@
         "decorations": true,
         "transparent": false,
         "dragDropEnabled": false,
-        "theme": "Dark"
+        "theme": "Dark",
+        "backgroundThrottling": "disabled"
       }
     ],
     "security": {
