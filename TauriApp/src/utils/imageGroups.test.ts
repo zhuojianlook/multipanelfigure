@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { ImageGroup } from "../api/types";
 import {
+  moveGroup,
   normalizeImageGroups,
   sectionsOf,
   stripImageFromGroup,
@@ -473,5 +474,44 @@ describe("moveImageToSection — atEnd (a section's explicit end drop zone)", ()
   it("without atEnd, a same-section drop stays a no-op", () => {
     const g = groups();
     expect(moveImageToSection(g, "a", "g", { dividerId: "d" })).toBe(g);
+  });
+});
+
+describe("moveGroup (reorder whole groups)", () => {
+  const g = () => deepFreeze<ImageGroup[]>([
+    { id: "a", name: "A", imageNames: ["x"], dividers: [{ id: "d", name: "D", imageNames: ["x"] }] },
+    { id: "b", name: "B", imageNames: [] },
+    { id: "c", name: "C", imageNames: [], futureKey: 1 } as unknown as ImageGroup,
+  ]);
+  const ids = (gs: ImageGroup[]) => gs.map((x) => x.id);
+  it("moves down (slot = insert before the group now at that index)", () => {
+    expect(ids(moveGroup(g(), "a", 2))).toEqual(["b", "a", "c"]);
+    expect(ids(moveGroup(g(), "a", 3))).toEqual(["b", "c", "a"]);
+  });
+  it("moves up", () => {
+    expect(ids(moveGroup(g(), "c", 0))).toEqual(["c", "a", "b"]);
+    expect(ids(moveGroup(g(), "c", 1))).toEqual(["a", "c", "b"]);
+  });
+  it("returns the same array for its own slots, an unknown id, or NaN", () => {
+    const gs = g();
+    expect(moveGroup(gs, "b", 1)).toBe(gs);
+    expect(moveGroup(gs, "b", 2)).toBe(gs);
+    expect(moveGroup(gs, "nope", 0)).toBe(gs);
+    expect(moveGroup(gs, "a", Number.NaN)).toBe(gs);
+    const one = deepFreeze<ImageGroup[]>([{ id: "a", name: "A", imageNames: [] }]);
+    expect(moveGroup(one, "a", 0)).toBe(one);
+    expect(moveGroup([], "a", 0)).toEqual([]);
+  });
+  it("clamps out-of-range slots", () => {
+    expect(ids(moveGroup(g(), "a", 99))).toEqual(["b", "c", "a"]);
+    expect(ids(moveGroup(g(), "c", -5))).toEqual(["c", "a", "b"]);
+  });
+  it("moves the group objects themselves (dividers + unknown keys kept), input untouched", () => {
+    const gs = g();
+    const out = moveGroup(gs, "a", 3);
+    expect(out[2]).toBe(gs[0]);
+    expect(out[2].dividers![0].imageNames).toEqual(["x"]);
+    expect((out[1] as unknown as { futureKey: number }).futureKey).toBe(1);
+    expect(ids(gs)).toEqual(["a", "b", "c"]);
   });
 });

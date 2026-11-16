@@ -358,3 +358,28 @@ export function deleteDividerFromGroup(
   secs.splice(k, 1);
   return replaceAt(groups, gi, fromSecs(group, secs));
 }
+
+/* ── Reordering whole groups ────────────────────────────── */
+
+/** MIME type of a whole-group reorder drag (started from the grip on a
+ *  group's header). Deliberately distinct from the image-tile MIME, so an
+ *  image drop target never accepts a group and a group slot never accepts
+ *  an image. */
+export const GROUP_DRAG_MIME = "application/x-image-group-id";
+
+/** Move a group to insertion slot `toSlot` — 0..groups.length, meaning
+ *  "insert before the group now at that index" (length = after the last).
+ *  Returns the SAME array when nothing changes (unknown id, or a slot that is
+ *  the group's own position: toSlot === from or from + 1), so the store can
+ *  skip the unsaved flag and the backend sync. Group objects are moved, not
+ *  copied, so dividers and any unknown keys travel with them. */
+export function moveGroup(groups: ImageGroup[], groupId: string, toSlot: number): ImageGroup[] {
+  const from = groups.findIndex((g) => g.id === groupId);
+  if (from < 0 || !Number.isFinite(toSlot)) return groups;
+  const slot = Math.max(0, Math.min(groups.length, Math.trunc(toSlot)));
+  if (slot === from || slot === from + 1) return groups;
+  const next = groups.slice();
+  const [g] = next.splice(from, 1);
+  next.splice(slot > from ? slot - 1 : slot, 0, g);
+  return next;
+}

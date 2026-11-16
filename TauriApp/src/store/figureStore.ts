@@ -21,6 +21,7 @@ import {
   normalizeImageGroups,
   newImageGroupId,
   stripImageFromGroups,
+  moveGroup,
   moveImageToSection,
   addDividerToGroup,
   renameDividerInGroup,
@@ -217,6 +218,8 @@ interface FigureState {
   createImageGroup: (name: string) => void;
   renameImageGroup: (groupId: string, name: string) => void;
   deleteImageGroup: (groupId: string) => void;
+  /** Move a whole group to insertion slot `toSlot` (see utils moveGroup). */
+  reorderImageGroup: (groupId: string, toSlot: number) => void;
   /** Move an image into a group. With no `target` (the original 2-arg form)
    *  it lands in the group's unsectioned area; `target.dividerId` picks a
    *  subgroup and `target.beforeImage` an insertion point within it. Always
@@ -1843,6 +1846,16 @@ export const useFigureStore = create<FigureState>()(
         s.imageGroups = s.imageGroups.filter(g => g.id !== groupId);
         s.unsaved = true;
       });
+      void get().syncToBackend();
+    },
+
+    // Group order is the image_groups ARRAY order, which is also what the
+    // .mpf stores — an older build simply sees the groups in the new order.
+    reorderImageGroup: (groupId, toSlot) => {
+      const prev = get().imageGroups;
+      const next = moveGroup(prev, groupId, toSlot);
+      if (next === prev) return;   // dropped in place: not an edit
+      set((s) => { s.imageGroups = next; s.unsaved = true; });
       void get().syncToBackend();
     },
 

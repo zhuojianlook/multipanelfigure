@@ -212,3 +212,36 @@ describe("moveImageToGroup with atEnd", () => {
     expect(mockApi.updateConfig).toHaveBeenCalled();
   });
 });
+
+describe("reorderImageGroup", () => {
+  beforeEach(() => { mockApi.updateConfig.mockClear(); });
+  it("reorders, keeps dividers, marks unsaved and syncs the new order", () => {
+    seed(twoGroups());
+    useFigureStore.getState().reorderImageGroup("g1", 2);
+    const s = useFigureStore.getState();
+    expect(s.imageGroups.map((g) => g.id)).toEqual(["g2", "g1"]);
+    expect(s.imageGroups[1].dividers).toEqual(twoGroups()[0].dividers);
+    expect(s.unsaved).toBe(true);
+    expect(lastSyncedGroups().map((g) => g.id)).toEqual(["g2", "g1"]);
+  });
+  it("a drop in place or an unknown id is not an edit", () => {
+    for (const [id, slot] of [["g1", 0], ["g1", 1], ["zzz", 0]] as const) {
+      seed(twoGroups());
+      useFigureStore.getState().reorderImageGroup(id, slot);
+      expect(useFigureStore.getState().imageGroups).toEqual(twoGroups());
+      expect(useFigureStore.getState().unsaved).toBe(false);
+    }
+    expect(mockApi.updateConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe("groups survive removing every image", () => {
+  it("keeps every group (now empty) with its id, name and dividers", async () => {
+    seed(twoGroups());
+    for (const n of names) await useFigureStore.getState().removeImage(n);
+    const gs = useFigureStore.getState().imageGroups;
+    expect(gs.map((g) => [g.id, g.name])).toEqual(twoGroups().map((g) => [g.id, g.name]));
+    expect(gs.every((g) => g.imageNames.length === 0)).toBe(true);
+    expect(gs.flatMap((g) => g.dividers ?? []).every((d) => d.imageNames.length === 0)).toBe(true);
+  });
+});

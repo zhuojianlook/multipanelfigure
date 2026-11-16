@@ -46,6 +46,7 @@ import ClearIcon from "@mui/icons-material/Clear";
 import ViewColumnIcon from "@mui/icons-material/ViewColumn";
 import CloseIcon from "@mui/icons-material/Close";
 import { useFigureStore, type LoadedImage } from "../../store/figureStore";
+import { GROUP_DRAG_MIME } from "../../utils/imageGroups";
 import { PanelCell } from "./PanelCell";
 import { FloatingToolbar } from "./FloatingToolbar";
 import { HeaderEditor, type HeaderEditorTarget } from "./HeaderEditor";
@@ -181,6 +182,8 @@ function DrawerStrip({ cols, drawerPanels, loadedImages }: DrawerStripProps) {
                 e.dataTransfer.effectAllowed = "move";
               }}
               onDragOver={(e: React.DragEvent) => {
+                // Not a target for a whole-group reorder drag from the strip.
+                if (e.dataTransfer.types.includes(GROUP_DRAG_MIME)) return;
                 e.preventDefault();
                 e.dataTransfer.dropEffect = "move";
                 setDragOverIdx(i);

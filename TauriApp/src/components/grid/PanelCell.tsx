@@ -31,6 +31,12 @@ import { useFigureStore, type LoadedImage } from "../../store/figureStore";
 import { EditPanelDialog } from "../dialogs/EditPanelDialog";
 import { getSelectedImageName, clearSelectedImage, useSelectedImage } from "../image-strip/ImageStrip";
 import type { PanelInfo } from "../../api/types";
+import { GROUP_DRAG_MIME } from "../../utils/imageGroups";
+
+/** A whole-group reorder drag from the media strip. Panels accept image,
+ *  drawer and panel-swap drags, never a group; the strip's document-level
+ *  guard already marks the drop as handled, so these just ignore it. */
+const isGroupDrag = (e: React.DragEvent) => e.dataTransfer.types.includes(GROUP_DRAG_MIME);
 import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 
 // Global clipboard for panel settings (excludes zoom_inset per spec 3.1.7)
@@ -160,6 +166,7 @@ export function PanelCell({ row, col, imageName }: Props) {
   // survive the await (the React.DragEvent is reused & its dataTransfer reset by
   // subsequent dispatches).
   const handleDrop = async (e: React.DragEvent) => {
+    if (isGroupDrag(e)) { setDragOver(false); return; }
     e.preventDefault();
     e.stopPropagation();
     setDragOver(false);
@@ -201,6 +208,7 @@ export function PanelCell({ row, col, imageName }: Props) {
   };
 
   const handleDragOver = (e: React.DragEvent) => {
+    if (isGroupDrag(e)) return;
     e.preventDefault();
     e.stopPropagation();
     // Accept both "copy" (from filmstrip) and "move" (from drawer/panel swap)
@@ -212,7 +220,7 @@ export function PanelCell({ row, col, imageName }: Props) {
   return (
     <Box
       onContextMenu={handleContextMenu}
-      onDragEnter={(e) => { e.preventDefault(); e.stopPropagation(); setDragOver(true); }}
+      onDragEnter={(e) => { if (isGroupDrag(e)) return; e.preventDefault(); e.stopPropagation(); setDragOver(true); }}
       onDragOver={handleDragOver}
       onDragLeave={(e) => {
         const relTarget = e.relatedTarget as HTMLElement | null;

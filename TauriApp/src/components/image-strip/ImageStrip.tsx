@@ -12,10 +12,11 @@ import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import CropSquareIcon from "@mui/icons-material/CropSquare";
+import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
 import { useFigureStore } from "../../store/figureStore";
 import type { LoadedImage } from "../../store/figureStore";
 import type { ImageGroup } from "../../api/types";
-import { sectionsOf, type SectionTarget } from "../../utils/imageGroups";
+import { sectionsOf, GROUP_DRAG_MIME, type SectionTarget } from "../../utils/imageGroups";
 import { imageUsage, type FigureUse, type ImageUsage } from "../../utils/figures";
 import { confirm } from "../shared/ConfirmDialog";
 import { FigureMarker } from "../shared/FigureMarker";
@@ -170,7 +171,7 @@ function ImageTile({ img, usage, multiFigure, isSelected, onRemove }: TileUsageP
         }}
         draggable="true"
         onDragStart={(e) => {
-          e.dataTransfer.setData("application/x-image-name", img.name);
+          e.dataTransfer.setData(IMAGE_DRAG_MIME, img.name);
           e.dataTransfer.setData("text/plain", img.name);
           e.dataTransfer.effectAllowed = "copyMove";
         }}
@@ -347,6 +348,36 @@ export function ImageStrip() {
   const groupsExpanded = useDrawerState((s) => s.drawerOpen);
   const setGroupsExpanded = useDrawerState((s) => s.setDrawerOpen);
   const [timelineDragOver, setTimelineDragOver] = useState(false);
+  const reorderImageGroup = useFigureStore((s) => s.reorderImageGroup);
+  // Whole-group reorder drag: the group being dragged, and the insertion
+  // slot (0..groups.length) the pointer is over. getData() is empty during
+  // dragover by spec, which is why the dragged id is held in state.
+  const [draggingGroupId, setDraggingGroupId] = useState<string | null>(null);
+  const [dropSlot, setDropSlot] = useState<number | null>(null);
+  const endGroupDrag = () => { setDraggingGroupId(null); setDropSlot(null); };
+  // WKWebView never ends a native drag whose drop lands on an element that
+  // didn't accept it — the app soft-locks (fixed for Analysis in 0.1.409 the
+  // same way). Most of the window isn't a group slot, so accept a GROUP drag
+  // everywhere at document level; a drop outside the group list is simply a
+  // no-op. Capture phase, no stopPropagation, and only for this MIME type, so
+  // image tiles, OS file drops and every other target behave as before.
+  // State is cleared on dragend (the backstop if the dragged row unmounts),
+  // NOT in this drop listener: it runs before React's drop handler, which
+  // still needs draggingGroupId.
+  useEffect(() => {
+    const isGrp = (dt: DataTransfer | null) => !!dt && dt.types.includes(GROUP_DRAG_MIME);
+    const onOver = (e: DragEvent) => { if (isGrp(e.dataTransfer)) e.preventDefault(); };
+    const onDrop = (e: DragEvent) => { if (isGrp(e.dataTransfer)) e.preventDefault(); };
+    const onEnd = () => { setDraggingGroupId(null); setDropSlot(null); };
+    document.addEventListener("dragover", onOver, true);
+    document.addEventListener("drop", onDrop, true);
+    document.addEventListener("dragend", onEnd, true);
+    return () => {
+      document.removeEventListener("dragover", onOver, true);
+      document.removeEventListener("drop", onDrop, true);
+      document.removeEventListener("dragend", onEnd, true);
+    };
+  }, []);
 
   const entries = Object.values(loadedImages);
   const groupedNames = new Set(imageGroups.flatMap(g => g.imageNames));
@@ -381,16 +412,12 @@ export function ImageStrip() {
     await removeImage(name);
   };
 
-  if (entries.length === 0 && visiblePendingUploads.length === 0) {
-    return (
-      <div
-        className="flex items-center px-3 py-2 text-[11px] border-b flex-none"
-        style={{ borderColor: "var(--c-border)", color: "var(--c-text-dim)", backgroundColor: "var(--c-bg)" }}
-      >
-        No images loaded. Use the toolbar to add images.
-      </div>
-    );
-  }
+  // With no images the timeline shrinks to a one-line hint, but the Groups
+  // section below still renders: user-made groups outlive their images (the
+  // store keeps emptied groups) and can be created, renamed, reordered and
+  // deleted before any image is loaded. This used to be an early return that
+  // hid the whole strip — groups included — whenever no image was loaded.
+  const noImages = entries.length === 0 && visiblePendingUploads.length === 0;
 
   return (
     <div className="flex-none" style={{ backgroundColor: "var(--c-bg)" }}>
@@ -400,23 +427,30 @@ export function ImageStrip() {
         style={{
           borderColor: "var(--c-border)",
           backgroundColor: timelineDragOver ? "rgba(33,150,243,0.08)" : undefined,
-          minHeight: 72,
+          minHeight: noImages ? undefined : 72,
         }}
         onDragOver={(e) => {
-          const imgName = e.dataTransfer.types.includes("application/x-image-name");
+          const imgName = e.dataTransfer.types.includes(IMAGE_DRAG_MIME);
           if (imgName) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setTimelineDragOver(true); }
         }}
         onDragLeave={() => setTimelineDragOver(false)}
         onDrop={(e) => {
+          // Image drags only — anything else (OS files, a group drag) keeps
+          // bubbling to whoever handles it.
+          if (!e.dataTransfer.types.includes(IMAGE_DRAG_MIME)) return;
           e.preventDefault();
           setTimelineDragOver(false);
-          const imgName = e.dataTransfer.getData("application/x-image-name");
+          const imgName = e.dataTransfer.getData(IMAGE_DRAG_MIME);
           if (imgName && groupedNames.has(imgName)) {
             moveImageToTimeline(imgName);
           }
         }}
       >
-        {timelineEntries.length === 0 && visiblePendingUploads.length === 0 ? (
+        {noImages ? (
+          <span className="text-[11px]" style={{ color: "var(--c-text-dim)" }}>
+            No images loaded. Use the toolbar to add images.
+          </span>
+        ) : timelineEntries.length === 0 && visiblePendingUploads.length === 0 ? (
           <span className="text-[10px]" style={{ color: "var(--c-text-dim)" }}>
             All images are in groups. Drag here to return to timeline.
           </span>
@@ -471,10 +505,48 @@ export function ImageStrip() {
           </IconButton>
         </div>
 
-        {/* Group rows */}
-        {groupsExpanded && imageGroups.map((group) => (
+        {/* Group rows — one container owns the whole-group reorder drop, so
+            the gaps between rows are targets too. Image drags are ignored
+            here and keep reaching each row's own handlers. */}
+        {groupsExpanded && (() => {
+          const from = imageGroups.findIndex((g) => g.id === draggingGroupId);
+          // No bar for a drop that wouldn't move anything (its own slots).
+          const slot = dropSlot !== null && from >= 0 && dropSlot !== from && dropSlot !== from + 1
+            ? dropSlot : null;
+          return (
+          <div
+            onDragOver={(e) => {
+              if (!isGroupDrag(e)) return;
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "move";
+              const s = slotFromEvent(e);
+              if (s !== null) setDropSlot((cur) => (cur === s ? cur : s));
+            }}
+            onDragLeave={(e) => {
+              if (e.relatedTarget instanceof Node && e.currentTarget.contains(e.relatedTarget)) return;
+              setDropSlot(null);
+            }}
+            onDrop={(e) => {
+              if (!isGroupDrag(e)) return;
+              e.preventDefault();
+              const id = e.dataTransfer.getData(GROUP_DRAG_MIME) || draggingGroupId;
+              const s = slotFromEvent(e) ?? dropSlot;
+              endGroupDrag();
+              if (id && s !== null) reorderImageGroup(id, s);
+            }}
+          >
+          {imageGroups.map((group, index) => (
           <GroupRow
             key={group.id}
+            index={index}
+            dropIndicator={slot === index ? "above"
+              : slot === imageGroups.length && index === imageGroups.length - 1 ? "below" : null}
+            isDragging={draggingGroupId === group.id}
+            onGroupDragStart={() => setDraggingGroupId(group.id)}
+            onGroupDragEnd={endGroupDrag}
+            onMoveBy={(d) => reorderImageGroup(group.id, d < 0 ? index - 1 : index + 2)}
+            canMoveUp={index > 0}
+            canMoveDown={index < imageGroups.length - 1}
             group={group}
             loadedImages={loadedImages}
             usage={usage}
@@ -488,7 +560,10 @@ export function ImageStrip() {
             onDeleteDivider={(dividerId) => deleteGroupDivider(group.id, dividerId)}
             onRemoveImage={requestRemove}
           />
-        ))}
+          ))}
+          </div>
+          );
+        })()}
       </div>
     </div>
   );
@@ -499,6 +574,18 @@ export function ImageStrip() {
  *  in-app drags pass straight through them. */
 const IMAGE_DRAG_MIME = "application/x-image-name";
 const isImageDrag = (e: ReactDragEvent) => e.dataTransfer.types.includes(IMAGE_DRAG_MIME);
+const isGroupDrag = (e: ReactDragEvent) => e.dataTransfer.types.includes(GROUP_DRAG_MIME);
+
+/** Insertion slot for a group drag: the row under the pointer, above or below
+ *  its vertical midpoint. null when not over a row (keep the last slot). */
+function slotFromEvent(e: ReactDragEvent): number | null {
+  const row = (e.target as Element).closest?.("[data-group-index]") as HTMLElement | null;
+  if (!row) return null;
+  const i = Number(row.dataset.groupIndex);
+  if (!Number.isFinite(i)) return null;
+  const r = row.getBoundingClientRect();
+  return e.clientY < r.top + r.height / 2 ? i : i + 1;
+}
 
 /** Hover-revealed "+" in the gap between two tiles of a drawer section.
  *  Clicking it starts a new subgroup at that gap: the tile on its right and
@@ -588,7 +675,18 @@ function SubgroupTag({ name, autoEdit, onRename, onDelete, onEditEnd }: {
 function GroupRow({
   group, loadedImages, usage, tileUsage, selectedImage, onRename, onDelete,
   onMoveImage, onAddDivider, onRenameDivider, onDeleteDivider, onRemoveImage,
+  index, dropIndicator, isDragging, onGroupDragStart, onGroupDragEnd, onMoveBy, canMoveUp, canMoveDown,
 }: {
+  /** Position in the group list — read by slotFromEvent via data-group-index. */
+  index: number;
+  /** Where to draw the whole-group insertion bar while a group is dragged. */
+  dropIndicator: "above" | "below" | null;
+  isDragging: boolean;
+  onGroupDragStart: () => void;
+  onGroupDragEnd: () => void;
+  onMoveBy: (delta: -1 | 1) => void;
+  canMoveUp: boolean;
+  canMoveDown: boolean;
   group: ImageGroup;
   loadedImages: Record<string, LoadedImage>;
   usage: Map<string, ImageUsage>;
@@ -603,6 +701,9 @@ function GroupRow({
   onRemoveImage: (name: string) => Promise<void>;
 }) {
   const [dragOver, setDragOver] = useState(false);
+  // The compact header (grip + name) is the drag ghost for a group reorder —
+  // a full-width row makes an oversized ghost.
+  const headerRef = useRef<HTMLDivElement | null>(null);
   // Each group is individually collapsible — when there are many groups,
   // collapsing the ones you're not working with keeps this strip short so
   // it doesn't squeeze the preview / panel planner below it. Collapsed
@@ -674,11 +775,13 @@ function GroupRow({
       // Expanded rows carry their vertical padding inside the sections
       // instead, so a drop anywhere in a section's column — right up to the
       // row's edges — lands in that section rather than the row fallback.
-      className={`flex items-center gap-2 border-t ${collapsed ? "px-3 py-1.5" : "pl-3"}`}
+      data-group-index={index}
+      className={`relative flex items-center gap-2 border-t ${collapsed ? "px-3 py-1.5" : "pl-3"}`}
       style={{
         borderColor: "var(--c-border)",
         backgroundColor: dragOver ? "rgba(33,150,243,0.08)" : undefined,
         minHeight: collapsed ? 30 : 56,
+        opacity: isDragging ? 0.4 : 1,
       }}
       onDragOver={(e) => {
         if (isImageDrag(e)) {
@@ -689,6 +792,9 @@ function GroupRow({
       }}
       onDragLeave={() => setDragOver(false)}
       onDrop={(e) => {
+        // Image drags only: a group drag must bubble on, untouched, to the
+        // group list's reorder handler.
+        if (!isImageDrag(e)) return;
         e.preventDefault();
         setDragOver(false);
         const imgName = e.dataTransfer.getData(IMAGE_DRAG_MIME);
@@ -696,8 +802,51 @@ function GroupRow({
         if (imgName) onMoveImage(imgName);
       }}
     >
-      {/* Collapse toggle + group name + add-divider + delete */}
-      <div className="flex items-center gap-0.5 flex-none" style={{ minWidth: 80 }}>
+      {dropIndicator && (
+        <span
+          aria-hidden
+          data-testid="group-drop-indicator"
+          className="pointer-events-none absolute left-0 right-0 rounded-full"
+          style={{
+            height: 2, backgroundColor: "var(--c-accent)", zIndex: 2,
+            ...(dropIndicator === "above" ? { top: -1 } : { bottom: -1 }),
+          }}
+        />
+      )}
+      {/* Grip + collapse toggle + group name + add-divider + delete */}
+      <div ref={headerRef} className="flex items-center gap-0.5 flex-none" style={{ minWidth: 80 }}>
+        {/* Drag handle for reordering the WHOLE group. Only the grip is
+            draggable, so dragging tiles and editing the name are unaffected.
+            Alt+↑/↓ is the keyboard alternative. */}
+        <span
+          role="button"
+          tabIndex={0}
+          draggable="true"
+          aria-label={`Reorder group ${group.name}`}
+          title="Drag to reorder group (Alt+↑ / Alt+↓)"
+          data-testid="group-drag-handle"
+          className="flex items-center flex-none"
+          style={{ cursor: "grab", opacity: 0.5 }}
+          onDragStart={(e) => {
+            e.stopPropagation();
+            e.dataTransfer.setData(GROUP_DRAG_MIME, group.id);
+            // An empty text/plain too: WebKit (the Tauri webview) may refuse
+            // to start a drag that carries only a custom type. Empty, so a
+            // text field it lands on inserts nothing.
+            e.dataTransfer.setData("text/plain", "");
+            e.dataTransfer.effectAllowed = "move";
+            if (headerRef.current) e.dataTransfer.setDragImage(headerRef.current, 8, 8);
+            onGroupDragStart();
+          }}
+          onDragEnd={onGroupDragEnd}
+          onKeyDown={(e) => {
+            if (!e.altKey) return;
+            if (e.key === "ArrowUp" && canMoveUp) { e.preventDefault(); onMoveBy(-1); }
+            if (e.key === "ArrowDown" && canMoveDown) { e.preventDefault(); onMoveBy(1); }
+          }}
+        >
+          <DragIndicatorIcon sx={{ fontSize: 14 }} />
+        </span>
         <IconButton
           size="small"
           onClick={() => setCollapsed(!collapsed)}
