@@ -280,7 +280,7 @@ export function AppShell() {
     setFileDragOver(false);
     const files = Array.from(e.dataTransfer.files);
     if (files.length === 0) return;
-    const imageExts = new Set(["tif","tiff","png","jpg","jpeg","cr2","cr3","nef","arw","dng","orf","rw2","pef","raf","nd2","mp4","avi","mov","mkv","webm","wmv","flv","m4v","mpg","mpeg","3gp","ts","mts"]);
+    const imageExts = new Set(["tif","tiff","png","jpg","jpeg","cr2","cr3","nef","arw","dng","orf","rw2","pef","raf","nd2","oir","mp4","avi","mov","mkv","webm","wmv","flv","m4v","mpg","mpeg","3gp","ts","mts"]);
     const validFiles = files.filter(f => {
       const ext = f.name.split(".").pop()?.toLowerCase() ?? "";
       return imageExts.has(ext);

@@ -55,6 +55,9 @@ from models import (
 )
 from image_processing import process_panel
 from figure_builder import assemble_figure
+# Olympus FluoView .oir reader (pure numpy). Imported at top level so
+# PyInstaller's static analysis bundles it (also listed in hiddenimports).
+import oir_reader
 
 # ── Inline helpers (avoid importing helpers.py which requires Qt) ──
 def pil_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
@@ -155,7 +158,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.418"  # CI re-syncs this from the release tag (build-sidecar)
+SIDECAR_BUILD = "0.1.419"  # CI re-syncs this from the release tag (build-sidecar)
 
 
 @app.get("/api/version")
@@ -1372,6 +1375,49 @@ def _is_nd2(filename: str) -> bool:
     return Path(filename).suffix.lower() == '.nd2'
 
 
+def _is_oir(filename: str) -> bool:
+    return Path(filename).suffix.lower() == '.oir'
+
+
+def _load_oir(data: bytes, name: str) -> Image.Image:
+    """Olympus FluoView .oir -> a channel group, exactly as a multichannel
+    TIFF becomes one. FV data is 12/16-bit, and the group path is the one
+    built for that: per-channel black/white levels in native units (the
+    default white point follows the data's real peak), the acquisition LUT
+    colour as the channel tint, and z handled inside the group. The legacy
+    single-channel path (PIL convert("RGB")) would clip 12-bit values at
+    255, so even single-channel files go through the group.
+
+    Uses the first time point, like the TIFF channel-group path. Raises
+    oir_reader.OirError with a user-facing message for unreadable files;
+    the upload handler turns that into an HTTP 400.
+    """
+    oir = oir_reader.read_oir(data)
+    stack = oir.data[0]                          # (Z, C, Y, X), first T
+    if stack.shape[0] > 1:
+        axes, arr = "ZCYX", stack
+    else:
+        axes, arr = "CYX", stack[0]
+    g = _init_channel_group(name, axes, arr)
+    for i, ch in enumerate(oir.channels[:g.num_channels]):
+        g.names[i] = ch.label
+        if ch.color_hex:
+            g.tints[i] = ch.color_hex
+    if g.num_z > 1:
+        # The frame-seek / 3D endpoints look the stack up by path, as for a
+        # TIFF z-stack — write the planes out once as an ImageJ hyperstack.
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".tif")
+        tmp.close()
+        import tifffile as _tf
+        _tf.imwrite(tmp.name, stack, imagej=True, metadata={"axes": "ZCYX"})
+        loaded_zstacks[name] = tmp.name
+        zstack_frames[name] = 0
+        zstack_counts[name] = g.num_z
+    img = _composite_channel_group(name)
+    loaded_images[name] = img
+    return img
+
+
 @app.post("/api/images/upload")
 async def upload_images(files: List[UploadFile] = File(...)):
     names = []
@@ -1395,6 +1441,9 @@ async def upload_images(files: List[UploadFile] = File(...)):
             elif _is_nd2(f.filename):
                 img = _load_nd2(data, f.filename)
                 loaded_images[f.filename] = img
+                names.append(f.filename)
+            elif _is_oir(f.filename):
+                _load_oir(data, f.filename)
                 names.append(f.filename)
             elif _is_tiff(f.filename):
                 # Save to temp file first so tifffile / PIL can both

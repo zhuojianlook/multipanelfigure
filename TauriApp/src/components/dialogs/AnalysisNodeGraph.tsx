@@ -6613,7 +6613,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         title: "Upload image(s) to Analysis",
         filters: [{
           name: "Images",
-          extensions: ["tif", "tiff", "png", "jpg", "jpeg", "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2", "pef", "raf", "nd2"],
+          extensions: ["tif", "tiff", "png", "jpg", "jpeg", "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2", "pef", "raf", "nd2", "oir"],
         }],
       });
       if (!selected) return;  // user cancelled
