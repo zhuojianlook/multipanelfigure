@@ -261,6 +261,10 @@ _GATE_EXEMPT = frozenset({
 # the swap, shared otherwise) — wrapping them shared would be an upgrade.
 # Engine runs hold it only while extracting inputs, never for the whole run.
 _GATE_SELF = frozenset({
+    # Replace or declare the live document: exclusive inside the handler.
+    "/api/project/activate-state", "/api/project/load",
+    "/api/project/new-blank", "/api/project/bind-live",
+    "/api/analysis/images/upload",
     "/api/analysis/inset-sources", "/api/analysis/inset-sources-for",
     "/api/analysis/inset-sources-for-doc", "/api/measurements",
     "/api/analysis/wb-preview", "/api/analysis/wb-detect-bands",
@@ -300,7 +304,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.420"  # CI re-syncs this from the release tag (build-sidecar)
+SIDECAR_BUILD = "0.1.421"  # CI re-syncs this from the release tag (build-sidecar)
 
 
 @app.get("/api/version")
@@ -873,7 +877,7 @@ def _get_panel_image(panel) -> Optional[Image.Image]:
         except OSError:
             mtime = 0.0
         frame_num = int(getattr(panel, "frame", 0) or 0)
-        key = (name, frame_num, mtime)
+        key = (path, frame_num, mtime)   # temp path: unique per upload, unlike the name
         cached = _video_frame_cache.get(key)
         if cached is not None:
             return cached
@@ -1560,6 +1564,72 @@ def _load_oir(data: bytes, name: str) -> Image.Image:
     return img
 
 
+def _ingest_upload_file(filename: str, data: bytes) -> None:
+    """Decode one uploaded file into the CURRENT per-document globals
+    (loaded_images, channel groups, z-stack tables, raw arrays). Shared by the
+    builder upload and the Analysis upload (which binds the globals to the
+    Analysis store while it runs)."""
+    if _is_video(filename):
+        # Save video to temp file and extract first frame as the image
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix)
+        tmp.write(data)
+        tmp.close()
+        loaded_videos[filename] = tmp.name
+        video_frames[filename] = 0
+        img = _extract_video_frame(tmp.name, 0)
+        loaded_images[filename] = img
+    elif _is_raw(filename):
+        img = _load_raw(data, filename)
+        loaded_images[filename] = img
+    elif _is_nd2(filename):
+        img = _load_nd2(data, filename)
+        loaded_images[filename] = img
+    elif _is_oir(filename):
+        _load_oir(data, filename)
+    elif _is_tiff(filename):
+        # Save to temp file first so tifffile / PIL can both
+        # read it (and so multi-frame seeks work for z-stacks).
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix)
+        tmp.write(data)
+        tmp.close()
+
+        # First check: is this a multichannel TIFF? If yes,
+        # build a channel group and use the composite as the
+        # initial image. Multichannel z-stacks (ZCYX, etc.)
+        # also register a zstack mapping so the existing
+        # frame-seek UI can drive `current_z`.
+        multi = _detect_multichannel_tiff(tmp.name)
+        if multi is not None:
+            axes, arr = multi
+            g = _init_channel_group(filename, axes, arr)
+            img = _composite_channel_group(filename)
+            loaded_images[filename] = img
+            if g.num_z > 1:
+                loaded_zstacks[filename] = tmp.name
+                zstack_frames[filename] = 0
+                zstack_counts[filename] = g.num_z
+        else:
+            # Single-channel: fall back to the legacy PIL path.
+            img_obj = Image.open(tmp.name)
+            n_frames = getattr(img_obj, "n_frames", 1)
+            if n_frames > 1:
+                loaded_zstacks[filename] = tmp.name
+                zstack_frames[filename] = 0
+                zstack_counts[filename] = n_frames
+                img = _extract_tiff_frame(tmp.name, 0)
+                loaded_images[filename] = img
+            else:
+                img = img_obj.convert("RGB")
+                loaded_images[filename] = img
+                # Retain the FULL-BIT-DEPTH array (e.g. 16-bit) so the
+                # analysis pipeline can quantify on raw pixels instead
+                # of this display-converted 8-bit RGB.
+                _retain_raw_analysis(filename, tmp.name, img_obj)
+    else:
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        loaded_images[filename] = img
+
+
 @app.post("/api/images/upload")
 def upload_images(files: List[UploadFile] = File(...)):
     # Sync (threadpool) so the doc gate covers it; it mutates the image maps.
@@ -1567,72 +1637,10 @@ def upload_images(files: List[UploadFile] = File(...)):
     for f in files:
         data = f.file.read()
         try:
-            if _is_video(f.filename):
-                # Save video to temp file and extract first frame as the image
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(f.filename).suffix)
-                tmp.write(data)
-                tmp.close()
-                loaded_videos[f.filename] = tmp.name
-                video_frames[f.filename] = 0
-                img = _extract_video_frame(tmp.name, 0)
-                loaded_images[f.filename] = img
-                names.append(f.filename)
-            elif _is_raw(f.filename):
-                img = _load_raw(data, f.filename)
-                loaded_images[f.filename] = img
-                names.append(f.filename)
-            elif _is_nd2(f.filename):
-                img = _load_nd2(data, f.filename)
-                loaded_images[f.filename] = img
-                names.append(f.filename)
-            elif _is_oir(f.filename):
-                _load_oir(data, f.filename)
-                names.append(f.filename)
-            elif _is_tiff(f.filename):
-                # Save to temp file first so tifffile / PIL can both
-                # read it (and so multi-frame seeks work for z-stacks).
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(f.filename).suffix)
-                tmp.write(data)
-                tmp.close()
-
-                # First check: is this a multichannel TIFF? If yes,
-                # build a channel group and use the composite as the
-                # initial image. Multichannel z-stacks (ZCYX, etc.)
-                # also register a zstack mapping so the existing
-                # frame-seek UI can drive `current_z`.
-                multi = _detect_multichannel_tiff(tmp.name)
-                if multi is not None:
-                    axes, arr = multi
-                    g = _init_channel_group(f.filename, axes, arr)
-                    img = _composite_channel_group(f.filename)
-                    loaded_images[f.filename] = img
-                    if g.num_z > 1:
-                        loaded_zstacks[f.filename] = tmp.name
-                        zstack_frames[f.filename] = 0
-                        zstack_counts[f.filename] = g.num_z
-                    names.append(f.filename)
-                else:
-                    # Single-channel: fall back to the legacy PIL path.
-                    img_obj = Image.open(tmp.name)
-                    n_frames = getattr(img_obj, "n_frames", 1)
-                    if n_frames > 1:
-                        loaded_zstacks[f.filename] = tmp.name
-                        zstack_frames[f.filename] = 0
-                        zstack_counts[f.filename] = n_frames
-                        img = _extract_tiff_frame(tmp.name, 0)
-                        loaded_images[f.filename] = img
-                    else:
-                        img = img_obj.convert("RGB")
-                        loaded_images[f.filename] = img
-                        # Retain the FULL-BIT-DEPTH array (e.g. 16-bit) so the
-                        # analysis pipeline can quantify on raw pixels instead
-                        # of this display-converted 8-bit RGB.
-                        _retain_raw_analysis(f.filename, tmp.name, img_obj)
-                    names.append(f.filename)
-            else:
-                img = Image.open(io.BytesIO(data)).convert("RGB")
-                loaded_images[f.filename] = img
-                names.append(f.filename)
+            _ingest_upload_file(f.filename, data)
+            names.append(f.filename)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(400, f"Failed to load {f.filename}: {e}")
     _recalc_min_dims()
@@ -1641,6 +1649,53 @@ def upload_images(files: List[UploadFile] = File(...)):
     for name in names:
         thumbnails[name] = _thumb_b64(loaded_images[name])
     return {"names": names, "thumbnails": thumbnails}
+
+
+@app.post("/api/analysis/images/upload")
+def upload_analysis_images(files: List[UploadFile] = File(...)):
+    """Standalone Analysis images ('+ Upload' in the Analysis tab). They are
+    stored in a session-wide store that belongs to NO document, so a tab
+    switch, a new tab or closing a tab never loses them or swaps in another
+    document's same-named image — and they are no longer written into the
+    active document's .mpf. Decoding reuses the builder ingest path with the
+    globals bound to the store (gate exclusive; file bytes read first)."""
+    payload = [(f.filename, f.file.read()) for f in files]
+    names: List[str] = []
+    thumbs: Dict[str, str] = {}
+    sizes: Dict[str, List[int]] = {}
+    with _doc_gate.exclusive():
+        saved = _live_refs()
+        try:
+            _bind_refs(_analysis_store)
+            for fn, data in payload:
+                try:
+                    _ingest_upload_file(fn, data)
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    raise HTTPException(400, f"Failed to load {fn}: {e}")
+                names.append(fn)
+            for n in names:
+                im = loaded_images[n]
+                thumbs[n] = _thumb_b64(im)
+                sizes[n] = [int(im.size[0]), int(im.size[1])]
+        finally:
+            _bind_refs(saved)
+    return {"names": names, "thumbnails": thumbs, "sizes": sizes}
+
+
+@app.delete("/api/analysis/images/{name}")
+def delete_analysis_image(name: str):
+    st = _analysis_store
+    if name not in st["loaded_images"]:
+        raise HTTPException(404, f"Analysis image '{name}' not found")
+    for k in ("loaded_images", "raw_analysis_images", "channel_groups",
+              "zstack_frames", "zstack_counts", "video_frames"):
+        st[k].pop(name, None)
+    paths = [p for p in (st["loaded_zstacks"].pop(name, None),
+                         st["loaded_videos"].pop(name, None)) if p]
+    _unlink_unreferenced(paths)
+    return {"ok": True}
 
 
 # ── Video Endpoints ────────────────────────────────────────────────────────
@@ -2037,7 +2092,7 @@ def _run_alignment_job(job_id: str, name: str, body: ZStackAlignRequest):
     try:
         job["stage"] = "loading source"
         job["progress"] = 0.02
-        with _doc_gate.shared():   # read the live doc, not a swapped-in one
+        with _job_doc_ctx(job.get("doc_id", ""), ""):   # the job's own document
             grp = channel_groups.get(name)
             _src_tiff_path = loaded_zstacks.get(name)
         method = body.method.lower()
@@ -2232,7 +2287,7 @@ def _run_alignment_job(job_id: str, name: str, body: ZStackAlignRequest):
         else:
             _tf2.imwrite(aligned_path.name, aligned_4d[:, 0])
 
-        with _doc_gate.shared():   # register into the live doc only
+        with _job_doc_ctx(job.get("doc_id", ""), ""):   # register into the job's document
             aligned_name = f"{name}::aligned"
             loaded_zstacks[aligned_name] = aligned_path.name
             zstack_frames[aligned_name] = 0
@@ -2288,6 +2343,9 @@ def align_zstack(name: str, body: ZStackAlignRequest):
     if name not in loaded_zstacks and name not in channel_groups:
         raise HTTPException(404, f"Z-stack '{name}' not found")
     job_id = _new_align_job()
+    # The result registers into THIS document even if the user switches tabs
+    # while the job runs (minutes for SIFT).
+    _align_jobs[job_id]["doc_id"] = _live_doc_id
     import threading
     t = threading.Thread(target=_run_alignment_job, args=(job_id, name, body), daemon=True)
     t.start()
@@ -2913,15 +2971,17 @@ class ZStackVolumeRenderRequest(BaseModel):
     fast: bool = False        # low-res fast mode (for drag preview)
 
 # Cache the loaded volume to avoid re-reading on every render
-_volume_cache: Dict[str, np.ndarray] = {}
+_volume_cache: Dict[tuple, np.ndarray] = {}
 
 def _load_volume(name: str, start: int, end: int, max_dim: int = 128) -> np.ndarray:
-    """Load z-stack volume with caching and downsampling."""
-    cache_key = f"{name}_{start}_{end}_{max_dim}"
+    """Load z-stack volume with caching and downsampling. Keyed by the temp
+    file (unique per upload), not the name: two tabs can hold different
+    stacks with the same filename."""
+    tiff_path = loaded_zstacks[name]
+    cache_key = (tiff_path, start, end, max_dim)
     if cache_key in _volume_cache:
         return _volume_cache[cache_key]
 
-    tiff_path = loaded_zstacks[name]
     img_obj = Image.open(tiff_path)
     n_frames = getattr(img_obj, "n_frames", 1)
     end = min(end if end >= 0 else n_frames - 1, n_frames - 1)
@@ -3251,15 +3311,13 @@ def delete_image(name: str):
         del loaded_images[name]
         raw_analysis_images.pop(name, None)
         hidden_images.discard(name)
-        # Clean up z-stack temp file if present
-        if name in loaded_zstacks:
-            try:
-                os.unlink(loaded_zstacks[name])
-            except Exception:
-                pass
-            del loaded_zstacks[name]
-            zstack_frames.pop(name, None)
-            zstack_counts.pop(name, None)
+        # Clean up the z-stack temp file — unless a parked tab (or the
+        # Analysis store) still references it.
+        zp = loaded_zstacks.pop(name, None)
+        zstack_frames.pop(name, None)
+        zstack_counts.pop(name, None)
+        if zp:
+            _unlink_unreferenced([zp])
         # Clear panel assignments — in the live figure and in every parked
         # figure tab, so no figure keeps pointing at an image that's gone.
         for r in range(cfg.rows):
@@ -3840,7 +3898,7 @@ def magic_wand_select(r: int, c: int, body: MagicWandRequest):
 
 # ── Measurements Endpoint ──────────────────────────────────────────────────
 
-def _collect_measurements():
+def _collect_measurements(fig_cfg=None):
     """Compute all line/area measurements across all panels of the LIVE
     figure state (reads the module globals), so callers that briefly swap
     the globals to another doc can collect that doc's measurements too.
@@ -3851,14 +3909,17 @@ def _collect_measurements():
     label, e.g. 'µm' / 'µm²'). The structured fields ensure the unit is
     explicitly recorded for the Analysis section rather than only being
     embedded inside the display string."""
+    # fig_cfg: a parked figure tab's config (images are project-level), so the
+    # multi-figure listing never has to rebind the global cfg.
+    c_ = cfg if fig_cfg is None else fig_cfg
     from models import (compute_line_measurement, compute_area_measurement,
                          compute_line_measurement_value,
                          compute_area_measurement_value, unit_label,
                          effective_line_type)
     results = []
-    for r in range(cfg.rows):
-        for c in range(cfg.cols):
-            panel = cfg.panels[r][c]
+    for r in range(c_.rows):
+        for c in range(c_.cols):
+            panel = c_.panels[r][c]
             if not panel.image_name or panel.image_name not in loaded_images:
                 continue
             img = _get_panel_image(panel) or loaded_images[panel.image_name]
@@ -3959,7 +4020,7 @@ def _collect_measurements():
     # Sample 1"). `panel` stays R#C# — it is the row identity (CSV Panel
     # column, measurement-group keys, saved workflows).
     try:
-        names = panel_display_names(cfg)
+        names = panel_display_names(c_)
         by_coord = {f"R{r+1}C{c+1}": nm for (r, c), nm in names.items()}
     except Exception:
         by_coord = {}
@@ -4319,7 +4380,8 @@ def render_video_start(body: RenderVideoRequest):
 
     t = _threading.Thread(
         target=_render_video_worker,
-        args=(job_id, body, total_frames, range_panels, save_path),
+        args=(job_id, body, total_frames, range_panels, save_path,
+              _live_doc_id, active_figure_id(cfg)),
         daemon=True,
     )
     t.start()
@@ -4329,13 +4391,13 @@ def render_video_start(body: RenderVideoRequest):
 def _render_video_worker(job_id: str, body: RenderVideoRequest,
                          total_frames: int,
                          range_panels: List[Tuple[int, int, "PanelInfo"]],
-                         save_path: str) -> None:
+                         save_path: str, job_doc: str = "", job_fig: str = "") -> None:
     import cv2 as _cv2
     import numpy as _np
     from io import BytesIO as _BytesIO
     from PIL import Image as _PIL
 
-    with _doc_gate.shared():
+    with _job_doc_ctx(job_doc, job_fig):
         rows, cols = cfg.rows, cfg.cols
     captures: Dict[str, "_cv2.VideoCapture"] = {}
     writer = None
@@ -4345,7 +4407,7 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
         # and just seek to per-panel frames per output index. Without
         # this de-dup, two panels using the same video would share their
         # range — exactly the user-reported bug.
-        with _doc_gate.shared():
+        with _job_doc_ctx(job_doc, job_fig):
             unique_video_names = {p.image_name for _, _, p in range_panels if p.image_name in loaded_videos}
             for name in unique_video_names:
                 path = loaded_videos.get(name)
@@ -4383,7 +4445,9 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
                 rgb = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2RGB)
                 panel_images[(r, c)] = _PIL.fromarray(rgb)
 
-            with _doc_gate.shared():   # released between frames so a swap can run
+            with _job_doc_ctx(job_doc, job_fig):   # released between frames so a swap can run
+                if cfg.rows != rows or cfg.cols != cols:
+                    raise RuntimeError("The figure's grid changed during the export.")
                 # Mirror the save_figure pipeline for this output frame.
                 processed: List[List[Optional[Image.Image]]] = []
                 for r in range(rows):
@@ -4445,15 +4509,14 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
                             else:
                                 full_res_sizes2[(r, c)] = orig_img.size
 
-                orig_format = cfg.output_format
-                orig_bg = cfg.background
-                cfg.output_format = "PNG"
-                cfg.background = body.background
-                try:
-                    fig_bytes = assemble_figure(cfg, processed, dpi=body.dpi, full_res_sizes=full_res_sizes2)
-                finally:
-                    cfg.output_format = orig_format
-                    cfg.background = orig_bg
+                # Render from a shallow copy: setting the export format and
+                # background on the live cfg (holding only the shared gate)
+                # leaked into concurrent previews / saves / stashes.
+                import copy as _copy_v
+                cfg_out = _copy_v.copy(cfg)
+                cfg_out.output_format = "PNG"
+                cfg_out.background = body.background
+                fig_bytes = assemble_figure(cfg_out, processed, dpi=body.dpi, full_res_sizes=full_res_sizes2)
 
             pil_out = _PIL.open(_BytesIO(fig_bytes)).convert("RGB")
             np_rgb = _np.asarray(pil_out)
@@ -4484,7 +4547,7 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
                 (p for _, _, p in range_panels if p.image_name == body.audio_panel_image_name),
                 None,
             )
-            with _doc_gate.shared():
+            with _job_doc_ctx(job_doc, job_fig):
                 audio_path = loaded_videos.get(body.audio_panel_image_name) if audio_panel else None
             if audio_panel and audio_path:
                 try:
@@ -4668,6 +4731,7 @@ def save_proj(body: ProjectSaveRequest):
 
 class ProjectLoadRequest(BaseModel):
     path: str
+    doc_id: Optional[str] = None   # frontend tab id the project is opened into
 
 
 def _serialize_channel_groups() -> Dict[str, dict]:
@@ -4743,20 +4807,31 @@ def _restore_channel_groups(channel_data: Optional[Dict[str, dict]]):
             print(f"[load] channel restore failed for {name}: {e}", file=sys.stderr, flush=True)
 
 
-def _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict, channel_data=None):
+def _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict, channel_data=None,
+                            fresh: bool = True):
     """Replace the global builder state (config + images + fonts) with a
     freshly-deserialized project. Returns the per-image thumbnails dict.
     Shared by the on-disk project loader (/api/project/load) and the
     in-session snapshot restore (/api/project/restore) so both paths hydrate
-    identically."""
-    global cfg, loaded_images, custom_fonts, loaded_videos, video_frames
-    cfg = loaded_cfg
+    identically.
+
+    fresh=True REBINDS every per-document global to new containers. Clearing
+    them in place used to leave the previous doc's z-stack tables and hidden
+    images in the loaded one, and wiped containers a parked stash shared.
+    fresh=False (snapshot restore: the blob carries no z-stack files) keeps the
+    z-stack tables, as before."""
+    global cfg, loaded_images, custom_fonts, loaded_videos, video_frames, raw_analysis_images
+    global channel_groups
+    if fresh:
+        _bind_refs({**_blank_doc_state({}), "cfg": loaded_cfg})
+    else:
+        cfg = loaded_cfg
+        loaded_images = {}
+        raw_analysis_images = {}
+        loaded_videos = {}
+        video_frames = {}
+        channel_groups = {}
     cfg.ensure_grid()
-    loaded_images.clear()
-    raw_analysis_images.clear()
-    loaded_videos.clear()
-    video_frames.clear()
-    channel_groups.clear()
     for name, data in img_bytes_dict.items():
         if _is_video(name):
             # Restore video: save to temp file and extract first frame
@@ -4790,7 +4865,25 @@ def load_proj(body: ProjectLoadRequest):
     if not os.path.isfile(path):
         raise HTTPException(404, f"Project file not found: {path}")
     loaded_cfg, img_bytes_dict, font_bytes_dict, analysis, channel_data = load_project(path)
-    thumbnails = _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict, channel_data)
+    global _live_doc_id
+    # Parse outside the gate; replace the live doc under EXCLUSIVE (see
+    # activate-state). An id-less load marks the live doc unknown rather than
+    # leaving the previous tab's id on the newly loaded content.
+    with _doc_gate.exclusive():
+        saved, saved_id = _live_refs(), _live_doc_id
+        try:
+            thumbnails = _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict, channel_data)
+        except Exception:
+            # All-or-nothing: a file with one undecodable image must not leave
+            # a half-loaded doc live while the frontend keeps the previous tab.
+            _restore_live_after_failed_replace(saved)
+            _live_doc_id = saved_id
+            raise
+        _live_doc_id = (body.doc_id or "").strip()
+        # Snapshot the response under the gate: read later, an Analysis swap
+        # could already have another document's config in the globals.
+        cfg_out = _cfg_json()
+        names_out = list(loaded_images.keys())
 
     # Re-encode any analysis plot bytes as base64 strings for transport to the
     # frontend; tables travel as plain CSV text.
@@ -4812,8 +4905,8 @@ def load_proj(body: ProjectLoadRequest):
         }
 
     return {
-        "config": _cfg_json(),
-        "image_names": list(loaded_images.keys()),
+        "config": cfg_out,
+        "image_names": names_out,
         "thumbnails": thumbnails,
         "analysis": analysis_out,
     }
@@ -4896,7 +4989,8 @@ def restore_proj(body: ProjectRestoreRequest):
             os.unlink(tmp.name)
         except OSError:
             pass
-    thumbnails = _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict, channel_data)
+    thumbnails = _hydrate_loaded_project(loaded_cfg, img_bytes_dict, font_bytes_dict, channel_data,
+                                         fresh=False)
     return {
         "config": _cfg_json(),
         "image_names": list(loaded_images.keys()),
@@ -4915,6 +5009,70 @@ def restore_proj(body: ProjectRestoreRequest):
 # endpoints above remain as a durable fallback.
 _doc_state_cache: Dict[str, dict] = {}
 
+# Every per-DOCUMENT global. A swap window saves/restores exactly these; a new
+# or loaded document gets fresh containers for all of them. (raw 16-bit arrays
+# used to sit outside this set, so same-named TIFFs in two tabs quantified with
+# each other's pixels and a new tab dropped a parked tab's raw data.)
+_DOC_GLOBALS = ("cfg", "loaded_images", "raw_analysis_images", "hidden_images",
+                "min_dims", "custom_fonts", "loaded_videos", "video_frames",
+                "loaded_zstacks", "zstack_frames", "zstack_counts", "channel_groups")
+
+# Frontend doc id of the document in the live globals; "" = unknown (an older
+# flow that didn't say). Set by stash/activate/load/new-blank/bind-live. Lets a
+# source tagged with its document id resolve to the live globals, to its parked
+# stash, or fail clearly — never to whichever document happens to be live.
+_live_doc_id: str = ""
+
+
+class _SourceDocUnavailable(HTTPException):
+    def __init__(self, doc_id: str):
+        super().__init__(409, "The document this source belongs to is no longer open "
+                              f"(id {doc_id}). Reopen it, or re-attach the source from an open figure.")
+
+
+def _live_refs() -> dict:
+    """REFERENCES (no copies) to every per-document global — the 'saved' side
+    of a swap window."""
+    g = globals()
+    return {k: g[k] for k in _DOC_GLOBALS}
+
+
+def _bind_refs(refs: dict) -> None:
+    """Rebind the per-document globals present in `refs`. No font work."""
+    g = globals()
+    for k in _DOC_GLOBALS:
+        if k in refs:
+            g[k] = refs[k]
+
+
+def _blank_doc_state(resolution_entries=None) -> dict:
+    """A fresh, empty document state — every container a NEW object."""
+    c = FigureConfig()
+    c.ensure_grid()
+    if resolution_entries is not None:
+        c.resolution_entries = dict(resolution_entries)
+    else:
+        c.resolution_entries = dict(_load_persistent_scale_bars() or DEFAULT_RESOLUTION_ENTRIES)
+    return {"cfg": c, "loaded_images": {}, "raw_analysis_images": {}, "hidden_images": set(),
+            "min_dims": (512, 512), "custom_fonts": {}, "loaded_videos": {}, "video_frames": {},
+            "loaded_zstacks": {}, "zstack_frames": {}, "zstack_counts": {}, "channel_groups": {}}
+
+
+# Session-wide store for standalone Analysis uploads — shaped like a document
+# state but belonging to no document (see upload_analysis_images).
+_analysis_store: dict = _blank_doc_state({})
+
+
+def _standalone_lookup(name: str):
+    """(image, raw array) for a standalone Analysis source. The Analysis store
+    wins; the context document is the legacy fallback (uploads made by 0.1.420
+    and earlier live in a document's loaded_images and may be inside saved
+    .mpf files). Image and raw always come from the same place."""
+    si = _analysis_store["loaded_images"]
+    if name in si:
+        return si[name], _analysis_store["raw_analysis_images"].get(name)
+    return loaded_images.get(name), raw_analysis_images.get(name)
+
 
 def _capture_doc_state() -> dict:
     """Snapshot the live builder globals by reference / shallow copy (no image
@@ -4925,6 +5083,7 @@ def _capture_doc_state() -> dict:
     return {
         "cfg": _copy.deepcopy(cfg),
         "loaded_images": dict(loaded_images),
+        "raw_analysis_images": dict(raw_analysis_images),
         "hidden_images": set(hidden_images),
         "min_dims": min_dims,
         "custom_fonts": dict(custom_fonts),
@@ -4941,16 +5100,23 @@ def _apply_doc_state(st: dict):
     """Make a previously-captured state the live builder state."""
     global cfg, loaded_images, hidden_images, min_dims, custom_fonts
     global loaded_videos, video_frames, loaded_zstacks, zstack_frames
-    global zstack_counts, channel_groups
+    global zstack_counts, channel_groups, raw_analysis_images
     cfg = st["cfg"]
     cfg.ensure_grid()
     loaded_images = st["loaded_images"]
+    # setdefault: a state captured before raw arrays were per-document gets
+    # one stable dict that stays attached to it.
+    raw_analysis_images = st.setdefault("raw_analysis_images", {})
     hidden_images = st["hidden_images"]
     min_dims = st["min_dims"]
+    fonts_same = st["custom_fonts"] == custom_fonts
     custom_fonts = st["custom_fonts"]
     # Undo/redo swaps the whole font dict — same reasoning as the load path.
-    _materialize_custom_fonts()
-    _invalidate_font_caches()
+    # Equal dicts mean identical files on disk, so skip the re-materialise +
+    # cache invalidation (most tab switches and every swap window).
+    if not fonts_same:
+        _materialize_custom_fonts()
+        _invalidate_font_caches()
     loaded_videos = st["loaded_videos"]
     video_frames = st["video_frames"]
     loaded_zstacks = st["loaded_zstacks"]
@@ -4968,9 +5134,13 @@ def stash_state(body: DocStateRequest):
     """Cache the current builder state under `doc_id` (fast, in-memory)."""
     # Gated shared, so a swap window can't be in progress; this only trips if
     # a future caller bypasses the gate — refuse rather than file the wrong doc.
+    global _live_doc_id
     if _doc_gate.swapped_elsewhere():
         raise HTTPException(503, "Document state is temporarily swapped; retry.")
     _doc_state_cache[body.doc_id] = _capture_doc_state()
+    # The frontend only ever stashes the LIVE doc under its own id, so this
+    # also declares which doc is live (e.g. the startup doc).
+    _live_doc_id = body.doc_id
     return {"ok": True, "doc_id": body.doc_id}
 
 
@@ -4978,25 +5148,123 @@ def stash_state(body: DocStateRequest):
 def activate_state(body: DocStateRequest):
     """Restore a previously stashed state as the live builder state. 404 if it
     isn't cached (e.g. the sidecar restarted) so the frontend can fall back to
-    the on-disk project."""
-    if _doc_gate.swapped_elsewhere():
-        raise HTTPException(503, "Document state is temporarily swapped; retry.")
-    st = _doc_state_cache.pop(body.doc_id, None)
-    if st is None:
-        raise HTTPException(404, "No cached state for that document.")
-    _apply_doc_state(st)
+    the on-disk project.
+
+    EXCLUSIVE gate: it rebinds the live document, so no in-flight reader (a
+    preview, an analysis extraction of the active doc, a video frame) may see
+    half of one document and half of another. The detail string of the 404 is
+    matched by the frontend (projectNav isStateCacheMiss) — keep it stable."""
+    global _live_doc_id
+    with _doc_gate.exclusive():
+        st = _doc_state_cache.get(body.doc_id)
+        if st is None:
+            raise HTTPException(404, "No cached state for that document.")
+        saved = _live_refs()
+        try:
+            _apply_doc_state(st)
+        except Exception:
+            _restore_live_after_failed_replace(saved)
+            raise
+        # Pop only after a successful apply, so a failure keeps the stash.
+        _doc_state_cache.pop(body.doc_id, None)
+        _live_doc_id = body.doc_id
+        cfg_out = _cfg_json()
+        imgs = dict(loaded_images)
     return {
-        "config": _cfg_json(),
-        "image_names": list(loaded_images.keys()),
-        "thumbnails": {n: _thumb_b64(img) for n, img in loaded_images.items()},
+        "config": cfg_out,
+        "image_names": list(imgs.keys()),
+        "thumbnails": {n: _thumb_b64(img) for n, img in imgs.items()},
     }
+
+
+def _restore_live_after_failed_replace(saved: dict) -> None:
+    """Undo a partially-applied document replacement (load / activate)."""
+    fonts_changed = custom_fonts != saved.get("custom_fonts")
+    _bind_refs(saved)
+    if fonts_changed:
+        try:
+            _materialize_custom_fonts()
+            _invalidate_font_caches()
+        except Exception:
+            pass
+
+
+def _temp_paths_of(st) -> set:
+    return (set((st.get("loaded_zstacks") or {}).values())
+            | set((st.get("loaded_videos") or {}).values()))
+
+
+def _referenced_temp_paths() -> set:
+    """Every temp file some document can still reach: the live doc, every
+    parked stash, and the Analysis upload store."""
+    out = set(loaded_zstacks.values()) | set(loaded_videos.values())
+    for st in list(_doc_state_cache.values()):
+        out |= _temp_paths_of(st)
+    out |= _temp_paths_of(_analysis_store)
+    return out
+
+
+def _unlink_unreferenced(paths) -> None:
+    keep = _referenced_temp_paths()
+    for p in set(paths) - keep:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
 
 
 @app.post("/api/project/drop-state")
 def drop_state(body: DocStateRequest):
-    """Forget a cached document state (e.g. when its tab is closed)."""
-    _doc_state_cache.pop(body.doc_id, None)
+    """Forget a cached document state (e.g. when its tab is closed), and delete
+    the temp files (z-stacks, videos) nothing else references any more."""
+    st = _doc_state_cache.pop(body.doc_id, None)
+    if st:
+        _unlink_unreferenced(_temp_paths_of(st))
     return {"ok": True}
+
+
+class NewBlankRequest(BaseModel):
+    doc_id: Optional[str] = None
+
+
+@app.post("/api/project/new-blank")
+def new_blank(body: NewBlankRequest):
+    """Make the live document a fresh, empty one. Rebinds every per-document
+    global to NEW containers and deletes nothing — a parked stash may still
+    reference the outgoing doc's temp files (the old per-image DELETE loop
+    unlinked a parked tab's z-stack files; drop-state cleans up instead)."""
+    global _live_doc_id
+    with _doc_gate.exclusive():
+        # Custom fonts are app-wide (loaded from ~/.multipanelfigure/fonts at
+        # startup), so a blank doc keeps them, as the old reset did.
+        _apply_doc_state({**_blank_doc_state(cfg.resolution_entries),
+                          "custom_fonts": dict(custom_fonts)})
+        _live_doc_id = (body.doc_id or "").strip()
+        return {"ok": True, "doc_id": _live_doc_id, "config": _cfg_json(),
+                "image_names": [], "resolution_entries": dict(cfg.resolution_entries)}
+
+
+class BindLiveRequest(BaseModel):
+    doc_id: str
+    reset_cache: bool = False
+
+
+@app.post("/api/project/bind-live")
+def bind_live(body: BindLiveRequest):
+    """Declare which frontend doc the live globals belong to. Called once per
+    webview load: the sidecar outlives a reload, after which the frontend's
+    tab ids are new (stale stashes are unreachable, so `reset_cache` drops
+    them). Touches no document content; success doubles as the frontend's
+    'this sidecar tracks the live doc' capability check."""
+    global _live_doc_id
+    with _doc_gate.exclusive():
+        _live_doc_id = (body.doc_id or "").strip()
+        if body.reset_cache:
+            stale = list(_doc_state_cache.values())
+            _doc_state_cache.clear()
+            for st in stale:
+                _unlink_unreferenced(_temp_paths_of(st))
+        return {"ok": True, "live_doc_id": _live_doc_id}
 
 
 # ── Font Endpoints ─────────────────────────────────────────────────────────
@@ -7340,7 +7608,7 @@ def _extract_source_image(s: Dict[str, object]) -> Optional[Image.Image]:
     # tab (not a builder panel). The WHOLE image is the source.
     name = s.get("name") or s.get("image_name")
     if name:
-        im = loaded_images.get(str(name))
+        im, _raw = _standalone_lookup(str(name))
         return im.convert("RGB") if im is not None else None
     try:
         row = int(s.get("row") or 0)
@@ -7386,7 +7654,7 @@ def _extract_source_raw(s: Dict[str, object]):
         #    the primary path: exact, no geometry to mirror.
         name = s.get("name") or s.get("image_name")
         if name:
-            arr = raw_analysis_images.get(str(name))
+            _im, arr = _standalone_lookup(str(name))
             return np.asarray(arr) if arr is not None else None
 
         # 2) Builder panel / zoom inset — raw only when we have a raw array for
@@ -7592,7 +7860,6 @@ def list_inset_sources_for(body: InsetSourcesForRequest):
     .mpf's under the doc gate's EXCLUSIVE mode, restored in `finally`, so no
     builder request (tab switch, config write, preview) can run against the
     swapped-in document."""
-    global cfg, loaded_images, loaded_videos, video_frames, loaded_zstacks, channel_groups, min_dims
     path = os.path.expanduser(body.project_path.strip())
     if not os.path.dirname(path):
         path = os.path.join(os.path.expanduser("~"), "Documents", path)
@@ -7600,20 +7867,19 @@ def list_inset_sources_for(body: InsetSourcesForRequest):
         raise HTTPException(404, f"Project file not found: {path}")
     loaded_cfg, local_images = _load_collage_mpf(path)
     with _doc_gate.exclusive():
-        saved = (cfg, loaded_images, loaded_videos, video_frames, loaded_zstacks, channel_groups, min_dims)
+        saved = _live_refs()
         try:
-            cfg = loaded_cfg
-            loaded_images = dict(local_images)
-            loaded_videos = {}
-            video_frames = {}
-            loaded_zstacks = {}
-            channel_groups = {}
+            # .mpf files carry no raw 16-bit arrays or z-stack files: fresh
+            # containers, so the live doc's same-named data can't leak in.
+            _bind_refs({"cfg": loaded_cfg, "loaded_images": dict(local_images),
+                        "raw_analysis_images": {}, "hidden_images": set(),
+                        "loaded_videos": {}, "video_frames": {}, "loaded_zstacks": {},
+                        "zstack_frames": {}, "zstack_counts": {}, "channel_groups": {}})
             _recalc_min_dims()
             sources, figures = _collect_sources_all_figures()
             measurements = _collect_measurements_all_figures()
         finally:
-            (cfg, loaded_images, loaded_videos, video_frames,
-             loaded_zstacks, channel_groups, min_dims) = saved
+            _bind_refs(saved)
     return {"sources": sources, "measurements": measurements, "figures": figures}
 
 
@@ -7626,25 +7892,18 @@ def list_inset_sources_for_doc(body: DocStateRequest):
     were never written to disk (which inset-sources-for, reading the .mpf on
     disk, can't see).  404 when the doc has no stash, so the caller can fall
     back to the on-disk .mpf via inset-sources-for."""
-    global cfg, loaded_images, hidden_images, min_dims, custom_fonts
-    global loaded_videos, video_frames, loaded_zstacks, zstack_frames
-    global zstack_counts, channel_groups
     with _doc_gate.exclusive():
         # Looked up under the gate: a tab switch can't pop / refill it now.
         st = _doc_state_cache.get(body.doc_id)
         if st is None:
             raise HTTPException(404, "No stashed state for that document.")
-        saved = (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
-                 loaded_videos, video_frames, loaded_zstacks, zstack_frames,
-                 zstack_counts, channel_groups)
+        saved = _live_refs()
         try:
             _apply_doc_state(st)
             sources, figures = _collect_sources_all_figures()
             measurements = _collect_measurements_all_figures()
         finally:
-            (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
-             loaded_videos, video_frames, loaded_zstacks, zstack_frames,
-             zstack_counts, channel_groups) = saved
+            _bind_refs(saved)
             _resync_fonts_after_swap(st)
     return {"sources": sources, "measurements": measurements, "figures": figures}
 
@@ -7654,7 +7913,7 @@ def _resync_fonts_after_swap(st: dict):
     shared fonts dir and invalidates caches; put the live doc's back after the
     swap is undone (nothing did, so the parked doc's fonts leaked into the
     live one)."""
-    if custom_fonts is not st.get("custom_fonts"):
+    if custom_fonts != st.get("custom_fonts"):
         try:
             _materialize_custom_fonts()
             _invalidate_font_caches()
@@ -7668,70 +7927,72 @@ import contextlib as _contextlib
 
 @_contextlib.contextmanager
 def _doc_context(doc_id="", project_path=""):
-    """Temporarily make the global figure state point at a DIFFERENT figure so
-    inset extraction (`_extract_source_image` / `_extract_inset_image`, which
-    read the module globals) pulls pixels from that figure instead of the
-    active builder doc.  Used by the analysis pipelines to run a workflow that
-    combines sources from MORE THAN ONE MPF — each source carries its own
-    `mpf_doc_id` and/or `project_path`.
+    """Temporarily make the global figure state point at the document a source
+    belongs to, so inset extraction (`_extract_source_image` /
+    `_extract_source_raw`, which read the module globals) pulls pixels from
+    THAT document. Every figure-bound source carries its `mpf_doc_id` (and
+    `project_path` as a fallback); resolution, in order:
 
-    Resolution order, so it works for unsaved tabs too:
-      1. `doc_id` present in the in-memory tab cache → swap to that STASHED
-         state (covers Untitled docs + unsaved 'add to analysis' edits).
-      2. else `project_path` is a real .mpf on disk → load it.
-      3. else no-op (active doc — single-MPF behaviour, unchanged).
-    Swaps run under _doc_gate.exclusive(); the no-swap paths hold it shared
-    (the active doc is being read). Restore in finally."""
-    global cfg, loaded_images, hidden_images, min_dims, custom_fonts
-    global loaded_videos, video_frames, loaded_zstacks, zstack_frames
-    global zstack_counts, channel_groups
-    if doc_id:
+      A. doc_id is the LIVE doc (_live_doc_id)  -> live globals, gate shared.
+         Checked before the stash: a doc can be live AND still have a stale
+         stash (a stash whose switch then failed), and live is the newer one.
+      B. doc_id has a parked stash             -> swap to it, gate exclusive.
+      C. project_path is a readable .mpf       -> swap to it, gate exclusive.
+      D. doc_id given and the live doc is known -> 409: its document is no
+         longer open. Never fall back to the live doc: that read another
+         tab's pixels at the same grid position with no error.
+      E. no doc_id, or an older frontend that never declared the live doc
+         -> live globals, gate shared (previous behaviour)."""
+    did = (doc_id or "").strip()
+    if did:
+        with _doc_gate.shared():
+            if did == _live_doc_id:
+                yield
+                return
         with _doc_gate.exclusive():
+            if did == _live_doc_id:          # became live between the two acquisitions
+                yield
+                return
             # Looked up under the gate so a concurrent tab switch can't pop /
             # refill the entry between the lookup and the swap.
-            st = _doc_state_cache.get(doc_id)
+            st = _doc_state_cache.get(did)
             if st is not None:
-                saved = (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
-                         loaded_videos, video_frames, loaded_zstacks, zstack_frames,
-                         zstack_counts, channel_groups)
+                saved = _live_refs()
                 try:
                     _apply_doc_state(st)
                     yield
                 finally:
-                    (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
-                     loaded_videos, video_frames, loaded_zstacks, zstack_frames,
-                     zstack_counts, channel_groups) = saved
+                    _bind_refs(saved)
                     _resync_fonts_after_swap(st)
                 return
     pp = os.path.expanduser((project_path or "").strip())
     if pp and not os.path.dirname(pp):
         pp = os.path.join(os.path.expanduser("~"), "Documents", pp)
-    if not pp or not os.path.isfile(pp):
-        with _doc_gate.shared():
-            yield
-        return
-    try:
-        loaded_cfg, local_images = _load_collage_mpf(pp)
-    except Exception as _e:
-        import sys as __s
-        print(f"[analysis] could not load source project {pp!r}: {_e}", file=__s.stderr, flush=True)
-        with _doc_gate.shared():
-            yield
-        return
-    with _doc_gate.exclusive():
-        saved = (cfg, loaded_images, loaded_videos, video_frames, loaded_zstacks, channel_groups, min_dims)
+    loaded = None
+    if pp and os.path.isfile(pp):
         try:
-            cfg = loaded_cfg
-            loaded_images = dict(local_images)
-            loaded_videos = {}
-            video_frames = {}
-            loaded_zstacks = {}
-            channel_groups = {}
-            _recalc_min_dims()
-            yield
-        finally:
-            (cfg, loaded_images, loaded_videos, video_frames,
-             loaded_zstacks, channel_groups, min_dims) = saved
+            loaded = _load_collage_mpf(pp)
+        except Exception as _e:
+            import sys as __s
+            print(f"[analysis] could not load source project {pp!r}: {_e}", file=__s.stderr, flush=True)
+    if loaded is not None:
+        loaded_cfg, local_images = loaded
+        with _doc_gate.exclusive():
+            saved = _live_refs()
+            try:
+                _bind_refs({"cfg": loaded_cfg, "loaded_images": dict(local_images),
+                            "raw_analysis_images": {}, "hidden_images": set(),
+                            "loaded_videos": {}, "video_frames": {}, "loaded_zstacks": {},
+                            "zstack_frames": {}, "zstack_counts": {}, "channel_groups": {}})
+                _recalc_min_dims()
+                yield
+            finally:
+                _bind_refs(saved)
+        return
+    if did and _live_doc_id:
+        raise _SourceDocUnavailable(did)
+    with _doc_gate.shared():
+        yield
 
 
 def _empty_figure_cfg() -> FigureConfig:
@@ -7774,6 +8035,20 @@ def _project_context(doc_id="", project_path="", figure_id=""):
         with _doc_context(doc_id, project_path):
             with _figure_context(figure_id):
                 yield
+
+
+@_contextlib.contextmanager
+def _job_doc_ctx(doc_id: str, fig_id: str):
+    """For background jobs: the document / figure tab the job was STARTED on.
+    While that is still live and on screen (or the id is unknown) this holds
+    the gate shared, as before; after the user switched away it swaps to the
+    job's document (exclusive) so the job keeps reading its own content."""
+    with _doc_gate.shared():
+        if (not doc_id or doc_id == _live_doc_id) and (not fig_id or fig_id == active_figure_id(cfg)):
+            yield
+            return
+    with _project_context(doc_id, "", fig_id):
+        yield
 
 
 def _source_ctx(source):
@@ -7833,7 +8108,16 @@ def _collect_measurements_all_figures():
     """_collect_measurements over every figure tab. Rows gain figure_id /
     figure_name only when the project has more than one figure, so the
     measurements of a single-figure project stay exactly as before."""
-    per = _for_each_figure(_collect_measurements)
+    # Shared gate only, even for a multi-figure doc: parked figure tabs are
+    # read via their resolved configs instead of swapping the global cfg, so
+    # the builder's debounced measurements poll never pauses other requests.
+    with _doc_gate.shared():
+        base = cfg
+        per = []
+        for fid, fname, is_active in iter_figures(base):
+            sub = base if is_active else resolve_figure_config(base, fid)
+            if sub is not None:
+                per.append((fid, fname, _collect_measurements(sub)))
     multi = len(per) > 1
     rows = []
     for fid, fname, ms in per:
@@ -8013,6 +8297,8 @@ def wb_detect_bands(body: WbBandDetectRequest):
         try:
             with _source_ctx(body.source):
                 arr = _extract_source_raw(body.source)
+        except _SourceDocUnavailable:
+            raise
         except Exception as _e:
             print(f"[wb-detect] raw extract failed: {_e}", file=__s.stderr, flush=True)
             arr = None
@@ -8036,6 +8322,8 @@ def wb_detect_bands(body: WbBandDetectRequest):
                 if ex is not None:
                     rgb = _np.asarray(ex.convert("RGB")).astype(_np.float32)
                     used_source = True
+            except _SourceDocUnavailable:
+                raise
             except Exception as _e:
                 print(f"[wb-detect] full-res extract failed: {_e}", file=__s.stderr, flush=True)
                 rgb = None
@@ -9697,6 +9985,8 @@ def run_imagej_pipeline(body: ImageJAnalysisRequest):
                 fpath = _os.path.join(out_dir, f"{key}.png")
                 arr.save(fpath)
                 materialised.append({"path": fpath, "label": label, "key": key})
+            except _SourceDocUnavailable:
+                raise
             except Exception as _e:  # pragma: no cover
                 print(f"[run-imagej] extract failed for {s}: {_e}", file=_sys.stderr, flush=True)
         # 1b. extra_inputs — upstream node outputs piped in by the
@@ -9929,6 +10219,8 @@ def run_matlab_pipeline(body: MatlabAnalysisRequest):
                     "label": str(s.get("label") or orig),
                     "row": r, "col": c, "inset_index": int(s.get("inset_index", -1)),
                 }
+            except _SourceDocUnavailable:
+                raise
             except Exception as _e:
                 import sys as __s
                 print(f"[run-matlab] extract failed for {s}: {_e}", file=__s.stderr, flush=True)

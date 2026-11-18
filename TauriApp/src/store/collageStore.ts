@@ -595,7 +595,9 @@ export type CollageState = {
 
   // ── Document tabs ──
   /** Append a new doc tab (stable order). Returns its id. */
-  docAdd: (doc: { path?: string | null; name?: string }) => string;
+  /** `id` lets a caller mint the id first (newDocId) so the sidecar can be
+   *  told which tab a new / loaded document belongs to before it is added. */
+  docAdd: (doc: { id?: string; path?: string | null; name?: string }) => string;
   /** Remove a doc tab by id. */
   docRemove: (id: string) => void;
   /** Set the active builder document. */
@@ -607,7 +609,11 @@ export type CollageState = {
    *  also seeds the Save Project modal's filename. */
   docRename: (id: string, name: string) => void;
   /** Ensure a tab exists for `path`; returns its id (existing or new). */
-  docEnsure: (path: string, name?: string) => string;
+  docEnsure: (path: string, name?: string, id?: string) => string;
+  /** True while a document swap (stash → activate/load/new) is in flight:
+   *  the builder/analysis content is inert so no edit lands mid-swap. */
+  docSwapBusy: boolean;
+  setDocSwapBusy: (v: boolean) => void;
   /** Replace the set of docs that have unsaved in-memory snapshots. */
   setSnapshotDirtyDocIds: (ids: string[]) => void;
 
@@ -864,6 +870,8 @@ function persist(s: Persisted) {
 
 let _docSeq = 1;
 const _newDocId = () => `doc_${Date.now()}_${_docSeq++}`;
+/** Mint a document-tab id (see docAdd's `id`). */
+export const newDocId = (): string => _newDocId();
 
 /** Next free "Untitled_N" name not already used by an open tab. Numbered so
  *  multiple blank tabs are distinguishable in the tab strip and — crucially —
@@ -886,6 +894,7 @@ export const useCollageStore = create<CollageState>()(
     openDocs: [{ id: "doc_initial", path: null, name: "Untitled_1" }],
     activeDocId: "doc_initial",
     snapshotDirtyDocIds: [],
+    docSwapBusy: false,
     elemSyncItemId: null,
     elemListByItem: {},
     elemSelByItem: {},
@@ -1258,7 +1267,7 @@ export const useCollageStore = create<CollageState>()(
 
     // ── Document tabs (session-only, not persisted) ──
     docAdd: (doc) => {
-      const id = _newDocId();
+      const id = doc.id ?? _newDocId();
       set((s) => {
         // Derive the display name: an explicit name wins; else a file path's
         // basename; else the next free "Untitled_N" (numbered against the
@@ -1297,11 +1306,13 @@ export const useCollageStore = create<CollageState>()(
       if (d && trimmed) d.name = trimmed;
     }),
 
-    docEnsure: (path, name) => {
+    docEnsure: (path, name, id) => {
       const existing = get().openDocs.find((d) => d.path === path);
       if (existing) return existing.id;
-      return get().docAdd({ path, name });
+      return get().docAdd({ id, path, name });
     },
+
+    setDocSwapBusy: (v) => set((s) => { s.docSwapBusy = v; }),
 
     setSnapshotDirtyDocIds: (ids) => set((s) => { s.snapshotDirtyDocIds = ids; }),
 

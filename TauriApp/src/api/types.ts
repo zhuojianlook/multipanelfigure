@@ -437,6 +437,8 @@ export interface FigureTab {
 export interface UploadResponse {
   names: string[];
   thumbnails: Record<string, string>;  // name -> base64 png
+  /** name -> [width, height]; sent by the Analysis upload store. */
+  sizes?: Record<string, [number, number]>;
 }
 
 export interface ImagesListResponse {

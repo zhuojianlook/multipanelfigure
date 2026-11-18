@@ -45,6 +45,7 @@ import { analysisSourceSigs, changedSourceRawKeys } from "../utils/analysisStale
 import { figKey, nsKey } from "../utils/analysisKeys";
 import { useCollageStore } from "./collageStore";
 import { useSourceEditStore } from "./sourceEditStore";
+import { serializeDocOp, backendTracksLiveDoc, setBackendTracksLiveDoc } from "../utils/docOpQueue";
 
 /** Analysis keys (figKey::raw, as the graph binds them) of the ON-SCREEN
  *  figure's sources whose pixels change when panel (row, col) goes from
@@ -210,8 +211,17 @@ interface FigureState {
    *  analysis plots being pushed onto the timeline) through the
    *  backend. Returns the canonical names the backend assigned so
    *  callers can map their inputs to loadedImages entries. */
+  /** Upload into the doc that is live when the upload STARTS — runs as one
+   *  doc op, so a tab click waits for the batch instead of splitting it. */
   uploadImages: (files: File[]) => Promise<string[]>;
   uploadImagesFromPaths: (filePaths: string[]) => Promise<string[]>;
+  /** The un-queued bodies — only call these from INSIDE a doc op. */
+  _uploadImagesNow: (files: File[]) => Promise<string[]>;
+  _uploadImagesFromPathsNow: (filePaths: string[]) => Promise<string[]>;
+  /** Make the sidecar's live config equal the store's and wait until every
+   *  config write has landed. Called before the live doc is stashed, so a
+   *  debounced edit can neither be lost nor land in the next tab. */
+  flushConfigWrites: () => Promise<void>;
   removeImage: (name: string) => Promise<void>;
 
   // Image group management
@@ -240,7 +250,7 @@ interface FigureState {
   syncToBackend: () => Promise<void>;
 
   saveProject: (path: string) => Promise<boolean>;
-  loadProject: (path: string) => Promise<void>;
+  loadProject: (path: string, docId?: string) => Promise<void>;
   /** Restore an in-session document snapshot (a base64 .mpf blob captured
    *  by api.snapshotProject) into the builder. Used by the document-tab
    *  switcher so a tab's unsaved edits survive being swapped out of the
@@ -255,7 +265,7 @@ interface FigureState {
   /** Reset the builder to a fresh blank 2×2 figure (new document) WITHOUT
    *  a page reload and without touching the collage. Deletes loaded
    *  images on the backend, resets cfg, clears the project path. */
-  newBlankFigure: () => Promise<void>;
+  newBlankFigure: (docId?: string) => Promise<void>;
 
   // ── Figure tabs ── Call these through utils/projectNav (switchFigure,
   // addFigure, …), which serializes them with document switch/save/open.
@@ -526,6 +536,29 @@ function buildDefaultConfig(rows: number, cols: number): FigureConfig {
   };
 }
 
+/** Tell the sidecar which tab holds the live globals after a webview (re)load.
+ *  The sidecar outlives a reload, after which the tab ids are new — its stale
+ *  stashes are unreachable, so reset them. Success is also the capability
+ *  check for sending document ids on active-doc analysis sources. */
+async function bindLiveDocAfterConnect(): Promise<void> {
+  try {
+    const id = useCollageStore.getState().activeDocId;
+    if (!id) { setBackendTracksLiveDoc(false); return; }
+    const r = await api.bindLiveDoc(id, true);
+    setBackendTracksLiveDoc(!!r?.ok);
+  } catch {
+    setBackendTracksLiveDoc(false);   // older sidecar: keep 0.1.420 behaviour
+  }
+}
+
+/** File names shown as pending upload tiles (works for / and \\ separators). */
+function uploadPendingNames(filePaths: string[]): string[] {
+  return filePaths.map((p) => {
+    const parts = p.split(/[\\/]/);
+    return parts[parts.length - 1] || p;
+  });
+}
+
 // ── Debounce helper ──────────────────────────────────────
 
 let previewTimer: ReturnType<typeof setTimeout> | null = null;
@@ -535,6 +568,23 @@ let syncTimer: ReturnType<typeof setTimeout> | null = null;
 // flushHeaderEdits() consults this so it can no-op when nothing is pending
 // (and so the closeToolbar + onBlur double-fire collapses to one flush).
 let headerEditsPending = false;
+
+/** Debounced backend sync (one shared timer, as before). */
+function scheduleSync(fn: () => void | Promise<void>, ms: number) {
+  if (syncTimer) clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => { syncTimer = null; void fn(); }, ms);
+}
+/** Drop pending debounced syncs (the doc they belong to is being replaced
+ *  or was just flushed with a full PUT). */
+function cancelConfigDebounce() {
+  if (syncTimer) { clearTimeout(syncTimer); syncTimer = null; }
+  headerEditsPending = false;
+}
+/* Bumped whenever the store's document is replaced (load / restore / new /
+   figure switch). Async responses that started under an older epoch — e.g. a
+   panel thumbnail rendered for the previous tab — are dropped instead of
+   being painted into the new document's grid. */
+let docEpoch = 0;
 // Monotonic sequence for preview requests so an older in-flight GET
 // response can't overwrite a newer one (race condition seen as a
 // "ghost" of the previous header state appearing in the preview).
@@ -649,6 +699,7 @@ export const useFigureStore = create<FigureState>()(
                   s.imageGroups = normalizeImageGroups(cfg.image_groups);
                   s.apiError = null;
                 });
+                await bindLiveDocAfterConnect();
               } catch {
                 set((s) => { s.apiError = null; });
               }
@@ -675,6 +726,7 @@ export const useFigureStore = create<FigureState>()(
           s.imageGroups = normalizeImageGroups(cfg.image_groups);
           s.apiError = null;
         });
+        await bindLiveDocAfterConnect();
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         console.warn("Failed to fetch config, using default", err);
@@ -786,8 +838,7 @@ export const useFigureStore = create<FigureState>()(
           s.configDirty = true; s.unsaved = true;
         }
       });
-      if (syncTimer) clearTimeout(syncTimer);
-      syncTimer = setTimeout(() => {
+      scheduleSync(() => {
         const cfg = get().config;
         if (cfg) {
           api.patchGrid(cfg.rows, cfg.cols, cfg.spacing).catch(console.error);
@@ -1077,8 +1128,10 @@ export const useFigureStore = create<FigureState>()(
     },
 
     refreshPanelThumbnail: async (row, col) => {
+      const ep = docEpoch;
       try {
         const resp = await api.getPanelPreview(row, col);
+        if (ep !== docEpoch) return;   // rendered for a document that's no longer shown
         if (resp.image) {
           set((s) => {
             s.panelThumbnails[`${row}-${col}`] = resp.image;
@@ -1121,8 +1174,7 @@ export const useFigureStore = create<FigureState>()(
         }
       });
       if (opts?.skipSync) { headerEditsPending = true; return; }  // typing — defer to flushHeaderEdits() on blur
-      if (syncTimer) clearTimeout(syncTimer);
-      syncTimer = setTimeout(async () => {
+      scheduleSync(async () => {
         const cfg = get().config;
         if (!cfg) return;
         try {
@@ -1150,8 +1202,7 @@ export const useFigureStore = create<FigureState>()(
         }
       });
       if (opts?.skipSync) { headerEditsPending = true; return; }  // typing — defer to flushHeaderEdits() on blur
-      if (syncTimer) clearTimeout(syncTimer);
-      syncTimer = setTimeout(async () => {
+      scheduleSync(async () => {
         const cfg = get().config;
         if (!cfg) return;
         try {
@@ -1219,8 +1270,7 @@ export const useFigureStore = create<FigureState>()(
       // store only — no backend patch, no preview refresh. The
       // deferred sync is flushed by flushHeaderEdits() on blur.
       if (opts?.skipSync) { headerEditsPending = true; return; }
-      if (syncTimer) clearTimeout(syncTimer);
-      syncTimer = setTimeout(async () => {
+      scheduleSync(async () => {
         const cfg = get().config;
         if (!cfg) return;
         try {
@@ -1554,8 +1604,7 @@ export const useFigureStore = create<FigureState>()(
       // when the header/label editing context loses focus — otherwise
       // every colour/style tweak triggers its own preview render (lag).
       if (opts?.skipSync) { headerEditsPending = true; return; }
-      if (syncTimer) clearTimeout(syncTimer);
-      syncTimer = setTimeout(async () => {
+      scheduleSync(async () => {
         const cfg = get().config;
         if (!cfg) return;
         // AWAIT the patch so the backend definitely has the latest state
@@ -1598,8 +1647,7 @@ export const useFigureStore = create<FigureState>()(
       // See updateHeaderGroupFormatting — defer styling pushes to
       // flushHeaderEdits() on blur so the preview renders once, not per tweak.
       if (opts?.skipSync) { headerEditsPending = true; return; }
-      if (syncTimer) clearTimeout(syncTimer);
-      syncTimer = setTimeout(async () => {
+      scheduleSync(async () => {
         const cfg = get().config;
         if (!cfg) return;
         // Await label patch so the backend has the latest labels before
@@ -1720,11 +1768,16 @@ export const useFigureStore = create<FigureState>()(
 
     // ── Image management ──────────────────────────────────
 
-    uploadImages: async (files) => {
+    uploadImages: (files) => {
       const pendingNames = files.map((f) => f.name);
       set((s) => {
-        s.pendingUploads.push(...pendingNames);
+        s.pendingUploads.push(...pendingNames);   // tiles show immediately
       });
+      return serializeDocOp(() => get()._uploadImagesNow(files));
+    },
+
+    _uploadImagesNow: async (files) => {
+      const pendingNames = files.map((f) => f.name);
       try {
         const { names, thumbnails } = await api.uploadImages(files);
         set((s) => {
@@ -1755,15 +1808,15 @@ export const useFigureStore = create<FigureState>()(
       }
     },
 
-    uploadImagesFromPaths: async (filePaths) => {
-      const pendingNames = filePaths.map((p) => {
-        // Extract filename from path (works for both / and \ separators)
-        const parts = p.split(/[\\/]/);
-        return parts[parts.length - 1] || p;
-      });
+    uploadImagesFromPaths: (filePaths) => {
       set((s) => {
-        s.pendingUploads.push(...pendingNames);
+        s.pendingUploads.push(...uploadPendingNames(filePaths));   // tiles show immediately
       });
+      return serializeDocOp(() => get()._uploadImagesFromPathsNow(filePaths));
+    },
+
+    _uploadImagesFromPathsNow: async (filePaths) => {
+      const pendingNames = uploadPendingNames(filePaths);
       try {
         const { names, thumbnails } = await api.uploadImagesFromPaths(filePaths);
         set((s) => {
@@ -1982,6 +2035,16 @@ export const useFigureStore = create<FigureState>()(
 
     // ── Full config sync ──────────────────────────────────
 
+    flushConfigWrites: async () => {
+      const pending = syncTimer !== null || headerEditsPending;
+      cancelConfigDebounce();
+      await settleConfigWrites();                 // in-flight PATCHes first…
+      // …then one full PUT (the same "backend = store" step a save does),
+      // which also carries store-only edits a debounce never pushed.
+      if (pending || get().unsaved) await get().syncToBackend();
+      await settleConfigWrites();
+    },
+
     syncToBackend: async () => {
       const cfg = get().config;
       if (!cfg) return;
@@ -2027,12 +2090,21 @@ export const useFigureStore = create<FigureState>()(
       }
     },
 
-    newBlankFigure: async () => {
-      // Delete all backend images so the fresh figure starts clean.
-      try {
-        const imgs = await api.listImages();
-        for (const n of imgs.names) await api.deleteImage(n).catch(() => {});
-      } catch { /* ignore */ }
+    newBlankFigure: async (docId) => {
+      cancelConfigDebounce();
+      await settleConfigWrites();
+      if (backendTracksLiveDoc()) {
+        // Fresh containers in the sidecar. The old per-image DELETE loop
+        // unlinked z-stack temp files a parked tab still referenced. Throws
+        // → the caller aborts and the previous document stays live.
+        await api.newBlank(docId);
+      } else {
+        // Older sidecar without new-blank: legacy reset.
+        try {
+          const imgs = await api.listImages();
+          for (const n of imgs.names) await api.deleteImage(n).catch(() => {});
+        } catch { /* ignore */ }
+      }
       // Carry the scale-bar (resolution) presets over to the new project.
       // buildDefaultConfig() starts with an empty resolution_entries; without
       // this the bundled microscope defaults vanish on every "New". Fall back
@@ -2041,11 +2113,13 @@ export const useFigureStore = create<FigureState>()(
       if (!resolutions || Object.keys(resolutions).length === 0) {
         try { resolutions = await api.getResolutions(); } catch { /* ignore */ }
       }
+      docEpoch++; previewSeq++;   // drop late renders of the previous doc
       set((s) => {
         s.config = buildDefaultConfig(2, 2);
         if (s.config && resolutions) s.config.resolution_entries = resolutions;
         s.loadedImages = {};
         s.panelThumbnails = {};
+        s.panelProcessedSizes = {};
         s.imageGroups = [];
         s.figures = defaultFigureTabs();
         s.activeFigureId = DEFAULT_FIGURE_ID;
@@ -2057,16 +2131,20 @@ export const useFigureStore = create<FigureState>()(
       get().requestPreview();
     },
 
-    loadProject: async (path) => {
+    loadProject: async (path, docId) => {
       try {
-        const resp = await api.loadProject(path);
+        cancelConfigDebounce();
+        await settleConfigWrites();
+        const resp = await api.loadProject(path, docId);
         const doc = docFigureFields(resp.config);
+        docEpoch++; previewSeq++;   // drop late renders of the previous doc
         set((s) => {
           s.config = doc.config;
           s.figures = doc.figures;
           s.activeFigureId = doc.activeFigureId;
           s.loadedImages = {};
           s.panelThumbnails = {};
+          s.panelProcessedSizes = {};
           for (const name of resp.image_names) {
             s.loadedImages[name] = {
               name,
@@ -2127,14 +2205,18 @@ export const useFigureStore = create<FigureState>()(
       // instead of disk, and leaves analysis state untouched (analysis is
       // a single global, not yet per-document). The restored doc is marked
       // unsaved because a snapshot is only ever taken for a dirty tab.
+      cancelConfigDebounce();
+      await settleConfigWrites();
       const resp = await api.restoreProject(blob);
       const doc = docFigureFields(resp.config);
+      docEpoch++; previewSeq++;   // drop late renders of the previous doc
       set((s) => {
         s.config = doc.config;
         s.figures = doc.figures;
         s.activeFigureId = doc.activeFigureId;
         s.loadedImages = {};
         s.panelThumbnails = {};
+        s.panelProcessedSizes = {};
         for (const name of resp.image_names) {
           s.loadedImages[name] = {
             name,
@@ -2164,14 +2246,18 @@ export const useFigureStore = create<FigureState>()(
       // Fast path: the backend swapped its globals to this doc's cached state
       // (no image re-encode/decode). Apply the returned config + thumbnails
       // exactly like restoreDoc. Throws (404) if the cache entry is gone.
+      cancelConfigDebounce();
+      await settleConfigWrites();
       const resp = await api.activateState(docId);
       const doc = docFigureFields(resp.config);
+      docEpoch++; previewSeq++;   // drop late renders of the previous doc
       set((s) => {
         s.config = doc.config;
         s.figures = doc.figures;
         s.activeFigureId = doc.activeFigureId;
         s.loadedImages = {};
         s.panelThumbnails = {};
+        s.panelProcessedSizes = {};
         for (const name of resp.image_names) {
           s.loadedImages[name] = { name, thumbnailB64: resp.thumbnails[name] ?? "" };
         }
@@ -2198,6 +2284,7 @@ export const useFigureStore = create<FigureState>()(
 
     _applyFigureState: async (next, opts) => {
       const switched = next.activeFigureId !== get().activeFigureId;
+      if (switched) docEpoch++;
       if (switched) {
         // Writes for the OUTGOING figure must land before the incoming one
         // becomes the backend's live config. Deferred header/label edits are

@@ -272,6 +272,11 @@ describe("figure tabs inside one document", () => {
     expect(sourceProvenance({ figKey: figKey(B, "fig-x") }, docs, "d1").owner).toBeUndefined();
     // Standalone uploads carry nothing.
     expect(sourceProvenance({ name: "blot.png" }, docs, "d1").fields).toEqual({});
+    // When the sidecar tracks the live doc, the ACTIVE doc is named too, so a
+    // mid-run tab switch can't redirect the source to another document.
+    const tracked = sourceProvenance({ figKey: figKey(A, "fig-x"), figureId: "fig-x" }, docs, "d1", true);
+    expect(tracked.fields.mpf_doc_id).toBe("d1");
+    expect(sourceProvenance({ name: "blot.png" }, docs, "d1", true).fields).toEqual({});
   });
 
   it("measurements: the Figure column and group keys separate tabs", () => {

@@ -1379,6 +1379,9 @@ export function Toolbar() {
             try {
               // Preserve user-defined scale bars
               const savedScales = await api.getResolutions().catch(() => ({}));
+              // Fresh, empty document in the sidecar (new containers; it
+              // deletes no temp file a parked tab may still reference).
+              const blanked = await api.newBlank().then(() => true, () => false);
               // Reset backend to fresh 2x2 grid
               await api.updateConfig({
                 rows: 2, cols: 2, spacing: 0.02, output_format: "TIFF", background: "White",
@@ -1397,10 +1400,12 @@ export function Toolbar() {
                 // keys: a PUT without `figures` keeps the old project's tabs.
                 figures: [], active_figure_id: "", image_groups: [],
               });
-              // Delete all loaded images
-              const imgs = await api.listImages();
-              for (const name of imgs.names) {
-                await api.deleteImage(name).catch(() => {});
+              // Older sidecar without new-blank: delete the loaded images.
+              if (!blanked) {
+                const imgs = await api.listImages();
+                for (const name of imgs.names) {
+                  await api.deleteImage(name).catch(() => {});
+                }
               }
             } catch (err) {
               console.error("Clear session failed", err);

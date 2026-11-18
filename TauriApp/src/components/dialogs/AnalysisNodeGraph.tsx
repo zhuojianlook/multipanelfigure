@@ -84,7 +84,8 @@ import { api, getApiBase } from "../../api/client";
 import type { RDepsStatus } from "../../api/types";
 import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
-import { switchToDocument, whenDocOpsIdle } from "../../utils/projectNav";
+import { switchToDocument, whenDocOpsIdle, uploadIntoDocument } from "../../utils/projectNav";
+import { backendTracksLiveDoc } from "../../utils/docOpQueue";
 import { DEFAULT_FIGURE_ID } from "../../utils/figures";
 import { figKey, nsKey } from "../../utils/analysisKeys";
 import { useSourceEditStore } from "../../store/sourceEditStore";
@@ -992,11 +993,17 @@ export function migrateLegacySource(
  *  it isn't the active one (doc id for its stashed live state, path for the
  *  .mpf on disk) and always the figure tab, so a source from a figure that
  *  isn't on screen is read from THAT figure. A source with no figure id
- *  predates figure tabs and belongs to the project's first figure. */
+ *  predates figure tabs and belongs to the project's first figure.
+ *
+ *  `liveTracked` (the sidecar answered bind-live): name the document for the
+ *  ACTIVE doc too. Without it, an active-doc source carried no document id and
+ *  was read from whatever document was live when its run reached it — after a
+ *  mid-run tab switch, another tab's pixels at the same grid position. */
 export function sourceProvenance(
   src: { figKey?: string; mpfId?: string; figureId?: string; name?: string },
   docs: Array<{ id: string; path?: string | null }>,
   activeDocId: string | null,
+  liveTracked = false,
 ): { owner?: { id: string; path?: string | null }; fields: { mpf_doc_id?: string; project_path?: string; figure_id?: string } } {
   if (src.name) return { fields: {} };                  // standalone upload — no figure
   const owner = src.figKey
@@ -1005,9 +1012,13 @@ export function sourceProvenance(
   const fields: { mpf_doc_id?: string; project_path?: string; figure_id?: string } = {
     figure_id: src.figureId || DEFAULT_FIGURE_ID,
   };
-  if (owner && owner.id !== activeDocId) {
+  if (owner && (liveTracked || owner.id !== activeDocId)) {
     fields.mpf_doc_id = owner.id;
     if (owner.path) fields.project_path = owner.path;
+  } else if (!owner && liveTracked && src.mpfId) {
+    // Its document was closed: name it anyway so the sidecar answers "no
+    // longer open" instead of reading the live doc at the same grid position.
+    fields.mpf_doc_id = src.mpfId;
   }
   return { owner, fields };
 }
@@ -6534,7 +6545,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     const key = s.key;
     // Evict on the backend first so quick re-uploads of the same filename
     // get a fresh slot. Best-effort: still drop the UI entry on failure.
-    try { await api.deleteImage(name); }
+    // Uploads live in the sidecar's Analysis store (no document), so this can
+    // never delete a same-named builder image of whichever tab is live.
+    try { await api.deleteAnalysisImage(name); }
     catch (e) { logUpload(`[upload] backend delete failed for ${name}: ${e instanceof Error ? e.message : String(e)}`); }
     // Drop from the library list.
     setInsetSources((cur) => cur.filter((x) => x.key !== key));
@@ -6553,28 +6566,26 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     logUpload(`[upload] removed "${name}" from Analysis`);
   }, [logUpload, sourceGroups, persistSourceGroups, setNodes]);
 
-  /** Resolve names → standalone source-library entries (full bit depth on the
-   *  backend) and add them to the Sources panel, deduped, newest on top. Marks
-   *  each backend image HIDDEN from the builder's media timeline (Analysis
-   *  uploads are analysis-only). Thumbnails fetched per-name. */
-  const addUploadedSources = useCallback(async (names: string[]) => {
+  /** Turn an Analysis-store upload response into standalone source-library
+   *  entries (full bit depth on the backend) and add them to the Sources
+   *  panel, deduped, newest on top. The store belongs to no document, so the
+   *  images never appear in a builder timeline or get saved into an .mpf, and
+   *  a tab switch can't lose them. Thumbnails + sizes come with the response. */
+  const addUploadedSources = useCallback(async (res: { names?: string[]; thumbnails?: Record<string, string>; sizes?: Record<string, [number, number]> }) => {
+    const names = res.names || [];
     if (!names.length) { logUpload("[upload] no images were returned by the backend"); return; }
-    const entries: InsetSource[] = [];
-    for (const name of names) {
-      // Keep these out of the builder's media timeline — analysis-only.
-      try { await api.hideImage(name); } catch { /* best-effort */ }
-      let w = 0, h = 0, thumb = "";
-      try { const info = await api.getImageInfo(name); w = info.width; h = info.height; } catch { /* size unknown */ }
-      try { thumb = (await api.getImageThumbnail(name)).thumbnail || ""; } catch { /* no thumb */ }
-      entries.push({
+    const entries: InsetSource[] = names.map((name) => {
+      const [w, h] = res.sizes?.[name] || [0, 0];
+      return {
         key: `img:${name}`, name, row: -1, col: -1, inset_index: -1,
-        label: name, natural_width: w, natural_height: h, thumbnail: thumb,
-      });
-    }
+        label: name, natural_width: w, natural_height: h, thumbnail: res.thumbnails?.[name] || "",
+      };
+    });
     setInsetSources((cur) => {
-      const have = new Set(cur.map((s) => s.key));
-      const add = entries.filter((e) => !have.has(e.key));
-      return add.length ? [...add, ...cur] : cur;
+      // A re-upload of the same filename replaced the backend image — refresh
+      // its card (thumbnail / size) instead of keeping the stale one.
+      const fresh = new Set(entries.map((e) => e.key));
+      return [...entries, ...cur.filter((s) => !fresh.has(s.key))];
     });
     // Auto-park direct uploads under a dedicated "Direct upload" folder so
     // they're visually separated from builder-flagged insets (which appear
@@ -6615,8 +6626,8 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     setUploading((cur) => [...cur, ...names]);
     try {
       logUpload(`[upload] uploading ${files.length} file(s)…`);
-      const res = await api.uploadImages(files);
-      await addUploadedSources(res.names || []);
+      const res = await api.uploadImages(files, "/api/analysis/images/upload");
+      await addUploadedSources(res);
     } catch (e) {
       logUpload(`[upload] FAILED: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -6658,12 +6669,11 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       setUploading((cur) => [...cur, ...basenames]);
       logUpload(`[upload] uploading ${paths.length} file(s)…`);
       try {
-        // RAW api (NOT the store action) — analysis uploads must NOT populate
-        // figureStore.loadedImages or trigger requestPreview; we want them
-        // analysis-only. addUploadedSources also marks each name hidden so
-        // /api/images excludes them from the builder timeline.
-        const res = await api.uploadImagesFromPaths(paths);
-        await addUploadedSources(res.names || []);
+        // RAW api (NOT the store action) into the sidecar's Analysis store,
+        // which belongs to no document: analysis uploads must not populate
+        // figureStore.loadedImages, any builder timeline or any .mpf.
+        const res = await api.uploadImagesFromPaths(paths, "/api/analysis/images/upload");
+        await addUploadedSources(res);
       } finally {
         setUploading((cur) => cur.filter((n) => !basenames.includes(n)));
       }
@@ -6963,7 +6973,8 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     // Source-descriptor lookup so each membrane can re-extract full-res for
     // detection + the wb-preview contrast stretch. Standalone uploads resolve
     // by name; builder insets by row/col/inset_index.
-    const srcByKey = new Map<string, { key: string; name?: string; row?: number; col?: number; inset_index?: number }>();
+    const srcByKey = new Map<string, { key: string; name?: string; row?: number; col?: number; inset_index?: number;
+      mpf_doc_id?: string; project_path?: string; figure_id?: string }>();
     // Binding key → the sidecar's `inputs` key. They are NOT the same string:
     // the binding key namespaces by figure (and embeds a path), the runtime key
     // stays bare for the active figure. See runtimeKeyFor.
@@ -6973,7 +6984,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       if (s.runKey) runByKey.set(s.key, s.runKey);
       srcByKey.set(s.key, s.name
         ? { key: s.key, name: s.name }
-        : { key: rawKeyOf(s), row: s.row, col: s.col, inset_index: s.inset_index });
+        : { key: rawKeyOf(s), row: s.row, col: s.col, inset_index: s.inset_index,
+            // Which document / figure tab to re-extract from (absent = the
+            // live figure, which is wrong for a source of another tab).
+            ...sourceProvenance(s, openDocs, activeDocId, backendTracksLiveDoc()).fields });
     };
     for (const s of insetSources) addSrc(s);
     for (const n of nodes) {
@@ -7004,7 +7018,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     }
     const node = nm.get(nodeId);
     setBandPicker({ open: true, nodeId, images: built, cfg: (node?.data.roi as BandPickerConfig | undefined) || emptyBandConfig() });
-  }, [nodes, collectInputs, insetSources]);
+  }, [nodes, collectInputs, insetSources, openDocs, activeDocId]);
 
   // Persist the edited ROIs back onto the node and regenerate its
   // Python so a normal Run uses the new lanes.
@@ -7182,7 +7196,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           inset_index: (src as { inset_index?: number }).inset_index,
           name: src.label,
           // Which document / figure tab to extract from (not just the live one).
-          ...sourceProvenance(src, openDocs, activeDocId).fields,
+          ...sourceProvenance(src, openDocs, activeDocId, backendTracksLiveDoc()).fields,
         });
       }
     }
@@ -7261,7 +7275,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
             key: s.rawKey || s.key,
             row: s.row, col: s.col, inset_index: s.inset_index,
             ...(s.name ? { name: s.name } : {}),
-            ...sourceProvenance(s, openDocs, activeDocId).fields,
+            ...sourceProvenance(s, openDocs, activeDocId, backendTracksLiveDoc()).fields,
           } as unknown as FluorImageSource,
         }));
     }
@@ -7509,7 +7523,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           // figure (the stashed live state by doc id, or the .mpf on disk).
           // Active-figure sources send nothing → backend uses the live figure
           // (single-MPF behaviour unchanged).
-          const { owner, fields } = sourceProvenance(src, openDocs, activeDocId);
+          const { owner, fields } = sourceProvenance(src, openDocs, activeDocId, backendTracksLiveDoc());
           const rtKey = runtimeKeyFor(src, owner?.id, activeDocId, activeFigureId);
           const base: { key: string; row: number; col: number; inset_index: number; label: string; name?: string; project_path?: string; mpf_doc_id?: string; figure_id?: string } =
             { key: rtKey, row: src.row, col: src.col,
@@ -8062,35 +8076,26 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     );
     if (list.length === 0) return;
     if (bucket === "main") {
-      // Pick destination MPF tab. Default = currently-active doc. If the
-      // user picked a DIFFERENT tab in the dropdown we switch there first
-      // (figureStore.uploadImages always writes to the active doc), then
-      // switch back to where they were so they're not surprised by the
-      // builder swap. switchToDocument handles snapshot/restore.
+      // Pick destination MPF tab. Default = currently-active doc. A
+      // DIFFERENT tab is switched to, uploaded into, and switched back from
+      // as ONE doc op (uploadIntoDocument), so a tab click can't slip in
+      // between and send the outputs to a third document.
       const cs = useCollageStore.getState();
       const originalDocId = cs.activeDocId;
       const targetDocId = mainTargetDocId || originalDocId || "";
       const docName = cs.openDocs.find((d) => d.id === targetDocId)?.name || "MPF";
-      let switched = false;
       try {
-        if (targetDocId && targetDocId !== originalDocId) {
-          await switchToDocument(targetDocId);
-          switched = true;
-        }
         const stamp = Date.now();
         const files = list.map((o) => b64ToFile(o.payload, `${outputFilename(o)}_${stamp}.png`));
-        const names = await uploadImages(files);
+        const names = targetDocId
+          ? await uploadIntoDocument(targetDocId, files)
+          : await uploadImages(files);
         consoleRef.current += `\n[${names.length} output(s) sent to "${docName}".]\n`;
         // Tag the kept outputs with the destination chip — user sees
         // "→ docName" on each card and can re-send later if needed.
         tagSentTo(list, `MPF · ${docName}`);
       } catch (err) {
         consoleRef.current += `\n[Send to MPF failed: ${err instanceof Error ? err.message : String(err)}]\n`;
-      } finally {
-        // Restore the user's original tab if we wandered off.
-        if (switched && originalDocId && originalDocId !== targetDocId) {
-          try { await switchToDocument(originalDocId); } catch { /* best-effort */ }
-        }
       }
       setStagedForMain(new Set());
     } else {

@@ -44,6 +44,8 @@ vi.mock("../api/client", () => ({
   api: mockApi,
   checkHealth: mockCheckHealth,
   lastHealthError: "",
+  // figureStore awaits in-flight config writes before replacing a document.
+  settleConfigWrites: vi.fn(async () => {}),
   default: vi.fn(),
 }));
 

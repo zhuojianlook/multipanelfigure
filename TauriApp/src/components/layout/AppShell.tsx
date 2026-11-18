@@ -96,6 +96,23 @@ export function AppShell() {
   // closing. Sits BELOW MUI dialogs (z 1300) so the per-file save prompts stay
   // clickable above it.
   const [closing, setClosing] = useState(false);
+  // True while a document swap (stash → activate/load/new) is in flight. The
+  // window is made non-interactive so no click or shortcut edits the outgoing
+  // doc after it was stashed, or lands in the incoming one.
+  const docSwapBusy = useCollageStore((s) => s.docSwapBusy);
+  useEffect(() => {
+    if (!docSwapBusy) return;
+    const swallow = (e: KeyboardEvent) => {
+      // Dialogs raised during a swap (Save, "Load failed", Save / Don't save)
+      // sit above the shield and must keep the keyboard (typing, Enter, Esc).
+      const t = e.target as Element | null;
+      if (t && typeof t.closest === "function" && t.closest('[role="dialog"], [role="alertdialog"]')) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    };
+    window.addEventListener("keydown", swallow, true);
+    return () => window.removeEventListener("keydown", swallow, true);
+  }, [docSwapBusy]);
 
   useEffect(() => {
     const init = async () => {
@@ -366,6 +383,12 @@ export function AppShell() {
             </span>
           </div>
         </div>
+      )}
+      {/* ── Document-swap shield ─────────────────────────── */}
+      {/* Transparent, below MUI dialogs (z 1300) so a "Load failed" alert
+          raised mid-swap stays clickable. */}
+      {docSwapBusy && (
+        <div className="fixed inset-0" style={{ zIndex: 1240, cursor: "progress" }} />
       )}
       {/* ── File Drop Overlay ──────────────────────────── */}
       {fileDragOver && (

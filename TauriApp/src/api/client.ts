@@ -178,7 +178,9 @@ class ApiClient {
 
   // ── Image upload / management ──────────────────────────
 
-  async uploadImages(files: File[]): Promise<UploadResponse> {
+  /** `apiPath` lets the Analysis tab send standalone images to the
+   *  document-independent store (/api/analysis/images/upload). */
+  async uploadImages(files: File[], apiPath: string = "/api/images/upload"): Promise<UploadResponse> {
     // File uploads use base64 through Tauri IPC proxy
     const invoke = await getInvoke();
     if (invoke) {
@@ -194,7 +196,7 @@ class ApiClient {
         filesData.push({ name: f.name, data: btoa(chunks.join("")) });
       }
       const text = await invoke("proxy_upload", {
-        path: "/api/images/upload",
+        path: apiPath,
         files: filesData,
         fieldName: "files",
       }) as string;
@@ -211,22 +213,23 @@ class ApiClient {
     // Fallback: browser fetch with FormData
     const form = new FormData();
     for (const f of files) form.append("files", f);
-    const res = await fetch(`${DEFAULT_BASE}/api/images/upload`, { method: "POST", body: form });
+    const res = await fetch(`${DEFAULT_BASE}${apiPath}`, { method: "POST", body: form });
     return res.json() as Promise<UploadResponse>;
   }
 
   /** Upload images from file paths — one at a time to avoid IPC size limits */
-  async uploadImagesFromPaths(filePaths: string[]): Promise<UploadResponse> {
+  async uploadImagesFromPaths(filePaths: string[], apiPath: string = "/api/images/upload"): Promise<UploadResponse> {
     const invoke = await getInvoke();
     if (!invoke) throw new Error("Path-based upload requires Tauri runtime");
 
     const allNames: string[] = [];
     const allThumbnails: Record<string, string> = {};
+    const allSizes: Record<string, [number, number]> = {};
 
     // Upload one file at a time to avoid IPC response size limits
     for (const filePath of filePaths) {
       const text = await invoke("upload_files_from_paths", {
-        apiPath: "/api/images/upload",
+        apiPath,
         filePaths: [filePath],
         fieldName: "files",
       }) as string;
@@ -241,9 +244,17 @@ class ApiClient {
       if (result.thumbnails && typeof result.thumbnails === "object") {
         Object.assign(allThumbnails, result.thumbnails);
       }
+      if (result.sizes && typeof result.sizes === "object") {
+        Object.assign(allSizes, result.sizes);
+      }
     }
 
-    return { names: allNames, thumbnails: allThumbnails };
+    return { names: allNames, thumbnails: allThumbnails, sizes: allSizes };
+  }
+
+  /** Remove a standalone Analysis upload from the document-independent store. */
+  async deleteAnalysisImage(name: string): Promise<void> {
+    await apiRequest(`/api/analysis/images/${encodeURIComponent(name)}`, "DELETE");
   }
 
   async deleteImage(name: string): Promise<void> {
@@ -327,8 +338,23 @@ class ApiClient {
     );
   }
 
-  async loadProject(path: string): Promise<ProjectLoadResponse> {
-    return apiJson<ProjectLoadResponse>("/api/project/load", "POST", JSON.stringify({ path }));
+  /** `docId` = the tab the project is opened into, so the sidecar knows
+   *  which document is live (analysis sources resolve by document id). */
+  async loadProject(path: string, docId?: string): Promise<ProjectLoadResponse> {
+    return apiJson<ProjectLoadResponse>("/api/project/load", "POST",
+      JSON.stringify(docId ? { path, doc_id: docId } : { path }));
+  }
+
+  /** Make the live document a fresh empty one (fresh containers; deletes no
+   *  file a parked tab may still reference). */
+  async newBlank(docId?: string): Promise<{ ok: boolean }> {
+    return apiJson<{ ok: boolean }>("/api/project/new-blank", "POST", JSON.stringify({ doc_id: docId ?? null }));
+  }
+
+  /** Tell the sidecar which tab is live after a webview (re)load. */
+  async bindLiveDoc(docId: string, resetCache = false): Promise<{ ok: boolean; live_doc_id?: string }> {
+    return apiJson<{ ok: boolean; live_doc_id?: string }>("/api/project/bind-live", "POST",
+      JSON.stringify({ doc_id: docId, reset_cache: resetCache }));
   }
 
   /** Cheaply check which of the given .mpf paths still exist on disk (used by

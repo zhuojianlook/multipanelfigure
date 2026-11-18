@@ -15,7 +15,7 @@
    ────────────────────────────────────────────────────────── */
 
 import { useFigureStore } from "../store/figureStore";
-import { useCollageStore } from "../store/collageStore";
+import { useCollageStore, newDocId } from "../store/collageStore";
 import { api } from "../api/client";
 import { confirm } from "../components/shared/ConfirmDialog";
 import { serializeDocOp } from "./projectNav";
@@ -157,13 +157,14 @@ export async function maybeRestoreSession(): Promise<boolean> {
 
     // Now fill the builder with the active doc's content.
     try {
-      await useFigureStore.getState().loadProject(activePath);
+      await useFigureStore.getState().loadProject(activePath, activeId);
     } catch {
       // Rare: the file vanished between the existence check and the load. Reset
       // to a clean blank working doc so the active tab and backend stay
       // consistent (the other restored tabs remain and load on click).
-      await useFigureStore.getState().newBlankFigure().catch(() => {});
-      const blankId = useCollageStore.getState().docAdd({ path: null });
+      const blankId = newDocId();
+      await useFigureStore.getState().newBlankFigure(blankId).catch(() => {});
+      useCollageStore.getState().docAdd({ id: blankId, path: null });
       useCollageStore.getState().docSetActive(blankId);
       return false;
     }

@@ -10,10 +10,11 @@
    ────────────────────────────────────────────────────────── */
 
 import { useFigureStore } from "../store/figureStore";
-import { useCollageStore } from "../store/collageStore";
-import { api, settleConfigWrites } from "../api/client";
+import { useCollageStore, newDocId } from "../store/collageStore";
+import { api } from "../api/client";
 import { confirmThree, alert as alertDialog } from "../components/shared/ConfirmDialog";
 import { saveProjectDialog } from "../components/shared/SaveProjectDialog";
+import { serializeDocOp, isStateCacheMiss } from "./docOpQueue";
 
 /* ── Per-document in-memory state cache ──────────────────────────────────
    The Python backend holds exactly ONE builder document's state (config +
@@ -72,39 +73,9 @@ function syncSnapshotDirty() {
   useCollageStore.getState().setSnapshotDirtyDocIds(Array.from(backendStashed));
 }
 
-/* ── Document-operation serialization ────────────────────────────────────
-   The Python sidecar holds ONE builder document in shared globals. Its doc gate
-   (api_server._DocGate) keeps a request from running INSIDE Analysis's
-   temporary swap to another document, but it does not order two ordinary
-   requests against each other (sync endpoints run in uvicorn's threadpool). If two
-   document operations overlap — e.g. a user clicks tab B while a switch to tab
-   A is still loading, or a save runs while a switch is mid-flight — their
-   loadProject / stash / activate calls interleave and corrupt which document is
-   "live", causing switches that don't land and saves that write the wrong
-   document's content. We therefore funnel every top-level doc operation through
-   a single promise chain so they run strictly one-at-a-time. INTERNAL helpers
-   (…Impl, stashCurrentDoc, activateDoc) are NOT serialized — they only ever run
-   inside an already-serialized operation, so wrapping them too would deadlock. */
-let _docOpChain: Promise<unknown> = Promise.resolve();
-
-/** Run `fn` after all previously-queued document operations finish, and make
- *  later ones wait for it. Failures don't break the chain (the next op still
- *  runs). Exported so session restore can join the same queue. */
-export function serializeDocOp<T>(fn: () => Promise<T>): Promise<T> {
-  const run = _docOpChain.then(fn, fn);
-  _docOpChain = run.then(() => {}, () => {});
-  return run;
-}
-
-/** Resolves once the doc-op queue is empty, including ops queued while
- *  waiting. Background readers (the Analysis sources listing) wait on this so
- *  they never start while a tab switch is mid-flight — a listing started then
- *  would see a half-switched document and hold the sidecar for seconds just as
- *  the builder appears. */
-export async function whenDocOpsIdle(): Promise<void> {
-  let c: Promise<unknown>;
-  do { c = _docOpChain; await c; } while (c !== _docOpChain);
-}
+/* Document-operation serialization lives in ./docOpQueue (shared with
+   figureStore's uploads); re-exported here for existing importers. */
+export { serializeDocOp, whenDocOpsIdle } from "./docOpQueue";
 
 /** True if any open document has unsaved in-memory edits (a stash). Used by
  *  the app-close guard to warn about tabs whose edits would be lost on quit. */
@@ -115,40 +86,98 @@ export function hasUnsavedSnapshots(): boolean {
 /** Stash the currently-active builder doc's live state in the backend so
  *  switching away and back is fast. Dirty docs go in `backendStashed` (their
  *  edits must survive — drives the save guards); clean docs go in the
- *  `cleanCached` perf layer (a fast reload, never counted as unsaved). No-op
- *  for an active doc that was already removed (e.g. mid-close). */
-async function stashCurrentDoc(): Promise<void> {
+ *  `cleanCached` perf layer (a fast reload, never counted as unsaved).
+ *
+ *  Returns true when the live doc is safely parked (or there is nothing to
+ *  park). False means the stash failed for a doc that can't simply be
+ *  reloaded from disk — the caller MUST NOT replace the live document then,
+ *  or its unsaved content is gone. */
+async function stashCurrentDoc(): Promise<boolean> {
   const cs = useCollageStore.getState();
-  const fs = useFigureStore.getState();
   const activeId = cs.activeDocId;
-  if (!activeId) return;
-  if (!cs.openDocs.some((d) => d.id === activeId)) return; // already removed
+  if (!activeId) return true;
+  const doc = cs.openDocs.find((d) => d.id === activeId);
+  if (!doc) return true; // already removed (mid-close)
+  // Push every pending / debounced config write of THIS doc first, so an edit
+  // made just before the click is in the stash — and can't land in the next tab.
+  await useFigureStore.getState().flushConfigWrites();
+  const st = useFigureStore.getState();
+  // An Untitled doc with content has nowhere to reload from: treat it as
+  // unsaved even if no edit flagged it, so it is never evicted as "clean".
+  const keep = st.unsaved || (!doc.path && Object.keys(st.loadedImages).length > 0);
   try {
-    // Let fire-and-forget config writes of THIS doc land first, so a late
-    // panel PATCH can't arrive after the switch and edit the incoming doc.
-    await settleConfigWrites();
     await api.stashState(activeId);
-    if (fs.unsaved) {
-      backendStashed.add(activeId);
-      cleanCached.delete(activeId);
-    } else {
-      // Clean: cache for fast return. Refresh its LRU position, then evict
-      // the oldest clean caches past the cap.
-      backendStashed.delete(activeId);
-      cleanCached.delete(activeId);
-      cleanCached.add(activeId);
-      evictCleanCache();
-    }
   } catch (e) {
     console.error("[projectNav] stash failed for", activeId, e);
+    syncSnapshotDirty();
+    // A clean saved doc can be reloaded from disk; anything else must stay live.
+    return !keep && !!doc.path;
+  }
+  if (keep) {
+    backendStashed.add(activeId);
+    cleanCached.delete(activeId);
+  } else {
+    // Clean: cache for fast return. Refresh its LRU position, then evict
+    // the oldest clean caches past the cap.
+    backendStashed.delete(activeId);
+    cleanCached.delete(activeId);
+    cleanCached.add(activeId);
+    evictCleanCache();
   }
   syncSnapshotDirty();
+  return true;
+}
+
+/** Tell the user a document switch was refused because the outgoing doc
+ *  could not be parked safely (nothing was changed). */
+async function alertCouldNotPark(): Promise<void> {
+  const cs = useCollageStore.getState();
+  const name = cs.openDocs.find((d) => d.id === cs.activeDocId)?.name || "This document";
+  await alertDialog({
+    title: "Could not switch documents",
+    body: `"${name}" has changes that could not be set aside safely, so it was kept open.\n\n`
+      + "Save it, then try again.",
+  });
+}
+
+/* The builder content is inert (collageStore.docSwapBusy → AppShell shield)
+   from the moment a document-replacing op is QUEUED until it finishes. Raising
+   it only when the op starts running left a gap: a tab click queued behind a
+   long upload let the user open e.g. Edit Panel on the outgoing doc, whose
+   Save then wrote that panel into the incoming one. Reference-counted, so a
+   queued wrapper plus its inner withDocSwap (or two queued swaps) never drop
+   the shield early. */
+let _pendingSwaps = 0;
+function beginDocSwap(): void {
+  _pendingSwaps++;
+  (document.activeElement as HTMLElement | null)?.blur?.();   // fire onBlur → flushHeaderEdits first
+  useCollageStore.getState().setDocSwapBusy(true);
+}
+function endDocSwap(): void {
+  _pendingSwaps = Math.max(0, _pendingSwaps - 1);
+  if (_pendingSwaps === 0) useCollageStore.getState().setDocSwapBusy(false);
+}
+/** Queue a document-replacing op with the shield raised immediately. */
+function queueDocSwap<T>(fn: () => Promise<T>): Promise<T> {
+  beginDocSwap();
+  return serializeDocOp(fn).finally(endDocSwap);
+}
+/** Make the builder content inert while the live document is being swapped,
+ *  so no click or keystroke edits the outgoing doc after it was stashed (it
+ *  would be lost) or lands in the incoming one. */
+async function withDocSwap<T>(fn: () => Promise<T>): Promise<T> {
+  beginDocSwap();
+  try {
+    return await fn();
+  } finally {
+    endDocSwap();
+  }
 }
 
 /** Load a document's state into the backend builder: prefer its in-memory
  *  cache — a dirty stash (preserves unsaved edits) or a clean perf cache (fast
  *  reload) — else the on-disk .mpf, else blank. */
-async function activateDoc(doc: { id: string; path: string | null }): Promise<void> {
+async function activateDoc(doc: { id: string; path: string | null; name?: string }): Promise<void> {
   const wasDirty = backendStashed.has(doc.id);
   if (wasDirty || cleanCached.has(doc.id)) {
     try {
@@ -160,17 +189,28 @@ async function activateDoc(doc: { id: string; path: string | null }): Promise<vo
       syncSnapshotDirty();
       return;
     } catch (e) {
-      // Cache miss (e.g. sidecar restarted) — drop it and fall back to disk.
-      console.error("[projectNav] activate-state failed; falling back to disk/blank", e);
+      // Only a genuine cache miss (e.g. the sidecar restarted) may fall back
+      // to disk. Any other failure is transient: keep the stash and its
+      // unsaved flag, and let the caller report the failed switch.
+      if (!isStateCacheMiss(e)) throw e;
+      console.error("[projectNav] activate-state cache miss; falling back to disk/blank", e);
       backendStashed.delete(doc.id);
       cleanCached.delete(doc.id);
       syncSnapshotDirty();
+      if (wasDirty) {
+        await alertDialog({
+          title: "Unsaved changes lost",
+          body: `The unsaved changes in "${doc.name || "this document"}" are no longer available `
+            + "(the backend restarted). "
+            + (doc.path ? "The last saved version was loaded." : "The document was reset."),
+        });
+      }
     }
   }
   if (doc.path) {
-    await useFigureStore.getState().loadProject(doc.path);
+    await useFigureStore.getState().loadProject(doc.path, doc.id);
   } else {
-    await useFigureStore.getState().newBlankFigure();
+    await useFigureStore.getState().newBlankFigure(doc.id);
   }
 }
 
@@ -352,8 +392,9 @@ export function saveAllOpenDocs(
   opts: { promptForLocation?: boolean } = {},
 ): Promise<boolean> {
   // Serialized as ONE unit so a stray tab click mid-save can't interleave with
-  // the loop; the loop calls the un-serialized …Impl helpers directly.
-  return serializeDocOp(async () => {
+  // the loop; the loop calls the un-serialized …Impl helpers directly. It
+  // switches documents to save each one, so the shield is up throughout.
+  return queueDocSwap(async () => {
     const cs = useCollageStore.getState();
     const fs = useFigureStore.getState();
     const dirtyIds = cs.openDocs
@@ -427,51 +468,73 @@ async function switchToDocumentImpl(docId: string): Promise<boolean> {
     return true;
   }
   // Switching to a different doc: snapshot the outgoing one (if dirty),
-  // then activate the target.
-  await stashCurrentDoc();
-  try {
-    await activateDoc(doc);
-  } catch (e) {
-    console.error("[projectNav] switch document failed:", e);
-    await alertDialog({
-      title: "Load failed",
-      body: `Could not load "${doc.name}".\n\nIts .mpf may have been moved or deleted.`,
-    });
-    // Leave the previous doc active/live — do NOT flip activeDocId to a tab
-    // whose content failed to load (that would desync active vs backend).
-    return false;
-  }
-  useCollageStore.getState().docSetActive(docId);
-  useCollageStore.getState().setMode("builder");
-  return true;
+  // then activate the target — with the builder inert throughout.
+  return withDocSwap(async () => {
+    if (!(await stashCurrentDoc())) {
+      await alertCouldNotPark();
+      return false;
+    }
+    try {
+      await activateDoc(doc);
+    } catch (e) {
+      console.error("[projectNav] switch document failed:", e);
+      await alertDialog({
+        title: "Load failed",
+        body: `Could not load "${doc.name}".\n\nIts .mpf may have been moved or deleted.`,
+      });
+      // Leave the previous doc active/live — do NOT flip activeDocId to a tab
+      // whose content failed to load (that would desync active vs backend).
+      return false;
+    }
+    useCollageStore.getState().docSetActive(docId);
+    useCollageStore.getState().setMode("builder");
+    return true;
+  });
 }
 
 /** Public, serialized entry point for tab switching (see serializeDocOp). */
 export function switchToDocument(docId: string): Promise<boolean> {
-  return serializeDocOp(() => switchToDocumentImpl(docId));
+  // Re-selecting the live doc only changes mode — no shield needed.
+  if (useCollageStore.getState().activeDocId === docId) {
+    return serializeDocOp(() => switchToDocumentImpl(docId));
+  }
+  return queueDocSwap(() => switchToDocumentImpl(docId));
 }
 
 /** Create a new blank document tab and switch to it. Seamless — the prior
  *  tab is snapshotted (if dirty) so its edits survive; closing it is what
  *  guards. */
 export function newBlankDoc(): Promise<void> {
-  return serializeDocOp(async () => {
-    await stashCurrentDoc();
-    await useFigureStore.getState().newBlankFigure();
+  return queueDocSwap(() => withDocSwap(async () => {
+    if (!(await stashCurrentDoc())) { await alertCouldNotPark(); return; }
+    const id = newDocId();
+    try {
+      await useFigureStore.getState().newBlankFigure(id);
+    } catch (e) {
+      console.error("[projectNav] new blank document failed:", e);
+      await alertDialog({ title: "Could not create a document", body: "The previous document is still open." });
+      return;
+    }
     // No name → the store assigns the next free "Untitled_N".
-    const id = useCollageStore.getState().docAdd({ path: null });
+    useCollageStore.getState().docAdd({ id, path: null });
     useCollageStore.getState().docSetActive(id);
     useCollageStore.getState().setMode("builder");
-  });
+  }));
 }
 
 /** Open a project file into a (new or existing) document tab. Seamless —
  *  the prior tab is snapshotted (if dirty) so its edits survive. */
 export function openProjectIntoTab(path: string): Promise<void> {
-  return serializeDocOp(async () => {
-    await stashCurrentDoc();
+  return queueDocSwap(async () => {
+    // Already open → just focus its tab. (Re-loading it from disk used to
+    // silently discard that tab's unsaved edits.)
+    const existing = useCollageStore.getState().openDocs.find((d) => d.path === path);
+    if (existing) { await switchToDocumentImpl(existing.id); return; }
+    await withDocSwap(async () => {
+    if (!(await stashCurrentDoc())) { await alertCouldNotPark(); return; }
+    const newId = newDocId();
     try {
-      await useFigureStore.getState().loadProject(path);
+      await useFigureStore.getState().loadProject(path, newId);
     } catch (e) {
       console.error("[projectNav] open project failed:", e);
       await alertDialog({
@@ -480,12 +543,13 @@ export function openProjectIntoTab(path: string): Promise<void> {
       });
       return;
     }
-    const id = useCollageStore.getState().docEnsure(path);
+    const id = useCollageStore.getState().docEnsure(path, undefined, newId);
     // Freshly loaded from disk — drop any stale in-memory stash for it.
     dropStash(id);
     syncSnapshotDirty();
     useCollageStore.getState().docSetActive(id);
     useCollageStore.getState().setMode("builder");
+    });
   });
 }
 
@@ -553,26 +617,63 @@ async function closeDocImpl(docId: string): Promise<boolean> {
     // neighbour (or a fresh blank) so the builder is consistent. Done even
     // in collage mode; we don't change the current mode.
     const next = remaining[0];
-    if (next) {
-      useCollageStore.getState().docSetActive(next.id);
-      try {
-        await activateDoc(next);
-      } catch (e) {
-        console.error("[projectNav] activate neighbour after close failed:", e);
+    await withDocSwap(async () => {
+      if (next) {
+        try {
+          // Activate first, mark active after: if the load fails the tab strip
+          // must not claim a document the backend doesn't hold (a later save
+          // would write the closed doc's content into the neighbour's file).
+          await activateDoc(next);
+          useCollageStore.getState().docSetActive(next.id);
+          return;
+        } catch (e) {
+          console.error("[projectNav] activate neighbour after close failed:", e);
+          await alertDialog({ title: "Load failed", body: `Could not load "${next.name}".` });
+        }
       }
-    } else {
-      // No docs left — make a fresh blank one so the builder isn't empty.
-      await useFigureStore.getState().newBlankFigure();
-      const id = useCollageStore.getState().docAdd({ path: null });
+      // No docs left (or the neighbour failed) — a fresh blank one, so the
+      // builder and the active tab always match.
+      const id = newDocId();
+      await useFigureStore.getState().newBlankFigure(id).catch((e) => {
+        console.error("[projectNav] new blank after close failed:", e);
+      });
+      useCollageStore.getState().docAdd({ id, path: null });
       useCollageStore.getState().docSetActive(id);
-    }
+    });
   }
   return true;
 }
 
+/** Upload files into document `targetDocId` — switching to it and back when it
+ *  isn't the live doc — as ONE doc op, so a tab click can't slip between the
+ *  switch and the upload and send the files to a third document. Returns the
+ *  uploaded names. */
+export function uploadIntoDocument(targetDocId: string, files: File[]): Promise<string[]> {
+  const run = useCollageStore.getState().activeDocId === targetDocId ? serializeDocOp : queueDocSwap;
+  return run(async () => {
+    const cs = useCollageStore.getState();
+    const orig = cs.activeDocId;
+    const mode0 = cs.mode;
+    const switched = !!orig && targetDocId !== orig;
+    if (switched && !(await switchToDocumentImpl(targetDocId))) {
+      throw new Error("Could not open the target document.");
+    }
+    try {
+      return await useFigureStore.getState()._uploadImagesNow(files);
+    } finally {
+      if (switched && orig) {
+        await switchToDocumentImpl(orig);
+        useCollageStore.getState().setMode(mode0);
+      }
+    }
+  });
+}
+
 /** Public, serialized entry point for closing a document tab. */
 export function closeDoc(docId: string): Promise<boolean> {
-  return serializeDocOp(() => closeDocImpl(docId));
+  // Closing the live doc replaces it (neighbour or blank) — shield from now.
+  const run = useCollageStore.getState().activeDocId === docId ? queueDocSwap : serializeDocOp;
+  return run(() => closeDocImpl(docId));
 }
 
 /* ── Figure tabs (several figures inside ONE document) ──────────────────
