@@ -11,7 +11,7 @@
 
 import { useFigureStore } from "../store/figureStore";
 import { useCollageStore } from "../store/collageStore";
-import { api } from "../api/client";
+import { api, settleConfigWrites } from "../api/client";
 import { confirmThree, alert as alertDialog } from "../components/shared/ConfirmDialog";
 import { saveProjectDialog } from "../components/shared/SaveProjectDialog";
 
@@ -73,8 +73,10 @@ function syncSnapshotDirty() {
 }
 
 /* ── Document-operation serialization ────────────────────────────────────
-   The Python sidecar holds ONE builder document and mutates shared globals
-   without its own locking (sync endpoints run in uvicorn's threadpool). If two
+   The Python sidecar holds ONE builder document in shared globals. Its doc gate
+   (api_server._DocGate) keeps a request from running INSIDE Analysis's
+   temporary swap to another document, but it does not order two ordinary
+   requests against each other (sync endpoints run in uvicorn's threadpool). If two
    document operations overlap — e.g. a user clicks tab B while a switch to tab
    A is still loading, or a save runs while a switch is mid-flight — their
    loadProject / stash / activate calls interleave and corrupt which document is
@@ -92,6 +94,16 @@ export function serializeDocOp<T>(fn: () => Promise<T>): Promise<T> {
   const run = _docOpChain.then(fn, fn);
   _docOpChain = run.then(() => {}, () => {});
   return run;
+}
+
+/** Resolves once the doc-op queue is empty, including ops queued while
+ *  waiting. Background readers (the Analysis sources listing) wait on this so
+ *  they never start while a tab switch is mid-flight — a listing started then
+ *  would see a half-switched document and hold the sidecar for seconds just as
+ *  the builder appears. */
+export async function whenDocOpsIdle(): Promise<void> {
+  let c: Promise<unknown>;
+  do { c = _docOpChain; await c; } while (c !== _docOpChain);
 }
 
 /** True if any open document has unsaved in-memory edits (a stash). Used by
@@ -112,6 +124,9 @@ async function stashCurrentDoc(): Promise<void> {
   if (!activeId) return;
   if (!cs.openDocs.some((d) => d.id === activeId)) return; // already removed
   try {
+    // Let fire-and-forget config writes of THIS doc land first, so a late
+    // panel PATCH can't arrive after the switch and edit the incoming doc.
+    await settleConfigWrites();
     await api.stashState(activeId);
     if (fs.unsaved) {
       backendStashed.add(activeId);

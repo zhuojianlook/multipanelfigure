@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { MEAS_CSV_HEADER } from "./AnalysisNodeGraph";
+import { MEAS_CSV_HEADER, measArrToCsv, measRowKeys } from "./AnalysisNodeGraph";
 
 describe("measurements CSV contract", () => {
   it("carries a Figure column", () => {
@@ -51,5 +51,29 @@ describe("per-panel grouping", () => {
     const b = { panel: "R1C1", name: "L", figure: "Fig B" };
     expect(a.panel).toBe(b.panel);              // the old ambiguity
     expect(a.figure).not.toBe(b.figure);        // now resolvable
+  });
+});
+
+describe("panel display names", () => {
+  const row = { panel: "R8C1", panel_name: "1hr, Sample 1", name: "Line 1", numeric: 4.2, unit: "µm", type: "line" };
+
+  it("puts the header-derived name in Panel and keeps the coordinates in Cell", () => {
+    const [head, line] = measArrToCsv([row], "fig").split("\n");
+    const cols = head.split(",");
+    expect(cols[cols.length - 1]).toBe("Figure");
+    expect(line).toBe('"1hr, Sample 1","Line 1","1hr, Sample 1","4.2","µm","line","R8C1","fig"');
+  });
+
+  it("falls back to the coordinates when the sidecar sends no name", () => {
+    const line = measArrToCsv([{ panel: "R1C1", name: "L", numeric: 1 }], "").split("\n")[1];
+    expect(line.startsWith('"R1C1","L","R1C1"')).toBe(true);
+  });
+
+  it("row identity survives a header rename and matches pre-Cell tables", () => {
+    const a = measRowKeys(measArrToCsv([row], "fig"));
+    const b = measRowKeys(measArrToCsv([{ ...row, panel_name: "2hr, Sample 1" }], "fig"));
+    expect([...a]).toEqual([...b]);
+    const legacy = 'Panel,Name,Group,Value,Unit,Type,Figure\n"R8C1","Line 1","R8C1","4.2","µm","line","fig"';
+    expect([...measRowKeys(legacy)]).toEqual([...a]);
   });
 });

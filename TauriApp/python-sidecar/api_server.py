@@ -58,6 +58,7 @@ from figure_builder import assemble_figure
 # Olympus FluoView .oir reader (pure numpy). Imported at top level so
 # PyInstaller's static analysis bundles it (also listed in hiddenimports).
 import oir_reader
+from panel_naming import panel_display_names, panel_name as _panel_name
 
 # ── Inline helpers (avoid importing helpers.py which requires Qt) ──
 def pil_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
@@ -149,6 +150,147 @@ class PrivateNetworkMiddleware:
 
 app.add_middleware(PrivateNetworkMiddleware)
 
+
+# ── Document gate ──────────────────────────────────────────────────────────
+#
+# The sidecar holds ONE live builder document in module globals (cfg,
+# loaded_images, … — see _capture_doc_state). To list or extract analysis
+# sources from ANOTHER open document or figure tab, a few code paths
+# temporarily rebind those globals to that document and restore them after
+# ("swap windows": _doc_context, _figure_context, _for_each_figure,
+# inset-sources-for[-doc]). FastAPI runs sync routes concurrently, so before
+# this gate a tab switch (stash-state / activate-state), a config PUT or a
+# panel PATCH that landed inside a swap window read or wrote the OTHER
+# document: tabs came back with each other's images (0.1.419 bug report).
+#
+# Readers/writer gate: a swap window holds it EXCLUSIVELY; every other route
+# that touches builder state holds it SHARED (applied by default to every
+# route via _GatedRoute, so a new route is protected unless explicitly
+# exempted). Shared holders still run concurrently with each other, so the
+# builder's parallel per-panel previews keep today's concurrency.
+#
+# Acquired inside the handler's own thread (the endpoint is wrapped), never in
+# a dependency/middleware: those enter and exit on different threads and can
+# starve the threadpool.
+import contextlib as _gate_ctx
+import functools as _gate_functools
+import inspect as _gate_inspect
+import threading as _gate_threading
+from fastapi.routing import APIRoute as _APIRoute
+
+
+class _DocGate:
+    """exclusive(): a window that temporarily rebinds the builder globals to
+    another document/figure. shared(): anything else that reads or writes
+    them. Exclusive nests in exclusive and shared nests in either on the same
+    thread; shared -> exclusive upgrade raises instead of deadlocking."""
+
+    def __init__(self):
+        self._cv = _gate_threading.Condition(_gate_threading.Lock())
+        self._readers = 0
+        self._writer = None          # thread ident of the exclusive holder
+        self._tl = _gate_threading.local()
+
+    @_gate_ctx.contextmanager
+    def shared(self):
+        me = _gate_threading.get_ident()
+        nested = self._writer == me or getattr(self._tl, "r", 0) > 0
+        if not nested:
+            with self._cv:
+                while self._writer is not None:
+                    self._cv.wait()
+                self._readers += 1
+        self._tl.r = getattr(self._tl, "r", 0) + 1
+        try:
+            yield
+        finally:
+            self._tl.r -= 1
+            if not nested:
+                with self._cv:
+                    self._readers -= 1
+                    if self._readers == 0:
+                        self._cv.notify_all()
+
+    @_gate_ctx.contextmanager
+    def exclusive(self):
+        me = _gate_threading.get_ident()
+        if self._writer == me:           # nested swap on the same thread
+            yield
+            return
+        if getattr(self._tl, "r", 0) > 0:
+            raise RuntimeError("doc gate: shared -> exclusive upgrade is not allowed")
+        with self._cv:
+            while self._writer is not None or self._readers > 0:
+                self._cv.wait()
+            self._writer = me
+        try:
+            yield
+        finally:
+            with self._cv:
+                self._writer = None
+                self._cv.notify_all()
+
+    def swapped_elsewhere(self) -> bool:
+        """True while ANOTHER thread holds a swap window."""
+        w = self._writer
+        return w is not None and w != _gate_threading.get_ident()
+
+
+_doc_gate = _DocGate()
+
+# Routes that never touch builder state (several run for minutes: R, console,
+# installers). Verified by a call-graph scan of this module; keep it that way.
+_GATE_EXEMPT = frozenset({
+    "/api/health", "/api/version",
+    "/api/analysis/warmup",
+    "/api/zstack/align/availability", "/api/zstack/align/status/{job_id}",
+    "/api/figure/render-video/ffmpeg-available",
+    "/api/figure/render-video/{job_id}/progress",
+    "/api/figure/render-video/{job_id}/cancel",
+    "/api/fs/exists",
+    "/api/analysis/check-r", "/api/analysis/run-r",
+    "/api/analysis/r-deps", "/api/analysis/r-deps/install",
+    "/api/analysis/run-console",
+    "/api/analysis/refine-mask",
+    "/api/analysis/check-matlab", "/api/analysis/check-imagej",
+    "/api/analysis/check-cellpose",
+    "/api/analysis/install-cellpose", "/api/analysis/install-cellpose-stream",
+})
+
+# Routes that enter swap windows and take the gate themselves (exclusive in
+# the swap, shared otherwise) — wrapping them shared would be an upgrade.
+# Engine runs hold it only while extracting inputs, never for the whole run.
+_GATE_SELF = frozenset({
+    "/api/analysis/inset-sources", "/api/analysis/inset-sources-for",
+    "/api/analysis/inset-sources-for-doc", "/api/measurements",
+    "/api/analysis/wb-preview", "/api/analysis/wb-detect-bands",
+    "/api/analysis/fluor-preview-segment",
+    "/api/analysis/run-python", "/api/analysis/run-cellpose",
+    "/api/analysis/cellpose-preview", "/api/analysis/run-imagej",
+    "/api/analysis/run-matlab",
+})
+
+
+def _gate_shared_endpoint(fn):
+    @_gate_functools.wraps(fn)
+    def _wrapped(*a, **k):
+        with _doc_gate.shared():
+            return fn(*a, **k)
+    _wrapped._doc_gate = "shared"
+    return _wrapped
+
+
+class _GatedRoute(_APIRoute):
+    def __init__(self, path, endpoint, **kw):
+        if path not in _GATE_EXEMPT and path not in _GATE_SELF:
+            if _gate_inspect.iscoroutinefunction(endpoint):
+                raise RuntimeError(f"async route {path} must be sync or listed in _GATE_EXEMPT")
+            endpoint = _gate_shared_endpoint(endpoint)
+        super().__init__(path, endpoint, **kw)
+
+
+app.router.route_class = _GatedRoute
+
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
@@ -158,7 +300,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.419"  # CI re-syncs this from the release tag (build-sidecar)
+SIDECAR_BUILD = "0.1.420"  # CI re-syncs this from the release tag (build-sidecar)
 
 
 @app.get("/api/version")
@@ -1419,10 +1561,11 @@ def _load_oir(data: bytes, name: str) -> Image.Image:
 
 
 @app.post("/api/images/upload")
-async def upload_images(files: List[UploadFile] = File(...)):
+def upload_images(files: List[UploadFile] = File(...)):
+    # Sync (threadpool) so the doc gate covers it; it mutates the image maps.
     names = []
     for f in files:
-        data = await f.read()
+        data = f.file.read()
         try:
             if _is_video(f.filename):
                 # Save video to temp file and extract first frame as the image
@@ -1894,7 +2037,9 @@ def _run_alignment_job(job_id: str, name: str, body: ZStackAlignRequest):
     try:
         job["stage"] = "loading source"
         job["progress"] = 0.02
-        grp = channel_groups.get(name)
+        with _doc_gate.shared():   # read the live doc, not a swapped-in one
+            grp = channel_groups.get(name)
+            _src_tiff_path = loaded_zstacks.get(name)
         method = body.method.lower()
         sift_path, _ = _find_imagej_executable()
         if method == "sift" and not sift_path:
@@ -1930,7 +2075,9 @@ def _run_alignment_job(job_id: str, name: str, body: ZStackAlignRequest):
                 n_ch = 1
                 align_channel = 0
         else:
-            tiff_path = loaded_zstacks[name]
+            tiff_path = _src_tiff_path
+            if tiff_path is None:
+                raise HTTPException(404, f"Z-stack {name!r} is no longer loaded")
             img_obj = Image.open(tiff_path)
             n_frames = getattr(img_obj, "n_frames", 1)
             start = max(0, body.start_frame)
@@ -2085,28 +2232,29 @@ def _run_alignment_job(job_id: str, name: str, body: ZStackAlignRequest):
         else:
             _tf2.imwrite(aligned_path.name, aligned_4d[:, 0])
 
-        aligned_name = f"{name}::aligned"
-        loaded_zstacks[aligned_name] = aligned_path.name
-        zstack_frames[aligned_name] = 0
-        zstack_counts[aligned_name] = int(Z)
-        if C > 1:
-            # Re-register the aligned stack as a channel group so the UI
-            # still shows tints / names. Inherit parent's metadata.
-            new_grp = _init_channel_group(aligned_name, "ZCYX", aligned_4d)
-            if grp is not None:
-                # Inherit user-set tints / names / enabled / levels for
-                # channels that overlap between source and aligned stack.
-                for c in range(min(grp.num_channels, new_grp.num_channels)):
-                    new_grp.tints[c]        = grp.tints[c]
-                    new_grp.names[c]        = grp.names[c]
-                    new_grp.enabled[c]      = grp.enabled[c]
-                    new_grp.black_levels[c] = grp.black_levels[c]
-                    new_grp.white_levels[c] = grp.white_levels[c]
-            # Initial composite for the panel thumbnail
-            loaded_images[aligned_name] = _composite_channel_group(aligned_name)
-        else:
-            loaded_images[aligned_name] = _extract_tiff_frame(aligned_path.name, 0)
-        _recalc_min_dims()
+        with _doc_gate.shared():   # register into the live doc only
+            aligned_name = f"{name}::aligned"
+            loaded_zstacks[aligned_name] = aligned_path.name
+            zstack_frames[aligned_name] = 0
+            zstack_counts[aligned_name] = int(Z)
+            if C > 1:
+                # Re-register the aligned stack as a channel group so the UI
+                # still shows tints / names. Inherit parent's metadata.
+                new_grp = _init_channel_group(aligned_name, "ZCYX", aligned_4d)
+                if grp is not None:
+                    # Inherit user-set tints / names / enabled / levels for
+                    # channels that overlap between source and aligned stack.
+                    for c in range(min(grp.num_channels, new_grp.num_channels)):
+                        new_grp.tints[c]        = grp.tints[c]
+                        new_grp.names[c]        = grp.names[c]
+                        new_grp.enabled[c]      = grp.enabled[c]
+                        new_grp.black_levels[c] = grp.black_levels[c]
+                        new_grp.white_levels[c] = grp.white_levels[c]
+                # Initial composite for the panel thumbnail
+                loaded_images[aligned_name] = _composite_channel_group(aligned_name)
+            else:
+                loaded_images[aligned_name] = _extract_tiff_frame(aligned_path.name, 0)
+            _recalc_min_dims()
 
         job["status"] = "done"
         job["stage"] = "done"
@@ -3807,6 +3955,16 @@ def _collect_measurements():
                                     "annotation": tm.name or "Curved surface",
                                     "ann_index": ti,
                                     "reading_index": ri + 1})
+    # Display name from the figure's row/column labels + headers ("1hr,
+    # Sample 1"). `panel` stays R#C# — it is the row identity (CSV Panel
+    # column, measurement-group keys, saved workflows).
+    try:
+        names = panel_display_names(cfg)
+        by_coord = {f"R{r+1}C{c+1}": nm for (r, c), nm in names.items()}
+    except Exception:
+        by_coord = {}
+    for m in results:
+        m["panel_name"] = by_coord.get(m["panel"], m["panel"])
     return results
 
 
@@ -4177,7 +4335,8 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
     from io import BytesIO as _BytesIO
     from PIL import Image as _PIL
 
-    rows, cols = cfg.rows, cfg.cols
+    with _doc_gate.shared():
+        rows, cols = cfg.rows, cfg.cols
     captures: Dict[str, "_cv2.VideoCapture"] = {}
     writer = None
     try:
@@ -4186,11 +4345,12 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
         # and just seek to per-panel frames per output index. Without
         # this de-dup, two panels using the same video would share their
         # range — exactly the user-reported bug.
-        unique_video_names = {p.image_name for _, _, p in range_panels if p.image_name in loaded_videos}
-        for name in unique_video_names:
-            path = loaded_videos.get(name)
-            if path:
-                captures[name] = _cv2.VideoCapture(path)
+        with _doc_gate.shared():
+            unique_video_names = {p.image_name for _, _, p in range_panels if p.image_name in loaded_videos}
+            for name in unique_video_names:
+                path = loaded_videos.get(name)
+                if path:
+                    captures[name] = _cv2.VideoCapture(path)
 
         for frame_idx in range(total_frames):
             with _render_jobs_lock:
@@ -4223,76 +4383,77 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
                 rgb = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2RGB)
                 panel_images[(r, c)] = _PIL.fromarray(rgb)
 
-            # Mirror the save_figure pipeline for this output frame.
-            processed: List[List[Optional[Image.Image]]] = []
-            for r in range(rows):
-                row_imgs = []
-                for c in range(cols):
-                    panel = cfg.panels[r][c]
-                    src_img: Optional[Image.Image]
-                    if (r, c) in panel_images:
-                        # Range video panel — per-panel extracted frame
-                        # for THIS output index.
-                        src_img = panel_images[(r, c)]
-                    elif panel.image_name and panel.image_name in loaded_videos:
-                        # Static (non-range) video panel — show the
-                        # panel's own selected frame, panel-aware so
-                        # shared video sources don't alias.
-                        src_img = _get_panel_image(panel)
-                    elif panel.image_name and panel.image_name in loaded_images:
-                        # Plain image panel.
-                        src_img = loaded_images[panel.image_name]
-                    else:
-                        src_img = None
-                    if src_img is not None:
-                        row_imgs.append(process_panel(
-                            src_img, panel,
-                            min_dims, loaded_images,
-                            skip_labels=True, skip_symbols=True,
-                        ))
-                    else:
-                        row_imgs.append(None)
-                processed.append(row_imgs)
-
-            # Empty tracks: see _grid_track_sizes (shared with preview/save).
-            col_max_w, row_max_h = _grid_track_sizes(processed, rows, cols, min_dims)
-            for r in range(rows):
-                for c in range(cols):
-                    if processed[r][c] is None:
-                        processed[r][c] = _PIL.new("RGB", (col_max_w[c], row_max_h[r]), "white")
-
-            # Adjacent Panel zoom insets — share the helper used by the
-            # /api/preview and /api/figure/save paths so video export
-            # honours every adjacent inset configured on every panel.
-            # Pass `panel_images` (the per-output-frame frames we
-            # extracted for range-video panels) as the cascade source
-            # override, so insets animate frame-by-frame instead of
-            # repeatedly sampling the static `frame` field of each
-            # source panel.
-            _apply_adjacent_zoom_insets(cfg, processed, rows, cols,
-                                        image_override=panel_images)
-            _apply_zoom_target_self_overlays(cfg, processed, rows, cols)
-
-            full_res_sizes2: Dict[Tuple[int, int], Tuple[int, int]] = {}
-            for r in range(rows):
-                for c in range(cols):
-                    panel = cfg.panels[r][c]
-                    if panel.image_name and panel.image_name in loaded_images:
-                        orig_img = loaded_images[panel.image_name]
-                        if panel.crop_image and panel.crop and len(panel.crop) == 4:
-                            full_res_sizes2[(r, c)] = (panel.crop[2] - panel.crop[0], panel.crop[3] - panel.crop[1])
+            with _doc_gate.shared():   # released between frames so a swap can run
+                # Mirror the save_figure pipeline for this output frame.
+                processed: List[List[Optional[Image.Image]]] = []
+                for r in range(rows):
+                    row_imgs = []
+                    for c in range(cols):
+                        panel = cfg.panels[r][c]
+                        src_img: Optional[Image.Image]
+                        if (r, c) in panel_images:
+                            # Range video panel — per-panel extracted frame
+                            # for THIS output index.
+                            src_img = panel_images[(r, c)]
+                        elif panel.image_name and panel.image_name in loaded_videos:
+                            # Static (non-range) video panel — show the
+                            # panel's own selected frame, panel-aware so
+                            # shared video sources don't alias.
+                            src_img = _get_panel_image(panel)
+                        elif panel.image_name and panel.image_name in loaded_images:
+                            # Plain image panel.
+                            src_img = loaded_images[panel.image_name]
                         else:
-                            full_res_sizes2[(r, c)] = orig_img.size
+                            src_img = None
+                        if src_img is not None:
+                            row_imgs.append(process_panel(
+                                src_img, panel,
+                                min_dims, loaded_images,
+                                skip_labels=True, skip_symbols=True,
+                            ))
+                        else:
+                            row_imgs.append(None)
+                    processed.append(row_imgs)
 
-            orig_format = cfg.output_format
-            orig_bg = cfg.background
-            cfg.output_format = "PNG"
-            cfg.background = body.background
-            try:
-                fig_bytes = assemble_figure(cfg, processed, dpi=body.dpi, full_res_sizes=full_res_sizes2)
-            finally:
-                cfg.output_format = orig_format
-                cfg.background = orig_bg
+                # Empty tracks: see _grid_track_sizes (shared with preview/save).
+                col_max_w, row_max_h = _grid_track_sizes(processed, rows, cols, min_dims)
+                for r in range(rows):
+                    for c in range(cols):
+                        if processed[r][c] is None:
+                            processed[r][c] = _PIL.new("RGB", (col_max_w[c], row_max_h[r]), "white")
+
+                # Adjacent Panel zoom insets — share the helper used by the
+                # /api/preview and /api/figure/save paths so video export
+                # honours every adjacent inset configured on every panel.
+                # Pass `panel_images` (the per-output-frame frames we
+                # extracted for range-video panels) as the cascade source
+                # override, so insets animate frame-by-frame instead of
+                # repeatedly sampling the static `frame` field of each
+                # source panel.
+                _apply_adjacent_zoom_insets(cfg, processed, rows, cols,
+                                            image_override=panel_images)
+                _apply_zoom_target_self_overlays(cfg, processed, rows, cols)
+
+                full_res_sizes2: Dict[Tuple[int, int], Tuple[int, int]] = {}
+                for r in range(rows):
+                    for c in range(cols):
+                        panel = cfg.panels[r][c]
+                        if panel.image_name and panel.image_name in loaded_images:
+                            orig_img = loaded_images[panel.image_name]
+                            if panel.crop_image and panel.crop and len(panel.crop) == 4:
+                                full_res_sizes2[(r, c)] = (panel.crop[2] - panel.crop[0], panel.crop[3] - panel.crop[1])
+                            else:
+                                full_res_sizes2[(r, c)] = orig_img.size
+
+                orig_format = cfg.output_format
+                orig_bg = cfg.background
+                cfg.output_format = "PNG"
+                cfg.background = body.background
+                try:
+                    fig_bytes = assemble_figure(cfg, processed, dpi=body.dpi, full_res_sizes=full_res_sizes2)
+                finally:
+                    cfg.output_format = orig_format
+                    cfg.background = orig_bg
 
             pil_out = _PIL.open(_BytesIO(fig_bytes)).convert("RGB")
             np_rgb = _np.asarray(pil_out)
@@ -4323,7 +4484,8 @@ def _render_video_worker(job_id: str, body: RenderVideoRequest,
                 (p for _, _, p in range_panels if p.image_name == body.audio_panel_image_name),
                 None,
             )
-            audio_path = loaded_videos.get(body.audio_panel_image_name) if audio_panel else None
+            with _doc_gate.shared():
+                audio_path = loaded_videos.get(body.audio_panel_image_name) if audio_panel else None
             if audio_panel and audio_path:
                 try:
                     src_info = _get_video_info(audio_path)
@@ -4804,6 +4966,10 @@ class DocStateRequest(BaseModel):
 @app.post("/api/project/stash-state")
 def stash_state(body: DocStateRequest):
     """Cache the current builder state under `doc_id` (fast, in-memory)."""
+    # Gated shared, so a swap window can't be in progress; this only trips if
+    # a future caller bypasses the gate — refuse rather than file the wrong doc.
+    if _doc_gate.swapped_elsewhere():
+        raise HTTPException(503, "Document state is temporarily swapped; retry.")
     _doc_state_cache[body.doc_id] = _capture_doc_state()
     return {"ok": True, "doc_id": body.doc_id}
 
@@ -4813,6 +4979,8 @@ def activate_state(body: DocStateRequest):
     """Restore a previously stashed state as the live builder state. 404 if it
     isn't cached (e.g. the sidecar restarted) so the frontend can fall back to
     the on-disk project."""
+    if _doc_gate.swapped_elsewhere():
+        raise HTTPException(503, "Document state is temporarily swapped; retry.")
     st = _doc_state_cache.pop(body.doc_id, None)
     if st is None:
         raise HTTPException(404, "No cached state for that document.")
@@ -5036,11 +5204,12 @@ def get_font_file(name: str):
 
 
 @app.post("/api/fonts/upload")
-async def upload_fonts(files: List[UploadFile] = File(...)):
+def upload_fonts(files: List[UploadFile] = File(...)):
+    # Sync (threadpool) so the doc gate covers it; it mutates custom_fonts.
     names = []
     _CUSTOM_FONTS_DIR.mkdir(parents=True, exist_ok=True)
     for f in files:
-        data = await f.read()
+        data = f.file.read()
         custom_fonts[f.filename] = data
         # Save to persistent storage
         try:
@@ -6773,6 +6942,12 @@ def _collect_analysis_insets(include_thumbnails: bool = True):
     if cfg is None:
         return out
     parent_cache: Dict[Tuple[int, int], Dict[str, object]] = {}
+    # Display names from row/column labels + nested headers, recomputed on
+    # every call so renaming a header renames the source. Keys stay R/C.
+    try:
+        _names = panel_display_names(cfg)
+    except Exception:
+        _names = {}
     # Per-panel POST-CROP pixel size — keyed by (r, c).  Used to
     # build the figure-context thumbnail below; doubles as a way to
     # avoid re-running process_panel just to read the dimensions.
@@ -6822,6 +6997,7 @@ def _collect_analysis_insets(include_thumbnails: bool = True):
     for r in range(cfg.rows):
         for c in range(cfg.cols):
             panel = cfg.panels[r][c]
+            nm = _panel_name(_names, r, c)
 
             # 1) PANEL-LEVEL flag — the cropped panel itself as a
             #    source.  Lets users analyse the whole panel image
@@ -6840,7 +7016,8 @@ def _collect_analysis_insets(include_thumbnails: bool = True):
                             "inset_type": "Panel",
                             "x": 0, "y": 0, "width": pw, "height": ph,
                             "zoom_factor": 1.0,
-                            "label": f"R{r+1}C{c+1} (panel)",
+                            "label": nm,
+                            "panel_name": nm,
                             "natural_width": pw,
                             "natural_height": ph,
                             "thumbnail": pthumb_b64,
@@ -6877,7 +7054,8 @@ def _collect_analysis_insets(include_thumbnails: bool = True):
                         "x": int(bbox_px[0]), "y": int(bbox_px[1]),
                         "width": int(bbox_px[2]), "height": int(bbox_px[3]),
                         "zoom_factor": 1.0,
-                        "label": f"R{r+1}C{c+1} area {ai+1}" + (f" ({area.name})" if area.name else ""),
+                        "label": f"{nm} · area {ai+1}" + (f" ({area.name})" if area.name else ""),
+                        "panel_name": nm,
                         "natural_width": mw,
                         "natural_height": mh,
                         "thumbnail": base64.b64encode(tb.getvalue()).decode("ascii"),
@@ -6904,7 +7082,8 @@ def _collect_analysis_insets(include_thumbnails: bool = True):
                     "inset_type": zi.inset_type,
                     "x": zi.x, "y": zi.y, "width": zi.width, "height": zi.height,
                     "zoom_factor": zi.zoom_factor,
-                    "label": f"R{r+1}C{c+1} · inset {idx+1} ({zi.inset_type})",
+                    "label": f"{nm} · inset {idx+1} ({zi.inset_type})",
+                    "panel_name": nm,
                     "natural_width": 0,
                     "natural_height": 0,
                     "thumbnail": "",
@@ -7393,10 +7572,11 @@ def list_inset_analysis_sources():
     return {"sources": sources, "figures": figures}
 
 
-# Serialises the temporary global-state swap used to collect sources from a
-# non-active .mpf (see below). Re-entrant: a figure-tab swap
+# The temporary global-state swaps below (another .mpf, another open tab,
+# another figure tab) run under _doc_gate.exclusive(), so no other route can
+# observe or modify the swapped-in document — see the gate's comment at the
+# top of this module. Exclusive is re-entrant: a figure-tab swap
 # (_figure_context) nests inside a document swap (_doc_context).
-_source_swap_lock = _threading.RLock()
 
 
 class InsetSourcesForRequest(BaseModel):
@@ -7409,9 +7589,9 @@ def list_inset_sources_for(body: InsetSourcesForRequest):
     the Analysis tab can show one sources drawer per loaded MPF — including
     figures that aren't the active builder doc. Reuses the active-figure
     collector by briefly swapping the global figure state to the target
-    .mpf's (serialised by a lock, restored in `finally`). The Analysis tab
-    is a separate workspace, so concurrent builder ops during the short swap
-    window are not expected."""
+    .mpf's under the doc gate's EXCLUSIVE mode, restored in `finally`, so no
+    builder request (tab switch, config write, preview) can run against the
+    swapped-in document."""
     global cfg, loaded_images, loaded_videos, video_frames, loaded_zstacks, channel_groups, min_dims
     path = os.path.expanduser(body.project_path.strip())
     if not os.path.dirname(path):
@@ -7419,7 +7599,7 @@ def list_inset_sources_for(body: InsetSourcesForRequest):
     if not os.path.isfile(path):
         raise HTTPException(404, f"Project file not found: {path}")
     loaded_cfg, local_images = _load_collage_mpf(path)
-    with _source_swap_lock:
+    with _doc_gate.exclusive():
         saved = (cfg, loaded_images, loaded_videos, video_frames, loaded_zstacks, channel_groups, min_dims)
         try:
             cfg = loaded_cfg
@@ -7449,10 +7629,11 @@ def list_inset_sources_for_doc(body: DocStateRequest):
     global cfg, loaded_images, hidden_images, min_dims, custom_fonts
     global loaded_videos, video_frames, loaded_zstacks, zstack_frames
     global zstack_counts, channel_groups
-    st = _doc_state_cache.get(body.doc_id)
-    if st is None:
-        raise HTTPException(404, "No stashed state for that document.")
-    with _source_swap_lock:
+    with _doc_gate.exclusive():
+        # Looked up under the gate: a tab switch can't pop / refill it now.
+        st = _doc_state_cache.get(body.doc_id)
+        if st is None:
+            raise HTTPException(404, "No stashed state for that document.")
         saved = (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
                  loaded_videos, video_frames, loaded_zstacks, zstack_frames,
                  zstack_counts, channel_groups)
@@ -7464,7 +7645,22 @@ def list_inset_sources_for_doc(body: DocStateRequest):
             (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
              loaded_videos, video_frames, loaded_zstacks, zstack_frames,
              zstack_counts, channel_groups) = saved
+            _resync_fonts_after_swap(st)
     return {"sources": sources, "measurements": measurements, "figures": figures}
+
+
+def _resync_fonts_after_swap(st: dict):
+    """_apply_doc_state materialises the swapped-in doc's custom fonts into the
+    shared fonts dir and invalidates caches; put the live doc's back after the
+    swap is undone (nothing did, so the parked doc's fonts leaked into the
+    live one)."""
+    if custom_fonts is not st.get("custom_fonts"):
+        try:
+            _materialize_custom_fonts()
+            _invalidate_font_caches()
+        except Exception as _e:
+            import sys as __s
+            print(f"[doc-gate] font re-sync failed: {_e}", file=__s.stderr, flush=True)
 
 
 import contextlib as _contextlib
@@ -7484,38 +7680,45 @@ def _doc_context(doc_id="", project_path=""):
          state (covers Untitled docs + unsaved 'add to analysis' edits).
       2. else `project_path` is a real .mpf on disk → load it.
       3. else no-op (active doc — single-MPF behaviour, unchanged).
-    Serialised by the same lock as inset-sources-for; restore in finally."""
+    Swaps run under _doc_gate.exclusive(); the no-swap paths hold it shared
+    (the active doc is being read). Restore in finally."""
     global cfg, loaded_images, hidden_images, min_dims, custom_fonts
     global loaded_videos, video_frames, loaded_zstacks, zstack_frames
     global zstack_counts, channel_groups
-    st = _doc_state_cache.get(doc_id) if doc_id else None
-    if st is not None:
-        with _source_swap_lock:
-            saved = (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
+    if doc_id:
+        with _doc_gate.exclusive():
+            # Looked up under the gate so a concurrent tab switch can't pop /
+            # refill the entry between the lookup and the swap.
+            st = _doc_state_cache.get(doc_id)
+            if st is not None:
+                saved = (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
+                         loaded_videos, video_frames, loaded_zstacks, zstack_frames,
+                         zstack_counts, channel_groups)
+                try:
+                    _apply_doc_state(st)
+                    yield
+                finally:
+                    (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
                      loaded_videos, video_frames, loaded_zstacks, zstack_frames,
-                     zstack_counts, channel_groups)
-            try:
-                _apply_doc_state(st)
-                yield
-            finally:
-                (cfg, loaded_images, hidden_images, min_dims, custom_fonts,
-                 loaded_videos, video_frames, loaded_zstacks, zstack_frames,
-                 zstack_counts, channel_groups) = saved
-        return
+                     zstack_counts, channel_groups) = saved
+                    _resync_fonts_after_swap(st)
+                return
     pp = os.path.expanduser((project_path or "").strip())
     if pp and not os.path.dirname(pp):
         pp = os.path.join(os.path.expanduser("~"), "Documents", pp)
     if not pp or not os.path.isfile(pp):
-        yield
+        with _doc_gate.shared():
+            yield
         return
     try:
         loaded_cfg, local_images = _load_collage_mpf(pp)
     except Exception as _e:
         import sys as __s
         print(f"[analysis] could not load source project {pp!r}: {_e}", file=__s.stderr, flush=True)
-        yield
+        with _doc_gate.shared():
+            yield
         return
-    with _source_swap_lock:
+    with _doc_gate.exclusive():
         saved = (cfg, loaded_images, loaded_videos, video_frames, loaded_zstacks, channel_groups, min_dims)
         try:
             cfg = loaded_cfg
@@ -7546,9 +7749,10 @@ def _figure_context(figure_id=""):
     global cfg
     fid = str(figure_id or "").strip()
     if not fid:
-        yield
+        with _doc_gate.shared():
+            yield
         return
-    with _source_swap_lock:
+    with _doc_gate.exclusive():
         saved = cfg
         try:
             sub = resolve_figure_config(cfg, fid)
@@ -7562,9 +7766,14 @@ def _figure_context(figure_id=""):
 def _project_context(doc_id="", project_path="", figure_id=""):
     """Swap the globals to document `doc_id` / `project_path` (see
     _doc_context) and, inside it, to its figure tab `figure_id`."""
-    with _doc_context(doc_id, project_path):
-        with _figure_context(figure_id):
-            yield
+    fid = str(figure_id or "").strip()
+    # A figure id means _figure_context will swap, so take exclusive FIRST:
+    # otherwise the active-doc branch of _doc_context would hold shared and
+    # _figure_context would have to upgrade it.
+    with (_doc_gate.exclusive() if fid else _contextlib.nullcontext()):
+        with _doc_context(doc_id, project_path):
+            with _figure_context(figure_id):
+                yield
 
 
 def _source_ctx(source):
@@ -7582,9 +7791,17 @@ def _for_each_figure(collector):
     in tab order. Used to list analysis sources / measurements from every
     figure of a project, not only the active one."""
     global cfg
+    # Single-figure doc (the common case): nothing to swap, so read under the
+    # SHARED gate and never rebind cfg — a concurrent config PUT can't be
+    # silently reverted, and the builder (which also polls /api/measurements)
+    # never blocks on it.
+    with _doc_gate.shared():
+        figs = iter_figures(cfg)
+        if all(is_active for _, _, is_active in figs):
+            return [(fid, fname, collector()) for fid, fname, _ in figs]
     out = []
-    with _source_swap_lock:
-        base = cfg
+    with _doc_gate.exclusive():
+        base = cfg                      # re-read under the exclusive gate
         try:
             for fid, fname, is_active in iter_figures(base):
                 sub = base if is_active else resolve_figure_config(base, fid)
@@ -10021,6 +10238,21 @@ def main():
         traceback.print_exc(file=sys.stderr)
         sys.exit(1)
 
+
+# Doc-gate self-check: every exempt / self-gated path must be a real route
+# (a typo would silently leave a swap-entering route wrapped shared, or a
+# state-touching route ungated) and every other route must be wrapped.
+def _doc_gate_selfcheck():
+    paths = {r.path for r in app.routes if isinstance(r, _APIRoute)}
+    unknown = sorted((_GATE_EXEMPT | _GATE_SELF) - paths)
+    unwrapped = sorted(r.path for r in app.routes if isinstance(r, _APIRoute)
+                       and r.path not in _GATE_EXEMPT and r.path not in _GATE_SELF
+                       and getattr(r.endpoint, "_doc_gate", None) != "shared")
+    if unknown or unwrapped:
+        raise RuntimeError(f"doc gate misconfigured: unknown={unknown} unwrapped={unwrapped}")
+
+
+_doc_gate_selfcheck()
 
 if __name__ == "__main__":
     main()

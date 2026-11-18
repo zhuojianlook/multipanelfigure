@@ -84,7 +84,7 @@ import { api, getApiBase } from "../../api/client";
 import type { RDepsStatus } from "../../api/types";
 import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
-import { switchToDocument } from "../../utils/projectNav";
+import { switchToDocument, whenDocOpsIdle } from "../../utils/projectNav";
 import { DEFAULT_FIGURE_ID } from "../../utils/figures";
 import { figKey, nsKey } from "../../utils/analysisKeys";
 import { useSourceEditStore } from "../../store/sourceEditStore";
@@ -539,7 +539,7 @@ function SourceLibraryRow({ source, isUngrouped, onRemoveFromGroup, onDelete }: 
             {name}
           </Typography>
           <Typography variant="caption" sx={{ fontSize: "0.5rem", color: "text.secondary", lineHeight: 1 }}>
-            R{source.row + 1}C{source.col + 1}·{source.inset_index + 1} · {source.natural_width}×{source.natural_height}
+            R{source.row + 1}C{source.col + 1}{source.inset_index >= 0 ? `·${source.inset_index + 1}` : ""} · {source.natural_width}×{source.natural_height}
           </Typography>
           {/* A user group mixes sources from any document / figure and has
               no per-document folder header, so name the origin here. */}
@@ -1056,7 +1056,11 @@ export function figureLabels(docs: Array<{ id: string; name: string }>): Record<
    Without Type, an R script cannot tell a curved-surface reading from a line
    length: the backend tags every row ("line" | "area" | "curved_surface") but
    that tag used to be dropped right here. */
-export const MEAS_CSV_HEADER = "Panel,Name,Group,Value,Unit,Type,Figure";
+/* Panel carries the panel's DISPLAY name — its row/column labels and headers
+   ("1hr, Sample 1") — because that's what plots put on the x-axis. Cell keeps
+   the grid coordinates (R1C1) as the stable identity; it is a character
+   column inserted before Figure for the same positional reasons as Type. */
+export const MEAS_CSV_HEADER = "Panel,Name,Group,Value,Unit,Type,Cell,Figure";
 
 /** Identity of the READINGS in a measurements CSV: the set of
  *  "Figure|Panel|Name" keys, ignoring Group/Value formatting.
@@ -1069,18 +1073,29 @@ export const MEAS_CSV_HEADER = "Panel,Name,Group,Value,Unit,Type,Figure";
  *  twice (n doubles, sd shrinks, p-values go optimistic) with both 📋 rows
  *  carrying the same label — it reads as a cosmetic duplicate, not a
  *  corrupted analysis. */
-function measRowKeys(csv: string): Set<string> {
+/** Split one CSV line on commas outside double quotes, then unquote. */
+function splitCsvLine(line: string): string[] {
+  return (line.match(/("([^"]|"")*"|[^,]*)(,|$)/g) || [])
+    .map((c) => c.replace(/,$/, "").replace(/^"|"$/g, "").replace(/""/g, '"'));
+}
+
+export function measRowKeys(csv: string): Set<string> {
   const out = new Set<string>();
   const lines = (csv || "").split("\n");
+  const head = splitCsvLine(lines[0] || "");
+  const cellIdx = head.indexOf("Cell");
+  // Older tables: Panel,Name,Group,Value,Unit,Type,Figure (Figure at 6).
+  const figIdx = head.indexOf("Figure") >= 0 ? head.indexOf("Figure") : 6;
   for (let i = 1; i < lines.length; i++) {   // skip header
     const line = lines[i];
     if (!line.trim()) continue;
-    // Split on commas outside double quotes, then unquote.
-    const cells = (line.match(/("([^"]|"")*"|[^,]*)(,|$)/g) || [])
-      .map((c) => c.replace(/,$/, "").replace(/^"|"$/g, "").replace(/""/g, '"'));
-    // header: Panel,Name,Group,Value,Unit,Type,Figure
-    const [panel, name] = cells;
-    const figure = cells[6] ?? "";
+    const cells = splitCsvLine(line);
+    // Identity is the grid cell, not the display name (a header rename must
+    // not make the same readings look new). Tables built before the Cell
+    // column existed carry the coordinates in Panel.
+    const panel = (cellIdx >= 0 ? cells[cellIdx] : "") || cells[0];
+    const name = cells[1];
+    const figure = (figIdx >= 0 ? cells[figIdx] : "") ?? "";
     out.add(`${figure}|${panel}|${name}`);
   }
   return out;
@@ -1104,11 +1119,12 @@ export function measArrToCsv(
   const q = (c: unknown) => `"${String(c ?? "").replace(/"/g, '""')}"`;
   const body = (rows || []).map((m) => {
     const value = m.numeric != null ? String(m.numeric) : String(m.value ?? "");
-    const group = (groupOf?.(m) || "") || m.panel;
+    const shown = m.panel_name || m.panel;
+    const group = (groupOf?.(m) || "") || shown;
     // A project with several figure tabs tags each row with its figure; the
     // Figure column then names both, so "R1C1" of two figures stays distinct.
     const fig = m.figure_name ? (figure ? `${figure} › ${String(m.figure_name)}` : String(m.figure_name)) : figure;
-    return [m.panel, m.name, group, value, m.unit ?? "", m.type ?? "", fig].map(q).join(",");
+    return [shown, m.name, group, value, m.unit ?? "", m.type ?? "", m.panel, fig].map(q).join(",");
   }).join("\n");
   return body ? `${header}\n${body}` : `${header}\n`;
 }
@@ -1170,9 +1186,8 @@ function MeasurementFigureFolder({
     for (const item of visible) {
       // Prefix the figure tab when rows carry one (multi-figure project), so
       // "R1C1" of two figures doesn't merge into one panel node.
-      const p = item.r.figure_name
-        ? `${String(item.r.figure_name)} › ${String(item.r.panel ?? "—")}`
-        : String(item.r.panel ?? "—");
+      const shown = String(item.r.panel_name || item.r.panel || "—");
+      const p = item.r.figure_name ? `${String(item.r.figure_name)} › ${shown}` : shown;
       const a = `${item.r.ann_index ?? "?"}|${String(item.r.annotation ?? item.r.name ?? "—")}`;
       if (!m.has(p)) m.set(p, new Map());
       const inner = m.get(p)!;
@@ -1538,6 +1553,9 @@ export interface InsetSource {
   col: number;
   inset_index: number;
   label: string;
+  /** The panel's name from its row/column labels + headers ("1hr, Sample 1").
+   *  Display only — the key stays grid coordinates. Absent on older sidecars. */
+  panel_name?: string;
   natural_width: number;
   natural_height: number;
   thumbnail: string;
@@ -5719,9 +5737,13 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     saveAnalysisUploads(uploads);
   }, [insetSources]);
 
+  // Bumped on every run / cleanup of the sources effect below, so a listing
+  // that resolves after a newer one started (or after unmount) is dropped.
+  const sourcesSeq = useRef(0);
   // Load inset sources + MATLAB availability on open.
   useEffect(() => {
     if (!open) return;
+    const seq = ++sourcesSeq.current;
     // Per-MPF sources: pull insets from the ACTIVE doc AND every OTHER open
     // .mpf. EVERY source's key is namespaced by its figure's stable figKey —
     // the active doc included.
@@ -5737,119 +5759,128 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     // Each source is also tagged with mpfId / mpf so the Sources panel can fold
     // them into per-figure folders and the run can extract each from its OWN
     // project (buildSources → project_path → backend _project_context).
-    const _docs = openDocs;
-    const _active = activeDocId;
-    const _labels = figureLabels(_docs);
-    // Docs whose live edits are parked as an in-memory stash (switched away
-    // from while dirty). For those we read the STASH — so unsaved
-    // "add to analysis" flags and Untitled (never-saved) docs still
-    // contribute — instead of the (stale or missing) .mpf on disk.
-    const _dirty = new Set(useCollageStore.getState().snapshotDirtyDocIds || []);
-    const _activeFig = activeFigureId;
-    // Each row names the figure TAB it came from (a document can hold
-    // several); that id joins the binding key, the runtime key and — when
-    // the DOCUMENT has more than one figure (`figureCount`, from the
-    // response's figure list — not just figures that happen to have
-    // sources) — the origin label "doc › figure".
-    const _tag = (arr: Array<Record<string, unknown>>, d: DocTabLike, figureCount: number) => {
-      return arr.map((s) => {
-        const src = s as unknown as InsetSource & { figure_id?: unknown; figure_name?: unknown };
-        const fid = typeof src.figure_id === "string" && src.figure_id ? src.figure_id : undefined;
-        const fname = typeof src.figure_name === "string" ? src.figure_name : undefined;
-        const fk = figKey(d, fid);
-        const raw = rawKeyOf(src);
-        const docLabel = _labels[d.id] || d.name;
-        const { figure_id: _fi, figure_name: _fn, ...rest } = src;
-        return {
-          ...rest, key: nsKey(fk, raw), rawKey: raw, figKey: fk,
-          figureId: fid, figureName: fname,
-          runKey: runtimeKeyFor({ ...rest, rawKey: raw, figureId: fid }, d.id, _active, _activeFig),
-          mpfId: d.id, mpf: sourceOriginLabel(docLabel, fname, figureCount),
-        } as InsetSource;
-      });
-    };
-    // Per-figure measurements (one tile per figure). The per-doc endpoints
-    // return this figure's measurements too; record them so the Sources
-    // panel can offer a draggable Measurements tile for EACH open figure.
-    const _measAccum: Record<string, { csv: string; rows: number; items: Array<Record<string, unknown>> }> = {};
-    const _capMeas = (r: { sources?: Array<Record<string, unknown>>; measurements?: Array<Record<string, unknown>>; figures?: unknown[] }, d: DocTabLike) => {
-      const m = r.measurements || [];
-      // Tag with the DISAMBIGUATED label, not d.name — two tabs can share a
-      // name, and the Figure column is the only thing separating their rows.
-      if (m.length) _measAccum[d.id] = { csv: measArrToCsv(m, _labels[d.id] || d.name), rows: m.length, items: m };
-      return _tag(r.sources || [], d, r.figures?.length ?? 0);
-    };
-    const _activeDoc = _docs.find((d) => d.id === _active);
-    const tasks: Promise<InsetSource[]>[] = [
-      api.listInsetAnalysisSources()
-        .then((r) => (_activeDoc
-          ? _tag((r.sources || []) as Array<Record<string, unknown>>, _activeDoc, (r as { figures?: unknown[] }).figures?.length ?? 0)
-          : ([] as InsetSource[])))
-        .catch(() => [] as InsetSource[]),
-    ];
-    for (const d of _docs) {
-      if (d.id === _active) continue;
-      if (_dirty.has(d.id)) {
-        // Unsaved-but-open tab → read its stashed live state; if the stash is
-        // gone (sidecar restart) fall back to the on-disk .mpf when saved.
-        tasks.push(
-          api.listInsetAnalysisSourcesForDoc(d.id)
-            .then((r) => _capMeas(r, d))
-            .catch(() => (d.path
-              ? api.listInsetAnalysisSourcesFor(d.path).then((r) => _capMeas(r, d)).catch(() => [] as InsetSource[])
-              : ([] as InsetSource[]))),
-        );
-      } else if (d.path) {
-        tasks.push(
-          api.listInsetAnalysisSourcesFor(d.path)
-            .then((r) => _capMeas(r, d))
-            .catch(() => [] as InsetSource[]),
-        );
-      }
-    }
-    Promise.all(tasks)
-      .then((groups) => {
-        const list = groups.flat();
-        // Preserve user-uploaded standalone sources (name-based) across the
-        // refresh — they live in loaded_images for the session, not in the
-        // builder inset list the backend returns here.
-        setInsetSources((prev) => {
-          const liveKeys = new Set(list.map((l) => l.key));
-          const uploads = prev.filter((s) => s.name && !liveKeys.has(s.key));
-          return [...uploads, ...list];
+    // Wait for any in-flight tab switch / save to finish, then read what is
+    // live NOW. A listing started mid-switch tags sources with a half-switched
+    // document and makes the sidecar hold its doc gate (exclusive, seconds of
+    // thumbnail rendering) just as the builder appears. A switch started from
+    // Analysis unmounts this view first, so its listing is skipped entirely.
+    void whenDocOpsIdle().then(() => {
+    if (seq !== sourcesSeq.current) return;
+      const _docs = useCollageStore.getState().openDocs;
+      const _active = useCollageStore.getState().activeDocId;
+      const _labels = figureLabels(_docs);
+      // Docs whose live edits are parked as an in-memory stash (switched away
+      // from while dirty). For those we read the STASH — so unsaved
+      // "add to analysis" flags and Untitled (never-saved) docs still
+      // contribute — instead of the (stale or missing) .mpf on disk.
+      const _dirty = new Set(useCollageStore.getState().snapshotDirtyDocIds || []);
+      const _activeFig = useFigureStore.getState().activeFigureId;
+      // Each row names the figure TAB it came from (a document can hold
+      // several); that id joins the binding key, the runtime key and — when
+      // the DOCUMENT has more than one figure (`figureCount`, from the
+      // response's figure list — not just figures that happen to have
+      // sources) — the origin label "doc › figure".
+      const _tag = (arr: Array<Record<string, unknown>>, d: DocTabLike, figureCount: number) => {
+        return arr.map((s) => {
+          const src = s as unknown as InsetSource & { figure_id?: unknown; figure_name?: unknown };
+          const fid = typeof src.figure_id === "string" && src.figure_id ? src.figure_id : undefined;
+          const fname = typeof src.figure_name === "string" ? src.figure_name : undefined;
+          const fk = figKey(d, fid);
+          const raw = rawKeyOf(src);
+          const docLabel = _labels[d.id] || d.name;
+          const { figure_id: _fi, figure_name: _fn, ...rest } = src;
+          return {
+            ...rest, key: nsKey(fk, raw), rawKey: raw, figKey: fk,
+            figureId: fid, figureName: fname,
+            runKey: runtimeKeyFor({ ...rest, rawKey: raw, figureId: fid }, d.id, _active, _activeFig),
+            mpfId: d.id, mpf: sourceOriginLabel(docLabel, fname, figureCount),
+          } as InsetSource;
         });
-        setSourcesLoaded(true);
-        setExtraMeasurements(_measAccum);
-        // Do NOT auto-populate the Source node — the user picks
-        // which insets to attach by dragging from the library
-        // panel. We still refresh any sources that are already
-        // attached so saved workflows pick up the latest thumbnail
-        // / pixel data when the figure changed underneath them.
-        //
-        // Matching is by the figure-namespaced key, so a refresh can only ever
-        // re-resolve a source to the SAME figure it was attached from. Matching
-        // on the bare key is what let a tab switch silently swap an attached
-        // inset for a different figure's inset at the same grid coords.
-        setWorkflowTabs((tabs) => tabs.map((t) => ({
-          ...t,
-          nodes: t.nodes.map((n) => {
-            if (n.data.kind !== "source") return n;
-            const refreshed = (n.data.sources || []).map((s) => {
-              // Standalone uploads aren't figure-bound; leave them alone.
-              if (s.name) return s;
-              const bound = s.figKey ? s : migrateLegacySource(s, _docs, _active, _activeFig);
-              const live = list.find((l) => l.key === bound.key);
-              // No match → the owning figure is closed, or is an Untitled whose
-              // session ended. Keep the stale entry: it still carries figKey, so
-              // buildSources reports it as unresolved instead of quietly
-              // reading the active figure.
-              return live ?? bound;
-            });
-            return { ...n, data: { ...n.data, sources: refreshed } };
-          }),
-        })));
-      })
-      .catch(() => setInsetSources([]));
+      };
+      // Per-figure measurements (one tile per figure). The per-doc endpoints
+      // return this figure's measurements too; record them so the Sources
+      // panel can offer a draggable Measurements tile for EACH open figure.
+      const _measAccum: Record<string, { csv: string; rows: number; items: Array<Record<string, unknown>> }> = {};
+      const _capMeas = (r: { sources?: Array<Record<string, unknown>>; measurements?: Array<Record<string, unknown>>; figures?: unknown[] }, d: DocTabLike) => {
+        const m = r.measurements || [];
+        // Tag with the DISAMBIGUATED label, not d.name — two tabs can share a
+        // name, and the Figure column is the only thing separating their rows.
+        if (m.length) _measAccum[d.id] = { csv: measArrToCsv(m, _labels[d.id] || d.name), rows: m.length, items: m };
+        return _tag(r.sources || [], d, r.figures?.length ?? 0);
+      };
+      const _activeDoc = _docs.find((d) => d.id === _active);
+      const tasks: Promise<InsetSource[]>[] = [
+        api.listInsetAnalysisSources()
+          .then((r) => (_activeDoc
+            ? _tag((r.sources || []) as Array<Record<string, unknown>>, _activeDoc, (r as { figures?: unknown[] }).figures?.length ?? 0)
+            : ([] as InsetSource[])))
+          .catch(() => [] as InsetSource[]),
+      ];
+      for (const d of _docs) {
+        if (d.id === _active) continue;
+        if (_dirty.has(d.id)) {
+          // Unsaved-but-open tab → read its stashed live state; if the stash is
+          // gone (sidecar restart) fall back to the on-disk .mpf when saved.
+          tasks.push(
+            api.listInsetAnalysisSourcesForDoc(d.id)
+              .then((r) => _capMeas(r, d))
+              .catch(() => (d.path
+                ? api.listInsetAnalysisSourcesFor(d.path).then((r) => _capMeas(r, d)).catch(() => [] as InsetSource[])
+                : ([] as InsetSource[]))),
+          );
+        } else if (d.path) {
+          tasks.push(
+            api.listInsetAnalysisSourcesFor(d.path)
+              .then((r) => _capMeas(r, d))
+              .catch(() => [] as InsetSource[]),
+          );
+        }
+      }
+      Promise.all(tasks)
+        .then((groups) => {
+          if (seq !== sourcesSeq.current) return;   // a newer listing (or unmount) superseded this one
+          const list = groups.flat();
+          // Preserve user-uploaded standalone sources (name-based) across the
+          // refresh — they live in loaded_images for the session, not in the
+          // builder inset list the backend returns here.
+          setInsetSources((prev) => {
+            const liveKeys = new Set(list.map((l) => l.key));
+            const uploads = prev.filter((s) => s.name && !liveKeys.has(s.key));
+            return [...uploads, ...list];
+          });
+          setSourcesLoaded(true);
+          setExtraMeasurements(_measAccum);
+          // Do NOT auto-populate the Source node — the user picks
+          // which insets to attach by dragging from the library
+          // panel. We still refresh any sources that are already
+          // attached so saved workflows pick up the latest thumbnail
+          // / pixel data when the figure changed underneath them.
+          //
+          // Matching is by the figure-namespaced key, so a refresh can only ever
+          // re-resolve a source to the SAME figure it was attached from. Matching
+          // on the bare key is what let a tab switch silently swap an attached
+          // inset for a different figure's inset at the same grid coords.
+          setWorkflowTabs((tabs) => tabs.map((t) => ({
+            ...t,
+            nodes: t.nodes.map((n) => {
+              if (n.data.kind !== "source") return n;
+              const refreshed = (n.data.sources || []).map((s) => {
+                // Standalone uploads aren't figure-bound; leave them alone.
+                if (s.name) return s;
+                const bound = s.figKey ? s : migrateLegacySource(s, _docs, _active, _activeFig);
+                const live = list.find((l) => l.key === bound.key);
+                // No match → the owning figure is closed, or is an Untitled whose
+                // session ended. Keep the stale entry: it still carries figKey, so
+                // buildSources reports it as unresolved instead of quietly
+                // reading the active figure.
+                return live ?? bound;
+              });
+              return { ...n, data: { ...n.data, sources: refreshed } };
+            }),
+          })));
+        })
+        .catch(() => setInsetSources([]));
+    });
     // Probe MATLAB / ImageJ with the user's pinned binary (if any).
     // The sidecar accepts a `?path=` query — empty falls back to
     // its auto-detection.
@@ -5882,6 +5913,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     api.checkRDeps(enginePaths.r || undefined)
       .then(setRDeps)
       .catch(() => setRDeps(null));
+    return () => { sourcesSeq.current++; };
   }, [open, enginePaths, openDocs, activeDocId, activeFigureId, figureTabs]);
 
   /** One-click: install missing build tools (Homebrew) + R packages, then
@@ -8805,10 +8837,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                   )}
                   <Box sx={{ flex: 1, minWidth: 0 }}>
                     <Typography variant="caption" sx={{ fontSize: "0.7rem", fontWeight: 600, display: "block" }}>
-                      R{s.row + 1}C{s.col + 1} · inset {s.inset_index + 1}
+                      {displayName(s, sourceNameOverrides)}
                     </Typography>
                     <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary" }}>
-                      {!s.name && s.mpf ? `${s.mpf} · ` : ""}{s.label} · {s.natural_width}×{s.natural_height}
+                      {!s.name && s.mpf ? `${s.mpf} · ` : ""}{s.name ? "" : `R${s.row + 1}C${s.col + 1}${s.inset_index >= 0 ? ` · inset ${s.inset_index + 1}` : ""} · `}{s.natural_width}×{s.natural_height}
                     </Typography>
                   </Box>
                   <IconButton size="small" onClick={() => removeSourceFromNode(selectedNode.id, idx)} title="Detach this inset">
