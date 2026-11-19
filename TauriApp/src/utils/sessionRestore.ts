@@ -25,7 +25,11 @@ const REOPEN_PREF_KEY = "mpfig_reopen_tabs_v1";
 /** The mirrored open-document record (paths + active doc). */
 const OPEN_DOCS_KEY = "mpfig_open_docs_v1";
 
-type PersistedDoc = { path: string; name: string };
+/** `rank`: the tab's place in OPENING order (DocTab.seq) among the saved
+ *  tabs. The list itself is in tab order, which the user can drag; the rank
+ *  lets a relaunch re-open same-name tabs in their original order, so their
+ *  "name (2)" labels (written into Analysis data) don't swap. */
+type PersistedDoc = { path: string; name: string; rank?: number };
 type PersistedSession = { docs: PersistedDoc[]; activePath: string | null };
 
 /** Whether the "re-open tabs on relaunch" preference is on. Default OFF
@@ -48,9 +52,12 @@ export function setReopenPref(on: boolean): void {
 export function persistOpenDocs(): void {
   try {
     const { openDocs, activeDocId } = useCollageStore.getState();
-    const docs: PersistedDoc[] = openDocs
-      .filter((d) => !!d.path)
-      .map((d) => ({ path: d.path as string, name: d.name }));
+    const withPath = openDocs.filter((d) => !!d.path);
+    const byOpen = [...withPath].sort(
+      (a, b) => (a.seq ?? Number.MAX_SAFE_INTEGER) - (b.seq ?? Number.MAX_SAFE_INTEGER));
+    const rankOf = new Map(byOpen.map((d, i) => [d.id, i] as const));
+    const docs: PersistedDoc[] = withPath
+      .map((d) => ({ path: d.path as string, name: d.name, rank: rankOf.get(d.id) }));
     const active = openDocs.find((d) => d.id === activeDocId);
     const session: PersistedSession = { docs, activePath: active?.path ?? null };
     localStorage.setItem(OPEN_DOCS_KEY, JSON.stringify(session));
@@ -64,11 +71,12 @@ function readSession(): PersistedSession | null {
     const data = JSON.parse(raw);
     if (!data || !Array.isArray(data.docs)) return null;
     const docs: PersistedDoc[] = data.docs
-      .filter((d: unknown): d is { path: string; name?: unknown } =>
+      .filter((d: unknown): d is { path: string; name?: unknown; rank?: unknown } =>
         !!d && typeof (d as { path?: unknown }).path === "string")
-      .map((d: { path: string; name?: unknown }) => ({
+      .map((d: { path: string; name?: unknown; rank?: unknown }) => ({
         path: d.path,
         name: typeof d.name === "string" ? d.name : "",
+        ...(typeof d.rank === "number" && Number.isFinite(d.rank) ? { rank: d.rank } : {}),
       }));
     return {
       docs,
@@ -147,10 +155,30 @@ export async function maybeRestoreSession(): Promise<boolean> {
     // React paint a transient state with the stray Untitled_1 sitting next to
     // the restored tabs (the "3 tabs for a moment" glitch). No awaits here, so
     // the strip renders its final shape directly.
-    for (const d of liveDocs) cs.docEnsure(d.path, d.name || undefined);
+    // Re-open in OPENING order (rank; sessions saved before ranks existed:
+    // list order), so each tab's seq — and with it any "name (2)" label —
+    // matches last session. They are shown in the saved TAB order below.
+    const byRank = liveDocs
+      .map((d, i) => ({ d, i }))
+      .sort((a, b) => (a.d.rank ?? a.i) - (b.d.rank ?? b.i) || a.i - b.i);
+    const idOf = new Map<string, string>();
+    for (const { d } of byRank) idOf.set(d.path, cs.docEnsure(d.path, d.name || undefined));
+    const sessionIds = liveDocs.map((d) => idOf.get(d.path) as string);
     const activeId = useCollageStore.getState().docEnsure(activePath);
     for (const d of useCollageStore.getState().openDocs) {
       if (!d.path && d.id !== activeId) useCollageStore.getState().docRemove(d.id);
+    }
+    // A tab seeded earlier from a collage figure already existed, so it kept
+    // its earlier seq: hand the restored tabs' seqs back out in rank order.
+    useCollageStore.getState().docSetOpenOrder(byRank.map(({ d }) => idOf.get(d.path) as string));
+    // Put the tabs back in the saved (possibly user-dragged) order. The
+    // seeded tab sits wherever docEnsure found it; tabs not in the session
+    // keep their order after these.
+    {
+      const curIds = useCollageStore.getState().openDocs.map((d) => d.id);
+      const first = [...new Set(sessionIds)].filter((id) => curIds.includes(id));
+      const rest = curIds.filter((id) => !first.includes(id));
+      useCollageStore.getState().docReorder([...first, ...rest]);
     }
     useCollageStore.getState().docSetActive(activeId);
     useCollageStore.getState().setMode("builder");

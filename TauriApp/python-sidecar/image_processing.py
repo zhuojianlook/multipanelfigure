@@ -908,6 +908,16 @@ def draw_lines(image: Image.Image, lines: List[LineAnnotation],
     return img
 
 
+def thickness_surfaces_complete(tm) -> bool:
+    """True when both of a Curved Surface measurement's surfaces have the 2+
+    points a reading needs. A surface that was cleared to be traced again
+    keeps the OLD readings stored (so their hidden / text / style carry over
+    by index once it is retraced), but they no longer sit on anything: they
+    are neither drawn nor reported until both surfaces are complete again."""
+    return (len(getattr(tm, 'top_points', None) or []) >= 2
+            and len(getattr(tm, 'bottom_points', None) or []) >= 2)
+
+
 def draw_thickness_measurements(image: Image.Image, items,
                                 micron_per_pixel: float = 1.0) -> Image.Image:
     """Draw Curved Surface Measurement readings between two curved surfaces.
@@ -952,7 +962,10 @@ def draw_thickness_measurements(image: Image.Image, items,
                     pts = [(p[0] / 100.0 * iw, p[1] / 100.0 * ih) for p in samples]
                     draw.line(pts, fill=color, width=width)
 
-        # 2) Per-reading segments + value labels
+        # 2) Per-reading segments + value labels — only between two complete
+        #    surfaces (see thickness_surfaces_complete).
+        if not thickness_surfaces_complete(tm):
+            continue
         unit = getattr(tm, 'measure_unit', 'um')
         show_measure = getattr(tm, 'show_measure', True)
         m_color = getattr(tm, 'measure_color', color) or color

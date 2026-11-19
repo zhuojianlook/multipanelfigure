@@ -353,3 +353,15 @@ describe("identities", () => {
     expect(newDocUid()).not.toBe(u);
   });
 });
+
+describe("sourceDocUid — two open tabs on the same path", () => {
+  it("binds to the source's own tab, whatever order the tabs are in", () => {
+    const P: DocRef = { id: "doc_p", uid: "du_p", name: "fig", path: "/exp/fig.mpf" };
+    const Q: DocRef = { id: "doc_q", uid: "du_q2", name: "fig", path: "/exp/fig.mpf" };
+    const s = src(Q, "r0c0_i0");
+    expect(sourceDocUid(s, ctx(P, Q))).toBe("du_q2");
+    expect(sourceDocUid(s, ctx(Q, P))).toBe("du_q2");
+    // A source whose session tab is gone falls back to the first match.
+    expect(sourceDocUid({ ...s, mpfId: "doc_gone" }, ctx(P, Q))).toBe("du_p");
+  });
+});

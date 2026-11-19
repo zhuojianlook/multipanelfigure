@@ -134,3 +134,18 @@ def test_overrides_reach_styled_segment_labels():
 def test_bad_colour_falls_back_to_measurement_colour():
     arr = _render([_reading(color="not-a-colour")])
     assert _mask(arr, (0, 229, 255)).sum() > 20
+
+
+def test_cleared_surface_draws_no_stale_readings():
+    """'Clear and retrace' empties one surface but keeps the old readings
+    stored (their hidden / text / style carry over by index). Until both
+    surfaces have 2+ points again those readings sit on nothing, so the
+    figure must not draw them."""
+    from image_processing import thickness_surfaces_complete
+    rds = [_reading(top=[50, 40], bottom=[50, 80], color=RED)]
+    assert _mask(_render(rds), (255, 0, 0)).sum() > 20
+    for kw in ({"top_points": []}, {"bottom_points": [[20, 70]]}, {"top_points": [], "bottom_points": []}):
+        tm = _from_dict(ThicknessMeasurement, _measurement(rds, **kw))
+        assert not thickness_surfaces_complete(tm)
+        assert not _render(rds, **kw).any(), kw
+    assert thickness_surfaces_complete(_from_dict(ThicknessMeasurement, _measurement(rds)))

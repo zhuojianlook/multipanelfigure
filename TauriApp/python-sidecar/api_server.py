@@ -310,7 +310,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.424"  # CI re-syncs this from the release tag (build-sidecar)
+SIDECAR_BUILD = "0.1.425"  # CI re-syncs this from the release tag (build-sidecar)
 
 
 @app.get("/api/version")
@@ -4029,6 +4029,11 @@ def _collect_measurements(fig_cfg=None):
             # readings excluded). Gated on measure_in_analysis, not show_measure.
             for ti, tm in enumerate(getattr(panel, 'thickness_measurements', None) or []):
                 if not getattr(tm, 'measure_in_analysis', True):
+                    continue
+                # A surface cleared for retracing leaves stale readings
+                # stored; they measure nothing until both surfaces are back.
+                from image_processing import thickness_surfaces_complete
+                if not thickness_surfaces_complete(tm):
                     continue
                 unit = getattr(tm, 'measure_unit', 'um')
                 ulabel = unit_label(unit, squared=False)

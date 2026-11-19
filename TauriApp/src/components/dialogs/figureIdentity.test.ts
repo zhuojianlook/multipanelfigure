@@ -6,7 +6,7 @@
 import { describe, it, expect } from "vitest";
 import {
   figKey, rawKeyOf, nsKey, figureLabels, migrateLegacySource, measArrToCsv,
-  runtimeKeyFor, sourceProvenance, measRowKey, sourceOriginLabel,
+  runtimeKeyFor, sourceProvenance, measRowKey, sourceOriginLabel, matchLiveSource,
   type InsetSource,
 } from "./AnalysisNodeGraph";
 
@@ -159,6 +159,18 @@ describe("figureLabels — disambiguating the Figure column", () => {
     const l = figureLabels([doc("d1", "fig1"), doc("d2", "fig1")]);
     expect(l.d1).not.toBe(l.d2);
   });
+
+  it("ranks collisions by opening order (seq), so dragging tabs never swaps labels", () => {
+    const a = { ...doc("d1", "fig1"), seq: 1 };
+    const b = { ...doc("d2", "fig1"), seq: 2 };
+    const c = { ...doc("d3", "other"), seq: 3 };
+    const before = figureLabels([a, b, c]);
+    expect(before).toEqual({ d1: "fig1", d2: "fig1 (2)", d3: "other" });
+    // Same tabs, dragged into every other order: identical labels.
+    for (const order of [[b, a, c], [c, b, a], [b, c, a]]) {
+      expect(figureLabels(order)).toEqual(before);
+    }
+  });
 });
 
 describe("migrateLegacySource — saved workflows", () => {
@@ -257,6 +269,16 @@ describe("figure tabs inside one document", () => {
     expect(runtimeKeyFor({ key: "k", rawKey: "r0c0_panel", figureId: "fig-x" }, "d2", "d1")).toMatch(/_panel$/);
   });
 
+  it("sourceProvenance: two tabs on the same path — the source's own tab wins, whatever the tab order", () => {
+    const P = doc("d1", "fig", "/exp/fig.mpf");
+    const Q = doc("d2", "fig", "/exp/fig.mpf");
+    const s = { figKey: figKey(Q), mpfId: "d2" };
+    expect(sourceProvenance(s, [P, Q], null).owner?.id).toBe("d2");
+    expect(sourceProvenance(s, [Q, P], null).owner?.id).toBe("d2");
+    // No session id to go by: the first match, as before.
+    expect(sourceProvenance({ figKey: figKey(Q) }, [P, Q], null).owner?.id).toBe("d1");
+  });
+
   it("sourceProvenance: resolves the owner by figKey and always names the figure", () => {
     const docs = [A, B];
     const own = sourceProvenance({ figKey: figKey(A, "fig-x"), figureId: "fig-x" }, docs, "d1");
@@ -304,5 +326,18 @@ describe("sourceOriginLabel — which document and figure a source came from", (
   });
   it("falls back to the document name when the figure name is missing", () => {
     expect(sourceOriginLabel("A.mpf", undefined, 3)).toBe("A.mpf");
+  });
+});
+
+describe("matchLiveSource — refreshing an attached source", () => {
+  it("prefers the source's own tab when two tabs share a key, whatever the list order", () => {
+    const p = { key: "p:/exp/fig|r0c0_i0", mpfId: "d1", label: "P" };
+    const q = { key: "p:/exp/fig|r0c0_i0", mpfId: "d2", label: "Q" };
+    expect(matchLiveSource([p, q], { key: q.key, mpfId: "d2" })?.label).toBe("Q");
+    expect(matchLiveSource([q, p], { key: q.key, mpfId: "d1" })?.label).toBe("P");
+    // Its tab is gone (or it never had one): the first key match, as before.
+    expect(matchLiveSource([p, q], { key: q.key, mpfId: "gone" })?.label).toBe("P");
+    expect(matchLiveSource([p, q], { key: q.key })?.label).toBe("P");
+    expect(matchLiveSource([p, q], { key: "other" })).toBeUndefined();
   });
 });

@@ -989,8 +989,11 @@ export function sourceProvenance(
   liveTracked = false,
 ): { owner?: { id: string; path?: string | null }; fields: { mpf_doc_id?: string; project_path?: string; figure_id?: string } } {
   if (src.name) return { fields: {} };                  // standalone upload — no figure
+  // Two open tabs can share a path (and so a figKey): prefer the source's own
+  // tab, so the owner never depends on tab ORDER (tabs can be dragged).
+  const keyed = src.figKey ? docs.filter((d) => figKey(d, src.figureId) === src.figKey) : [];
   const owner = src.figKey
-    ? docs.find((d) => figKey(d, src.figureId) === src.figKey)
+    ? keyed.find((d) => d.id === src.mpfId) ?? keyed[0]
     : docs.find((d) => d.id === src.mpfId);
   const fields: { mpf_doc_id?: string; project_path?: string; figure_id?: string } = {
     figure_id: src.figureId || DEFAULT_FIGURE_ID,
@@ -1004,6 +1007,22 @@ export function sourceProvenance(
     fields.mpf_doc_id = src.mpfId;
   }
   return { owner, fields };
+}
+
+/** The live entry for an attached source: same figure-namespaced key,
+ *  preferring the same session tab. Two open tabs can share a path — and so a
+ *  key — and the live list comes back in TAB order (which the user can drag),
+ *  so a plain first-match would rebind the source to whichever tab is first. */
+export function matchLiveSource<T extends { key: string; mpfId?: string }>(
+  list: readonly T[], s: { key: string; mpfId?: string },
+): T | undefined {
+  let first: T | undefined;
+  for (const l of list) {
+    if (l.key !== s.key) continue;
+    if (s.mpfId && l.mpfId === s.mpfId) return l;
+    first ??= l;
+  }
+  return first;
 }
 
 /** Where an analysis source came from, as shown on its card / node / folder:
@@ -1023,10 +1042,19 @@ export function sourceOriginLabel(docLabel: string, figureName: string | undefin
  *  positional suffix: "fig1", "fig1 (2)".
  *
  *  This is a DISPLAY label, never an identity — use figKey to bind. */
-export function figureLabels(docs: Array<{ id: string; name: string }>): Record<string, string> {
+export function figureLabels(docs: Array<{ id: string; name: string; seq?: number }>): Record<string, string> {
   const seen = new Map<string, number>();
   const out: Record<string, string> = {};
-  for (const d of docs || []) {
+  // Suffix same-name tabs in the order they were OPENED (DocTab.seq), not
+  // their tab position: dragging tabs into a new order must not swap which
+  // one is "fig1 (2)" — the label is written into measurement tables, the
+  // re-drop dedup keys and each source's origin. Tabs without a seq (tests,
+  // older callers) keep tab order, after any that have one.
+  const ranked = (docs || [])
+    .map((d, i) => ({ d, i }))
+    .sort((a, b) => (a.d.seq ?? Number.MAX_SAFE_INTEGER) - (b.d.seq ?? Number.MAX_SAFE_INTEGER) || a.i - b.i)
+    .map(({ d }) => d);
+  for (const d of ranked) {
     const n = (seen.get(d.name) || 0) + 1;
     seen.set(d.name, n);
     out[d.id] = n === 1 ? d.name : `${d.name} (${n})`;
@@ -4715,6 +4743,13 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   const [mainTargetDocId, setMainTargetDocId] = useState<string | null>(null);
   // Open MPF docs from the collage store (the tab strip is rendered there).
   const openDocs = useCollageStore((s) => s.openDocs);
+  // The open documents as a SET (order ignored). The sources listing below
+  // re-reads every open .mpf and re-probes MATLAB / ImageJ / Cellpose / R;
+  // dragging tabs into a new order changes nothing it reads (figureLabels
+  // ranks by DocTab.seq, not position), so a reorder must not re-run it.
+  const openDocsSetKey = useMemo(
+    () => openDocs.map((d) => `${d.id}\u0000${d.path ?? ""}\u0000${d.name}`).sort().join("\u0001"),
+    [openDocs]);
   const activeDocId = useCollageStore((s) => s.activeDocId);
 
   // ── Locked (greyed-out) workflows ────────────────────────────
@@ -5095,7 +5130,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                 // nothing open can match it — it waits for its document.
                 if (s.figKey?.startsWith(CLOSED_KEY_PREFIX)) return s;
                 const bound = s.figKey ? s : migrateLegacySource(s, _docs, _active, _activeFig);
-                const live = list.find((l) => l.key === bound.key);
+                const live = matchLiveSource(list, bound);
                 // No match → the owning figure is closed, or is an Untitled whose
                 // session ended. Keep the stale entry: it still carries figKey, so
                 // buildSources reports it as unresolved instead of quietly
@@ -5141,7 +5176,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       .then(setRDeps)
       .catch(() => setRDeps(null));
     return () => { sourcesSeq.current++; };
-  }, [open, enginePaths, openDocs, activeDocId, activeFigureId, figureTabs]);
+  }, [open, enginePaths, openDocsSetKey, activeDocId, activeFigureId, figureTabs]);
 
   /** One-click: install missing build tools (Homebrew) + R packages, then
    *  re-check. Slow — a from-source CRAN build runs for minutes — so the
@@ -6053,7 +6088,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     const refreshedNodes = wf.nodes.map((n) => {
       if (n.data.kind !== "source") return n;
       const refreshed = (n.data.sources || []).map((s) => {
-        const live = insetSources.find((l) => l.key === s.key);
+        const live = matchLiveSource(insetSources, s);
         return live ?? s;
       });
       return { ...n, data: { ...n.data, sources: refreshed } };
@@ -6791,14 +6826,17 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           const insetKey = x.key.replace(/^inset_\d+_/, "");
           // Builder insets live in the live inset list; standalone analysis
           // uploads live only on the Source node — search both.
-          let src = insetSources.find((s) => s.key === insetKey);
-          if (!src) {
-            for (const n of nodes) {
-              if (n.data.kind !== "source") continue;
-              const f = (n.data.sources || []).find((s) => s.key === insetKey);
-              if (f) { src = f; break; }
-            }
+          // The ATTACHED copy names its own tab (mpfId): resolve the live entry
+          // through it, so two tabs sharing a path can't swap by tab order.
+          let attached: InsetSource | undefined;
+          for (const n of nodes) {
+            if (n.data.kind !== "source") continue;
+            const f = (n.data.sources || []).find((s) => s.key === insetKey);
+            if (f) { attached = f; break; }
           }
+          const src = attached
+            ? matchLiveSource(insetSources, attached) ?? attached
+            : insetSources.find((s) => s.key === insetKey);
           if (!src) return null;
           if (src.name) {
             // Standalone upload — belongs to no figure; the backend resolves

@@ -7001,22 +7001,22 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         })}
                       </Box>
                       {mode && (
-                        <Tooltip placement="top" title={mode.kind === "trace" ? "Finish this surface (Enter or double-click also works)" : "Stop editing this surface (Esc also works)"}>
+                        <Tooltip placement="top" title={mode.kind === "trace" ? "Save this surface and show the readings (Enter or double-click also works)" : "Save this surface and show the readings (Esc also works)"}>
                           <Button
                             size="small" variant="contained" color="success"
-                            aria-label={`Done ${mode.kind === "trace" ? "tracing" : "editing"} the ${mode.which} surface`}
+                            aria-label={`Save the ${mode.which} surface`}
                             onClick={(e) => { e.stopPropagation(); finishSurface(); }}
                             sx={{ fontSize: "0.62rem", py: 0.1, textTransform: "none", alignSelf: "flex-start" }}
                           >
-                            Done
+                            Save
                           </Button>
                         </Tooltip>
                       )}
                       <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.62rem", fontStyle: "italic" }}>
                         {mode?.kind === "trace"
-                          ? `Click along the ${mode.which} surface — as many points as you like (2 = straight, 3 = arc, 4+ = smooth curve). Press Enter, double-click or Done to finish; Esc stops (and cancels a surface with fewer than 2 points).`
+                          ? `Click along the ${mode.which} surface — as many points as you like (2 = straight, 3 = arc, 4+ = smooth curve). Press Save, Enter or double-click to finish; Esc stops (and cancels a surface with fewer than 2 points). Readings stay hidden until you save.`
                           : mode?.kind === "edit"
-                            ? `Click the image to add a point to the ${mode.which} surface. Drag a point to move it. Alt-click or right-click a point (or select it and press Delete) to remove it. Esc or Done to finish.`
+                            ? `Click the image to add a point to the ${mode.which} surface. Drag a point to move it. Alt-click or right-click a point (or select it and press Delete) to remove it. Save (or Esc) to finish — readings stay hidden until then.`
                             : "Click Top or Bottom (or the curve itself) to add or remove points. Drag the white handles to reshape; drag the ringed node to move the centre."}
                       </Typography>
                       {thickMsg && (
@@ -9831,8 +9831,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                               );
                             })}
 
-                            {/* Readings */}
-                            {(tm.readings ?? []).map((rd, ri) => {
+                            {/* Readings — not while a surface of THIS
+                                measurement is being traced / edited: they
+                                appear once the user clicks Save (or leaves
+                                the mode with Enter / Esc / double-click).
+                                Other measurements keep theirs. Nor when a
+                                surface has < 2 points (cleared to retrace):
+                                the stored readings are stale; the backend
+                                skips them too (thickness_surfaces_complete). */}
+                            {!mode && (tm.top_points?.length ?? 0) >= 2 && (tm.bottom_points?.length ?? 0) >= 2
+                              && (tm.readings ?? []).map((rd, ri) => {
                               if (rd.hidden) return null;
                               const [tx, ty] = toVb(rd.top);
                               const [bx, by] = toVb(rd.bottom);

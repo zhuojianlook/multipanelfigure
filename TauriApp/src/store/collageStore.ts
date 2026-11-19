@@ -328,11 +328,16 @@ export type WorkspaceMode = "builder" | "collage" | "analysis";
 
 /** An open .mpf document represented as a tab. `path` is null for a
  *  never-saved ("Untitled") working document. Order in `openDocs` is
- *  stable — switching tabs does NOT reorder them. */
+ *  stable — switching tabs does NOT reorder them; only the user dragging a
+ *  tab does (docReorder). */
 export type DocTab = {
   id: string;
   path: string | null;
   name: string;
+  /** When the tab was opened (increasing, session-only). Never changed by
+   *  docReorder: figureLabels ranks same-name tabs by it, so dragging tabs
+   *  can't swap their "name (2)" labels in Analysis data. */
+  seq?: number;
 };
 
 /** A single collage page — now a VISUAL REGION of a shared "spread"
@@ -612,6 +617,15 @@ export type CollageState = {
   docRename: (id: string, name: string) => void;
   /** Ensure a tab exists for `path`; returns its id (existing or new). */
   docEnsure: (path: string, name?: string, id?: string) => string;
+  /** Put the doc tabs in `orderedIds` order (drag-to-reorder). Only a
+   *  permutation of the CURRENT tabs is applied: an id list that names a
+   *  tab that no longer exists, or misses one (the set changed while the
+   *  drag was in flight), is ignored, as is an unchanged order. */
+  docReorder: (orderedIds: string[]) => void;
+  /** Session restore: re-rank the given tabs' `seq` (opening order) to the
+   *  order listed, reusing the seqs they already hold, so it stays unique.
+   *  Tab ORDER is untouched. */
+  docSetOpenOrder: (idsInOpenOrder: string[]) => void;
   /** True while a document swap (stash → activate/load/new) is in flight:
    *  the builder/analysis content is inert so no edit lands mid-swap. */
   docSwapBusy: boolean;
@@ -872,6 +886,8 @@ function persist(s: Persisted) {
 
 let _docSeq = 1;
 const _newDocId = () => `doc_${Date.now()}_${_docSeq++}`;
+/** Opening order of doc tabs (DocTab.seq); 0 is the initial tab. */
+let _docOpenSeq = 1;
 /** Mint a document-tab id (see docAdd's `id`). */
 export const newDocId = (): string => _newDocId();
 
@@ -893,7 +909,7 @@ export const useCollageStore = create<CollageState>()(
     selectedIds: [],
     mode: "builder" as WorkspaceMode,
     // Seed with a single numbered Untitled working document.
-    openDocs: [{ id: "doc_initial", path: null, name: "Untitled_1" }],
+    openDocs: [{ id: "doc_initial", path: null, name: "Untitled_1", seq: 0 }],
     activeDocId: "doc_initial",
     snapshotDirtyDocIds: [],
     docSwapBusy: false,
@@ -1280,7 +1296,7 @@ export const useCollageStore = create<CollageState>()(
             ? (doc.path.split(/[\\/]/).pop()?.replace(/\.mpf$/i, "") || doc.path)
             : _nextUntitledName(s.openDocs);
         }
-        s.openDocs.push({ id, path: doc.path ?? null, name });
+        s.openDocs.push({ id, path: doc.path ?? null, name, seq: _docOpenSeq++ });
       });
       return id;
     },
@@ -1312,6 +1328,36 @@ export const useCollageStore = create<CollageState>()(
       const existing = get().openDocs.find((d) => d.path === path);
       if (existing) return existing.id;
       return get().docAdd({ id, path, name });
+    },
+
+    docReorder: (orderedIds) => {
+      const cur = get().openDocs;
+      if (orderedIds.length !== cur.length) return;
+      if (new Set(orderedIds).size !== orderedIds.length) return;
+      if (orderedIds.every((id, i) => cur[i].id === id)) return;
+      const byId = new Map(cur.map((d) => [d.id, d] as const));
+      if (!orderedIds.every((id) => byId.has(id))) return;
+      // Session-only like the rest of openDocs (AppShell mirrors the order
+      // to the re-open-on-relaunch list itself), so no persist() here.
+      set((s) => {
+        const live = new Map(s.openDocs.map((d) => [d.id, d] as const));
+        s.openDocs = orderedIds.map((id) => live.get(id)!);
+      });
+    },
+
+    docSetOpenOrder: (idsInOpenOrder) => {
+      const cur = get().openDocs;
+      const docs = [...new Set(idsInOpenOrder)]
+        .map((id) => cur.find((d) => d.id === id))
+        .filter((d): d is DocTab => !!d);
+      const seqs = docs.map((d) => d.seq ?? 0).sort((a, b) => a - b);
+      if (docs.every((d, i) => (d.seq ?? 0) === seqs[i])) return;
+      set((s) => {
+        docs.forEach((d, i) => {
+          const live = s.openDocs.find((x) => x.id === d.id);
+          if (live) live.seq = seqs[i];
+        });
+      });
     },
 
     setDocSwapBusy: (v) => set((s) => { s.docSwapBusy = v; }),

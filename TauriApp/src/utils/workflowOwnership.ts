@@ -129,7 +129,11 @@ export function sourceDocUid(
   if (fk) {
     const closed = closedKeyUid(fk);
     if (closed) return closed;
-    for (const d of ctx.docs) if (figKey(d, s.figureId) === fk) return d.uid;
+    // Two open tabs can hold the same path (an Untitled saved over an open
+    // file): prefer the source's own tab, so the binding never depends on
+    // which of them comes first in the (user-reorderable) tab strip.
+    const matches = ctx.docs.filter((d) => figKey(d, s.figureId) === fk);
+    if (matches.length) return (matches.find((d) => d.id === s.mpfId) ?? matches[0]).uid;
     if (ctx.known) {
       for (const [uid, k] of Object.entries(ctx.known)) {
         if (k.path && figKey({ id: "", path: k.path }, s.figureId) === fk) return uid;

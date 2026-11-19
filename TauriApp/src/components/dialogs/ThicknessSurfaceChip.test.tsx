@@ -7,20 +7,21 @@ import { ThicknessSurfaceChip } from "./ThicknessSurfaceChip";
 afterEach(() => cleanup());
 
 describe("ThicknessSurfaceChip", () => {
-  it("lets clicks through to the image; only Done takes the mouse", () => {
+  it("lets clicks through to the image; only Save takes the mouse", () => {
     render(<ThicknessSurfaceChip which="bottom" kind="trace" nPts={1} onDone={vi.fn()} />);
     const chip = screen.getByTestId("thickness-surface-chip");
     // Regression: the chip used to take (and stop) every click and
     // mousedown over the bottom-centre of the image, where a bottom
     // surface often runs, so points there could not be added or grabbed.
     expect(chip.style.pointerEvents).toBe("none");
-    const done = screen.getByRole("button", { name: "Done tracing the bottom surface" });
+    const done = screen.getByRole("button", { name: "Save the bottom surface" });
+    expect(done.textContent).toBe("Save");
     expect(done.style.pointerEvents).toBe("auto");
     expect(chip.textContent).toContain("Tracing bottom surface · 1 point —");
     expect(chip.textContent).toContain("double-click to finish");
   });
 
-  it("Done finishes once and keeps its click / press off the preview", () => {
+  it("Save finishes once and keeps its click / press off the preview", () => {
     const onDone = vi.fn();
     const outerClick = vi.fn();
     const outerDown = vi.fn();
@@ -29,11 +30,11 @@ describe("ThicknessSurfaceChip", () => {
         <ThicknessSurfaceChip which="top" kind="edit" nPts={4} message="" onDone={onDone} />
       </div>,
     );
-    const done = screen.getByRole("button", { name: "Done editing the top surface" });
+    const done = screen.getByRole("button", { name: "Save the top surface" });
     fireEvent.mouseDown(done);
     fireEvent.click(done, { detail: 1 });
     expect(onDone).toHaveBeenCalledTimes(1);
-    // The second click of a double-click is not a second Done.
+    // The second click of a double-click is not a second Save.
     fireEvent.click(done, { detail: 2 });
     expect(onDone).toHaveBeenCalledTimes(1);
     expect(outerClick).not.toHaveBeenCalled();
