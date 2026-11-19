@@ -4399,7 +4399,9 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     show_curves: false, show_measure: true, measure_in_analysis: true,
     label_offset: 14,
     measure_unit: local?.scale_bar?.unit || "um",
-    measure_font_size: 5,
+    // Smaller than lines/areas (5): a surface carries many readings side by
+    // side, and at 5 pt their values crowded and overlapped.
+    measure_font_size: 3,
     measure_color: "#00E5FF",
     measure_font_name: config?.column_labels?.[0]?.font_name || "arial.ttf",
     measure_font_style: [],
@@ -8441,8 +8443,13 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
           </Box>{/* end left controls panel */}
 
           {/* -- Right: Live Preview with draggable labels ----------- */}
+          {/* A FIXED height, not maxHeight: the preview shows the cropped
+              result live, so with maxHeight its height followed the crop's
+              aspect while the user dragged the crop box, the dialog grew or
+              shrank, re-centred itself, and slid the crop box out from under
+              the cursor. A constant height keeps the dialog still. */}
           <Box
-            sx={{ position: "relative", flex: 1, display: "flex", alignItems: "flex-start", justifyContent: "center", p: 1, bgcolor: "action.hover", borderRadius: 2, border: "1px solid", borderColor: "divider", maxHeight: "70vh", overflow: "hidden" }}
+            sx={{ position: "relative", flex: 1, display: "flex", alignItems: "flex-start", justifyContent: "center", p: 1, bgcolor: "action.hover", borderRadius: 2, border: "1px solid", borderColor: "divider", height: "70vh", overflow: "hidden" }}
             onWheel={(e) => {
               // Wheel = zoom. Only when there's something to zoom into.
               if (!(previewB64 || renderedPreviewB64)) return;
