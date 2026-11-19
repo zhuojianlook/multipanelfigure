@@ -131,6 +131,17 @@ import CellposeSegDialog, {
   cellposeSegToJson,
   cellposeSegFromJson,
 } from "./CellposeSegDialog";
+import IntensityPlotOptionsDialog from "./IntensityPlotOptionsDialog";
+import {
+  applyIntensityPlotOptions, defaultIntensityPlotConfig, defaultIntensityPlotFields, deriveIntensityPlotContext,
+  intensityPlotEditable, intensityPlotState, intensityPlotSummary, isFutureIntensityPlotConfig,
+  normalizeIntensityPlotConfig, restoreIntensityPlotBackup, withoutIntensityPlot,
+  type IntensityPlotCodeState, type IntensityPlotConfig, type IntensityPlotContext,
+} from "../../utils/intensityPlotOptions";
+import { rInputsPrelude } from "../../utils/rPrelude";
+import { rRerunPng, rRerenderError } from "../../utils/rRerender";
+import { csvDataRowCount, parseCsvTable } from "../../utils/csvTable";
+import TuneIcon from "@mui/icons-material/Tune";
 
 // ── Helper: base64 PNG → File (for main-timeline + collage uploads) ──
 function b64ToFile(b64: string, filename: string): File {
@@ -1501,6 +1512,8 @@ interface GraphCallbacks {
   /** The workflow on screen is locked (greyed out, read-only: one of its
    *  documents is closed) — cards hide their attach / detach / × controls. */
   locked: boolean;
+  /** Open the "Plot intensities" options dialog for this node. */
+  openPlotOptions: (nodeId: string) => void;
 }
 const GraphCallbacksContext = createContext<GraphCallbacks | null>(null);
 function useGraphCallbacks(): GraphCallbacks | null {
@@ -1841,6 +1854,11 @@ function ProcessNode({ data, id }: NodeCardProps) {
   // data-extraction by design).
   const allowedOutKinds: DataKind[] = engine === "r" ? ["plot", "table"] : ["image", "table"];
   void allowedOutKinds;
+  // "Plot intensities" nodes get a Plot options button (also: double-click).
+  const { kind, code, intensityPlot, intensityPlotHash } = data;
+  const hasPlotOptions = useMemo(
+    () => kind === "r" && intensityPlotEditable({ kind, code, intensityPlot, intensityPlotHash }),
+    [kind, code, intensityPlot, intensityPlotHash]);
 
   // Kind glyph for the output indicator chips on the card.
   const kindGlyph: Record<DataKind, string> = { image: "🖼", table: "📋", plot: "📊" };
@@ -1861,6 +1879,15 @@ function ProcessNode({ data, id }: NodeCardProps) {
           {KIND_ICON[engine]} {data.label}
         </Typography>
         <Box sx={{ flex: 1 }} />
+        {hasPlotOptions && cbs && !cbs.locked && (
+          <Tooltip placement="top" title="Plot options (or double-click the node)">
+            <IconButton className="nodrag nopan" size="small" aria-label="Plot options"
+              onClick={() => cbs.openPlotOptions(id)} onDoubleClick={(e) => e.stopPropagation()}
+              sx={{ p: 0, color: "inherit" }}>
+              <TuneIcon sx={{ fontSize: 12 }} />
+            </IconButton>
+          </Tooltip>
+        )}
         {data.status !== "running" && cbs?.staleNodeIds.has(id) && <StaleBadge title={STALE_NODE_TIP} />}
         <StatusPip status={data.status} />
       </Box>
@@ -1937,7 +1964,10 @@ function ProcessNode({ data, id }: NodeCardProps) {
       {(() => {
         const declared = cbs?.declaredByNode.get(id) || [];
         const realNames = new Set(outputs.map((o) => o.name));
-        const placeholders = declared.filter((d) => !realNames.has(d.name));
+        // Plot outputs are named plot_1..N, never after the declared file, so
+        // once any plot exists the declared plots are not placeholders.
+        const hasPlot = outputs.some((o) => o.kind === "plot");
+        const placeholders = declared.filter((d) => !realNames.has(d.name) && !(d.kind === "plot" && hasPlot));
         if (outputs.length === 0 && placeholders.length === 0) return null;
         return (
           <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.25, px: 0.5, pb: 0.4, pt: 0.1, borderTop: "1px dashed", borderColor: "divider" }}>
@@ -3095,417 +3125,26 @@ function buildCornealHazeWorkflow(): SavedWorkflow {
 // significance brackets.  The picker emits the Python body that
 // runs on the upstream Source images; the user reaches it via the
 // "Configure intensity…" button on the node (and a "Run graph"
-// pauses there until the user clicks Save).
+// pauses there until the user clicks Save). The R node's code is
+// generated from its Plot options (double-click it; see
+// utils/intensityPlotOptions and IntensityPlotOptionsDialog).
 
-const INTENSITY_PLOT_R = `# @name: Plot intensities (groups × channels × compartments)
-# Per-channel comparison across user-defined groups (set in the
-# Intensity picker UI). Bars = group mean, error = SD, jittered raw
-# points overlaid, ANOVA + Tukey HSD pairwise brackets per channel.
-#
-# Three Python-side enhancements this plot now consumes:
-#   - "compartment" column: when the picker's "Measure compartments"
-#     is ON, each cell emits THREE rows (whole_cell / nucleus /
-#     cytoplasm). The plot facets channel × compartment so each
-#     localisation gets its own panel.
-#   - "mean_intensity_norm": when a control channel is set, each
-#     row's mean intensity is also divided by the per-image control
-#     mean. A SECOND output (channel_intensity_norm.png) renders
-#     the same comparison on the normalised scale — cancels
-#     exposure / staining-intensity differences between images.
-#   - Control sanity panel as before — flagged red if between-
-#     group test rejects H0 (groups may not be comparable).
-suppressWarnings(suppressMessages({ library(ggplot2); library(ggprism) }))
+/** A new "Plot intensities" R node: default options and their code. */
+const intensityPlotNodeData = (label: string): NodeData => ({
+  label, kind: "r", ...defaultIntensityPlotFields(),
+  outputs: [], inputs: [], status: "idle", currentPreset: "custom",
+});
 
-data <- inputs[[1]]
-if (!"mean_intensity" %in% names(data)) data$mean_intensity <- 0
-if (!"channel" %in% names(data)) data$channel <- "Channel"
-if (!"group"   %in% names(data)) data$group   <- "all"
-if (!"is_control" %in% names(data)) data$is_control <- FALSE
-if (!"compartment" %in% names(data)) data$compartment <- "whole_image"
-data$mean_intensity <- suppressWarnings(as.numeric(data$mean_intensity))
-data$is_control <- as.logical(data$is_control)
-data$is_control[is.na(data$is_control)] <- FALSE
-data <- data[is.finite(data$mean_intensity), , drop = FALSE]
-data$channel <- factor(data$channel, levels = unique(data$channel))
-data$group   <- factor(data$group,   levels = unique(data$group))
-# Compartment values used by the picker:
-#   whole_image  → simple-strategy: no segmentation, one mean per image
-#                  inside the channel's threshold mask
-#   whole_cell   → cellpose: full cyto3 mask
-#   nucleus      → cellpose: cell ∩ nuclei mask
-#   cytoplasm    → cellpose: cell − nucleus
-# Listed in a sensible reading order; droplevels() drops empty ones.
-data$compartment <- factor(data$compartment, levels = c("whole_image", "whole_cell", "nucleus", "cytoplasm"))
-# Drop empty compartment levels so we don't render empty facet rows.
-data$compartment <- droplevels(data$compartment)
-has_compartments <- nlevels(data$compartment) > 1
-has_norm <- ("mean_intensity_norm" %in% names(data)) &&
-            any(is.finite(suppressWarnings(as.numeric(data$mean_intensity_norm))))
-if (has_norm) data$mean_intensity_norm <- suppressWarnings(as.numeric(data$mean_intensity_norm))
-
-# Tukey HSD across groups within a (channel, compartment) subset.
-# Returns a data.frame of pairwise comparisons (group1, group2, p.adj)
-# ready for ggprism::add_pvalue. y_col selects which column to test
-# ("mean_intensity" raw vs "mean_intensity_norm" normalised).
-.tukey_for <- function(sub, y_col) {
-  grps <- intersect(levels(data$group), unique(as.character(sub$group)))
-  usable <- grps[vapply(grps, function(gg) sum(sub$group == gg) >= 2, logical(1))]
-  if (length(usable) < 2) return(NULL)
-  sub2 <- sub[sub$group %in% usable, , drop = FALSE]
-  sub2$group <- factor(sub2$group, levels = usable)
-  fml <- as.formula(paste(y_col, "~ group"))
-  aov_res <- tryCatch(aov(fml, data = sub2), error = function(e) NULL)
-  if (is.null(aov_res)) return(NULL)
-  tk <- tryCatch(TukeyHSD(aov_res), error = function(e) NULL)
-  if (is.null(tk)) return(NULL)
-  tk_mat <- tk[["group"]]
-  if (is.null(tk_mat) || nrow(tk_mat) == 0) return(NULL)
-  pairs <- strsplit(rownames(tk_mat), "-", fixed = TRUE)
-  data.frame(
-    group1 = vapply(pairs, function(p) p[2], character(1)),
-    group2 = vapply(pairs, function(p) p[1], character(1)),
-    p.adj  = tk_mat[, "p adj"],
-    stringsAsFactors = FALSE
-  )
+/** `nodes` with one node's data replaced by `fn(data)`, or `nodes` itself
+ *  when `fn` returns the same data (so a no-op is not an edit). */
+function withNodeData(nodes: Node<NodeData>[], id: string, fn: (d: NodeData) => NodeData): Node<NodeData>[] {
+  const i = nodes.findIndex((n) => n.id === id);
+  const data = i < 0 ? undefined : fn(nodes[i].data);
+  if (!data || data === nodes[i].data) return nodes;
+  const next = [...nodes];
+  next[i] = { ...nodes[i], data };
+  return next;
 }
-
-# Build a brackets df for ggprism::add_pvalue across (channel × compartment)
-# facets so the stat lines stack per facet, not across them.
-.brackets <- function(sub, summ, y_col) {
-  out <- list()
-  for (ch in levels(droplevels(sub$channel))) {
-    for (co in levels(droplevels(sub$compartment))) {
-      s <- sub[sub$channel == ch & sub$compartment == co, , drop = FALSE]
-      if (nrow(s) == 0) next
-      tk <- .tukey_for(s, y_col)
-      if (is.null(tk) || nrow(tk) == 0) next
-      tk <- tk[order(tk$p.adj), , drop = FALSE]
-      # ymax for THIS facet only.
-      sf <- summ[summ$channel == ch & summ$compartment == co, ]
-      ymax <- max(sf$mean + sf$sd, na.rm = TRUE)
-      if (!is.finite(ymax) || ymax <= 0) ymax <- max(s[[y_col]], na.rm = TRUE)
-      step <- 0.13 * ymax
-      k <- 0
-      for (i in seq_len(nrow(tk))) {
-        pv <- tk$p.adj[i]
-        if (is.na(pv)) next
-        lab <- if (pv < 0.001) "***" else if (pv < 0.01) "**" else if (pv < 0.05) "*" else "ns"
-        k <- k + 1
-        out[[length(out) + 1]] <- data.frame(
-          channel = ch, compartment = co,
-          group1 = tk$group1[i], group2 = tk$group2[i],
-          p.label = lab, y.position = ymax + step * k, stringsAsFactors = FALSE)
-      }
-    }
-  }
-  if (length(out) == 0) return(NULL)
-  do.call(rbind, out)
-}
-
-# Per-(group, channel, compartment) summary used by both panels.
-.summary <- function(d, y_col) {
-  if (nrow(d) == 0) return(data.frame(group = character(0), channel = character(0),
-                                       compartment = character(0),
-                                       mean = numeric(0), sd = numeric(0), n = integer(0)))
-  fml <- as.formula(paste(y_col, "~ group + channel + compartment"))
-  agg <- aggregate(fml, data = d,
-                   FUN = function(v) c(m = mean(v, na.rm = TRUE),
-                                       s = sd(v, na.rm = TRUE),
-                                       n = length(v)))
-  out <- data.frame(group = agg$group, channel = agg$channel,
-                    compartment = agg$compartment,
-                    mean = agg[[y_col]][, "m"],
-                    sd   = agg[[y_col]][, "s"],
-                    n    = as.integer(agg[[y_col]][, "n"]))
-  out$sd[is.na(out$sd)] <- 0
-  out
-}
-
-# Render a ggplot for the given data subset. When the data has multiple
-# compartment levels, facet as channel ROWS x compartment COLUMNS so
-# each (channel, compartment) combination gets its own panel — that's
-# the natural way to compare e.g. nuclear vs cytoplasmic Anti-VegF.
-.render_panel <- function(d, title, flag_warning, y_col, y_label) {
-  if (nrow(d) == 0) {
-    return(ggplot() + theme_void() +
-           annotate("text", x = 0.5, y = 0.5, label = paste0(title, ": no rows")))
-  }
-  d$compartment <- droplevels(d$compartment)
-  d$channel <- droplevels(d$channel)
-  # Drop rows without a usable y-column value (matters mostly for the
-  # normalised plot when control was missing on some images).
-  d <- d[is.finite(d[[y_col]]), , drop = FALSE]
-  if (nrow(d) == 0) {
-    return(ggplot() + theme_void() +
-           annotate("text", x = 0.5, y = 0.5, label = paste0(title, ": no rows with ", y_col)))
-  }
-  s <- .summary(d, y_col)
-  br <- .brackets(d, s, y_col)
-  multi_compart <- nlevels(d$compartment) > 1
-  # Force every group level (including ones with zero rows) to appear
-  # on the x-axis so a missing group shows as an empty slot the user
-  # can see — instead of silently shrinking the axis and pretending
-  # the comparison ran fine.  drop = FALSE on scale_x_discrete +
-  # droplevels OFF for the group factor.
-  group_levels_all <- levels(d$group)
-  p <- ggplot() +
-    geom_col(data = s, aes(x = group, y = mean, fill = group),
-             width = 0.7, color = "grey25", linewidth = 0.3) +
-    geom_errorbar(data = s, aes(x = group, ymin = pmax(0, mean - sd), ymax = mean + sd),
-                  width = 0.22, linewidth = 0.4) +
-    geom_jitter(data = d, aes(x = group, y = !!sym(y_col)),
-                width = 0.13, height = 0, size = 1.0, alpha = 0.7,
-                color = "grey20", stroke = 0) +
-    scale_x_discrete(drop = FALSE, labels = function(z) .mpfig_wrap(z, 14)) +
-    scale_fill_brewer(palette = "Set2", drop = FALSE,
-                      labels = function(z) .mpfig_wrap(z, 13),
-                      guide = guide_legend(title = "Group")) +
-    theme_prism(base_size = 11) +
-    # Legend at the BOTTOM (not the right): long group names on a right
-    # legend steal panel width and shove the facets off the canvas.  At
-    # the bottom they wrap across rows and never eat the plot.
-    theme(legend.position = "bottom",
-          legend.text = element_text(size = 8),
-          legend.title = element_text(size = 9),
-          axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
-          # Generous top margin + full-plot title positioning so the
-          # (often long) wrapped header is never clipped at the top or
-          # right edge when the figure is exported / sent to collage.
-          plot.margin = margin(16, 14, 8, 12),
-          plot.title.position = "plot",
-          plot.title = element_text(size = 11, face = "bold", lineheight = 1.05,
-                                    margin = margin(b = 8),
-                                    color = if (flag_warning) "#b03030" else "grey25")) +
-    # Wrap the title to whatever fits THIS figure's width (dev.size) so a
-    # long header breaks onto multiple lines instead of running off the
-    # edge of the PNG.
-    labs(x = NULL, y = y_label, title = .mpfig_fit(title))
-  if (multi_compart) {
-    p <- p + facet_grid(compartment ~ channel, scales = "free_y", switch = "y",
-                        labeller = .mpfig_labeller(14))
-  } else {
-    p <- p + facet_wrap(~ channel, scales = "free_y", nrow = 1,
-                        labeller = .mpfig_labeller(14))
-  }
-  if (!is.null(br)) {
-    p <- tryCatch(
-      p + ggprism::add_pvalue(br, label = "p.label",
-                              xmin = "group1", xmax = "group2",
-                              y.position = "y.position",
-                              tip.length = 0.01, label.size = 3.0, bracket.size = 0.3),
-      error = function(e) { message("add_pvalue failed: ", conditionMessage(e)); p })
-  }
-  p
-}
-
-# rlang::sym is in the standard ggplot2 import; provide a tiny shim
-# in case the host R lacks it (very old ggplot2).
-if (!exists("sym")) sym <- function(x) rlang::sym(x)
-
-# Per-image aggregation: average per-cell measurements within each
-# (image × group × channel × compartment) into ONE row. Used for the
-# Gap-4 publication-grade plot where the unit of analysis is the
-# image (n = number of images per group), not the cell. Cellpose's
-# per-cell rows alone would treat cells as independent observations,
-# but cells share staining batch / exposure / focus within an image
-# — pseudo-replication inflates n and produces overconfident
-# p-values. Per-image means side-steps the issue entirely.
-.per_image_aggregate <- function(d, y_col) {
-  if (nrow(d) == 0) return(d)
-  if (!(y_col %in% names(d))) return(d[0, , drop = FALSE])
-  dd <- d[is.finite(d[[y_col]]), , drop = FALSE]
-  if (nrow(dd) == 0) return(dd)
-  fml <- as.formula(paste(y_col, "~ source + group + channel + compartment"))
-  agg <- aggregate(fml, data = dd, FUN = mean, na.rm = TRUE)
-  # Preserve is_control + factor levels (aggregate() drops factor
-  # ordering — we restore it so downstream colour/order matches).
-  agg$is_control <- FALSE
-  agg$group <- factor(agg$group, levels = levels(d$group))
-  agg$channel <- factor(agg$channel, levels = levels(d$channel))
-  agg$compartment <- factor(agg$compartment, levels = levels(d$compartment))
-  agg
-}
-
-# Detect cellpose mode by presence of cellpose-only compartments. In
-# simple mode every row is compartment == "whole_image"; in cellpose
-# mode at least some rows are "whole_cell"/"nucleus"/"cytoplasm".
-is_cellpose <- any(as.character(data$compartment) %in% c("whole_cell", "nucleus", "cytoplasm"))
-
-# ── Split control vs analysis channels and render each. ─────────────
-control_data  <- data[data$is_control == TRUE, , drop = FALSE]
-analysis_data <- data[data$is_control == FALSE, , drop = FALSE]
-
-# Plot dimension helper — wider when we have multiple channels and
-# taller when we have multiple compartments.  Extra +160 px height
-# headroom so a wrapped 2-line title isn't squeezed against the top.
-.dims_for <- function(d) {
-  nch <- length(unique(d$channel))
-  nco <- length(unique(d$compartment))
-  list(w = max(1100, 520 * min(nch, 4)),
-       h = (if (nco > 1) (550 * nco + 100) else 1050) + 160)
-}
-
-if (nrow(analysis_data) == 0 && nrow(control_data) == 0) {
-  mpfig_plot("channel_intensity.png", width = 1100, height = 800, res = 300)
-  print(ggplot() + theme_void() + annotate("text", x = 0.5, y = 0.5,
-        label = "No intensity rows — wire images upstream and Configure intensity."))
-} else {
-  # ── PER-CELL panel (cellpose) OR per-image panel (simple). ──────
-  # The data unit depends on mode: in simple mode each row IS already
-  # per-image (one threshold-mask mean per image), so this plot's
-  # statistics are already at the right level. In cellpose mode each
-  # row is a CELL; the brackets here therefore use n=cells, which
-  # over-states n (pseudo-replication). The per-image aggregate
-  # plot below is the publication-grade counterpart.
-  cell_n_label <- if (is_cellpose) " — per-CELL (n = cells; descriptive)" else ""
-  if (nrow(analysis_data) > 0) {
-    dms <- .dims_for(analysis_data)
-    mpfig_plot("channel_intensity.png", width = dms$w, height = dms$h, res = 300)
-    print(.render_panel(analysis_data,
-                        paste0(if (has_compartments) "Channel intensities (channel × compartment)" else "Channel intensities",
-                               cell_n_label),
-                        FALSE, "mean_intensity", "Mean intensity (BG-corrected)"))
-  }
-  if (nrow(analysis_data) > 0 && has_norm) {
-    dms <- .dims_for(analysis_data)
-    mpfig_plot("channel_intensity_norm.png", width = dms$w, height = dms$h, res = 300)
-    print(.render_panel(analysis_data,
-                        paste0("Channel intensities — NORMALISED per image to control channel", cell_n_label),
-                        FALSE, "mean_intensity_norm", "Mean intensity / per-image control"))
-  }
-
-  # ── Gap 4: PER-IMAGE AGGREGATE plot. Only meaningful in cellpose
-  #    mode (in simple mode each row is already per-image, so this
-  #    would just duplicate the previous plot). Aggregates the
-  #    per-cell rows by image first, then runs ANOVA + Tukey on
-  #    those image means. n drops from cells → images, removing
-  #    the within-image pseudo-replication bias.
-  if (is_cellpose && nrow(analysis_data) > 0) {
-    agg_raw <- .per_image_aggregate(analysis_data, "mean_intensity")
-    if (nrow(agg_raw) > 0) {
-      dms <- .dims_for(agg_raw)
-      mpfig_plot("channel_intensity_per_image.png", width = dms$w, height = dms$h, res = 300)
-      print(.render_panel(agg_raw,
-                          paste0(if (has_compartments) "Channel intensities (channel × compartment)" else "Channel intensities",
-                                 " — PER-IMAGE means (n = images; publication-grade)"),
-                          FALSE, "mean_intensity", "Per-image mean intensity"))
-    }
-    if (has_norm) {
-      agg_norm <- .per_image_aggregate(analysis_data, "mean_intensity_norm")
-      if (nrow(agg_norm) > 0) {
-        dms <- .dims_for(agg_norm)
-        mpfig_plot("channel_intensity_norm_per_image.png", width = dms$w, height = dms$h, res = 300)
-        print(.render_panel(agg_norm,
-                            paste0("Channel intensities — NORMALISED, PER-IMAGE means (n = images; publication-grade)"),
-                            FALSE, "mean_intensity_norm", "Per-image normalised intensity"))
-      }
-    }
-  }
-
-  # ── Cross-group comparison: log2 fold-change vs first group. ─────
-  # The descriptive panels above show every group's mean side by side,
-  # but the comparison the reader actually wants is "how much higher /
-  # lower is group N relative to baseline?".  This panel collapses
-  # that to a single bar per (group, channel[, compartment]) anchored
-  # at log2(group / baseline).  Only emitted when ≥2 groups carry data.
-  .fold_change_panel <- function(d, y_col, base_group) {
-    dd <- d[is.finite(d[[y_col]]), , drop = FALSE]
-    if (nrow(dd) == 0) return(NULL)
-    fml <- as.formula(paste(y_col, "~ group + channel + compartment"))
-    grp <- aggregate(fml, data = dd, FUN = mean, na.rm = TRUE)
-    base <- grp[as.character(grp$group) == as.character(base_group), , drop = FALSE]
-    if (nrow(base) == 0) return(NULL)
-    out <- merge(grp, base[, c("channel", "compartment", y_col)],
-                 by = c("channel", "compartment"),
-                 suffixes = c("", ".base"))
-    out$log2fc <- log2(pmax(out[[y_col]], 1e-9) / pmax(out[[paste0(y_col, ".base")]], 1e-9))
-    out <- out[as.character(out$group) != as.character(base_group), , drop = FALSE]
-    if (nrow(out) == 0) return(NULL)
-    p <- ggplot(out, aes(x = group, y = log2fc, fill = group)) +
-      geom_col(color = "grey25", linewidth = 0.3, width = 0.7) +
-      geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
-      scale_x_discrete(labels = function(z) .mpfig_wrap(z, 14)) +
-      scale_fill_brewer(palette = "Set2", drop = FALSE,
-                        labels = function(z) .mpfig_wrap(z, 13),
-                        guide = guide_legend(title = "Group")) +
-      theme_prism(base_size = 11) +
-      theme(legend.position = "bottom",
-            legend.text = element_text(size = 8),
-            legend.title = element_text(size = 9),
-            axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
-            plot.margin = margin(16, 14, 8, 12),
-            plot.title.position = "plot",
-            plot.title = element_text(size = 11, face = "bold", lineheight = 1.05,
-                                      margin = margin(b = 8))) +
-      labs(x = NULL, y = .mpfig_wrap(paste0("log2(group / ", base_group, ")"), 28),
-           title = .mpfig_fit(paste0("Cross-group comparison vs ", base_group,
-                                     " (log2 fold-change)")))
-    if (nlevels(droplevels(out$compartment)) > 1) {
-      p <- p + facet_grid(compartment ~ channel, scales = "free_y", switch = "y",
-                          labeller = .mpfig_labeller(14))
-    } else {
-      p <- p + facet_wrap(~ channel, scales = "free_y", nrow = 1,
-                          labeller = .mpfig_labeller(14))
-    }
-    p
-  }
-  groups_with_data <- unique(as.character(analysis_data$group[is.finite(analysis_data$mean_intensity)]))
-  groups_with_data <- groups_with_data[groups_with_data != "(unassigned)"]
-  if (length(groups_with_data) >= 2 && nrow(analysis_data) > 0) {
-    base_grp <- groups_with_data[1]
-    fc <- .fold_change_panel(analysis_data, "mean_intensity", base_grp)
-    if (!is.null(fc)) {
-      dms <- .dims_for(analysis_data)
-      mpfig_plot("channel_intensity_fc.png", width = dms$w, height = dms$h, res = 300)
-      print(fc)
-    }
-    if (has_norm) {
-      fc_n <- .fold_change_panel(analysis_data, "mean_intensity_norm", base_grp)
-      if (!is.null(fc_n)) {
-        dms <- .dims_for(analysis_data)
-        mpfig_plot("channel_intensity_norm_fc.png", width = dms$w, height = dms$h, res = 300)
-        print(fc_n)
-      }
-    }
-  } else if (nrow(analysis_data) > 0) {
-    # Single-group case — explicit warning panel so the user knows
-    # the comparison plots can't be generated, and which groups
-    # ended up with no rows (helps diagnose the picker's image-to-
-    # group mapping).
-    all_defined <- unique(as.character(analysis_data$group))
-    missing_grps <- setdiff(all_defined, groups_with_data)
-    msg <- if (length(missing_grps) > 0)
-      paste0("Only 1 group has data (", paste(groups_with_data, collapse = ", "),
-             "). Missing: ", paste(missing_grps, collapse = ", "),
-             ". Check the Intensity picker's image-to-group assignments.")
-    else
-      "Only 1 group is defined. Add a second group in the Intensity picker to enable cross-group comparison."
-    mpfig_plot("channel_intensity_warning.png", width = 1400, height = 500, res = 300)
-    print(ggplot() + theme_void() +
-          annotate("text", x = 0.5, y = 0.62, size = 5.5, color = "#b03030",
-                   label = .mpfig_wrap("⚠ Only 1 group has data — comparison plots skipped", 44)) +
-          annotate("text", x = 0.5, y = 0.34, size = 3.8, color = "grey30",
-                   label = .mpfig_wrap(msg, 60)) +
-          xlim(0, 1) + ylim(0, 1))
-  }
-
-  # ── Control sanity check — unchanged. Stays per-cell (or per-image
-  #    in simple mode) because it's a yes/no flag for group comparability,
-  #    not a quantitative comparison the reader's going to put in a paper.
-  if (nrow(control_data) > 0) {
-    ctrl_summary <- .summary(control_data, "mean_intensity")
-    ctrl_brackets <- .brackets(control_data, ctrl_summary, "mean_intensity")
-    is_flagged <- !is.null(ctrl_brackets) && any(ctrl_brackets$p.label %in% c("*", "**", "***"))
-    title <- if (is_flagged)
-      "Control channel — DIFFERS between groups (groups may not be comparable)"
-    else
-      "Control channel — sanity check (NS expected)"
-    dms <- .dims_for(control_data)
-    mpfig_plot("control_intensity.png", width = 1100, height = max(900, dms$h), res = 300)
-    print(.render_panel(control_data, title, is_flagged, "mean_intensity", "Mean intensity (BG-corrected)"))
-  }
-}
-`;
 
 function buildIntensityWorkflow(): SavedWorkflow {
   const srcId = "source", pyId = "intensity_py", rId = "intensity_plot";
@@ -3529,8 +3168,7 @@ function buildIntensityWorkflow(): SavedWorkflow {
     },
     {
       id: rId, type: "r", position: { x: 680, y: 60 },
-      data: { label: "Plot intensities", kind: "r", code: INTENSITY_PLOT_R,
-              outputs: [], inputs: [], status: "idle", currentPreset: "custom" } as NodeData,
+      data: intensityPlotNodeData("Plot intensities"),
     },
   ];
   const mkEdge = (s: string, sh: string, t: string, th: string, k: DataKind): Edge => ({
@@ -3799,8 +3437,7 @@ function buildNucleiCountWorkflow(): SavedWorkflow {
     // detector's per-nucleus table directly).
     {
       id: intId, type: "r", position: { x: 700, y: 320 },
-      data: { label: "Plot nucleus intensity", kind: "r", code: INTENSITY_PLOT_R,
-              outputs: [], inputs: [], status: "idle", currentPreset: "custom" } as NodeData,
+      data: intensityPlotNodeData("Plot nucleus intensity"),
     },
   ];
   const mkEdge = (s: string, sh: string, t: string, th: string, k: DataKind): Edge => ({
@@ -4988,6 +4625,13 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     open: boolean; nodeId: string | null; images: FluorPickerImage[]; cfg: FluorIntensityConfig | null;
   }>(() => ({ open: false, nodeId: null, images: [], cfg: null }));
   const intensityPickerResolveRef = useRef<((cfg: FluorIntensityConfig | null) => void) | null>(null);
+  // "Plot intensities" options dialog: the node's options, what its upstream
+  // data offers, and how its code relates to the options (opened by
+  // double-clicking the node, its header icon or the inspector button).
+  const [plotOptions, setPlotOptions] = useState<{
+    open: boolean; nodeId: string | null; wfId: string | null; label: string;
+    cfg: IntensityPlotConfig | null; ctx: IntensityPlotContext; state: IntensityPlotCodeState;
+  }>(() => ({ open: false, nodeId: null, wfId: null, label: "", cfg: null, ctx: deriveIntensityPlotContext({}), state: "none" }));
   // Cellpose segmentation picker modal state — same shape/lifecycle as the
   // intensity picker, but drives the interactive Cellpose node in the
   // "Cell characteristics" workflow. `images` reuses the SAME builder so the
@@ -6929,6 +6573,45 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     return new Promise((resolve) => { cellposePickerResolveRef.current = resolve; });
   }, [openCellposePicker]);
 
+  // ── "Plot intensities" options ──────────────────────────────
+  // The groups / channels the dialog lists come from what the node's run
+  // reads (its first table input) and from the Intensity picker wired into
+  // its table port.
+  const openPlotOptions = useCallback((nodeId: string) => {
+    if (activeWfLocked()) return;
+    const nm = new Map(nodes.map((n) => [n.id, n]));
+    const node = nm.get(nodeId);
+    if (!node || !intensityPlotEditable(node.data)) return;
+    const tableCsv = collectInputs(nodeId, nm).find((x) => x.kind === "table")?.csv ?? null;
+    const upEdge = edges.find((e) => e.target === nodeId && e.targetHandle === "in_table");
+    const up = upEdge ? nm.get(upEdge.source) : undefined;
+    const pickerCfg = up?.data.interactive === "fluor_intensity" ? up.data.intensity ?? null : null;
+    setPlotOptions({
+      open: true, nodeId, wfId: activeWf.id, label: node.data.label,
+      cfg: normalizeIntensityPlotConfig(node.data.intensityPlot) ?? defaultIntensityPlotConfig(),
+      ctx: deriveIntensityPlotContext({ pickerCfg, tableCsv, pickerChanged: !!pickerCfg && up?.data.status !== "ok" }),
+      state: intensityPlotState(node.data),
+    });
+  }, [activeWfLocked, nodes, edges, collectInputs, activeWf.id]);
+
+  const closePlotOptions = useCallback(() => setPlotOptions((p) => ({ ...p, open: false })), []);
+
+  // Apply: regenerate the node's code from the options (the pure helper keeps
+  // a hand edit as the backup and marks an ok node stale, like a code edit).
+  const savePlotOptions = useCallback((cfg: IntensityPlotConfig) => {
+    const { nodeId, wfId } = plotOptions;
+    setPlotOptions((p) => ({ ...p, open: false }));
+    if (!nodeId || wfId !== activeWf.id || activeWfLocked()) return;
+    const savedAt = new Date().toISOString();
+    setNodes((cur) => withNodeData(cur, nodeId, (d) => applyIntensityPlotOptions(d, cfg, savedAt)));
+  }, [plotOptions, activeWf.id, activeWfLocked, setNodes]);
+
+  const restorePlotCode = useCallback((nodeId: string) => {
+    if (activeWfLocked()) return;
+    const savedAt = new Date().toISOString();
+    setNodes((cur) => withNodeData(cur, nodeId, (d) => restoreIntensityPlotBackup(d, savedAt)));
+  }, [activeWfLocked, setNodes]);
+
   const runNode = useCallback(async (node: Node<NodeData>, nodeMap: Map<string, Node<NodeData>>) => {
     // A locked workflow can't run: its results couldn't be written back.
     if (activeWfLocked()) return;
@@ -7034,6 +6717,16 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       }
       node = { ...node, data: { ...node.data, cellposeSeg: picked, code: cellposeSegToJson(picked) } };
     }
+    // An unmodified copy of the old hand-written "Plot intensities" template
+    // becomes the generated one (default options) here, on its next run, so
+    // reopening a document never rewrites it. Hand-edited copies run as written.
+    if (intensityPlotState(node.data) === "legacy") {
+      const fresh = defaultIntensityPlotFields();
+      node = { ...node, data: { ...node.data, ...fresh } };
+      setNodes((cur) => withNodeData(cur, node.id, (d) => ({ ...d, ...fresh })));
+      consoleRef.current += `\n=== ${node.data.label}: updated to the side-by-side plot template; double-click the node for options ===\n`;
+      setConsoleOut(consoleRef.current);
+    }
     // Parse a `# @name: <label>` / `// @name: <label>` marker from the
     // first 20 lines so users can name a node from within the code.
     const codeBody = node.data.code || "";
@@ -7044,6 +6737,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         setNodes((cur) => cur.map((n) => n.id === node.id ? { ...n, data: { ...n.data, label: newLabel } } : n));
       }
     }
+    // The code this run executes. If the node's code changes while it runs
+    // (code editor, Plot options), its results are stale on arrival.
+    const ranCode = node.data.code;
     // Mark running
     setNodes((cur) => cur.map((n) => n.id === node.id ? { ...n, data: { ...n.data, status: "running", error: undefined } } : n));
     // Which version of each upstream source this run reads — taken at the
@@ -7244,24 +6940,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         // frames named after their source. We assemble an inline
         // R script that defines `inputs <- list(...)` from the
         // upstream CSVs, then appends the user's code.
-        const tables = extra.filter((x) => x.kind === "table");
-        // R is usually spawned without LANG/LC_ALL (a Tauri app launched
-        // from Finder inherits no locale), so it runs under LC_CTYPE=C.
-        // In that locale read.csv(text=) TRANSLITERATES any non-ASCII
-        // byte into literal escape text — "µm" becomes the 9-character
-        // string "<c2><b5>m", which then draws as garbage in every plot
-        // label.  Marking the CSV string as UTF-8 *before* parsing is the
-        // only thing that survives: passing encoding="UTF-8" to read.csv
-        // has no effect on the text= path, and re-marking afterwards is
-        // too late because the character is already destroyed.
-        const csvHelper =
-          '.mpfig_csv <- function(s) { Encoding(s) <- "UTF-8"; read.csv(text = s, stringsAsFactors = FALSE) }\n';
-        const inputsAssign = tables.map((t, i) =>
-          `  ${JSON.stringify(t.label || `t${i}`)} = .mpfig_csv(${JSON.stringify(t.csv || "")})`
-        ).join(",\n");
-        const prelude = tables.length > 0
-          ? `${csvHelper}inputs <- list(\n${inputsAssign}\n)\n# Convenience: \`data\` aliases the first input table.\nif (length(inputs) > 0) data <- inputs[[1]] else data <- data.frame()\n\n`
-          : `inputs <- list()\ndata <- data.frame()\n\n`;
+        // utils/rPrelude: `inputs` / `data` from the upstream CSVs (read as
+        // UTF-8 whatever R's locale), plus their text as .mpfig_csv_text.
+        const prelude = rInputsPrelude(extra.filter((x) => x.kind === "table"));
         const fullCode = prelude + (node.data.code || R_DEFAULT);
         rExecutedCode = fullCode;
         const resp = await fetch(`${apiBase}/api/analysis/run-r`, {
@@ -7352,7 +7033,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           data: {
             ...n.data,
             outputs: [...tagged, ...kept],
-            status: result.success ? "ok" : "error",
+            status: !result.success ? "error" : n.data.code === ranCode ? "ok" : "stale",
             error: result.success ? undefined : (result.stderr || "Run failed").slice(0, 200),
             consoleOut: nodeOut,
             ranWith: result.success ? ranWith : n.data.ranWith,
@@ -7537,7 +7218,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     try {
       const cur = allOutputsRef.current.find((o) => o.nodeId === ed.nodeId && o.outputId === ed.outputId);
       const dims = cur ? await _pngDims(cur.payload) : { w: 0, h: 0 };
-      const res = await api.runR(ed.rCode, "", ed.rInterpreter ?? undefined, null, {
+      // The header-only CSV the node's own run sends: an empty one makes the
+      // harness's read.csv stop R before anything is re-rendered.
+      const res = await api.runR(ed.rCode, `${MEAS_CSV_HEADER}\n`, ed.rInterpreter ?? undefined, null, {
         textOverrides: ov,
         overrideOnly: true,
         renderOverride: true,   // force the single-plot re-render even when ov is empty (reset)
@@ -7546,8 +7229,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         overrideHeight: dims.h || 850,
         overrideRes: 300,
       });
-      if (res.success && res.plots && res.plots[0]) {
-        const newPng = res.plots[0];
+      // No image (e.g. not a ggplot) keeps the card as it is, with the reason.
+      const newPng = rRerunPng(res, { override: true });
+      if (newPng) {
         const storeOv = Object.keys(ov).length ? ov : undefined;
         setNodes((curNodes) => curNodes.map((n) => n.id !== ed.nodeId ? n : {
           ...n,
@@ -7560,7 +7244,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         }));
         setRTextEditor(null);
       } else {
-        setRTextEditor((s) => s && ({ ...s, applying: false, error: (res.stderr || "Re-render failed").slice(-400) }));
+        setRTextEditor((s) => s && ({ ...s, applying: false, error: rRerenderError(res) }));
       }
     } catch (e) {
       setRTextEditor((s) => s && ({ ...s, applying: false, error: String(e) }));
@@ -7939,7 +7623,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         hasMeasurements, highlightedUpstreamIds,
         inputCountsByNode, declaredByNode,
         staleNodeIds: stale.nodeIds, staleSourceKeys: stale.sourceKeys,
-        locked: activeLocked,
+        locked: activeLocked, openPlotOptions,
       }}>
       <Box sx={{ flex: 1, display: "flex", minHeight: 0, position: "relative" }}>
       {/* Far left: source library panel.  Lists every flagged inset
@@ -8193,6 +7877,12 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           // Every edge gets the × delete button + wide hit area.
           defaultEdgeOptions={{ type: "deletable" }}
           onNodeClick={(_, n) => setSelectedNodeId(n.id)}
+          // Double-click a "Plot intensities" node for its Plot options (a no-op
+          // on other nodes and in a locked workflow). An output chip's own
+          // double-click (preview) stops propagation, so it never gets here.
+          // Canvas double-click zoom is off: it would zoom under the dialog.
+          onNodeDoubleClick={(_, n) => openPlotOptions(n.id)}
+          zoomOnDoubleClick={false}
           onPaneClick={() => setSelectedNodeId(null)}
           onSelectionChange={({ nodes: sn, edges: se }) => {
             // BAIL OUT when nothing actually changed.  React Flow fires
@@ -8691,6 +8381,43 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
               </Box>
             );
           })()}
+          {/* "Plot intensities" node: its code is generated from Plot options. */}
+          {(() => {
+            const d = selectedNode.data;
+            const st = intensityPlotState(d);
+            if (st === "none") return null;
+            const newer = isFutureIntensityPlotConfig(d.intensityPlot);
+            const caption = newer
+              ? "Options saved by a newer version of the app; update it to change them"
+              : intensityPlotSummary(normalizeIntensityPlotConfig(d.intensityPlot) ?? defaultIntensityPlotConfig())
+                + (st === "legacy" ? " · the new layout is used from the next run" : "");
+            return (
+              <Box sx={{ display: "flex", alignItems: "center", gap: 1, flexWrap: "wrap", px: 1, py: 0.75, borderBottom: "1px solid", borderColor: "divider", bgcolor: "action.hover" }}>
+                <Button size="small" variant="contained" disabled={activeLocked || newer} onClick={() => openPlotOptions(selectedNode.id)}
+                  sx={{ textTransform: "none", fontSize: "0.7rem" }}>
+                  📊 Plot options…
+                </Button>
+                <Typography variant="caption" sx={{ color: "text.secondary", lineHeight: 1.3, flex: 1, minWidth: 120 }}>
+                  {caption}
+                  {st === "edited" && !newer && (
+                    <Box component="span" sx={{ display: "block", color: "warning.main" }}>
+                      R code edited by hand: it runs as written until options are applied again
+                    </Box>
+                  )}
+                </Typography>
+                {d.intensityPlotBackup && (
+                  <Tooltip title={`Put back the code that applying options replaced (saved ${new Date(d.intensityPlotBackup.savedAt).toLocaleString()})`}>
+                    <span>
+                      <Button size="small" variant="outlined" disabled={activeLocked} onClick={() => restorePlotCode(selectedNode.id)}
+                        sx={{ textTransform: "none", fontSize: "0.7rem" }}>
+                        Restore previous code
+                      </Button>
+                    </span>
+                  </Tooltip>
+                )}
+              </Box>
+            );
+          })()}
           {/* Layer-1 preset selector — built-in snippets + user-
               saved presets stored per-engine in localStorage.  The
               Select is controlled by the node's currentPreset field
@@ -8734,8 +8461,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                   const newLabel = /^Custom/i.test(preset.name)
                     ? (engine === "python" ? "Python" : engine === "matlab" ? "MATLAB" : engine === "imagej" ? "ImageJ" : engine === "cellpose" ? "Cellpose" : "R Plot")
                     : preset.name;
+                  // The preset's code replaces a "Plot intensities" node's
+                  // generated code, so its plot options go too.
                   setNodes((cur) => cur.map((n) => n.id === selectedNode.id
-                    ? { ...n, data: { ...n.data, code: preset!.code, label: newLabel, status: "idle" as const, currentPreset: val } } : n));
+                    ? { ...n, data: { ...withoutIntensityPlot(n.data), code: preset!.code, label: newLabel, status: "idle" as const, currentPreset: val } } : n));
                 }
               }}
               sx={{ fontSize: "0.65rem", height: 26, minWidth: 200, "& .MuiSelect-select": { py: 0.4, px: 1 } }}
@@ -9089,7 +8818,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                               <Typography variant="caption"
                                 onClick={() => openPreview(o.nodeId, o.outputId)}
                                 sx={{ fontSize: "0.6rem", color: "primary.main", cursor: "pointer", textDecoration: "underline" }}>
-                                {(o.payload.split("\n").length - 1)} rows — preview
+                                {csvDataRowCount(o.payload)} rows — preview
                               </Typography>
                             </Tooltip>
                           )}
@@ -9284,7 +9013,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                   // doesn't degenerate into a single <pre> column.
                   <Box sx={{ width: "100%", maxHeight: "85vh", overflow: "auto", bgcolor: "background.paper", p: 1, border: "1px solid", borderColor: "divider", borderRadius: 0.5 }}>
                     {(() => {
-                      const rows = o.payload.split("\n").filter((r) => r.length > 0).map((r) => r.split(","));
+                      // Quoted cells may hold commas ("1hr, Sample 1"): a plain
+                      // split shifted every later cell under the wrong header.
+                      const rows = parseCsvTable(o.payload);
                       if (rows.length === 0) return <Typography variant="caption">(empty)</Typography>;
                       const header = rows[0];
                       const body = rows.slice(1);
@@ -9352,6 +9083,16 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         initial={intensityPicker.cfg}
         onClose={closeIntensityPicker}
         onSave={saveIntensityPicker}
+      />
+      {/* "Plot intensities" options — which graphs and how each one looks. */}
+      <IntensityPlotOptionsDialog
+        open={plotOptions.open}
+        initial={plotOptions.cfg}
+        context={plotOptions.ctx}
+        codeState={plotOptions.state}
+        nodeLabel={plotOptions.label}
+        onClose={closePlotOptions}
+        onSave={savePlotOptions}
       />
       {/* Cellpose segmentation picker — model/diameter/channel controls +
           live outline preview. Configures the kind:"cellpose" node's run

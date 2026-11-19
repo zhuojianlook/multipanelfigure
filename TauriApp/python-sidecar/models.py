@@ -245,6 +245,12 @@ class ThicknessReading:
     measure_position_x: float = -1.0            # absolute label pos (% 0-100), -1 = auto
     measure_position_y: float = -1.0
     styled_segments: List[StyledSegment] = field(default_factory=list)
+    # Per-reading label size (pt at the 216pt reference, like the
+    # measurement's measure_font_size) / colour, set in batch in the Edit
+    # Panel. None = inherit the measurement's. A styled segment's own
+    # size / colour still wins over these.
+    font_size: Optional[float] = None
+    color: Optional[str] = None
 
 
 @dataclass
@@ -252,9 +258,11 @@ class ThicknessMeasurement:
     """Curved Surface Measurement — thickness readings between two
     circular-arc surfaces.
 
-    Each surface is a 3-point circular arc (`top_points` / `bottom_points`,
-    each three (x%, y%) points). An ODD `num_readings` is placed along the
-    top arc — one exactly on the user's `center` node (0..1 of arc length),
+    Each surface is a curve through the user's points (`top_points` /
+    `bottom_points`, two or more (x%, y%) points each: 2 = straight, 3 = the
+    circular arc through them, 4+ = a smooth spline through every point —
+    see the frontend's utils/thicknessGeometry). An ODD `num_readings` is
+    placed along the top surface — one exactly on the user's `center` node (0..1 of arc length),
     the rest spread symmetrically either side, `spacing` apart as a fraction
     of the top arc's length. Each reading runs from its anchor to the
     NEAREST point on the bottom arc (minimal distance, perpendicular to the
@@ -265,8 +273,8 @@ class ThicknessMeasurement:
     polyline samples of the two arcs (also frontend-computed) so the backend
     can draw the guide curves without duplicating the arc math."""
     name: str = ""
-    top_points: List[Tuple[float, float]] = field(default_factory=list)     # 3 x (x%, y%)
-    bottom_points: List[Tuple[float, float]] = field(default_factory=list)  # 3 x (x%, y%)
+    top_points: List[Tuple[float, float]] = field(default_factory=list)     # 2+ x (x%, y%)
+    bottom_points: List[Tuple[float, float]] = field(default_factory=list)  # 2+ x (x%, y%)
     num_readings: int = 5          # always odd — a reading sits on `center`
     center: float = 0.5            # 0..1 along the top arc (draggable node)
     spacing: float = 0.12          # step between readings, fraction of top arc length

@@ -180,6 +180,7 @@ import { SaveFigureDialog } from "../dialogs/SaveFigureDialog";
 import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 import { ensureProjectSaved } from "../../utils/projectNav";
 import { DEFAULT_FIGURE_ID } from "../../utils/figures";
+import { rRerunPng, rRerenderError } from "../../utils/rRerender";
 
 /** CRC-32 (PNG polynomial) over a byte array — used to checksum the pHYs
  *  chunk we splice into the exported PNG. */
@@ -612,8 +613,10 @@ function SaveCollageButton() {
             overrideRes: Math.round(150 * k),
             overridePlotIndex: it.rPlotIndex ?? 0,
           });
-          const png = res.plots?.[0];
-          if (res.success && png) hiRes.set(it.id, `data:image/png;base64,${png}`);
+          // No image (e.g. not a ggplot): export keeps the item's existing raster.
+          const png = rRerunPng(res, { override: true });
+          if (png) hiRes.set(it.id, `data:image/png;base64,${png}`);
+          else console.warn("[collage] hi-res R render unavailable for", it.name, "-", rRerenderError(res));
         } catch (e) {
           console.warn("[collage] hi-res R render failed for", it.name, e);
         }

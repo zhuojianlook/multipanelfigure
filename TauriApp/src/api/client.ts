@@ -727,8 +727,9 @@ class ApiClient {
     rscriptPath?: string,
     baseFontSize?: number | null,
     opts?: {
-      /** Per-slot ggplot text overrides (title/axis/legend …) applied to
-       *  last_plot() — see backend RAnalysisRequest.text_overrides. */
+      /** Per-slot ggplot text overrides (title/axis/legend …) applied to the
+       *  plot overridePlotIndex selects — see backend
+       *  RAnalysisRequest.text_overrides. */
       textOverrides?: Record<string, unknown> | null;
       /** Return ONLY the override-applied plot (zz_mpfig_override.png). */
       overrideOnly?: boolean;
@@ -738,19 +739,21 @@ class ApiClient {
       /** PNG device res for the override plot; scale together with width/height
        *  to enlarge the whole plot uniformly (crisp, same proportions). */
       overrideRes?: number;
-      /** Force the last_plot() re-render even without text overrides (used to
-       *  re-render an R plot at a higher resolution for high-DPI export). */
+      /** Force the re-render of the selected plot even without text overrides
+       *  (used to re-render an R plot at a higher resolution for high-DPI
+       *  export). */
       renderOverride?: boolean;
-      /** Also return the plot's current ggplot text labels under `labels`. */
+      /** Also return the selected plot's ggplot text labels under `labels`. */
       emitLabels?: boolean;
       /** Render the override plot as SVG (vector) and return it under `svg` —
        *  used so collage R plots are crisp at any zoom. */
       renderSvg?: boolean;
-      /** 0-indexed plot to target in the override re-render.  Without this
-       *  the backend grabs ggplot2::last_plot(), which collapses every
-       *  output of a multi-plot script to the SAME plot — so two figures
-       *  from one script both ended up identical after a re-render.  Pass
-       *  the collage item's rPlotIndex here. */
+      /** Which plot the re-render / labels target: its 0-based position in
+       *  the `plots` list a normal run of the same code returns (filename
+       *  order, NOT mpfig_plot() call order) — i.e. the item's stored
+       *  rPlotIndex. A plot that cannot be re-rendered (not a ggplot drawn
+       *  through mpfig_plot()) comes back as no image + `override_error`,
+       *  never as a different plot. */
       overridePlotIndex?: number;
     },
   ): Promise<{
@@ -767,6 +770,13 @@ class ApiClient {
     labels?: Record<string, string>;
     /** Vector SVG of the override plot (only when renderSvg was set). */
     svg?: string | null;
+    /** Why no override image came back for overridePlotIndex (no such plot
+     *  any more, not a ggplot, R error). Null when it did or none was asked. */
+    override_error?: string | null;
+    /** Machine-readable override_error: "not_ggplot" / "not_mpfig_plot" /
+     *  "no_such_plot" (the script can never re-render this plot),
+     *  "script_error" / "mismatch" / "render_failed", or null. */
+    override_code?: string | null;
   }> {
     return apiJson("/api/analysis/run-r", "POST", JSON.stringify({
       code, data_csv: dataCsv, rscript_path: rscriptPath || null,

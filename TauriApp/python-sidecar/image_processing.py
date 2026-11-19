@@ -965,6 +965,7 @@ def draw_thickness_measurements(image: Image.Image, items,
         font = _load_font(m_font_path, scaled_font_size,
                           font_name=m_font_name, font_style=m_font_style)
         cap = max(3.0, 4.0 * width_scale)
+        fonts_by_px = {scaled_font_size: font}
 
         for _ri, rd in enumerate(getattr(tm, 'readings', None) or []):
             if getattr(rd, 'hidden', False):
@@ -987,6 +988,28 @@ def draw_thickness_measurements(image: Image.Image, items,
 
             if not show_measure:
                 continue
+
+            # Per-reading label size / colour (set in batch in the Edit
+            # Panel); None = the measurement's. Mirrors the dialog overlay.
+            r_pt = getattr(rd, 'font_size', None)
+            try:
+                r_pt = float(r_pt) if r_pt is not None else None
+            except (TypeError, ValueError):
+                r_pt = None
+            if not r_pt or r_pt <= 0:
+                r_pt = m_font_size
+            r_color = getattr(rd, 'color', None) or m_color
+            if r_color is not m_color:
+                try:
+                    ImageColor.getrgb(r_color)
+                except (ValueError, TypeError, AttributeError):
+                    r_color = m_color
+            r_px = max(8, int(r_pt * font_scale))
+            r_font = fonts_by_px.get(r_px)
+            if r_font is None:
+                r_font = _load_font(m_font_path, r_px,
+                                    font_name=m_font_name, font_style=m_font_style)
+                fonts_by_px[r_px] = r_font
 
             text = getattr(rd, 'text', '') or ''
             if not text:
@@ -1026,9 +1049,9 @@ def draw_thickness_measurements(image: Image.Image, items,
             # then keep the whole box on the image — the along-axis offset plus
             # the alternate-row stagger will otherwise throw a label for a
             # reading near the edge clean off the panel.
-            tw, th = _text_size(draw, text, font)
+            tw, th = _text_size(draw, text, r_font)
             tx -= tw // 2; ty -= th // 2
-            tx, ty = _clamp_text_pos(draw, text, font, tx, ty, iw, ih)
+            tx, ty = _clamp_text_pos(draw, text, r_font, tx, ty, iw, ih)
 
             # Leader: a hairline from the value back to the tick it measures.
             # Values sit off their line and alternate rows are staggered a
@@ -1049,7 +1072,7 @@ def draw_thickness_measurements(image: Image.Image, items,
                     sx, sy = lcx + ux_l * t_edge, lcy + uy_l * t_edge
                     # Only draw when the label actually sits off the tick.
                     if dist > t_edge + 1.0:
-                        draw.line([(sx, sy), (tx0, ty0)], fill=m_color,
+                        draw.line([(sx, sy), (tx0, ty0)], fill=r_color,
                                   width=max(1, int(round(width * 0.5))))
 
             segs = getattr(rd, 'styled_segments', None) or []
@@ -1058,13 +1081,13 @@ def draw_thickness_measurements(image: Image.Image, items,
                     draw, (tx, ty), segs,
                     base_font_name=m_font_name,
                     base_font_path=m_font_path,
-                    base_size_px=scaled_font_size,
-                    base_size_pt=m_font_size,
-                    base_color=m_color,
+                    base_size_px=r_px,
+                    base_size_pt=r_pt,
+                    base_color=r_color,
                     base_style=m_font_style,
                 )
             else:
-                draw.text((tx, ty), text, fill=m_color, font=font)
+                draw.text((tx, ty), text, fill=r_color, font=r_font)
 
     return img
 

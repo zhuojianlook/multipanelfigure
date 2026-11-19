@@ -12,6 +12,7 @@ import type { Node, Edge } from "@xyflow/react";
 import type { BandPickerConfig } from "../components/dialogs/BandPickerDialog";
 import type { FluorIntensityConfig } from "../components/dialogs/IntensityPickerDialog";
 import type { CellposeSegConfig } from "../components/dialogs/CellposeSegDialog";
+import type { IntensityPlotConfig } from "./intensityPlotOptions";
 
 export type DataKind = "image" | "table" | "plot";
 export type EngineKind = "python" | "matlab" | "r" | "imagej" | "cellpose";
@@ -131,6 +132,8 @@ export interface NodeOutput {
    *  can re-run it at a new font size via "Synchronize headers". */
   rCode?: string;
   rInterpreter?: string | null;
+  /** Position of this plot in the run's returned `plots` (filename order) —
+   *  run-r's override_plot_index. */
   rPlotIndex?: number;
   /** Destinations this output has already been committed to (one entry
    *  per "Send" click). Surfaced as small chips on the output card so
@@ -228,6 +231,12 @@ export interface NodeData {
   intensity?: FluorIntensityConfig;
   /** Cellpose segmentation config (only when interactive === "cellpose_seg"). */
   cellposeSeg?: CellposeSegConfig;
+  /** "Plot intensities" options; `code` is generated from them. */
+  intensityPlot?: IntensityPlotConfig;
+  /** hashCode of the generated `code`; a mismatch means it was edited by hand. */
+  intensityPlotHash?: string;
+  /** The hand-edited code that applying options last replaced. */
+  intensityPlotBackup?: { code: string; savedAt: string };
   [key: string]: unknown;  // index signature for ReactFlow's Record
 }
 

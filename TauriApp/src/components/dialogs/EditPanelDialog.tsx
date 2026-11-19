@@ -82,11 +82,14 @@ import type { PctPt } from "../../utils/scaleCalibration";
 import {
   computeThicknessReadings, readingValue, normalizeCount, maxSpacingFor,
   snapToCurve, paramOnCurve, pointOnCurve,
+  insertSurfacePoint, removeSurfacePoint, reanchorTop,
 } from "../../utils/thicknessGeometry";
 import type { Pt as ThickPt, ThicknessReadingData } from "../../utils/thicknessGeometry";
 import { alert as alertDialog, confirm as confirmDialog, confirmThree } from "../shared/ConfirmDialog";
 import { StyledTextField } from "../shared/StyledTextField";
 import { ColorPickerButton } from "../shared/ColorPickerButton";
+import { ReadingBatchStyleBar } from "./ReadingBatchStyleBar";
+import { ThicknessSurfaceChip } from "./ThicknessSurfaceChip";
 import type {
   PanelInfo,
   LabelSettings,
@@ -102,6 +105,35 @@ interface Props {
   onClose: () => void;
   row: number;
   col: number;
+}
+
+/* Curved Surface editing mode (UI-only, never persisted).
+   `trace` = preview clicks append to `which`; `edit` = clicks insert into it
+   where they fall along the surface; `idle` = no mode AND no implicit
+   "trace the incomplete surface" fallback (after Esc / leaving a mode).
+   `prevPts` = that surface's points when the trace began (Esc on a trace
+   with fewer than 2 points restores them); `isNew` = the measurement was
+   just added (Esc before any surface is complete removes it again). */
+type ThickSurfState = {
+  idx: number;
+  which: "top" | "bottom";
+  kind: "trace" | "edit" | "idle";
+  prevPts: [number, number][];
+  isNew: boolean;
+};
+type ThickSurfMode = { which: "top" | "bottom"; kind: "trace" | "edit" };
+
+/** The selected measurement's mode: the explicit one, else trace whichever
+ *  surface still has fewer than 2 points (top first), else none. */
+function thicknessSurfaceModeOf(
+  tm: { top_points?: [number, number][]; bottom_points?: [number, number][] },
+  idx: number,
+  s: ThickSurfState | null,
+): ThickSurfMode | null {
+  if (s && s.idx === idx) return s.kind === "idle" ? null : { which: s.which, kind: s.kind };
+  if ((tm.top_points?.length ?? 0) < 2) return { which: "top", kind: "trace" };
+  if ((tm.bottom_points?.length ?? 0) < 2) return { which: "bottom", kind: "trace" };
+  return null;
 }
 
 function TabPanel({ children, value, index }: { children: React.ReactNode; value: number; index: number }) {
@@ -2673,7 +2705,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     ] as unknown as (keyof PanelInfo)[],
     labels: ["labels"] as unknown as (keyof PanelInfo)[],
     scale: ["scale_bar", "add_scale_bar"] as unknown as (keyof PanelInfo)[],
-    annot: ["symbols", "lines", "areas"] as unknown as (keyof PanelInfo)[],
+    annot: ["symbols", "lines", "areas", "thickness_measurements"] as unknown as (keyof PanelInfo)[],
     zoom: ["zoom_inset", "add_zoom_inset"] as unknown as (keyof PanelInfo)[],
   };
   const historyRef = useRef<Record<TabKey, { stack: Partial<PanelInfo>[]; idx: number }>>({
@@ -2979,6 +3011,14 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   // editor controls light up the right entry.
   const [selectedInsetIdx, setSelectedInsetIdx] = useState(0);
   const [selectedAnnotIdx, setSelectedAnnotIdx] = useState<{ type: "symbol" | "line" | "area" | "thickness"; idx: number } | null>(null);
+  // Curved Surface: which surface is being traced / edited, the selected
+  // surface point (Delete removes it), a transient warning, and the readings
+  // ticked for batch size / colour. UI-only state — nothing is persisted.
+  const [thickSurf, setThickSurf] = useState<ThickSurfState | null>(null);
+  const [thickSelPt, setThickSelPt] = useState<{ which: "top" | "bottom"; pi: number } | null>(null);
+  const [thickMsg, setThickMsg] = useState("");
+  const thickMsgTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [thickSelRd, setThickSelRd] = useState<Set<number>>(() => new Set());
   // Per-type collapse state for the Annotations tab's four sections
   // (Symbols / Lines / Areas / Thickness), so the tab stays compact when a
   // panel has many annotations of many types.
@@ -3384,6 +3424,59 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     return () => window.removeEventListener("keydown", onKey, true);
   }, [scaleMeasureActive]);
 
+  /* ── Curved Surface: mode resets + keyboard ─────────────────────
+     Enter finishes the traced surface, Delete / Backspace removes the
+     selected surface point, Esc leaves the mode — and on a trace with
+     fewer than 2 points CANCELS it (see escapeSurface). The handler body
+     is assigned each render (thickKeyRef) so it always sees fresh state. */
+  const selThickIdx = selectedAnnotIdx?.type === "thickness" ? selectedAnnotIdx.idx : -1;
+  const selThickTm = selThickIdx >= 0
+    ? ((local?.thickness_measurements ?? []) as ThicknessMeasurement[])[selThickIdx]
+    : undefined;
+  const selThickRdLen = selThickTm?.readings?.length ?? 0;
+  const selThickTopN = selThickTm?.top_points?.length ?? 0;
+  const selThickBotN = selThickTm?.bottom_points?.length ?? 0;
+  useEffect(() => {
+    setThickSurf(null); setThickSelPt(null); setThickSelRd(new Set()); setThickMsg("");
+  }, [open, row, col, tabIdx]);
+  useEffect(() => {
+    // Keep a mode set by the same handler that selected this measurement
+    // (Add Measurement starts tracing its top surface straight away).
+    setThickSurf((s) => (s && s.idx === selThickIdx ? s : null));
+    setThickSelPt(null); setThickSelRd(new Set());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedAnnotIdx?.type, selectedAnnotIdx?.idx]);
+  // Reading indices shift when the count changes — drop the batch selection.
+  useEffect(() => { setThickSelRd(new Set()); }, [selThickRdLen]);
+  // An undo can take the selected surface point away.
+  useEffect(() => {
+    setThickSelPt((p) => (p && p.pi >= (p.which === "top" ? selThickTopN : selThickBotN) ? null : p));
+  }, [selThickTopN, selThickBotN]);
+  useEffect(() => () => { if (thickMsgTimerRef.current) clearTimeout(thickMsgTimerRef.current); }, []);
+  const thickKeyRef = useRef<(e: KeyboardEvent) => boolean>(() => false);
+  const thickKbActive = open && tabIdx === TAB_ANNOT && !!selThickTm
+    && (thickSelPt !== null || thicknessSurfaceModeOf(selThickTm, selThickIdx, thickSurf) !== null);
+  useEffect(() => {
+    if (!thickKbActive) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (!["Escape", "Enter", "Delete", "Backspace"].includes(e.key)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      // Same layering guards as the scale-measure Esc above.
+      const t = e.target as HTMLElement | null;
+      if (t?.closest?.('[role="listbox"],[role="menu"],.MuiPopover-root,.MuiPopper-root,.MuiAutocomplete-popper')) return;
+      const dlg = t?.closest?.(".MuiDialog-root");
+      if (dlg && !dlg.hasAttribute("data-edit-panel-dialog")) return;
+      // Text fields keep their own Enter / Delete / Backspace. Esc stays
+      // ours while a surface is traced or edited, so it never reaches MUI
+      // and closes the whole Edit Panel.
+      const isTyping = !!t && (["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName) || t.isContentEditable);
+      if (isTyping && e.key !== "Escape") return;
+      if (thickKeyRef.current(e)) { e.preventDefault(); e.stopPropagation(); }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [thickKbActive]);
+
   /* ── Preview zoom / pan ─────────────────────────────────────────
      A CSS transform on the aspect wrapper. Everything inside (the <img> and
      every % -positioned overlay) scales together, and because drag handlers
@@ -3526,8 +3619,8 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     // what the backend draws) plus the style/params, so dragging a curve
     // point or a single reading re-renders the matplotlib preview.
     const thickFp = (local.thickness_measurements || []).map((t) => {
-      const rds = (t.readings || []).map((r) => `${r.top?.[0]},${r.top?.[1]}>${r.bottom?.[0]},${r.bottom?.[1]}|${r.hidden ? 1 : 0}|${r.text || ""}`).join("/");
-      return `T:${t.name}|${t.color}|${t.width}|${t.show_curves}|${t.show_measure}|${t.measure_unit}|${t.measure_color}|${t.measure_font_name}|${t.measure_font_size}|n${t.num_readings}|c${t.center}|s${t.spacing}|rds(${rds})`;
+      const rds = (t.readings || []).map((r) => `${r.top?.[0]},${r.top?.[1]}>${r.bottom?.[0]},${r.bottom?.[1]}|${r.hidden ? 1 : 0}|${r.text || ""}|${r.font_size ?? ""}|${r.color ?? ""}`).join("/");
+      return `T:${t.name}|${t.color}|${t.width}|${t.show_curves}|${t.show_measure}|${t.measure_unit}|${t.measure_color}|${t.measure_font_name}|${t.measure_font_size}|n${t.num_readings}|c${t.center}|s${t.spacing}|rds(${rds})|tp${JSON.stringify(t.top_points)}|bp${JSON.stringify(t.bottom_points)}`;
     }).join(";;");
     return `${labelFp}::${sbFp}::${symFp}::${lineFp}::${areaFp}::${thickFp}`;
   })();
@@ -4122,12 +4215,175 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
     updateLocal({ thickness_measurements: arr } as unknown as Partial<PanelInfo>);
   };
 
-  /** Which curve the next preview click fills: top first, then bottom.
-   *  null once both surfaces have their 3 points. */
-  const thicknessActiveCurve = (t: ThicknessMeasurement): "top" | "bottom" | null =>
-    (t.top_points?.length ?? 0) < 3 ? "top"
-      : (t.bottom_points?.length ?? 0) < 3 ? "bottom"
-        : null;
+  /** What a preview click does for measurement `idx` (see ThickSurfState):
+   *  trace / edit a surface, or nothing. */
+  const thicknessSurfaceMode = (t: ThicknessMeasurement, idx: number): ThickSurfMode | null =>
+    thicknessSurfaceModeOf(t, idx, thickSurf);
+
+  const flashThickMsg = (m: string) => {
+    setThickMsg(m);
+    if (thickMsgTimerRef.current) clearTimeout(thickMsgTimerRef.current);
+    thickMsgTimerRef.current = setTimeout(() => setThickMsg(""), 2500);
+  };
+  const thickAt = (ti: number) =>
+    ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[])[ti];
+  const surfPts = (t: ThicknessMeasurement, which: "top" | "bottom") =>
+    ((which === "top" ? t.top_points : t.bottom_points) ?? []) as [number, number][];
+
+  /** Every surface point add / remove goes through here. `reanchor` keeps
+   *  the reading set physically in place when a TOP point is added or
+   *  removed (centre / spacing are fractions of the surface's length). */
+  const setSurfacePoints = (
+    ti: number, which: "top" | "bottom", pts: [number, number][], opts?: { reanchor?: boolean },
+  ) => {
+    const cur = thickAt(ti);
+    if (!cur) return;
+    const key = which === "top" ? "top_points" : "bottom_points";
+    const patch: Partial<ThicknessMeasurement> = { [key]: pts };
+    if (which === "top" && opts?.reanchor) {
+      Object.assign(patch, reanchorTop(
+        (cur.top_points ?? []) as ThickPt[], pts as ThickPt[], cur.center, cur.spacing,
+        svgDims.w || 1000, svgDims.h || 1000,
+      ));
+    }
+    applyThickness(ti, patch);
+  };
+
+  const removeThickPoint = (ti: number, which: "top" | "bottom", pi: number) => {
+    const cur = thickAt(ti);
+    if (!cur) return;
+    const pts = surfPts(cur, which);
+    if (pi < 0 || pi >= pts.length) return;
+    if (pts.length <= 2) {
+      flashThickMsg("A surface needs at least 2 points — use Clear and retrace to start it again");
+      return;
+    }
+    setSurfacePoints(ti, which, removeSurfacePoint(pts as ThickPt[], pi) as [number, number][], { reanchor: true });
+    setThickSelPt(null);
+  };
+
+  /** Start tracing / editing a surface (or go idle). A trace remembers the
+   *  points it started from so Esc can put them back. */
+  const setSurfaceMode = (
+    ti: number, which: "top" | "bottom", kind: ThickSurfState["kind"], prevPts?: [number, number][],
+  ) => {
+    const same = thickSurf && thickSurf.idx === ti ? thickSurf : null;
+    const cur = thickAt(ti);
+    setThickSurf({
+      idx: ti, which, kind,
+      // A re-clear during the same trace keeps the ORIGINAL points to restore.
+      prevPts: same && same.kind === "trace" && same.which === which && kind === "trace"
+        ? same.prevPts
+        : (prevPts ?? (cur ? surfPts(cur, which) : [])),
+      isNew: !!same?.isNew,
+    });
+    setThickSelPt(null);
+  };
+
+  /** Enter / double-click / Done. A trace needs 2 points; finishing the top
+   *  surface moves straight on to tracing the bottom when that is missing. */
+  const finishSurface = () => {
+    if (selThickIdx < 0) return;
+    const ti = selThickIdx;
+    const cur = thickAt(ti);
+    if (!cur) return;
+    const mode = thicknessSurfaceMode(cur, ti);
+    if (!mode) return;
+    if (mode.kind === "trace" && surfPts(cur, mode.which).length < 2) {
+      flashThickMsg("A surface needs at least 2 points (Esc cancels)");
+      return;
+    }
+    const other = mode.which === "top" ? "bottom" : "top";
+    if (mode.kind === "trace" && surfPts(cur, other).length < 2) {
+      setSurfaceMode(ti, other, "trace");
+      return;
+    }
+    setSurfaceMode(ti, mode.which, "idle");
+  };
+
+  /** Esc. Leaves the mode; a trace with fewer than 2 points is CANCELLED —
+   *  the surface gets back the points it had when the trace began, and a
+   *  just-added measurement with no complete surface is removed. Never
+   *  closes the dialog. */
+  const escapeSurface = () => {
+    if (selThickIdx < 0) return;
+    const ti = selThickIdx;
+    const cur = thickAt(ti);
+    if (!cur) return;
+    const mode = thicknessSurfaceMode(cur, ti);
+    setThickSelPt(null);
+    if (!mode) return;
+    const pts = surfPts(cur, mode.which);
+    if (mode.kind === "trace" && pts.length < 2) {
+      const s = thickSurf && thickSurf.idx === ti && thickSurf.which === mode.which ? thickSurf : null;
+      const restored = s ? s.prevPts : pts;
+      const otherN = surfPts(cur, mode.which === "top" ? "bottom" : "top").length;
+      if (thickSurf?.idx === ti && thickSurf.isNew && restored.length < 2 && otherN < 2) {
+        const arr = ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[]).filter((_, j) => j !== ti);
+        updateLocal({ thickness_measurements: arr } as unknown as Partial<PanelInfo>);
+        setThickSurf(null);
+        setSelectedAnnotIdx(null);
+        return;
+      }
+      if (restored !== pts) setSurfacePoints(ti, mode.which, restored);
+      flashThickMsg(restored.length >= 2 ? "Retrace cancelled — surface restored" : "Tracing cancelled");
+    }
+    setSurfaceMode(ti, mode.which, "idle");
+  };
+
+  thickKeyRef.current = (e: KeyboardEvent) => {
+    if (selThickIdx < 0) return false;
+    const cur = thickAt(selThickIdx);
+    if (!cur) return false;
+    const mode = thicknessSurfaceMode(cur, selThickIdx);
+    if (e.key === "Enter") {
+      if (!mode) return false;
+      finishSurface();
+      return true;
+    }
+    if (e.key === "Delete" || e.key === "Backspace") {
+      if (!thickSelPt) return false;
+      removeThickPoint(selThickIdx, thickSelPt.which, thickSelPt.pi);
+      return true;
+    }
+    if (e.key === "Escape") {
+      if (!mode && !thickSelPt) return false;
+      escapeSurface();
+      return true;
+    }
+    return false;
+  };
+
+  /** Batch size / colour onto the given readings, in one write. */
+  const applyReadingStyle = (ti: number, idxs: number[], patch: { font_size?: number | null; color?: string | null }) => {
+    const cur = thickAt(ti);
+    if (!cur) return;
+    const rds = [...(cur.readings ?? [])];
+    const base = cur.measure_color || cur.color;
+    for (const k of idxs) {
+      const r = rds[k];
+      if (!r) continue;
+      const next = { ...r, ...patch };
+      // Typing a custom value bakes the then-current colour into its
+      // styled segments (StyledTextField). Retint those inherited runs so
+      // the batch colour shows on that reading too — in the figure as well
+      // as here; runs the user coloured on purpose keep their colour.
+      if ("color" in patch && (r.styled_segments ?? []).length) {
+        const oldEff = (r.color || base || "").toLowerCase();
+        const newEff = next.color || base;
+        next.styled_segments = (r.styled_segments ?? []).map((g) =>
+          (g.color || "").toLowerCase() === oldEff ? { ...g, color: newEff } : g);
+      }
+      rds[k] = next;
+    }
+    applyThickness(ti, { readings: rds });
+  };
+  const toggleThickRd = (ri: number) =>
+    setThickSelRd((prev) => {
+      const next = new Set(prev);
+      if (next.has(ri)) next.delete(ri); else next.add(ri);
+      return next;
+    });
 
   const defaultThickness = (n: number): ThicknessMeasurement => ({
     name: `Curved surface ${n}`,
@@ -4586,7 +4842,15 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
   };
 
   return (
-    <Dialog open={open} onClose={handleCancel} maxWidth="lg" fullWidth data-edit-panel-dialog="">
+    <Dialog
+      open={open} onClose={handleCancel} maxWidth={false} fullWidth data-edit-panel-dialog=""
+      // Wider preview when the window has room: never narrower than the old
+      // "lg" (1200px) cap, and above that grow with the window up to the
+      // width at which a 2:1 image reaches the preview's 68vh height limit
+      // (490px ≈ 400 controls + gap + paddings). Image-independent, so the
+      // dialog doesn't resize between tabs; windows ≤ 1264px are unchanged.
+      slotProps={{ paper: { sx: { maxWidth: "max(1200px, min(calc(100vw - 64px), calc(490px + 136vh)))" } } }}
+    >
       <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", py: 1 }}>
         <Box component="span">Edit Panel R{row + 1} C{col + 1}</Box>
         {/* Undo / Redo — applies to every tab (crop, resize, adjustments,
@@ -6595,8 +6859,8 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
             </AnnotationSection>
 
             {/* ── Curved surface measurements ───────────────────
-                Two 3-point circular-arc surfaces with N perpendicular
-                readings between them. Geometry lives in
+                Two traced surfaces (2+ points each: straight / arc /
+                smooth spline) with N perpendicular readings between them. Geometry lives in
                 utils/thicknessGeometry.ts; every control here routes
                 through applyThickness() which re-resolves the readings. */}
             <AnnotationSection
@@ -6609,14 +6873,16 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 const arr = [...thicknessList, defaultThickness(thicknessList.length + 1)];
                 updateLocal({ thickness_measurements: arr } as unknown as Partial<PanelInfo>);
                 setSelectedAnnotIdx({ type: "thickness", idx: arr.length - 1 });
+                setThickSurf({ idx: arr.length - 1, which: "top", kind: "trace", prevPts: [], isNew: true });
+                setThickSelPt(null);
               }}
             >
               {thicknessList.map((tm, i) => {
                 const isActive = selectedAnnotIdx?.type === "thickness" && selectedAnnotIdx.idx === i;
-                const active = thicknessActiveCurve(tm);
+                const mode = isActive ? thicknessSurfaceMode(tm, i) : null;
                 const nTop = tm.top_points?.length ?? 0;
                 const nBot = tm.bottom_points?.length ?? 0;
-                const ready = nTop === 3 && nBot === 3;
+                const ready = nTop >= 2 && nBot >= 2;
                 const discordant = thicknessDiscordant(tm);
                 const uLab: Record<string, string> = { km: "km", m: "m", cm: "cm", mm: "mm", um: "µm", nm: "nm", pm: "pm" };
                 const uT = tm.measure_unit || "um";
@@ -6635,7 +6901,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                     <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
                       <Box sx={{ width: 12, height: 12, borderRadius: 0.25, bgcolor: tm.color, flexShrink: 0 }} />
                       <Typography variant="caption" sx={{ flex: 1, fontSize: "0.7rem" }}>
-                        {tm.name} — {ready ? `${tm.readings?.length ?? 0} readings` : `${nTop}/3 top, ${nBot}/3 bottom`}
+                        {tm.name} — {ready ? `${tm.readings?.length ?? 0} readings` : `${nTop} top / ${nBot} bottom points`}
                       </Typography>
                       {/* Scale discordance indicator — this annotation measures
                           with a scale that differs from the image's bar. */}
@@ -6674,31 +6940,88 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         />
                       </Box>
 
-                      {/* Surfaces */}
+                      {/* Surfaces — as many points as the user likes. Click a
+                          surface's button (or its curve on the preview) to
+                          add / remove points; the restart icon clears it and
+                          traces it again. */}
                       <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary", fontSize: "0.68rem" }}>
-                        Surfaces (3 points each)
+                        Surfaces (2 or more points each)
                       </Typography>
                       <Box sx={{ display: "flex", gap: 0.5 }}>
-                        <Button
-                          size="small" variant={active === "top" ? "contained" : "outlined"}
-                          onClick={(e) => { e.stopPropagation(); applyThickness(i, { top_points: [] }); }}
-                          sx={{ flex: 1, fontSize: "0.62rem", py: 0.25, textTransform: "none" }}
-                        >
-                          Top ({nTop}/3){active === "top" ? " — click image" : ""}
-                        </Button>
-                        <Button
-                          size="small" variant={active === "bottom" ? "contained" : "outlined"}
-                          onClick={(e) => { e.stopPropagation(); applyThickness(i, { bottom_points: [] }); }}
-                          sx={{ flex: 1, fontSize: "0.62rem", py: 0.25, textTransform: "none" }}
-                        >
-                          Bottom ({nBot}/3){active === "bottom" ? " — click image" : ""}
-                        </Button>
+                        {(["top", "bottom"] as const).map((which) => {
+                          const nPts = which === "top" ? nTop : nBot;
+                          const label = which === "top" ? "Top" : "Bottom";
+                          const isMode = mode?.which === which;
+                          const text = isMode
+                            ? `${label} — ${mode!.kind === "trace" ? "tracing" : "editing"} (${nPts})`
+                            : `${label} (${nPts})`;
+                          const tip = nPts < 2
+                            ? `Trace the ${which} surface: click points along it on the image (2 or more).`
+                            : isMode
+                              ? `Stop ${mode!.kind === "trace" ? "tracing" : "editing"} the ${which} surface (or press Esc / Enter).`
+                              : `Edit the ${which} surface: click the image to add a point, Alt-click or right-click a point to remove it.`;
+                          return (
+                            <Box key={which} sx={{ flex: 1, display: "flex", alignItems: "center", gap: 0.25, minWidth: 0 }}>
+                              <Tooltip placement="top" title={tip}>
+                                <Button
+                                  size="small" variant={isMode ? "contained" : "outlined"}
+                                  aria-pressed={isMode}
+                                  aria-label={`${text}. ${tip}`}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (nPts < 2) setSurfaceMode(i, which, "trace");
+                                    else setSurfaceMode(i, which, isMode ? "idle" : "edit");
+                                  }}
+                                  sx={{ flex: 1, minWidth: 0, fontSize: "0.62rem", py: 0.25, textTransform: "none" }}
+                                >
+                                  {text}
+                                </Button>
+                              </Tooltip>
+                              <Tooltip placement="top" title={`Clear the ${which} surface and trace it again (Esc before 2 points puts the old one back)`}>
+                                <span>
+                                  <IconButton
+                                    size="small" sx={{ p: 0.25 }}
+                                    aria-label={`Clear and retrace the ${which} surface`}
+                                    disabled={nPts === 0}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      const prev = surfPts(tm, which);
+                                      applyThickness(i, { [which === "top" ? "top_points" : "bottom_points"]: [] } as Partial<ThicknessMeasurement>);
+                                      setSurfaceMode(i, which, "trace", prev);
+                                    }}
+                                  >
+                                    <RestartAltIcon sx={{ fontSize: 14 }} />
+                                  </IconButton>
+                                </span>
+                              </Tooltip>
+                            </Box>
+                          );
+                        })}
                       </Box>
+                      {mode && (
+                        <Tooltip placement="top" title={mode.kind === "trace" ? "Finish this surface (Enter or double-click also works)" : "Stop editing this surface (Esc also works)"}>
+                          <Button
+                            size="small" variant="contained" color="success"
+                            aria-label={`Done ${mode.kind === "trace" ? "tracing" : "editing"} the ${mode.which} surface`}
+                            onClick={(e) => { e.stopPropagation(); finishSurface(); }}
+                            sx={{ fontSize: "0.62rem", py: 0.1, textTransform: "none", alignSelf: "flex-start" }}
+                          >
+                            Done
+                          </Button>
+                        </Tooltip>
+                      )}
                       <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.62rem", fontStyle: "italic" }}>
-                        {active
-                          ? `Click 3 points on the preview to trace the ${active} surface.`
-                          : "Drag the white handles to reshape a surface; drag the ringed node to move the centre."}
+                        {mode?.kind === "trace"
+                          ? `Click along the ${mode.which} surface — as many points as you like (2 = straight, 3 = arc, 4+ = smooth curve). Press Enter, double-click or Done to finish; Esc stops (and cancels a surface with fewer than 2 points).`
+                          : mode?.kind === "edit"
+                            ? `Click the image to add a point to the ${mode.which} surface. Drag a point to move it. Alt-click or right-click a point (or select it and press Delete) to remove it. Esc or Done to finish.`
+                            : "Click Top or Bottom (or the curve itself) to add or remove points. Drag the white handles to reshape; drag the ringed node to move the centre."}
                       </Typography>
+                      {thickMsg && (
+                        <Typography variant="caption" role="status" sx={{ color: "warning.main", fontSize: "0.64rem" }}>
+                          {thickMsg}
+                        </Typography>
+                      )}
 
                       {/* Scale source */}
                       <Divider sx={{ my: 0.5 }} />
@@ -6872,7 +7195,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       </Typography>
                       <Button
                         size="small" variant="outlined"
-                        disabled={!(tm.readings ?? []).some((r) => r.edited || r.hidden || r.text)}
+                        disabled={!(tm.readings ?? []).some((r) => r.edited || r.hidden || r.text || r.font_size != null || !!r.color)}
                         onClick={(e) => { e.stopPropagation(); applyThickness(i, { readings: [] }); }}
                         sx={{ fontSize: "0.62rem", py: 0.25, textTransform: "none", alignSelf: "flex-start" }}
                       >
@@ -6890,13 +7213,34 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                             <Typography variant="caption" sx={{ fontWeight: 600, color: "text.secondary", fontSize: "0.68rem" }}>
                               Individual readings
                             </Typography>
+                            {/* Batch label size / colour for the ticked
+                                readings (per-reading font_size / color;
+                                null = the measurement's style). */}
+                            <ReadingBatchStyleBar
+                              readings={tm.readings ?? []}
+                              selected={[...thickSelRd].sort((a, b) => a - b)}
+                              defaultFontSize={tm.measure_font_size || 12}
+                              defaultColor={tm.measure_color || tm.color}
+                              onSelect={(idxs) => setThickSelRd(new Set(idxs))}
+                              onApply={(idxs, patch) => applyReadingStyle(i, idxs, patch)}
+                            />
                             <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5, maxHeight: 260, overflowY: "auto" }}>
                               {(tm.readings ?? []).map((rd, ri) => {
                                 const val = readingValue(rd as ThicknessReadingData, svgDims.w || 1000, svgDims.h || 1000, mppT, uT);
                                 const auto = `${val.toFixed(1)} ${uLab[uT] || uT}`;
                                 return (
                                   <Box key={`rd-${ri}`} sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-                                    <Typography variant="caption" sx={{ width: 16, fontSize: "0.62rem", color: "text.disabled", flexShrink: 0 }}>
+                                    <Tooltip placement="left" title="Select for batch size / colour (or Shift-click its value on the image)">
+                                      <Checkbox
+                                        size="small"
+                                        checked={thickSelRd.has(ri)}
+                                        onClick={(e) => e.stopPropagation()}
+                                        onChange={() => toggleThickRd(ri)}
+                                        slotProps={{ input: { "aria-label": `Select reading ${ri + 1} for batch size and colour` } }}
+                                        sx={{ p: 0.1, flexShrink: 0, "& .MuiSvgIcon-root": { fontSize: 15 } }}
+                                      />
+                                    </Tooltip>
+                                    <Typography variant="caption" sx={{ width: 14, fontSize: "0.62rem", color: "text.disabled", flexShrink: 0 }}>
                                       {ri + 1}
                                     </Typography>
                                     <Box sx={{ flex: 1, minWidth: 0 }}>
@@ -6910,8 +7254,8 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                                         label={rd.text ? "custom" : undefined}
                                         text={rd.text || auto}
                                         segments={rd.styled_segments as StyledSegment[] | undefined}
-                                        defaultColor={tm.measure_color || tm.color}
-                                        baseFontSize={tm.measure_font_size}
+                                        defaultColor={rd.color || tm.measure_color || tm.color}
+                                        baseFontSize={rd.font_size && rd.font_size > 0 ? rd.font_size : tm.measure_font_size}
                                         fonts={fonts}
                                         onChange={(text, styled_segments) => {
                                           const rds = [...(tm.readings ?? [])];
@@ -6958,7 +7302,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                               })}
                             </Box>
                             <Typography variant="caption" sx={{ color: "text.disabled", fontSize: "0.62rem", fontStyle: "italic" }}>
-                              Drag a reading's endpoint to place it by hand (snaps to the surface when close); drag its value to reposition the label.
+                              Drag a reading's endpoint to place it by hand (snaps to the surface when close); drag its value to reposition the label. Shift- or ⌘/Ctrl-click a value (or endpoint) to select it for batch size / colour.
                             </Typography>
                           </>
                         );
@@ -8178,6 +8522,21 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                 </Button>
               </Box>
             )}
+            {/* Curved Surface: what preview clicks do right now, where the
+                user is looking. Outside the transformed wrapper (like the
+                zoom controls) so it stays put and readable at any zoom. */}
+            {(previewB64 || renderedPreviewB64) && tabIdx === TAB_ANNOT && selThickTm && (() => {
+              const m = thicknessSurfaceMode(selThickTm, selThickIdx);
+              if (!m) return null;
+              return (
+                <ThicknessSurfaceChip
+                  which={m.which} kind={m.kind}
+                  nPts={surfPts(selThickTm, m.which).length}
+                  message={thickMsg}
+                  onDone={finishSurface}
+                />
+              );
+            })()}
             {/* Adjacent-zoom target panels have no `image_name` of
                 their own, so `previewB64` (which is fetched from the
                 base /api/panel-preview endpoint, gated on
@@ -8226,7 +8585,20 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   transform: `translate(${previewPan.x}px, ${previewPan.y}px) scale(${previewZoom})`,
                   transformOrigin: "center center",
                   cursor: previewZoom > 1 ? "grab" : undefined,
-                }}>
+                }}
+                  onDoubleClick={() => {
+                    // Double-click finishes the Curved Surface being traced.
+                    // Handled HERE, on the parent of both the click layer and
+                    // the overlay SVG: the first click adds a point whose
+                    // handle is drawn right under the cursor, so the second
+                    // click (and the dblclick) land on that handle in the SVG,
+                    // never on the click layer. Its two clicks add at most one
+                    // point (the layer's duplicate guard; the handle ignores a
+                    // second press while tracing).
+                    if (tabIdx !== TAB_ANNOT || !selThickTm) return;
+                    if (thicknessSurfaceMode(selThickTm, selThickIdx)?.kind === "trace") finishSurface();
+                  }}
+                >
                 {(() => {
                   // Use PIL-rendered preview on Adjustments, Labels, Scale Bar tabs.
                   // Annotations tab (4) uses base preview + SVG overlays for responsive drag.
@@ -9341,6 +9713,70 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                         const poly = (pts: [number, number][]) =>
                           pts.map(toVb).map(([x, y]) => `${x},${y}`).join(" ");
                         const centreNode = pointOnCurve((tm.top_points ?? []) as ThickPt[], tm.center, vbW, vbH);
+                        const mode = isActive ? thicknessSurfaceMode(tm, ti) : null;
+                        // Surface control points. The surface being traced /
+                        // edited is drawn LAST (after the centre node, whose
+                        // invisible grab disc would otherwise swallow them).
+                        const surfaceHandles = (which: "top" | "bottom") => {
+                          const key = which === "top" ? "top_points" : "bottom_points";
+                          const isModeSurf = mode?.which === which;
+                          return (tm[key] ?? []).map((p, pi) => {
+                            const [hx, hy] = toVb(p);
+                            const sel = thickSelPt?.which === which && thickSelPt.pi === pi;
+                            const drag = startDrag((nx2, ny2) => {
+                              const cur = ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[])[ti];
+                              if (!cur) return;
+                              const pts = [...((cur[key] ?? []) as [number, number][])];
+                              if (pi >= pts.length) return;
+                              pts[pi] = [nx2, ny2];
+                              applyThickness(ti, { [key]: pts } as Partial<ThicknessMeasurement>);
+                            });
+                            return (
+                              <g key={`${which}-${pi}`}>
+                                {sel && (
+                                  <circle cx={hx} cy={hy} r={handleR * 2.6} fill="none" stroke="#fff"
+                                    strokeWidth={strokeW * 1.2} style={{ pointerEvents: "none" }} />
+                                )}
+                                <circle
+                                  cx={hx} cy={hy} r={isModeSurf ? handleR * 1.7 : handleR * 1.3}
+                                  fill={isModeSurf ? tm.color : "#fff"}
+                                  stroke={isModeSurf ? "#fff" : tm.color}
+                                  strokeWidth={strokeW}
+                                  role="button"
+                                  aria-label={`${which === "top" ? "Top" : "Bottom"} surface point ${pi + 1}: drag to move, Alt-click or right-click to remove`}
+                                  style={{ pointerEvents: "auto", cursor: "grab" }}
+                                  onMouseDown={(e) => {
+                                    if (e.button !== 0) return;
+                                    // Second press of a double-click while
+                                    // tracing: it lands on the point the first
+                                    // press just added. Leave it alone — the
+                                    // dblclick (handled on the image wrapper,
+                                    // which this circle bubbles to) finishes
+                                    // the surface. Selecting / dragging it here
+                                    // would arm Delete on it and could nudge it.
+                                    if (e.detail >= 2 && isModeSurf && mode?.kind === "trace") {
+                                      e.preventDefault(); e.stopPropagation();
+                                      return;
+                                    }
+                                    if (e.altKey) {
+                                      e.preventDefault(); e.stopPropagation();
+                                      removeThickPoint(ti, which, pi);
+                                      return;
+                                    }
+                                    setThickSelPt({ which, pi });
+                                    drag(e);
+                                  }}
+                                  onContextMenu={(e) => {
+                                    e.preventDefault(); e.stopPropagation();
+                                    removeThickPoint(ti, which, pi);
+                                  }}
+                                >
+                                  <title>{`${which === "top" ? "Top" : "Bottom"} point ${pi + 1} — drag to move; Alt-click or right-click (or select + Delete) to remove`}</title>
+                                </circle>
+                              </g>
+                            );
+                          });
+                        };
                         return (
                           <g key={`thick-ov-${ti}`}>
                             {/* Guide arcs — always visible while editing; dashed
@@ -9363,6 +9799,31 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                               />
                             )}
 
+                            {/* Click a surface's curve to edit it (add / remove
+                                points). Not while tracing — those clicks belong
+                                to the trace — and not on the surface already
+                                being edited, where a click inserts a point. */}
+                            {isActive && mode?.kind !== "trace" && (["top", "bottom"] as const).map((which) => {
+                              const samples = which === "top" ? tm.top_samples : tm.bottom_samples;
+                              if ((samples?.length ?? 0) < 2 || mode?.which === which) return null;
+                              return (
+                                <polyline
+                                  key={`hit-${which}`}
+                                  points={poly(samples)} fill="none" stroke="transparent"
+                                  strokeWidth={handleR * 4}
+                                  role="button"
+                                  aria-label={`Edit the ${which} surface: add or remove points`}
+                                  style={{ pointerEvents: "stroke", cursor: "pointer" }}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setSurfaceMode(ti, which, "edit");
+                                  }}
+                                >
+                                  <title>{`Click to edit the ${which} surface — then click the image to add points, Alt-click / right-click a point to remove it`}</title>
+                                </polyline>
+                              );
+                            })}
+
                             {/* Readings */}
                             {(tm.readings ?? []).map((rd, ri) => {
                               if (rd.hidden) return null;
@@ -9370,6 +9831,11 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                               const [bx, by] = toVb(rd.bottom);
                               const val = readingValue(rd as ThicknessReadingData, vbW, vbH, mppT, uT);
                               const label = rd.text || `${val.toFixed(1)} ${uLab[uT] || uT}`;
+                              // Per-reading label size / colour (batch-set);
+                              // null = the measurement's. Mirrors the backend.
+                              const fsR = Math.max(6, (rd.font_size && rd.font_size > 0 ? rd.font_size : (tm.measure_font_size || 12)) * (vbW / 216));
+                              const colR = rd.color || tm.measure_color || tm.color;
+                              const rdSel = isActive && thickSelRd.has(ri);
                               // Label: dragged position, else pushed out along
                               // the reading's OWN axis, past its top end.
                               // Offsetting perpendicular (the obvious choice)
@@ -9398,8 +9864,8 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                               // reading near the edge clean off the panel.
                               // textAnchor is middle / baseline middle, so the
                               // half-extents are what must stay inside.
-                              const halfW = Math.max(1, label.length * fs * 0.3);
-                              const halfH = fs * 0.6;
+                              const halfW = Math.max(1, label.length * fsR * 0.3);
+                              const halfH = fsR * 0.6;
                               const clamp = (v: number, half: number, max: number) =>
                                 Math.max(half, Math.min(v, max - half));
                               // Clamp the DRAGGED position too, not just the
@@ -9412,29 +9878,48 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                               const ly = clamp(
                                 hasPos ? (rd.measure_position_y! / 100) * vbH : ty + uy * off,
                                 halfH, vbH);
+                              // Shift / Cmd / Ctrl-click toggles the reading in
+                              // the batch selection instead of dragging it.
+                              const selToggle = (e: React.MouseEvent) => {
+                                if (!(e.shiftKey || e.metaKey || e.ctrlKey)) return false;
+                                e.preventDefault(); e.stopPropagation();
+                                toggleThickRd(ri);
+                                return true;
+                              };
                               return (
                                 <g key={`rd-ov-${ri}`}>
+                                  {rdSel && (
+                                    <line x1={tx} y1={ty} x2={bx} y2={by} stroke="#fff" strokeWidth={strokeW * 3.2} opacity={0.9} />
+                                  )}
                                   <line x1={tx} y1={ty} x2={bx} y2={by} stroke={tm.color} strokeWidth={strokeW} />
-                                  {isActive && (["top", "bottom"] as const).map((endKey) => {
+                                  {/* End handles only when no surface is being
+                                      traced / edited — grabbing one by accident
+                                      while adding points would freeze it. */}
+                                  {isActive && !mode && (["top", "bottom"] as const).map((endKey) => {
                                     const [hx, hy] = endKey === "top" ? [tx, ty] : [bx, by];
+                                    const endDrag = startDrag((px, py) => {
+                                      const cur = ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[])[ti];
+                                      if (!cur) return;
+                                      // Free placement, but snap onto the
+                                      // surface when dropped near it.
+                                      const curvePts = (endKey === "top" ? cur.top_points : cur.bottom_points) as ThickPt[];
+                                      const { point } = snapToCurve([px, py], curvePts ?? [], vbW, vbH);
+                                      const rds = [...(cur.readings ?? [])];
+                                      rds[ri] = { ...rds[ri], [endKey]: point, edited: true };
+                                      applyThickness(ti, { readings: rds });
+                                    });
                                     return (
                                       <circle
                                         key={endKey}
                                         cx={hx} cy={hy} r={handleR}
                                         fill={tm.color} stroke="#000" strokeWidth={strokeW * 0.3}
+                                        role="button"
+                                        aria-label={`Reading ${ri + 1} ${endKey} end: drag to place by hand, Shift-click to select`}
                                         style={{ pointerEvents: "auto", cursor: "grab" }}
-                                        onMouseDown={startDrag((px, py) => {
-                                          const cur = ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[])[ti];
-                                          if (!cur) return;
-                                          // Free placement, but snap onto the
-                                          // surface when dropped near it.
-                                          const curvePts = (endKey === "top" ? cur.top_points : cur.bottom_points) as ThickPt[];
-                                          const { point } = snapToCurve([px, py], curvePts ?? [], vbW, vbH);
-                                          const rds = [...(cur.readings ?? [])];
-                                          rds[ri] = { ...rds[ri], [endKey]: point, edited: true };
-                                          applyThickness(ti, { readings: rds });
-                                        })}
-                                      />
+                                        onMouseDown={(e) => { if (!selToggle(e)) endDrag(e); }}
+                                      >
+                                        <title>{`Drag to place reading ${ri + 1} by hand · Shift / ⌘-click to select it for batch size / colour`}</title>
+                                      </circle>
                                     );
                                   })}
                                   {/* Leader: hairline from the value back to
@@ -9444,8 +9929,8 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                                       Drawn BEFORE the text and stopped at the
                                       label's box edge — mirrors the backend. */}
                                   {tm.show_measure && (tm.show_connecting_lines !== false) && (() => {
-                                    const hw = Math.max(1, label.length * fs * 0.3) + fs * 0.1;
-                                    const hh = fs * 0.6 + fs * 0.1;
+                                    const hw = Math.max(1, label.length * fsR * 0.3) + fsR * 0.1;
+                                    const hh = fsR * 0.6 + fsR * 0.1;
                                     const dxl = tx - lx, dyl = ty - ly;   // label -> reading top
                                     const dist = Math.hypot(dxl, dyl);
                                     if (dist < 1e-6) return null;
@@ -9459,63 +9944,65 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                                       <line
                                         x1={lx + uxl * tEdge} y1={ly + uyl * tEdge}
                                         x2={tx} y2={ty}
-                                        stroke={tm.measure_color || tm.color}
+                                        stroke={colR}
                                         strokeWidth={Math.max(0.25, strokeW * 0.5)}
                                         opacity={0.9}
                                       />
                                     );
                                   })()}
-                                  {tm.show_measure && (
-                                    <text
-                                      x={lx} y={ly}
-                                      fill={tm.measure_color || tm.color}
-                                      fontSize={fs}
-                                      fontFamily={(tm.measure_font_name || "arial.ttf").replace(/\.(ttf|otf|ttc)$/i, "") + ", sans-serif"}
-                                      textAnchor="middle"
-                                      dominantBaseline="middle"
-                                      style={{
-                                        paintOrder: "stroke", stroke: "rgba(0,0,0,0.6)", strokeWidth: fs * 0.08,
-                                        pointerEvents: isActive ? "auto" : "none",
-                                        cursor: isActive ? "move" : "default",
-                                        userSelect: "none",
-                                      }}
-                                      onMouseDown={isActive ? startDrag((px, py) => {
-                                        const cur = ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[])[ti];
-                                        if (!cur) return;
-                                        const rds = [...(cur.readings ?? [])];
-                                        rds[ri] = { ...rds[ri], measure_position_x: px, measure_position_y: py };
-                                        applyThickness(ti, { readings: rds });
-                                      }) : undefined}
-                                    >
-                                      {label}
-                                    </text>
+                                  {tm.show_measure && rdSel && (
+                                    <rect
+                                      x={lx - halfW - fsR * 0.15} y={ly - halfH - fsR * 0.1}
+                                      width={2 * halfW + fsR * 0.3} height={2 * halfH + fsR * 0.2}
+                                      fill="none" stroke="#fff" strokeWidth={1} strokeDasharray="3,2"
+                                      vectorEffect="non-scaling-stroke"
+                                      style={{ pointerEvents: "none" }}
+                                    />
                                   )}
+                                  {tm.show_measure && (() => {
+                                    // Like the end handles: not grabbable while
+                                    // a surface is traced / edited, so a click
+                                    // on a value adds a point instead of
+                                    // starting a label drag.
+                                    const valInteractive = isActive && !mode;
+                                    const labelDrag = startDrag((px, py) => {
+                                      const cur = ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[])[ti];
+                                      if (!cur) return;
+                                      const rds = [...(cur.readings ?? [])];
+                                      rds[ri] = { ...rds[ri], measure_position_x: px, measure_position_y: py };
+                                      applyThickness(ti, { readings: rds });
+                                    });
+                                    return (
+                                      <text
+                                        x={lx} y={ly}
+                                        fill={colR}
+                                        fontSize={fsR}
+                                        fontFamily={(tm.measure_font_name || "arial.ttf").replace(/\.(ttf|otf|ttc)$/i, "") + ", sans-serif"}
+                                        textAnchor="middle"
+                                        dominantBaseline="middle"
+                                        aria-label={valInteractive ? `Reading ${ri + 1} value: drag to move, Shift-click to select for batch size / colour` : undefined}
+                                        style={{
+                                          paintOrder: "stroke", stroke: "rgba(0,0,0,0.6)", strokeWidth: fsR * 0.08,
+                                          pointerEvents: valInteractive ? "auto" : "none",
+                                          cursor: valInteractive ? "move" : "default",
+                                          userSelect: "none",
+                                        }}
+                                        onMouseDown={valInteractive ? (e) => { if (!selToggle(e)) labelDrag(e); } : undefined}
+                                      >
+                                        {valInteractive && <title>{`Drag to move this value · Shift / ⌘-click to select it for batch size / colour`}</title>}
+                                        {label}
+                                      </text>
+                                    );
+                                  })()}
                                 </g>
                               );
                             })}
 
-                            {/* The 6 surface control points */}
-                            {isActive && (["top", "bottom"] as const).map((which) => {
-                              const key = which === "top" ? "top_points" : "bottom_points";
-                              return (tm[key] ?? []).map((p, pi) => {
-                                const [hx, hy] = toVb(p);
-                                return (
-                                  <circle
-                                    key={`${which}-${pi}`}
-                                    cx={hx} cy={hy} r={handleR * 1.3}
-                                    fill="#fff" stroke={tm.color} strokeWidth={strokeW}
-                                    style={{ pointerEvents: "auto", cursor: "grab" }}
-                                    onMouseDown={startDrag((nx2, ny2) => {
-                                      const cur = ((localRef.current?.thickness_measurements ?? []) as ThicknessMeasurement[])[ti];
-                                      if (!cur) return;
-                                      const pts = [...((cur[key] ?? []) as [number, number][])];
-                                      pts[pi] = [nx2, ny2];
-                                      applyThickness(ti, { [key]: pts } as Partial<ThicknessMeasurement>);
-                                    })}
-                                  />
-                                );
-                              });
-                            })}
+                            {/* Surface control points (any number per surface)
+                                — the ones NOT being traced / edited. */}
+                            {isActive && (["top", "bottom"] as const)
+                              .filter((which) => mode?.which !== which)
+                              .map((which) => surfaceHandles(which))}
 
                             {/* Centre node — drag along the top surface to move
                                 where the reading set is centred. A reading always
@@ -9535,7 +10022,11 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                                 applyThickness(ti, { center: t });
                               });
                               return (
-                                <g style={{ pointerEvents: "auto", cursor: "ew-resize" }} onMouseDown={drag}>
+                                // Inert while a surface is traced / edited: its
+                                // wide grab disc sits on the top surface and
+                                // would swallow the clicks that add points
+                                // there (and a twitch would drag the centre).
+                                <g style={{ pointerEvents: mode ? "none" : "auto", cursor: "ew-resize" }} onMouseDown={mode ? undefined : drag}>
                                   {/* dark halo so it survives on light images */}
                                   <circle cx={cx} cy={cy} r={R} fill="none" stroke="rgba(0,0,0,0.65)" strokeWidth={strokeW * 5} />
                                   <circle cx={cx} cy={cy} r={R} fill="none" stroke="#fff" strokeWidth={strokeW * 2.6} />
@@ -9551,6 +10042,11 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                                 </g>
                               );
                             })()}
+
+                            {/* The surface being traced / edited — on top of
+                                everything, so its points stay grabbable even
+                                under the centre node's grab area. */}
+                            {isActive && mode && surfaceHandles(mode.which)}
                           </g>
                         );
                       })}
@@ -9558,7 +10054,7 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                   );
                 })()}
                 {/* Click-to-add-point for lines / Click-to-place areas */}
-                {tabIdx === TAB_ANNOT && ((local.lines ?? []).length > 0 || (local.areas ?? []).some(a => !a.points || a.points.length < 2) || (selectedAnnotIdx?.type === "area" && ["Custom", "Magic"].includes((local.areas ?? [])[selectedAnnotIdx.idx]?.shape)) || (selectedAnnotIdx?.type === "thickness" && !!thicknessList[selectedAnnotIdx.idx] && thicknessActiveCurve(thicknessList[selectedAnnotIdx.idx]) !== null)) && (
+                {tabIdx === TAB_ANNOT && ((local.lines ?? []).length > 0 || (local.areas ?? []).some(a => !a.points || a.points.length < 2) || (selectedAnnotIdx?.type === "area" && ["Custom", "Magic"].includes((local.areas ?? [])[selectedAnnotIdx.idx]?.shape)) || (selectedAnnotIdx?.type === "thickness" && !!thicknessList[selectedAnnotIdx.idx] && thicknessSurfaceMode(thicknessList[selectedAnnotIdx.idx], selectedAnnotIdx.idx) !== null)) && (
                   <Box
                     sx={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", zIndex: 1, cursor: "crosshair" }}
                     onClick={(e) => {
@@ -9661,16 +10157,32 @@ export function EditPanelDialog({ open, onClose, row, col }: Props) {
                       };
 
                       // 1a-thickness. A Thickness annotation is selected →
-                      //   fill its active surface (top first, then bottom),
-                      //   3 points each. Once both are set the click layer
-                      //   unmounts and the handles take over.
+                      //   tracing: append to that surface (any number of
+                      //   points); editing: insert the point where it falls
+                      //   along the surface. With no mode the layer is
+                      //   unmounted and the handles take over.
                       if (selType === "thickness" && selIdx >= 0 && thicknessList[selIdx]) {
                         const tm = thicknessList[selIdx];
-                        const which = thicknessActiveCurve(tm);
-                        if (which) {
-                          const key = which === "top" ? "top_points" : "bottom_points";
-                          const pts = [...((tm[key] ?? []) as [number, number][]), [rpx, rpy] as [number, number]];
-                          applyThickness(selIdx, { [key]: pts } as Partial<ThicknessMeasurement>);
+                        const mode = thicknessSurfaceMode(tm, selIdx);
+                        if (mode) {
+                          const iwT = svgDims.w || 1000, ihT = svgDims.h || 1000;
+                          const cur = surfPts(tm, mode.which);
+                          // Ignore a click on top of an existing point (the
+                          // second click of a double-click, a stray re-click).
+                          const tolPx = Math.max(2, 0.004 * Math.min(iwT, ihT));
+                          const dup = cur.some((q) => Math.hypot((q[0] - rpx) / 100 * iwT, (q[1] - rpy) / 100 * ihT) <= tolPx);
+                          if (dup) return;
+                          if (mode.kind === "trace") {
+                            // A derived trace (incomplete measurement just
+                            // selected) becomes explicit on its first click,
+                            // or it would hop to the bottom at 2 points.
+                            if (!(thickSurf && thickSurf.idx === selIdx)) setSurfaceMode(selIdx, mode.which, "trace", cur);
+                            setSurfacePoints(selIdx, mode.which, [...cur, [rpx, rpy]]);
+                          } else {
+                            const { points, index } = insertSurfacePoint(cur as ThickPt[], [rpx, rpy], iwT, ihT);
+                            setSurfacePoints(selIdx, mode.which, points as [number, number][], { reanchor: true });
+                            setThickSelPt({ which: mode.which, pi: index });
+                          }
                         }
                         return;
                       }

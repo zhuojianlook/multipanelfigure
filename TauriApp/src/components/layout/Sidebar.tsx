@@ -41,6 +41,7 @@ import { api } from "../../api/client";
 import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 import { detectGlobalFont, describeDetectedFont } from "../../utils/detectGlobalFont";
 import { openProjectIntoTab, enterAnalysis, defaultProjectName } from "../../utils/projectNav";
+import { rRerunPng, rRerenderError } from "../../utils/rRerender";
 import { saveProjectDialog } from "../shared/SaveProjectDialog";
 
 /* ── tiny reusable pieces ─────────────────────────────── */
@@ -176,7 +177,9 @@ function CollageSidebar() {
     if (rLabels[it.id] || rLabelsLoading[it.id] || !it.rCode) return;
     setRLabelsLoading((m) => ({ ...m, [it.id]: true }));
     try {
-      const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, null, { emitLabels: true });
+      // THIS item's plot's labels (without the index: the first plot's).
+      const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, null,
+        { emitLabels: true, overridePlotIndex: it.rPlotIndex ?? 0 });
       const lab = res.labels || {};
       const mapped: Partial<Record<RTextSlot, string>> = {};
       if (lab.title != null) mapped.title = lab.title;
@@ -286,6 +289,9 @@ function CollageSidebar() {
     let succeeded = 0;
     let failed = 0;
     let skipped = 0;
+    // R plots that kept their image, with the sidecar's reason for each
+    // (shown in the summary: a packaged build has no console).
+    const rFailures: string[] = [];
     try {
       for (const it of useCollageStore.getState().items) {
         if (it.kind !== "figure" || !it.projectPath) continue;
@@ -372,7 +378,8 @@ function CollageSidebar() {
             if (applyColor) next.color = syncColor;
             rOv[slot] = next;
           }
-          updateItem(it.id, { rTextOverrides: rOv as CollageItem["rTextOverrides"] });
+          // rOv is stored only together with the image it produced (below):
+          // a plot that cannot be re-rendered keeps both as they were.
           const hasOv = Object.keys(rOv).length > 0;
           try {
             const res = await api.runR(it.rCode, it.rDataCsv ?? "", it.rInterpreter ?? undefined, null,
@@ -381,14 +388,15 @@ function CollageSidebar() {
                 overrideOnly: true,
                 overrideWidth: it.naturalW || 800,
                 overrideHeight: it.naturalH || 600,
-                // Critical: target THIS item's source plot, not last_plot().
-                // Two outputs from the same multi-plot script otherwise both
-                // render the script's last plot and visually duplicate.
+                // Critical: target THIS item's source plot (its position in
+                // the run's returned plots), or two outputs of one script
+                // re-render as the same plot.
                 overridePlotIndex: it.rPlotIndex ?? 0,
               } : undefined);
-            const idx = hasOv ? 0 : (it.rPlotIndex ?? 0);
-            const png = res.plots?.[idx] ?? res.plots?.[0];
-            if (res.success && png) {
+            // No image (e.g. not a ggplot, or the plot is gone) keeps the
+            // item as it is; never another plot of the script in its place.
+            const png = rRerunPng(res, { override: hasOv, plotIndex: it.rPlotIndex ?? 0 });
+            if (png) {
               const dataUrl = `data:image/png;base64,${png}`;
               const dims = await new Promise<{ w: number; h: number }>((resolve) => {
                 const im = new window.Image();
@@ -402,15 +410,17 @@ function CollageSidebar() {
                 naturalW: dims.w,
                 naturalH: dims.h,
                 h: it.w / Math.max(0.001, newAspect),
+                rTextOverrides: rOv as CollageItem["rTextOverrides"],
               });
               succeeded++;
             } else {
-              console.error("[collage] R re-run failed for", it.name, res.stderr);
-              failed++;
+              const why = rRerenderError(res);
+              console.error("[collage] R re-run failed for", it.name, why);
+              rFailures.push(`${it.name || "R plot"}: ${why}`);
             }
           } catch (e) {
             console.error("[collage] R re-run error for", it.name, e);
-            failed++;
+            rFailures.push(`${it.name || "R plot"}: ${String(e)}`);
           }
         }
       }
@@ -440,14 +450,17 @@ function CollageSidebar() {
     } finally {
       setApplyBusy(false);
     }
-    if (failed > 0 || skipped > 0) {
+    if (failed > 0 || skipped > 0 || rFailures.length > 0) {
       const props = [applySize ? `${targetPt} pt` : null, applyColor ? "color" : null, applyFont ? "font" : null].filter(Boolean).join(" + ");
+      const rN = rFailures.length;
       void alertDialog({
         title: "Finished",
         body: `Synchronized ${succeeded} item${succeeded === 1 ? "" : "s"} (${props})`
           + (skipped ? ` · ${skipped} skipped (no elements selected)` : "")
-          + (failed ? ` · ${failed} failed (the .mpf may have moved; check the console)` : "")
-          + ".",
+          + (failed ? ` · ${failed} figure${failed === 1 ? "" : "s"} failed (the .mpf may have moved; check the console)` : "")
+          + "."
+          + (rN ? `\n\n${rN} R plot${rN === 1 ? "" : "s"} could not be re-rendered and kept ${rN === 1 ? "its" : "their"} previous image:\n`
+            + rFailures.map((s) => `• ${s}`).join("\n") : ""),
       });
     }
   };

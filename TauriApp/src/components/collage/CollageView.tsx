@@ -61,6 +61,7 @@ import { api } from "../../api/client";
 import { sortFontList, pickDefaultFont } from "../../utils/fontList";
 import { alert as alertDialog } from "../shared/ConfirmDialog";
 import { openProjectIntoTab } from "../../utils/projectNav";
+import { rRerenderError, rPlotNotRerenderable } from "../../utils/rRerender";
 
 type Corner = "nw" | "ne" | "sw" | "se";
 
@@ -204,7 +205,7 @@ const R_FONT_FAMILIES: { value: string; label: string }[] = [
 /** Default R font when a slot has none set yet. */
 const R_DEFAULT_FONT = "Arial";
 
-/** Map ggplot's label keys (from last_plot()$labels) to our slot ids so the
+/** Map ggplot's label keys (run-r emit_labels, of the item's plot) to our slot ids so the
  *  dropdown can show each element's ACTUAL current text. The legend title is
  *  whichever mapped aesthetic carries it. */
 function mapRLabels(lab: Record<string, string>): Partial<Record<RTextSlot, string>> {
@@ -413,15 +414,38 @@ export function CollageView() {
   // Cache of each R plot's ACTUAL current ggplot text labels (fetched from R
   // when the item is selected), so the dropdown shows the real text.
   const [rLabelsByItem, setRLabelsByItem] = useState<Record<string, Partial<Record<RTextSlot, string>>>>({});
+  // R plots the sidecar said can never be re-rendered from their code (base
+  // graphics, grid.arrange, a directly saved PNG, a plot the script no longer
+  // makes), with the reason — so resizing does not re-run R for them. Keyed
+  // to the code + plot index it was learnt for.
+  const [rNoRerender, setRNoRerender] = useState<Record<string, { code: string; idx: number; data: string; reason: string }>>({});
+  const noRerenderReason = (it: CollageItem): string | undefined => {
+    const k = rNoRerender[it.id];
+    return k && k.code === it.rCode && k.idx === (it.rPlotIndex ?? 0) && k.data === (it.rDataCsv ?? "") ? k.reason : undefined;
+  };
+  const rememberNoRerender = (it: CollageItem, res: Parameters<typeof rRerenderError>[0]) => {
+    if (!rPlotNotRerenderable(res) || !it.rCode) return;
+    const entry = { code: it.rCode, idx: it.rPlotIndex ?? 0, data: it.rDataCsv ?? "", reason: rRerenderError(res) };
+    setRNoRerender((m) => ({ ...m, [it.id]: entry }));
+  };
 
   // Re-render an R-plot item as VECTOR SVG (svglite) so it stays crisp at any
-  // zoom/size with no further re-render. Uses last_plot() (render_override),
-  // applying any per-element text overrides. Falls back to a PNG if svglite
-  // isn't available in the user's R.
-  const rerenderRPlot = async (itemId: string) => {
+  // zoom/size with no further re-render. Re-renders the item's own plot
+  // (rPlotIndex, render_override), applying any per-element text overrides.
+  // Falls back to a PNG if svglite isn't available in the user's R; a plot
+  // that cannot be re-rendered keeps its image and the user is told why.
+  // `overrides`: render with these and store them only if an image comes
+  // back (Edit text Apply / Clear), so the stored overrides always match the
+  // image. `quiet`: no dialog when no image comes back (the resize-triggered
+  // SVG upgrade, which the user did not ask for).
+  const rerenderRPlot = async (
+    itemId: string,
+    opts?: { overrides?: CollageItem["rTextOverrides"]; quiet?: boolean },
+  ) => {
     const it = useCollageStore.getState().items.find((i) => i.id === itemId);
     if (!it || !it.rCode) return;
-    const ov = it.rTextOverrides || {};
+    const ov = opts?.overrides ?? it.rTextOverrides ?? {};
+    const storeOv = opts?.overrides !== undefined ? { rTextOverrides: opts.overrides } : {};
     const pt = useCollageStore.getState().globalHeaderPt;
     const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
     const baseFs = pt ? Math.max(1, Math.round(pt / Math.max(0.001, scale))) : null;
@@ -449,6 +473,7 @@ export function CollageView() {
           naturalW: nW,
           naturalH: nH,
           h: it.w / Math.max(0.001, nW / nH),
+          ...storeOv,
         });
       } else if (res.success && res.plots?.[0]) {
         // svglite missing — fall back to a raster PNG.
@@ -460,17 +485,17 @@ export function CollageView() {
           im.src = dataUrl;
         });
         const aspect = dims.h > 0 ? dims.w / dims.h : (it.naturalW / Math.max(1, it.naturalH));
-        updateItem(itemId, { src: dataUrl, naturalW: dims.w, naturalH: dims.h, h: it.w / Math.max(0.001, aspect) });
+        updateItem(itemId, { src: dataUrl, naturalW: dims.w, naturalH: dims.h, h: it.w / Math.max(0.001, aspect), ...storeOv });
       } else {
-        await alertDialog({
-          title: "Couldn't update R plot",
-          body: res.stderr?.slice(0, 500)
-            || "No ggplot output was produced. R editing works on ggplot plots (it styles last_plot()). Make sure R is installed.",
-        });
+        rememberNoRerender(it, res);
+        const why = rRerenderError(res,
+          "No ggplot output was produced. R editing works on ggplot plots drawn through mpfig_plot(). Make sure R is installed.");
+        if (opts?.quiet) console.warn("[collage] R plot kept its image:", it.name, "-", why);
+        else await alertDialog({ title: "Couldn't update R plot", body: why });
       }
     } catch (e) {
       console.error("[collage] R override re-render failed", e);
-      await alertDialog({ title: "R re-render error", body: String(e) });
+      if (!opts?.quiet) await alertDialog({ title: "R re-render error", body: String(e) });
     } finally {
       setRBusyItem(null);
     }
@@ -493,9 +518,9 @@ export function CollageView() {
     if (!ed) return;
     const cur = useCollageStore.getState().items.find((i) => i.id === ed.itemId);
     const next = { ...(cur?.rTextOverrides || {}), [ed.slot]: ed.value };
-    updateItem(ed.itemId, { rTextOverrides: next });
     setRTextEditor(null);
-    void rerenderRPlot(ed.itemId);
+    // Stored together with the re-rendered image, or not at all.
+    void rerenderRPlot(ed.itemId, { overrides: next });
   };
 
   // Re-render one figure item with the current sync pt + element selection +
@@ -557,7 +582,8 @@ export function CollageView() {
     const isSvg = (it.src || "").startsWith("data:image/svg");
     // Stable device px (clamp out any corrupt/tiny natural size).
     const corrupt = !(it.naturalW && it.naturalW >= 150 && it.naturalH && it.naturalH >= 150);
-    const needsSvg = !isSvg || corrupt; // upgrade to SVG, or repair a bad aspect
+    // Upgrade to SVG, or repair a bad aspect — unless R already said it cannot.
+    const needsSvg = (!isSvg || corrupt) && !noRerenderReason(it);
     const nW = it.naturalW && it.naturalW >= 150 ? it.naturalW : 800;
     const nH = it.naturalH && it.naturalH >= 150 ? it.naturalH : 600;
     let cancelled = false;
@@ -567,13 +593,15 @@ export function CollageView() {
         // plot becomes crisp-at-any-zoom and the dropdown shows real text.
         const res = await api.runR(it.rCode!, it.rDataCsv ?? "", it.rInterpreter ?? undefined, null, {
           emitLabels: true,
+          // Always: the labels are THIS item's plot's, not the first plot's.
+          overridePlotIndex: it.rPlotIndex ?? 0,
           ...(needsSvg ? { renderSvg: true, renderOverride: true, overrideOnly: true,
             overrideWidth: nW, overrideHeight: nH, overrideRes: 150,
-            textOverrides: (it.rTextOverrides || {}) as Record<string, unknown>,
-            overridePlotIndex: it.rPlotIndex ?? 0 } : {}),
+            textOverrides: (it.rTextOverrides || {}) as Record<string, unknown> } : {}),
         });
         if (cancelled) return;
         setRLabelsByItem((m) => ({ ...m, [it.id]: mapRLabels(res.labels || {}) }));
+        if (needsSvg && !res.svg) rememberNoRerender(it, res);
         if (needsSvg && res.svg) {
           updateItem(it.id, {
             src: svgToDataUrl(res.svg),
@@ -960,9 +988,11 @@ export function CollageView() {
             // raster just scales and the header overlays re-typeset from
             // it.w/it.h automatically. SVG R plots also scale crisply with no
             // re-render; only a still-PNG R plot is upgraded to SVG here.
+            // Quietly, and not at all once R said it cannot re-render it.
             const cur = useCollageStore.getState().items.find((i) => i.id === it.id);
-            if (cur && cur.kind === "image" && cur.rCode && !(cur.src || "").startsWith("data:image/svg")) {
-              void rerenderRPlot(cur.id);
+            if (cur && cur.kind === "image" && cur.rCode && !(cur.src || "").startsWith("data:image/svg")
+                && !noRerenderReason(cur)) {
+              void rerenderRPlot(cur.id, { quiet: true });
             }
           };
           window.addEventListener("mousemove", onMove);
@@ -2152,7 +2182,14 @@ export function CollageView() {
           {(() => {
             const labels = rLabelsByItem[rMenu.item.id] || {};
             const ov = rMenu.item.rTextOverrides || {};
-            return R_TEXT_SLOTS.map(({ slot, label }) => {
+            // Already known: say so up front rather than after an Apply.
+            const no = noRerenderReason(rMenu.item);
+            const note = no ? [
+              <MenuItem key="_no_rerender" disabled sx={{ whiteSpace: "normal", maxWidth: 300, fontSize: "0.7rem", "&.Mui-disabled": { opacity: 1 } }}>
+                {no}
+              </MenuItem>,
+            ] : [];
+            return [...note, ...R_TEXT_SLOTS.map(({ slot, label }) => {
               const textBearing = R_TEXT_BEARING.has(slot);
               const ovSlot = ov[slot];
               const has = !!ovSlot;
@@ -2179,7 +2216,7 @@ export function CollageView() {
                   <Box component="span" sx={{ fontSize: "0.6rem", color: "text.secondary" }}>{secondary}</Box>
                 </MenuItem>
               );
-            });
+            })];
           })()}
         </Menu>
       )}
@@ -2252,9 +2289,8 @@ export function CollageView() {
                   const cur = useCollageStore.getState().items.find((i) => i.id === ed.itemId);
                   const next = { ...(cur?.rTextOverrides || {}) };
                   delete next[ed.slot];
-                  updateItem(ed.itemId, { rTextOverrides: next });
                   setRTextEditor(null);
-                  void rerenderRPlot(ed.itemId);
+                  void rerenderRPlot(ed.itemId, { overrides: next });
                 }}>
                 Clear
               </Button>

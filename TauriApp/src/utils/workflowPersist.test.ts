@@ -424,6 +424,37 @@ describe("round trip and signatures", () => {
     }
   });
 
+  it("keeps a node's plot options, code hash and code backup", () => {
+    const fields = {
+      intensityPlot: { version: 1 as const, graphs: { channel_intensity: { chart: "box" as const, enabled: false } } },
+      intensityPlotHash: "12:0badf00d",
+      intensityPlotBackup: { code: "plot(1)", savedAt: "2026-11-19T00:00:00.000Z" },
+    };
+    const wf = singleWf();
+    wf.nodes = wf.nodes.map((n) => (n.id === "p2" ? { ...n, data: { ...n.data, ...fields } } : n));
+    const p = serializeForDoc(A.uid, { docs: [A, B], tabs: [wf], revs: {}, appVersion: "0.1.422" });
+    const d = deserializeDoc(readBack(p), { doc: A, uid: A.uid, docs: [A, B] });
+    expect(nodeById(tabById(d.tabs, wf.id), "p2").data).toMatchObject(fields);
+  });
+
+  it("a node whose code changed since its run reopens stale, not ok", () => {
+    const wf = singleWf();
+    wf.nodes = wf.nodes.map((n) => (n.id === "p2" ? { ...n, data: { ...n.data, status: "stale" as const } } : n));
+    const p = serializeForDoc(A.uid, { docs: [A, B], tabs: [wf], revs: {}, appVersion: "0.1.422" });
+    expect(p.manifest.workflows[0].nodes.find((n) => n.id === "p2")!.data.status).toBe("stale");
+    const d = deserializeDoc(readBack(p), { doc: A, uid: A.uid, docs: [A, B] });
+    const tab = tabById(d.tabs, wf.id);
+    expect(nodeById(tab, "p2").data.status).toBe("stale");
+    expect(nodeById(tab, "p1").data.status).toBe("ok");
+    // Stored again unchanged, so reopening does not make the file look edited.
+    expect(docSig(A.uid, { docs: [A, B], tabs: d.tabs, revs: {} })).toBe(docSig(A.uid, { docs: [A, B], tabs: [wf], revs: {} }));
+    // Without results there is nothing to be stale.
+    const empty = singleWf();
+    empty.nodes = empty.nodes.map((n) => (n.id === "p2" ? { ...n, data: { ...n.data, status: "stale" as const, outputs: [] } } : n));
+    const pe = serializeForDoc(A.uid, { docs: [A, B], tabs: [empty], revs: {}, appVersion: "0.1.422" });
+    expect(pe.manifest.workflows[0].nodes.find((n) => n.id === "p2")!.data.status).toBe("idle");
+  });
+
   it("contentSig ignores thumbnails, selection, runKey/mpfId, unpinned archives and updatedAt", () => {
     const base = singleWf();
     const sig = contentSig(base, { docs: [A, B] });

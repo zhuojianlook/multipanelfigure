@@ -14,7 +14,8 @@
      • every non-pristine workflow it owns (utils/workflowOwnership);
      • single-owner: the latest output per (kind, name) plus pinned
        versions, each payload a blob; results reading an edited (or,
-       with figureDiscarded, a discarded) image are flagged `stale`;
+       with figureDiscarded, a discarded) image are flagged `stale`,
+       and a node whose code changed since its run keeps status "stale";
      • shared: graph + config only — no outputs, no blobs, idle;
      • the uploads of workflows whose `home` it is (the sidecar embeds
        their original files).
@@ -391,7 +392,8 @@ function storeNode(n: Node<NodeData>, wf: WorkflowTab, own: Ownership, staleIds:
       sd.status = "error";
       if (error) sd.error = error;
     } else {
-      sd.status = kept.length ? "ok" : "idle";
+      // "stale": the node's code changed after its results were made.
+      sd.status = !kept.length ? "idle" : status === "stale" ? "stale" : "ok";
     }
     if (!own.shared && consoleOut) sd.consoleOut = capText(consoleOut);
     if (kept.length && staleIds.has(n.id)) sd.stale = true;
@@ -768,7 +770,7 @@ export function deserializeDoc(payload: DeserializePayload, ctx: DeserializeCtx)
         const outs = (Array.isArray(outputs) ? outputs : [])
           .map(restoreOutput).filter((o): o is NodeOutput => !!o);
         nd.outputs = outs;
-        nd.status = status === "error" ? "error" : (outs.length ? "ok" : "idle");
+        nd.status = status === "error" ? "error" : !outs.length ? "idle" : status === "stale" ? "stale" : "ok";
         if (stale && outs.length) staleIds.add(sn.id);
       }
       nd = mapPickerKeys(nd, (k) => remapRuntimeKey(k, idMap));

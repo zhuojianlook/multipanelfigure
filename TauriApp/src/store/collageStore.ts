@@ -143,8 +143,10 @@ export type CollageItem = {
   analysisSource?: { nodeId: string; outputId: string };
   /** Provenance for re-running an analysis (R) plot at a new font size via
    *  the collage's "Synchronize headers". Captured when the plot is added
-   *  from the Analysis dialog. rPlotIndex selects which plot from the
-   *  re-run's output array (a script may emit several). */
+   *  from the Analysis dialog. rPlotIndex = this plot's position in the R
+   *  run's returned `plots` list (filename order, not mpfig_plot() call
+   *  order; a script may emit several) — what run-r's override_plot_index
+   *  expects. */
   rCode?: string;
   rDataCsv?: string;
   rInterpreter?: string | null;

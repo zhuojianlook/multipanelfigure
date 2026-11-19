@@ -188,6 +188,10 @@ interface AnalysisPlot {
    *  entry is one named data.frame (the inline data + e.g. stat.test).
    *  Filled from the run-r response. */
   tables?: AnalysisTable[];
+  /** Position of this plot in the R run's returned `plots` (filename
+   *  order) — the collage's rPlotIndex. Fixed at run time: the position in
+   *  the tab's list shifts when an earlier plot is discarded. */
+  runIndex?: number;
 }
 
 // One CSV-encoded data table captured from R (the inlined `data`
@@ -904,6 +908,7 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
     mainName?: string;
     collageId?: string;
     tables?: AnalysisTable[];
+    runIndex?: number;
   }[] = tabs.flatMap((t) =>
     t.plots.map((p, idx) => ({
       key: plotKey(t.id, p.id),
@@ -918,6 +923,7 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
       mainName: p.mainName,
       collageId: p.collageId,
       tables: p.tables,
+      runIndex: p.runIndex,
     })),
   );
 
@@ -1316,6 +1322,7 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
         tables: tablesFromRun.length > 0 ? tablesFromRun : undefined,
         // mainName / collageId left undefined — fresh plots haven't
         // been sent anywhere yet.
+        runIndex: i,
       }));
       // Use a function form so we patch the LATEST tabs state, not
       // a stale closure copy (updateActiveTab depends on activeTabId
@@ -1348,13 +1355,14 @@ export function AnalysisDialog({ open, onClose, measurements }: Props) {
   // the first string column; the user can edit afterwards.
   const sendTableToRTab = useCallback((tbl: AnalysisTable) => {
     const id = makeTabId();
-    const lines = (tbl.csv || "").split(/\r?\n/).filter((l) => l.length > 0);
-    const header = (lines[0] || "").split(",");
+    // Quoted cells may hold commas ("1hr, Sample 1"); parseCsv keeps them whole.
+    const lines = parseCsv(tbl.csv || "").filter((r) => r.some((c) => c !== ""));
+    const header = lines[0] || [];
     // Detect first non-source column as the default y axis.
     const stringCol = header[0] || "source";
     let yCol = "value";
     if (lines.length > 1) {
-      const firstRow = lines[1].split(",");
+      const firstRow = lines[1];
       for (let i = 0; i < header.length; i++) {
         const v = firstRow[i];
         if (v !== undefined && v !== "" && !Number.isNaN(parseFloat(v.replace(/[^0-9.\-]/g, "")))) {
@@ -1380,12 +1388,12 @@ library(ggprism)
 data <- local({
   .s <- "${escapedCsv}"
   Encoding(.s) <- "UTF-8"
-  read.csv(text = .s, stringsAsFactors = FALSE)
+  read.csv(text = .s, stringsAsFactors = FALSE, check.names = FALSE)
 })
 
 mpfig_plot("${tbl.name}.png")
-ggplot(data, aes(x = ${stringCol}, y = ${yCol})) +
-  geom_col(aes(fill = ${stringCol}), width = 0.7) +
+ggplot(data, aes(x = .data[[${JSON.stringify(stringCol)}]], y = .data[[${JSON.stringify(yCol)}]])) +
+  geom_col(aes(fill = .data[[${JSON.stringify(stringCol)}]]), width = 0.7) +
   theme_prism() +
   labs(title = "${tbl.name}", x = NULL, y = "${yCol}") +
   theme(legend.position = "none", axis.text.x = element_text(angle = 30, hjust = 1))
@@ -1778,7 +1786,9 @@ ggplot(data, aes(x = ${stringCol}, y = ${yCol})) +
         rCode: p.code,
         rDataCsv: buildCsv(),
         rInterpreter: customRPath || null,
-        rPlotIndex: p.idx,
+        // Position in the run's returned plots (not in the tab's list,
+        // which shifts when an earlier plot is discarded).
+        rPlotIndex: p.runIndex ?? p.idx,
       });
       patchPlot(p.tabId, p.plotId, { collageId: newId });
       placed++;

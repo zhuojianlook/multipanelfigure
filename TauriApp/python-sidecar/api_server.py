@@ -310,7 +310,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.422"  # CI re-syncs this from the release tag (build-sidecar)
+SIDECAR_BUILD = "0.1.423"  # CI re-syncs this from the release tag (build-sidecar)
 
 
 @app.get("/api/version")
@@ -7061,25 +7061,32 @@ class RAnalysisRequest(BaseModel):
     # (title / subtitle / xaxis / yaxis / caption / legend_title / xticks /
     # yticks / legend_text). Each value is a dict with optional
     # text / size (pt) / color / bold / italic. Applied AFTER the user's code
-    # via ggplot2::last_plot(), so they win over the user's theming. Used by
-    # the collage to make R-plot title/axis/legend text editable.
+    # to the plot override_plot_index selects, so they win over the user's
+    # theming. Used by the collage to make R-plot title/axis/legend text
+    # editable.
     text_overrides: Optional[dict] = None
-    # Which plot from a multi-plot script the override should target.
-    # 0-indexed against the order in which mpfig_plot()/print() calls
-    # appear.  Default 0 = first plot.  Without this, the override
-    # block grabbed ggplot2::last_plot(), which silently meant "the
-    # LAST plot the script printed" — two outputs from the same multi-
-    # plot script both ended up overriding the same (last) plot,
-    # producing duplicates in the collage.  The matching prelude
-    # captures each plot into .mpfig_plots so the override can index
-    # the right one.
+    # Which plot of the script the override (and emit_labels) targets: its
+    # 0-based position in the `plots` list a normal run of the same script
+    # returns, i.e. Python sorted() FILENAME order of the PNGs in the plot
+    # dir, zz_mpfig_override.png excluded.  That is what every stored
+    # rPlotIndex already is (the position in the returned list), so saved
+    # .mpf files and collages need no migration.  It is NOT the order of
+    # the mpfig_plot() calls: a script that writes zeta.png then alpha.png
+    # returns alpha first.  R lists the plot dir the same way, takes the
+    # filename at this position and re-renders the ggplot (or patchwork)
+    # that the LAST mpfig_plot() call writing that file printed.  A plot
+    # that is not a ggplot drawn on an mpfig_plot() device (base graphics,
+    # grid, a PNG written with png()/ggsave() directly, one page of a
+    # multi-page "%d" file) is never re-rendered: the response carries
+    # `override_error` / `override_code` instead of a different plot.
     override_plot_index: int = 0
     # When True (with text_overrides), return ONLY the override-applied plot
     # (named zz_mpfig_override.png) instead of all of the script's plots.
     override_only: bool = False
-    # Force the last_plot() re-render to zz_mpfig_override.png even when there
-    # are no text_overrides — used by Save Collage to re-render an R plot at a
-    # higher resolution (override_width/height) for high-DPI export.
+    # Force the re-render of the selected plot to zz_mpfig_override.png even
+    # when there are no text_overrides — used by Save Collage to re-render an
+    # R plot at a higher resolution (override_width/height) for high-DPI
+    # export.
     render_override: bool = False
     # Render the override plot as SVG (svglite) instead of PNG and return it as
     # `svg` — used by the collage so R plots are vector-crisp at any zoom.
@@ -7094,9 +7101,10 @@ class RAnalysisRequest(BaseModel):
     # collage can render an R plot at higher resolution without changing its
     # proportions — used for crisp enlargement + export.
     override_res: int = 150
-    # When True, also extract the current ggplot text labels (title/subtitle/
-    # x/y/caption + legend title from the mapped aesthetic) from last_plot()
-    # and return them under "labels" — so the collage can show the ACTUAL
+    # When True, also extract the ggplot text labels (title/subtitle/
+    # x/y/caption + legend title from the mapped aesthetic) of the plot
+    # override_plot_index selects (with any text_overrides applied) and
+    # return them under "labels" — so the collage can show the ACTUAL
     # text of each editable element instead of generic slot names.
     emit_labels: bool = False
 
@@ -7202,15 +7210,210 @@ def _r_face(o: dict) -> str:
     return "plain"
 
 
-def _r_text_override_block(ov: dict, width: int, height: int, force: bool = False, res: int = 150, svg: bool = False, target_idx: int = 0) -> str:
-    """Build an R snippet that picks the target plot out of the prelude's
-    .mpfig_plots capture list (0-indexed, falls back to ggplot2::last_plot()),
-    applies per-slot text/size/color/face overrides via labs()+theme(), and
-    writes it to zz_mpfig_override.png. When `force` is set, the plot is re-
-    rendered at the given size even with no overrides (used for high-DPI
-    export). target_idx selects which captured plot to render — pass the
-    rPlotIndex of the collage item being re-rendered so a multi-plot
-    script doesn't collapse to last_plot() for every output."""
+# ── Which plot is "plot i" (see RAnalysisRequest.override_plot_index) ──
+# Index i is the position in the returned `plots` list, i.e. sorted()
+# filename order. The prelude below records, per mpfig_plot() call, the file
+# it writes (call order) and the ggplot actually PRINTED on its device; the
+# target block maps position -> filename -> last call writing that file.
+#
+# Capture is done by graphics hooks, not by snapshotting last_plot():
+#   - ggplot2 4.x updates last_plot() on every ggplot() and `+`, so a plot
+#     built BEFORE its device is opened (the nuclei, western blot and
+#     thickness templates: `p <- ggplot(...); mpfig_plot(f); print(p)`) made
+#     a snapshot taken when the next device opened file plot k+1 under k;
+#   - patchwork's print does not set last_plot() at all.
+# before.grid.newpage fires inside ggplot2's / patchwork's print method,
+# whose `x` IS the plot being drawn; any other grid page (grid.arrange,
+# pheatmap, lattice) and base graphics (before.plot.new) clear the slot, so
+# such a file maps to "not a ggplot" instead of to a stale plot.
+#
+# Which call's file a drawing lands in (.mpfig_slot): the mpfig_plot()
+# device is recognised by its number AND identity (device name + the
+# "filepath" attribute grDevices devices carry), so a device that reuses
+# the number after the user's own dev.off() is never mistaken for it:
+# svglite, and other packages' devices, have no "filepath" at all, and the
+# Windows png device names its file in the device name. A grDevices device
+# opened on an mpfig_plot() file (the user's own png() on the same path)
+# does update that file's slot: its drawing is what the file then holds.
+#
+# .mpfig_px: the macOS (quartz) PNG device works from inches (px / res) and
+# truncates on the way back, so e.g. width 1103 at res 300 or height 851
+# came out one pixel short, and a same-size re-render then laid the plot out
+# on a slightly different canvas. A quarter pixel is added only when that
+# truncation is predicted; devices that do not truncate (cairo, Windows)
+# truncate or round the quarter away, and every other size is untouched.
+_R_PLOT_CAPTURE_PRELUDE = r'''.plot_count <- 0
+.mpfig_files <- character(0)   # name each mpfig_plot() call gave its file (call order; NA = not directly in .plot_dir)
+.mpfig_paths <- character(0)   # path its device was opened on
+.mpfig_plots <- list()         # ggplot last printed onto that file, else NULL
+.mpfig_pages <- integer(0)     # pages drawn onto that file
+.mpfig_dev <- -1L
+.mpfig_devid <- NULL
+.mpfig_win <- .Platform$OS.type == "windows"
+.mpfig_px <- function(x, res) {
+  x <- suppressWarnings(as.numeric(x)[1]); res <- suppressWarnings(as.numeric(res)[1])
+  if (is.finite(x) && is.finite(res) && res > 0 && x == round(x) && trunc(x / res * res) != x) x + 0.25 else x
+}
+.mpfig_id <- function(n) { .d <- .Devices[[n]]; list(as.character(.d), attr(.d, "filepath", exact = TRUE)) }
+# A device path as the file system resolves it (real folder, name as stored).
+.mpfig_key <- function(p) {
+  p <- as.character(p)[1]
+  b <- if (file.exists(p)) basename(normalizePath(p, winslash = "/", mustWork = FALSE)) else basename(p)
+  k <- paste0(normalizePath(dirname(p), winslash = "/", mustWork = FALSE), "/", b)
+  if (.mpfig_win) tolower(k) else k
+}
+# The mpfig_plot() call whose file the current device draws onto (0 = none).
+.mpfig_slot <- function() {
+  n <- dev.cur()
+  if (.plot_count < 1 || n < 2L) return(0L)
+  open <- .mpfig_dev %in% dev.list() && identical(.mpfig_id(.mpfig_dev), .mpfig_devid)
+  if (open && n == .mpfig_dev) return(as.integer(.plot_count))
+  fp <- .mpfig_id(n)[[2]]
+  if (!is.character(fp) || length(fp) != 1L || !nzchar(fp)) return(0L)
+  hit <- which(vapply(.mpfig_paths, .mpfig_key, "", USE.NAMES = FALSE) == .mpfig_key(fp))
+  if (open) hit <- setdiff(hit, .plot_count)   # still being written by the mpfig_plot() device
+  if (length(hit)) as.integer(max(hit)) else 0L
+}
+setHook("before.grid.newpage", function(...) try({
+  .k <- .mpfig_slot()
+  if (.k > 0L) {
+    .p <- NULL
+    for (.i in rev(seq_len(sys.nframe()))) {
+      .f <- sys.function(.i)
+      if (is.function(.f) && !is.primitive(.f) &&
+          environmentName(topenv(environment(.f))) %in% c("ggplot2", "patchwork")) {
+        .x <- get0("x", envir = sys.frame(.i), inherits = FALSE)
+        if (inherits(.x, "ggplot")) { .p <- .x; break }
+      }
+    }
+    .mpfig_plots[.k] <<- list(.p)
+    .mpfig_pages[.k] <<- .mpfig_pages[.k] + 1L
+  }
+}, silent = TRUE), "append")
+setHook("before.plot.new", function(...) try({
+  .k <- .mpfig_slot()
+  if (.k > 0L) {
+    .mpfig_plots[.k] <<- list(NULL)
+    .mpfig_pages[.k] <<- .mpfig_pages[.k] + 1L
+  }
+}, silent = TRUE), "append")
+# The name call k's file has on disk (case and Unicode form as stored: the
+# macOS PNG device writes decomposed names, so "größe.png" is listed
+# as "größe.png"), or NA. A "%d" page pattern ("plot%02d.png") names one
+# file per page; it is mapped only when the call drew a single page.
+.mpfig_disk_name <- function(k) {
+  f <- .mpfig_files[k]
+  if (is.na(f)) return(NA_character_)
+  if (grepl("%", f, fixed = TRUE)) {
+    f1 <- tryCatch(suppressWarnings(sprintf(f, 1L)), error = function(e) NA_character_)
+    f2 <- tryCatch(suppressWarnings(sprintf(f, 2L)), error = function(e) NA_character_)
+    if (is.na(f1) || is.na(f2)) return(NA_character_)
+    if (f1 != f2 && (.mpfig_pages[k] > 1L || file.exists(file.path(.plot_dir, f2)))) return(NA_character_)
+    f <- f1
+  }
+  p <- file.path(.plot_dir, f)
+  if (!file.exists(p)) return(NA_character_)
+  basename(normalizePath(p, winslash = "/", mustWork = FALSE))
+}
+'''
+
+
+def _r_target_block(target_idx: int, target_file: str) -> str:
+    """R snippet that resolves `override_plot_index` to the plot to re-render.
+
+    Lists the plot dir exactly as `_r_plot_files` does (top level, ".png"
+    suffix — case-insensitive on Windows, like Python's glob there — no
+    dotfiles, no directories, the override image excluded), sorts it in
+    code-point order like Python's sorted(), takes the name at the requested
+    position and maps it to the LAST mpfig_plot() call whose file has that
+    name on disk. The sort compares the UTF-8 bytes (same order as code
+    points) as hex keys: R's radix sort refuses non-ASCII names that
+    list.files() returns unmarked, and the locale-aware default sort and
+    list.files() order both differ from Python's. Each call's name is
+    resolved to the stored one (`.mpfig_disk_name`), so a case-insensitive
+    file system ("A.png" then "a.png" is one file holding the second plot)
+    and macOS's decomposed names map correctly; Windows compares ignoring
+    case. Sets `.mpfig_p` to that ggplot, or NULL when there is none, and
+    writes the resolved name, a found flag and why not ("notgg": the file
+    holds base graphics / grid / another package's drawing; "nocall": no
+    single-page mpfig_plot() file has that name) to `target_file` so Python
+    can verify the name against its own list before trusting the result."""
+    tf = _r_escape(target_file.replace(chr(92), "/"))
+    idx = max(0, int(target_idx)) + 1
+    return (
+        "\n# ── mpfig: resolve override_plot_index (filename order) ──\n"
+        ".mpfig_p <- NULL\n"
+        "try({\n"
+        '  .mpfig_why <- "nocall"\n'
+        "  .mpfig_ls <- list.files(.plot_dir, all.files = FALSE, no.. = TRUE)\n"
+        '  .mpfig_ls <- .mpfig_ls[grepl("\\\\.png$", .mpfig_ls, ignore.case = .mpfig_win, useBytes = TRUE) &\n'
+        '                         !grepl("^\\\\.", .mpfig_ls, useBytes = TRUE) & .mpfig_ls != "zz_mpfig_override.png" &\n'
+        "                         !dir.exists(file.path(.plot_dir, .mpfig_ls))]\n"
+        "  .mpfig_ls <- .mpfig_ls[order(vapply(.mpfig_ls, function(s) paste(as.character(charToRaw(enc2utf8(s))), collapse = \"\"),\n"
+        '                                      "", USE.NAMES = FALSE), method = "radix")]\n'
+        f"  .mpfig_nm <- if (length(.mpfig_ls) >= {idx}) .mpfig_ls[{idx}] else NA_character_\n"
+        "  if (!is.na(.mpfig_nm)) {\n"
+        '    .mpfig_od <- vapply(seq_along(.mpfig_files), .mpfig_disk_name, "")\n'
+        "    .mpfig_c <- which(if (.mpfig_win) tolower(.mpfig_od) == tolower(.mpfig_nm) else .mpfig_od == .mpfig_nm)\n"
+        "    if (length(.mpfig_c)) {\n"
+        "      .mpfig_p <- .mpfig_plots[[max(.mpfig_c)]]\n"
+        '      .mpfig_why <- "notgg"\n'
+        "    }\n"
+        "  }\n"
+        '  if (!inherits(.mpfig_p, "ggplot")) .mpfig_p <- NULL else .mpfig_why <- ""\n'
+        '  writeLines(enc2utf8(c(if (is.na(.mpfig_nm)) "" else .mpfig_nm, if (is.null(.mpfig_p)) "0" else "1", .mpfig_why)),\n'
+        f'             "{tf}", useBytes = TRUE)\n'
+        "}, silent = TRUE)\n"
+    )
+
+
+_R_OVERRIDE_PNG = "zz_mpfig_override.png"
+_R_OVERRIDE_SVG = "zz_mpfig_override.svg"
+
+
+def _r_plot_files(plot_dir: str):
+    """(normal plot paths, override PNG path or None) of a run-r plot dir.
+
+    The normal list is what a run returns as `plots` and what
+    override_plot_index counts in: glob + sorted() as always (so the order,
+    and Windows' case-insensitive match, are what every stored rPlotIndex
+    was taken from), minus directories named *.png (open() would fail on
+    them) and minus the override image, which is returned separately so it
+    can go LAST whatever the other names are (a user's "zzz.png" sorts after
+    "zz_mpfig_override.png")."""
+    files = [p for p in sorted(glob_mod.glob(os.path.join(plot_dir, "*.png"))) if os.path.isfile(p)]
+    normal = [p for p in files if os.path.basename(p) != _R_OVERRIDE_PNG]
+    ov = next((p for p in files if os.path.basename(p) == _R_OVERRIDE_PNG), None)
+    return normal, ov
+
+
+def _r_read_target(path: str):
+    """(resolved filename, found a ggplot, why not: "notgg" / "nocall" / "")
+    from the target block, or None when R never got that far (the script
+    stopped with an error)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().split("\n")
+    except OSError:
+        return None
+    found = len(lines) > 1 and lines[1].strip() == "1"
+    why = lines[2].strip() if len(lines) > 2 else ""
+    return lines[0], found, why
+
+
+def _r_tail(text: Optional[str], n: int = 400) -> str:
+    t = (text or "").strip()
+    return t[-n:] if t else ""
+
+
+def _r_text_override_block(ov: dict, width: int, height: int, force: bool = False, res: int = 150, svg: bool = False) -> str:
+    """Build an R snippet that takes the plot `_r_target_block` resolved
+    (`.mpfig_p`), applies per-slot text/size/color/face overrides via
+    labs()+theme() (for a patchwork: `&` on every panel, plot_annotation()
+    for the overall title), and writes it to zz_mpfig_override.png (or .svg). When
+    `force` is set, the plot is re-rendered at the given size even with no
+    overrides (used for high-DPI export). Renders nothing when `.mpfig_p` is
+    NULL: a plot that cannot be re-rendered is never swapped for another."""
     ov = ov if isinstance(ov, dict) else {}
     if not ov and not force:
         return ""
@@ -7263,7 +7466,7 @@ def _r_text_override_block(ov: dict, width: int, height: int, force: bool = Fals
                 # The legend title comes from the mapped aesthetic — set the
                 # common ones to the same text so whichever is in use updates.
                 for aes in ("colour", "fill", "linetype", "shape", "size", "alpha"):
-                    labs_parts.append(f'{aes}="{_r_escape(txt)}"')
+                    labs_parts.append((aes, f'{aes}="{_r_escape(txt)}"'))
             et = elem_text(o)
             if et:
                 theme_parts.append(f"legend.title={et}")
@@ -7272,58 +7475,71 @@ def _r_text_override_block(ov: dict, width: int, height: int, force: bool = Fals
         if elem_name is None:
             continue
         if labs_key and o.get("text") is not None and o.get("text") != "":
-            labs_parts.append(f'{labs_key}="{_r_escape(o["text"])}"')
+            labs_parts.append((labs_key, f'{labs_key}="{_r_escape(o["text"])}"'))
         et = elem_text(o)
         if et:
             theme_parts.append(f"{elem_name}={et}")
 
     add = []
     if labs_parts:
-        add.append("ggplot2::labs(" + ", ".join(labs_parts) + ")")
+        add.append("ggplot2::labs(" + ", ".join(p for _, p in labs_parts) + ")")
     if theme_parts:
         add.append("ggplot2::theme(" + ", ".join(theme_parts) + ")")
     if not add and not force:
         return ""
-    apply_line = (f"      .mpfig_p <- .mpfig_p + {' + '.join(add)}\n") if add else ""
+    apply_line = ""
+    if add:
+        # A patchwork (e.g. the cell-shape template's wrap_plots() +
+        # plot_annotation()) is a ggplot whose `+` reaches only its LAST
+        # panel. Its title / subtitle / caption are the plot_annotation()'s,
+        # so their text goes there; styles go to every panel and to the
+        # annotation with `&` (which also updates the annotation theme), and
+        # axis / legend title text is set on every panel.
+        ann_keys = {"title", "subtitle", "caption"}
+        pw = []
+        panel_labs = [p for k, p in labs_parts if k not in ann_keys]
+        ann_labs = [p for k, p in labs_parts if k in ann_keys]
+        if panel_labs:
+            pw.append("ggplot2::labs(" + ", ".join(panel_labs) + ")")
+        if theme_parts:
+            pw.append("ggplot2::theme(" + ", ".join(theme_parts) + ")")
+        pw_lines = "".join(f"      .mpfig_p <- .mpfig_p & {e}\n" for e in pw)
+        if ann_labs:
+            pw_lines += f"      .mpfig_p <- .mpfig_p + patchwork::plot_annotation({', '.join(ann_labs)})\n"
+        apply_line = (
+            '    if (inherits(.mpfig_p, "patchwork")) {\n'
+            f"{pw_lines}"
+            "    } else {\n"
+            f"      .mpfig_p <- .mpfig_p + {' + '.join(add)}\n"
+            "    }\n"
+        )
     _res = max(72, int(res))
+    # Same px correction as mpfig_plot(), so a same-size re-render gets the
+    # same canvas as the original file.
+    png_dev = (f'png(file.path(.plot_dir, "{_R_OVERRIDE_PNG}"), width=.mpfig_px({int(width)}, {_res}), '
+               f'height=.mpfig_px({int(height)}, {_res}), res={_res})')
     if svg:
         # svglite width/height are in INCHES; derive from the px size + res so
         # the SVG reproduces the same text-to-plot proportions as the PNG path.
         w_in = max(1.0, float(width) / _res)
         h_in = max(1.0, float(height) / _res)
         device = (
-            '      if (requireNamespace("svglite", quietly=TRUE)) {\n'
-            f'        svglite::svglite(file.path(.plot_dir, "zz_mpfig_override.svg"), width={w_in:.4f}, height={h_in:.4f})\n'
-            "      } else {\n"
-            f'        png(file.path(.plot_dir, "zz_mpfig_override.png"), width={int(width)}, height={int(height)}, res={_res})\n'
-            "      }\n"
+            '    if (requireNamespace("svglite", quietly=TRUE)) {\n'
+            f'      svglite::svglite(file.path(.plot_dir, "{_R_OVERRIDE_SVG}"), width={w_in:.4f}, height={h_in:.4f})\n'
+            "    } else {\n"
+            f"      {png_dev}\n"
+            "    }\n"
         )
     else:
-        device = f'      png(file.path(.plot_dir, "zz_mpfig_override.png"), width={int(width)}, height={int(height)}, res={_res})\n'
-    # R indices are 1-based; the prelude's .mpfig_plots is keyed by
-    # the plot_count value at capture time, so target_idx + 1 reads
-    # the right slot.  Falls back to last_plot() when the requested
-    # index is missing (e.g. a single-plot script asking for index 0
-    # before the script finalised) — the prelude's end-of-script hook
-    # backfills .mpfig_plots[[.plot_count]] so this fallback is rare.
-    target_r = int(target_idx) + 1
+        device = f"    {png_dev}\n"
     return (
         "\n# ── mpfig R text overrides (collage) ──\n"
         "try({\n"
-        '  if (requireNamespace("ggplot2", quietly=TRUE)) {\n'
-        f"    .mpfig_target_idx <- {target_r}\n"
-        "    .mpfig_p <- tryCatch(\n"
-        "      if (.mpfig_target_idx >= 1 && exists('.mpfig_plots') && length(.mpfig_plots) >= .mpfig_target_idx)\n"
-        "        .mpfig_plots[[.mpfig_target_idx]]\n"
-        "      else ggplot2::last_plot(),\n"
-        "      error=function(e) ggplot2::last_plot()\n"
-        "    )\n"
-        '    if (!is.null(.mpfig_p) && inherits(.mpfig_p, "ggplot")) {\n'
+        '  if (!is.null(.mpfig_p) && requireNamespace("ggplot2", quietly=TRUE)) {\n'
         f"{apply_line}"
         f"{device}"
-        "      print(.mpfig_p)\n"
-        "      while (dev.cur() > 1) dev.off()\n"
-        "    }\n"
+        "    print(.mpfig_p)\n"
+        "    while (dev.cur() > 1) dev.off()\n"
         "  }\n"
         "}, silent=TRUE)\n"
     )
@@ -7343,7 +7559,7 @@ def run_r_code(body: RAnalysisRequest):
         body.data_csv = body.measurements_csv
     rscript = _find_rscript(body.rscript_path)
     if not rscript:
-        return {"success": False, "stdout": "", "stderr": "R is not installed. Please install R from https://cran.r-project.org/ or specify the Rscript path.", "plots": [], "tables": []}
+        return {"success": False, "stdout": "", "stderr": "R is not installed. Please install R from https://cran.r-project.org/ or specify the Rscript path.", "plots": [], "tables": [], "override_error": None, "override_code": None}
 
     with tempfile.TemporaryDirectory(prefix="mpfig_r_") as tmpdir:
         data_path = os.path.join(tmpdir, "data.csv")
@@ -7378,31 +7594,26 @@ def run_r_code(body: RAnalysisRequest):
         # renders as missing glyphs in every plot label.
         script += f'# Auto-generated data loading\ndata <- read.csv("{data_path.replace(chr(92), "/")}", encoding = "UTF-8")\n\n'
         script += f'# Set plot output directory\n.plot_dir <- "{plot_dir.replace(chr(92), "/")}"\n'
-        script += '.plot_count <- 0\n'
-        # Per-plot capture list — drives the text-override block's
-        # ability to target a SPECIFIC plot from a multi-plot script.
-        # Each mpfig_plot() call snapshots the previous device's
-        # last_plot() into this list keyed by the (just-finalised)
-        # plot index, so the override block can pick .mpfig_plots[[N]]
-        # rather than blindly using last_plot() (which is the LAST
-        # plot — wrong target whenever the script produced >1).
-        script += '.mpfig_plots <- list()\n'
+        # Per-plot capture (file written + ggplot printed, per mpfig_plot()
+        # call) — lets the override block re-render a SPECIFIC plot of a
+        # multi-plot script; see _R_PLOT_CAPTURE_PRELUDE.
+        script += _R_PLOT_CAPTURE_PRELUDE
         _base_fs = body.base_font_size if (body.base_font_size and body.base_font_size > 0) else None
         script += 'mpfig_plot <- function(filename=NULL, width=800, height=600, res=150) {\n'
-        script += '  # Finalise the previous plot before opening a new device:\n'
-        script += '  # close the current device so last_plot() / display state is\n'
-        script += '  # consistent, then capture the just-printed ggplot for the\n'
-        script += '  # override block.\n'
-        script += '  if (.plot_count > 0) {\n'
-        script += '    while (dev.cur() > 1) try(dev.off(), silent=TRUE)\n'
-        script += '    if (requireNamespace("ggplot2", quietly=TRUE)) {\n'
-        script += '      .lp <- tryCatch(ggplot2::last_plot(), error=function(e) NULL)\n'
-        script += '      if (!is.null(.lp)) .mpfig_plots[[.plot_count]] <<- .lp\n'
-        script += '    }\n'
-        script += '  }\n'
+        script += '  # Finalise the previous plot before opening a new device.\n'
+        script += '  if (.plot_count > 0) while (dev.cur() > 1) try(dev.off(), silent=TRUE)\n'
         script += '  .plot_count <<- .plot_count + 1\n'
         script += '  if (is.null(filename)) filename <- paste0("plot_", .plot_count, ".png")\n'
-        script += '  png(file.path(.plot_dir, filename), width=width, height=height, res=res)\n'
+        script += '  .mpfig_fn <- as.character(filename)[1]\n'
+        # Only a file directly in .plot_dir is returned (and indexable).
+        script += '  .mpfig_files[.plot_count] <<- if (isTRUE(dirname(.mpfig_fn) == ".")) basename(.mpfig_fn) else NA_character_\n'
+        script += '  .mpfig_plots[.plot_count] <<- list(NULL)\n'
+        script += '  .mpfig_pages[.plot_count] <<- 0L\n'
+        script += '  .mpfig_dev <<- -1L\n'
+        script += '  .mpfig_paths[.plot_count] <<- file.path(.plot_dir, filename)\n'
+        script += '  png(.mpfig_paths[.plot_count], width=.mpfig_px(width, res), height=.mpfig_px(height, res), res=res)\n'
+        script += '  .mpfig_dev <<- dev.cur()\n'
+        script += '  .mpfig_devid <<- .mpfig_id(.mpfig_dev)\n'
         if _base_fs:
             # Base-graphics best-effort: scale character expansion relative to
             # R's default 12pt so base plots roughly track the target size.
@@ -7492,49 +7703,72 @@ def run_r_code(body: RAnalysisRequest):
         script += '}\n\n'
         script += '# User code\n'
         script += body.code
-        script += '\n\n# Close any open graphics devices and snapshot the FINAL plot.\n'
+        # Close any open graphics devices. Plots were captured as they were
+        # printed (graphics hooks), so nothing is snapshotted here; the old
+        # top-level `.mpfig_plots[[n]] <<- last_plot()` failed silently
+        # (`<<-` from the global env cannot find the list) and the last
+        # plot was only reachable through a last_plot() fallback.
+        script += '\n\n# Close any open graphics devices.\n'
         script += 'while (dev.cur() > 1) try(dev.off(), silent=TRUE)\n'
-        # Wrap the snapshot in try() — R\'s [[]] on a list errors with
-        # "subscript out of bounds" when the index exceeds the list
-        # length, and we may legitimately be assigning past the end
-        # (mpfig_plot snapshots BEFORE opening the next device, so the
-        # LAST plot has never been written into .mpfig_plots yet —
-        # .plot_count is N, length(.mpfig_plots) is N-1).  Always
-        # assign unconditionally: R grows the list on <<- assignment,
-        # so .mpfig_plots[[.plot_count]] <<- .lp is safe whether the
-        # slot existed or not.  Older form used is.null(.mpfig_plots[[.plot_count]])
-        # to gate the assignment — but the [[]] read fails for the
-        # out-of-bounds case and halts the script.
-        script += 'try({\n'
-        script += '  if (.plot_count > 0 && requireNamespace("ggplot2", quietly=TRUE)) {\n'
-        script += '    .lp <- tryCatch(ggplot2::last_plot(), error=function(e) NULL)\n'
-        script += '    if (!is.null(.lp)) .mpfig_plots[[.plot_count]] <<- .lp\n'
-        script += '  }\n'
-        script += '}, silent = TRUE)\n'
+        script += '.mpfig_dev <- -1L\n'
+        want_override = bool(body.text_overrides or body.render_override or body.render_svg)
+        target_idx = max(0, int(body.override_plot_index or 0))
+        target_file = os.path.join(tmpdir, "mpfig_override_target.txt")
+        if want_override or body.emit_labels:
+            script += _r_target_block(target_idx, target_file)
         # Per-element text overrides (collage R-plot text editing): re-render
         # the targeted plot with title/axis/legend overrides into
         # zz_mpfig_override.png.  `render_override` forces this re-render
         # even with no overrides (used by Save Collage to re-render at
         # higher resolution for high-DPI export).
-        # `override_plot_index` is 0-based — 1-based in R as the list index.
-        if body.text_overrides or body.render_override or body.render_svg:
+        if want_override:
             script += _r_text_override_block(
                 body.text_overrides or {}, body.override_width, body.override_height,
                 force=bool(body.render_override or body.render_svg), res=body.override_res,
                 svg=bool(body.render_svg),
-                target_idx=int(body.override_plot_index or 0),
             )
         if body.emit_labels:
             script += (
-                "\n# ── mpfig: emit current ggplot text labels ──\n"
+                "\n# ── mpfig: emit the targeted ggplot's text labels ──\n"
                 "try({\n"
                 '  if (requireNamespace("ggplot2", quietly=TRUE)) {\n'
-                "    .mpfig_lp <- tryCatch(ggplot2::last_plot(), error=function(e) NULL)\n"
-                "    if (!is.null(.mpfig_lp)) {\n"
+                # The plot override_plot_index selected, with any text
+                # overrides applied (not last_plot(): that is the script's
+                # LAST plot, whichever item asked).
+                "    .mpfig_lp <- .mpfig_p\n"
                 # get_labs() (ggplot2 >= 3.5) resolves auto aesthetic labels
                 # (e.g. legend titles from aes(fill=...)); fall back to $labels.
-                "      .mpfig_lab <- tryCatch(ggplot2::get_labs(.mpfig_lp), error=function(e) .mpfig_lp$labels)\n"
-                "      if (is.null(.mpfig_lab)) .mpfig_lab <- .mpfig_lp$labels\n"
+                "    .mpfig_labs1 <- function(p) {\n"
+                "      l <- tryCatch(ggplot2::get_labs(p), error = function(e) NULL)\n"
+                "      if (is.null(l)) l <- tryCatch(p$labels, error = function(e) NULL)\n"
+                "      l\n"
+                "    }\n"
+                # A patchwork's own labels are its LAST panel's. Report what
+                # the override block edits instead: the plot_annotation()
+                # title / subtitle / caption, and an axis / legend title only
+                # when every panel that has one agrees on it.
+                "    .mpfig_leaves <- function(p) {\n"
+                "      out <- list()\n"
+                '      if (inherits(p, "patchwork")) for (q in p$patches$plots) if (inherits(q, "ggplot")) out <- c(out, .mpfig_leaves(q))\n'
+                "      c(out, list(.mpfig_labs1(p)))\n"
+                "    }\n"
+                "    if (!is.null(.mpfig_lp)) {\n"
+                '      if (inherits(.mpfig_lp, "patchwork")) {\n'
+                "        .mpfig_L <- Filter(Negate(is.null), .mpfig_leaves(.mpfig_lp))\n"
+                "        .mpfig_lab <- list()\n"
+                "        for (.mpfig_k in unique(unlist(lapply(.mpfig_L, names)))) {\n"
+                '          if (.mpfig_k %in% c("title", "subtitle", "caption", "tag")) next\n'
+                "          .mpfig_vs <- unique(Filter(Negate(is.null), lapply(.mpfig_L, function(l) l[[.mpfig_k]])))\n"
+                "          if (length(.mpfig_vs) == 1L) .mpfig_lab[[.mpfig_k]] <- .mpfig_vs[[1]]\n"
+                "        }\n"
+                "        .mpfig_ann <- tryCatch(.mpfig_lp$patches$annotation, error = function(e) NULL)\n"
+                '        for (.mpfig_k in c("title", "subtitle", "caption")) {\n'
+                "          .mpfig_v <- .mpfig_ann[[.mpfig_k]]\n"
+                '          if (length(.mpfig_v) && !inherits(.mpfig_v, "waiver")) .mpfig_lab[[.mpfig_k]] <- .mpfig_v\n'
+                "        }\n"
+                "      } else {\n"
+                "        .mpfig_lab <- .mpfig_labs1(.mpfig_lp)\n"
+                "      }\n"
                 '      cat("__MPFIG_LABELS_START__\\n")\n'
                 "      for (.mpfig_k in names(.mpfig_lab)) {\n"
                 "        .mpfig_v <- .mpfig_lab[[.mpfig_k]]\n"
@@ -7565,14 +7799,72 @@ def run_r_code(body: RAnalysisRequest):
                 encoding="utf-8", errors="replace",
             )
         except subprocess.TimeoutExpired:
-            return {"success": False, "stdout": "", "stderr": "R script timed out after 120 seconds (may be installing packages — try again).", "plots": [], "tables": []}
+            return {"success": False, "stdout": "", "stderr": "R script timed out after 120 seconds (may be installing packages — try again).", "plots": [], "tables": [], "override_error": None, "override_code": None}
         except Exception as e:
-            return {"success": False, "stdout": "", "stderr": str(e), "plots": [], "tables": []}
+            return {"success": False, "stdout": "", "stderr": str(e), "plots": [], "tables": [], "override_error": None, "override_code": None}
 
-        plot_files = sorted(glob_mod.glob(os.path.join(plot_dir, "*.png")))
+        normal_files, override_png = _r_plot_files(plot_dir)
+        override_svg = os.path.join(plot_dir, _R_OVERRIDE_SVG)
+        # Verify what R resolved against our own list before trusting it:
+        # the override image and the labels must belong to plot N, or
+        # nothing is returned for them (never a different plot).
+        override_error = None
+        # Machine-readable form of override_error. "not_ggplot",
+        # "not_mpfig_plot" and "no_such_plot" are properties of the script
+        # (re-running it cannot help); "script_error", "mismatch" and
+        # "render_failed" may not be.
+        override_code = None
+        target_ok = True
+        if want_override or body.emit_labels:
+            n = target_idx + 1
+            tgt = _r_read_target(target_file)
+            expected = os.path.basename(normal_files[target_idx]) if target_idx < len(normal_files) else None
+            keep = "it keeps its original image."
+            if tgt is None:
+                target_ok = False
+                override_code = "script_error"
+                override_error = (
+                    f"The R script stopped with an error, so plot {n} could not be re-rendered."
+                    if result.returncode != 0 else f"R could not look up plot {n} to re-render it."
+                )
+                if _r_tail(result.stderr):
+                    override_error += "\n\n" + _r_tail(result.stderr)
+            elif expected is None:
+                target_ok = False
+                override_code = "no_such_plot"
+                override_error = (f"There is no plot {n} in this script's output any more "
+                                  f"(it now makes {len(normal_files)}), so nothing was re-rendered.")
+            elif tgt[0] != expected:
+                target_ok = False
+                override_code = "mismatch"
+                override_error = (f"Plot {n} ({expected}) could not be matched to the R code that drew it, "
+                                  "so nothing was re-rendered.")
+            elif not tgt[1] and tgt[2] == "notgg":
+                target_ok = False
+                override_code = "not_ggplot"
+                override_error = (f"Plot {n} ({expected}) is not a ggplot (it holds base graphics, a grid page "
+                                  "such as grid.arrange(), or another package's drawing), so it cannot be "
+                                  f"re-rendered or have its text edited; {keep}")
+            elif not tgt[1]:
+                target_ok = False
+                override_code = "not_mpfig_plot"
+                override_error = (f"Plot {n} ({expected}) was not drawn as a single image through mpfig_plot() "
+                                  "(it was saved directly, e.g. with png() or ggsave(), or it is one page of a "
+                                  f"multi-page \"%d\" file), so it cannot be re-rendered or have its text edited; {keep}")
+            elif want_override and override_png is None and not os.path.isfile(override_svg):
+                override_code = "render_failed"
+                override_error = f"R could not re-render plot {n} ({expected})."
+                if _r_tail(result.stderr):
+                    override_error += "\n\n" + _r_tail(result.stderr)
+            if not want_override:
+                override_error = None
+                override_code = None
+        if not target_ok:
+            override_png = None
+        plot_files = normal_files + ([override_png] if override_png else [])
         # When the caller only wants the override-applied plot, drop the rest.
-        if body.override_only and (body.text_overrides or body.render_override or body.render_svg):
-            plot_files = [p for p in plot_files if os.path.basename(p) == "zz_mpfig_override.png"]
+        if body.override_only and want_override:
+            plot_files = [override_png] if override_png else []
         plots_b64 = []
         for png_path in plot_files:
             with open(png_path, "rb") as pf:
@@ -7592,8 +7884,8 @@ def run_r_code(body: RAnalysisRequest):
 
         # Read the override SVG (vector R plot) when requested.
         svg_text = None
-        if body.render_svg:
-            svg_path = os.path.join(plot_dir, "zz_mpfig_override.svg")
+        if body.render_svg and target_ok:
+            svg_path = override_svg
             if os.path.isfile(svg_path):
                 try:
                     with open(svg_path, "r", encoding="utf-8") as sf:
@@ -7604,7 +7896,7 @@ def run_r_code(body: RAnalysisRequest):
 
         # Parse emitted ggplot labels (between the markers) when requested.
         labels: Dict[str, str] = {}
-        if body.emit_labels:
+        if body.emit_labels and target_ok:
             so = result.stdout or ""
             if "__MPFIG_LABELS_START__" in so and "__MPFIG_LABELS_END__" in so:
                 seg = so.split("__MPFIG_LABELS_START__", 1)[1].split("__MPFIG_LABELS_END__", 1)[0]
@@ -7623,6 +7915,10 @@ def run_r_code(body: RAnalysisRequest):
             "tables": tables_out,
             "labels": labels,
             "svg": svg_text,
+            # Why no override image came back for override_plot_index (None
+            # when it did, or when no override was requested).
+            "override_error": override_error,
+            "override_code": override_code,
         }
 
 
@@ -10585,9 +10881,12 @@ def cellpose_preview(body: CellposePreviewRequest):
         return next((im.get("image") for im in imgs if str(im.get("name", "")).endswith(suffix)), None)
     n_cells = None
     for t in (res.get("tables") or []):
-        rows = [r for r in (t.get("csv") or "").splitlines() if r.strip()]
+        # csv.reader, not split(","): the first cell is the source name, which
+        # can hold a comma ("1hr, Sample 1") and would shift the count column.
+        import csv as _csv
+        rows = [r for r in _csv.reader(io.StringIO(t.get("csv") or "")) if any(c.strip() for c in r)]
         if len(rows) >= 2:
-            parts = rows[1].split(",")
+            parts = rows[1]
             if len(parts) >= 2:
                 try:
                     n_cells = int(float(parts[1]))

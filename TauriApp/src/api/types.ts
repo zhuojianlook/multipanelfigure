@@ -164,14 +164,22 @@ export interface ThicknessReading {
   measure_position_y?: number;
   /** Per-reading rich text from the hover toolbar. */
   styled_segments?: StyledSegment[];
+  /** Per-reading label size (pt, same 216pt reference as measure_font_size)
+   *  and colour, set in batch from the Individual readings list. null /
+   *  absent = inherit the measurement's. A styled segment's own size /
+   *  colour still wins over these. */
+  font_size?: number | null;
+  color?: string | null;
 }
 
-/** Curved Surface Measurement — thickness readings between two 3-point
- *  circular-arc surfaces. Backend mirror: models.ThicknessMeasurement. */
+/** Curved Surface Measurement — thickness readings between two traced
+ *  surfaces (2+ points each: 2 = straight, 3 = circular arc, 4+ = smooth
+ *  spline; see utils/thicknessGeometry). Backend mirror:
+ *  models.ThicknessMeasurement. */
 export interface ThicknessMeasurement {
   name: string;
-  top_points: [number, number][];     // 3 x (x%, y%) defining the top arc
-  bottom_points: [number, number][];  // 3 x (x%, y%) defining the bottom arc
+  top_points: [number, number][];     // 2+ x (x%, y%) defining the top surface
+  bottom_points: [number, number][];  // 2+ x (x%, y%) defining the bottom surface
   num_readings: number;       // always odd — a reading sits on `center`
   center: number;             // 0..1 along the top arc (draggable node)
   spacing: number;            // step between readings, fraction of top arc length
