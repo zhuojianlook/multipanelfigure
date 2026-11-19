@@ -1585,6 +1585,10 @@ export function Toolbar() {
                   onClick={async () => {
                     const { invoke } = await import("@tauri-apps/api/core");
                     const { listen } = await import("@tauri-apps/api/event");
+                    // Installing stops the sidecar: unsaved figures and every
+                    // document's Analysis workflows are dealt with first.
+                    const { runQuitGuard } = await import("../../utils/projectNav");
+                    if (!(await runQuitGuard("restart"))) return;
                     try {
                       try { await invoke("kill_sidecar"); } catch { /* ignore */ }
                       setUpdateStatus("downloading");

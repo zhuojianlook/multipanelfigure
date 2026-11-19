@@ -52,6 +52,9 @@ from models import (
     StyledSegment, save_config, load_config, save_project, load_project,
     _to_dict, _from_dict,
     DEFAULT_FIGURE_ID, active_figure_id, iter_figures, resolve_figure_config,
+    WORKFLOWS_PREFIX, WORKFLOWS_MANIFEST, WORKFLOWS_UPLOADS, WORKFLOWS_FORMAT,
+    WORKFLOWS_VERSION, WORKFLOW_BLOB_KINDS, workflow_blob_member, workflow_member_plan,
+    write_zip_members, copy_zip_member, read_workflow_members, workflows_manifest_status,
 )
 from image_processing import process_panel
 from figure_builder import assemble_figure
@@ -265,6 +268,9 @@ _GATE_SELF = frozenset({
     "/api/project/activate-state", "/api/project/load",
     "/api/project/new-blank", "/api/project/bind-live",
     "/api/analysis/images/upload",
+    # Parses the file outside the gate; exclusive only while it restores the
+    # file's embedded uploads into the Analysis store.
+    "/api/project/workflows/read",
     "/api/analysis/inset-sources", "/api/analysis/inset-sources-for",
     "/api/analysis/inset-sources-for-doc", "/api/measurements",
     "/api/analysis/wb-preview", "/api/analysis/wb-detect-bands",
@@ -304,7 +310,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.421"  # CI re-syncs this from the release tag (build-sidecar)
+SIDECAR_BUILD = "0.1.422"  # CI re-syncs this from the release tag (build-sidecar)
 
 
 @app.get("/api/version")
@@ -1651,6 +1657,36 @@ def upload_images(files: List[UploadFile] = File(...)):
     return {"names": names, "thumbnails": thumbnails}
 
 
+def _write_upload_original(name: str, data: bytes) -> str:
+    """Keep an Analysis upload's ORIGINAL bytes in a temp file: the ingest
+    keeps only decoded pixels for most formats, and a saved workflow embeds
+    exactly what was uploaded (z-stacks, videos, OIR/ND2 included)."""
+    fd, p = tempfile.mkstemp(prefix="mpf_orig_", suffix=Path(name).suffix[:16])
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except BaseException:
+        _unlink_quiet(p)
+        raise
+    return p
+
+
+def _set_upload_original(st: dict, name: str, path: str, sha: str) -> None:
+    """Record `path` (SHA-1 `sha`) as the original of upload `name` in store
+    `st`, deleting the original it replaces (a re-upload of the same name)."""
+    files, shas = st.setdefault("orig_files", {}), st.setdefault("orig_sha", {})
+    old = files.get(name)
+    files[name] = path
+    shas[name] = sha
+    if old and old != path:
+        _unlink_quiet(old)
+
+
+def _drop_upload_original(st: dict, name: str) -> None:
+    st.setdefault("orig_sha", {}).pop(name, None)
+    _unlink_quiet(st.setdefault("orig_files", {}).pop(name, None))
+
+
 @app.post("/api/analysis/images/upload")
 def upload_analysis_images(files: List[UploadFile] = File(...)):
     """Standalone Analysis images ('+ Upload' in the Analysis tab). They are
@@ -1658,29 +1694,42 @@ def upload_analysis_images(files: List[UploadFile] = File(...)):
     switch, a new tab or closing a tab never loses them or swaps in another
     document's same-named image — and they are no longer written into the
     active document's .mpf. Decoding reuses the builder ingest path with the
-    globals bound to the store (gate exclusive; file bytes read first)."""
+    globals bound to the store (gate exclusive; file bytes read first).
+    Each file's original bytes are kept too (orig_files / orig_sha), written
+    and hashed before the gate, for embedding in a saved workflow."""
     payload = [(f.filename, f.file.read()) for f in files]
+    origs: List[tuple] = []
+    registered: set = set()
     names: List[str] = []
     thumbs: Dict[str, str] = {}
     sizes: Dict[str, List[int]] = {}
-    with _doc_gate.exclusive():
-        saved = _live_refs()
-        try:
-            _bind_refs(_analysis_store)
-            for fn, data in payload:
-                try:
-                    _ingest_upload_file(fn, data)
-                except HTTPException:
-                    raise
-                except Exception as e:
-                    raise HTTPException(400, f"Failed to load {fn}: {e}")
-                names.append(fn)
-            for n in names:
-                im = loaded_images[n]
-                thumbs[n] = _thumb_b64(im)
-                sizes[n] = [int(im.size[0]), int(im.size[1])]
-        finally:
-            _bind_refs(saved)
+    try:
+        for fn, data in payload:
+            origs.append((_write_upload_original(fn, data), hashlib.sha1(data).hexdigest()))
+        with _doc_gate.exclusive():
+            saved = _live_refs()
+            try:
+                _bind_refs(_analysis_store)
+                for (fn, data), (op, sha) in zip(payload, origs):
+                    try:
+                        _ingest_upload_file(fn, data)
+                    except HTTPException:
+                        raise
+                    except Exception as e:
+                        raise HTTPException(400, f"Failed to load {fn}: {e}")
+                    _set_upload_original(_analysis_store, fn, op, sha)
+                    registered.add(op)
+                    names.append(fn)
+                for n in names:
+                    im = loaded_images[n]
+                    thumbs[n] = _thumb_b64(im)
+                    sizes[n] = [int(im.size[0]), int(im.size[1])]
+            finally:
+                _bind_refs(saved)
+    finally:
+        for op, _sha in origs:
+            if op not in registered:
+                _unlink_quiet(op)
     return {"names": names, "thumbnails": thumbs, "sizes": sizes}
 
 
@@ -1692,6 +1741,7 @@ def delete_analysis_image(name: str):
     for k in ("loaded_images", "raw_analysis_images", "channel_groups",
               "zstack_frames", "zstack_counts", "video_frames"):
         st[k].pop(name, None)
+    _drop_upload_original(st, name)
     paths = [p for p in (st["loaded_zstacks"].pop(name, None),
                          st["loaded_videos"].pop(name, None)) if p]
     _unlink_unreferenced(paths)
@@ -4645,6 +4695,135 @@ def render_video_cancel(job_id: str):
     return {"ok": True}
 
 
+# ── Atomic .mpf writes ─────────────────────────────────────────────────────
+# Every write of a .mpf goes to a temp file in the target's directory that is
+# then os.replace'd over it, so a crash, a full disk or an exception mid-write
+# leaves the previous file intact. _mpf_write_lock serializes the writers (a
+# figure save and a workflows/ rewrite): interleaved, the later replace would
+# silently drop the members the earlier one just wrote.
+import json as _json_wf
+import re as _re_wf
+import shutil as _shutil_wf
+import zipfile as _zipfile
+import zlib as _zlib_wf
+
+_mpf_write_lock = _threading.Lock()
+
+
+def _norm_mpf_path(raw: str, *, ensure_ext: bool = True) -> str:
+    """The on-disk path a request means: ~ expanded, a bare file name placed
+    in ~/Documents and, for a save (ensure_ext), exactly one .mpf extension."""
+    path = os.path.expanduser((raw or "").strip())
+    if ensure_ext and not path.lower().endswith('.mpf'):
+        path = path.rsplit('.', 1)[0] + '.mpf' if '.' in os.path.basename(path) else path + '.mpf'
+    if not os.path.dirname(path):
+        path = os.path.join(os.path.expanduser("~"), "Documents", path)
+    return path
+
+
+def _unlink_quiet(p: Optional[str]) -> None:
+    if p:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+def _mpf_temp_path(path: str) -> str:
+    """A new, empty file next to `path` (same volume, so os.replace is
+    atomic). Created with the default permissions: mkstemp's 0600 would
+    carry over to the saved .mpf."""
+    d = os.path.dirname(path) or "."
+    while True:
+        tmp = os.path.join(d, f".{os.path.basename(path)}.{_uuid.uuid4().hex[:12]}.tmp")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return tmp
+
+
+def _commit_mpf(tmp: str, path: str) -> None:
+    """Atomically put the finished temp file in place of `path`, keeping the
+    replaced file's permissions."""
+    if os.path.exists(path):
+        try:
+            _shutil_wf.copymode(path, tmp)
+        except OSError:
+            pass
+    for attempt in range(10):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            # Windows: the target is briefly open elsewhere (a reader, a sync
+            # client). Elsewhere this is a real permission error.
+            if attempt == 9:
+                raise
+            import time as _time_wf
+            _time_wf.sleep(0.05)
+
+
+def _check_disk_space(target_dir: str, required: int, who: str) -> None:
+    try:
+        usage = _shutil_wf.disk_usage(target_dir or ".")
+    except Exception as e:
+        print(f"[{who}] disk_usage check failed: {e}", file=_sys.stderr, flush=True)
+        return
+    if usage.free < required:
+        raise HTTPException(
+            507,
+            f"Not enough disk space to save project: need ~"
+            f"{required // (1024*1024)} MB, have "
+            f"{usage.free // (1024*1024)} MB free on the target volume.",
+        )
+
+
+def _carry_source(carry_from: Optional[str], path: str) -> Optional[str]:
+    """The file whose workflows/ (and legacy analysis/) members a figure save
+    carries over: the document's previous file (Save As, a moved document),
+    the target itself for a plain re-save (carry_from omitted), or nothing
+    (carry_from "": a document that never had a file must not inherit the
+    members of a file it overwrites)."""
+    if carry_from is None:
+        src = path
+    elif not carry_from.strip():
+        return None
+    else:
+        src = _norm_mpf_path(carry_from, ensure_ext=False)
+    return src if os.path.isfile(src) else None
+
+
+def _carry_size(src: Optional[str], prefixes) -> int:
+    if not src:
+        return 0
+    try:
+        with _zipfile.ZipFile(src, "r") as zs:
+            return sum(i.compress_size for i in zs.infolist() if i.filename.startswith(tuple(prefixes)))
+    except Exception:
+        return 0
+
+
+def _carry_members(src: str, dst: str, prefixes) -> int:
+    """Append `src`'s members under `prefixes` (prefix order, then file order)
+    to the zip at `dst`, so a carried workflows/ section stays contiguous at
+    the tail. Returns how many were carried. Raises when `src` is not a
+    readable zip or a member fails its CRC check."""
+    n = 0
+    with _zipfile.ZipFile(src, "r") as zs, _zipfile.ZipFile(dst, "a") as zd:
+        have = set(zd.namelist())
+        infos = zs.infolist()
+        for pre in prefixes:
+            for info in infos:
+                name = info.filename
+                if name.startswith(pre) and name not in have and not info.is_dir():
+                    copy_zip_member(zs, info, zd)
+                    have.add(name)
+                    n += 1
+    return n
+
+
 class ProjectSaveRequest(BaseModel):
     path: str
     # Optional analysis payload. Shape:
@@ -4656,17 +4835,16 @@ class ProjectSaveRequest(BaseModel):
     # The frontend ships PNG plots as base64 — we decode them here before
     # handing off to save_project().
     analysis: Optional[dict] = None
+    # The document's previous file. Its workflows/ (saved Analysis) members,
+    # and its legacy analysis/ members unless `analysis` is given, are carried
+    # into the saved file. Omitted/null = carry from `path` itself (a plain
+    # re-save); "" = carry nothing (a document that never had a file).
+    carry_from: Optional[str] = None
 
 
 @app.post("/api/project/save")
 def save_proj(body: ProjectSaveRequest):
-    path = os.path.expanduser(body.path.strip())
-    # Ensure .mpf extension (not doubled)
-    if not path.lower().endswith('.mpf'):
-        path = path.rsplit('.', 1)[0] + '.mpf' if '.' in os.path.basename(path) else path + '.mpf'
-    # If no directory specified, save to home directory
-    if not os.path.dirname(path):
-        path = os.path.join(os.path.expanduser("~"), "Documents", path)
+    path = _norm_mpf_path(body.path)
     # Ensure directory exists
     os.makedirs(os.path.dirname(path), exist_ok=True)
     img_bytes = {}
@@ -4677,27 +4855,6 @@ def save_proj(body: ProjectSaveRequest):
                 img_bytes[name] = vf.read()
         else:
             img_bytes[name] = pil_to_bytes(img)
-
-    # Pre-flight disk-space check. Project file size ≈ sum of all image
-    # bytes plus ~10% overhead for config JSON + ZIP metadata.
-    try:
-        import shutil as _shutil
-        target_dir = os.path.dirname(path) or "."
-        payload_size = sum(len(b) for b in img_bytes.values())
-        required = int(payload_size * 1.1) + 16 * 1024 * 1024  # +16 MB headroom
-        usage = _shutil.disk_usage(target_dir)
-        if usage.free < required:
-            raise HTTPException(
-                507,
-                f"Not enough disk space to save project: need ~"
-                f"{required // (1024*1024)} MB, have "
-                f"{usage.free // (1024*1024)} MB free on the target volume.",
-            )
-    except HTTPException:
-        raise
-    except Exception as e:
-        import sys
-        print(f"[save_proj] disk_usage check failed: {e}", file=sys.stderr, flush=True)
 
     # Convert the optional analysis payload from the wire format
     # ({plot_id: base64_png}) into the bytes the model layer expects.
@@ -4719,14 +4876,533 @@ def save_proj(body: ProjectSaveRequest):
             "tables": (body.analysis or {}).get("tables") or {},
         }
 
-    save_project(cfg, img_bytes, path, custom_fonts or None, analysis_payload,
-                 channel_data=_serialize_channel_groups())
-    # Verify file was written
-    if not os.path.isfile(path) or os.path.getsize(path) == 0:
-        try: os.unlink(path)
-        except OSError: pass
-        raise HTTPException(500, f"Save failed: file at {path} is empty or missing (possible disk-full or permission issue).")
-    return {"ok": True, "path": path, "size_bytes": os.path.getsize(path)}
+    # The figure is rebuilt from the live globals; the saved Analysis
+    # (workflows/) and a legacy analysis/ section are carried from disk.
+    prefixes = (WORKFLOWS_PREFIX,) if analysis_payload else ("analysis/", WORKFLOWS_PREFIX)
+    carry_src = _carry_source(body.carry_from, path)
+
+    # Pre-flight disk-space check. Project file size ≈ sum of all image
+    # bytes (+ carried members) plus ~10% overhead for config JSON + ZIP
+    # metadata.
+    payload_size = sum(len(b) for b in img_bytes.values()) + _carry_size(carry_src, prefixes)
+    _check_disk_space(os.path.dirname(path),
+                      int(payload_size * 1.1) + 16 * 1024 * 1024,  # +16 MB headroom
+                      "save_proj")
+
+    channel_data = _serialize_channel_groups()
+    carry_error = None
+    with _mpf_write_lock:
+        tmp = _mpf_temp_path(path)
+        try:
+            save_project(cfg, img_bytes, tmp, custom_fonts or None, analysis_payload,
+                         channel_data=channel_data)
+            if carry_src:
+                try:
+                    _carry_members(carry_src, tmp, prefixes)
+                except Exception as e:
+                    # An unreadable previous file must not block the figure
+                    # save: write it again without the carried members.
+                    carry_error = str(e) or type(e).__name__
+                    print(f"[save_proj] could not carry members from {carry_src}: {carry_error}",
+                          file=_sys.stderr, flush=True)
+                    save_project(cfg, img_bytes, tmp, custom_fonts or None, analysis_payload,
+                                 channel_data=channel_data)
+            # Verify the file was written before it replaces the previous one.
+            if os.path.getsize(tmp) == 0:
+                raise HTTPException(500, f"Save failed: file at {path} is empty or missing (possible disk-full or permission issue).")
+            # Whether the saved Analysis came along: when it didn't (previous
+            # file gone or unreadable) the frontend writes it again.
+            try:
+                with _zipfile.ZipFile(tmp, "r") as zt:
+                    workflows_carried = any(n.startswith(WORKFLOWS_PREFIX) for n in zt.namelist())
+            except Exception:
+                workflows_carried = False
+            _commit_mpf(tmp, path)
+        except BaseException:
+            _unlink_quiet(tmp)
+            raise
+    out = {"ok": True, "path": path, "size_bytes": os.path.getsize(path),
+           "workflows_carried": workflows_carried}
+    if carry_error:
+        out["carry_error"] = carry_error
+    return out
+
+
+# ── Saved Analysis workflows: the workflows/ section of a .mpf ─────────────
+# Written and read on their own, never through save/load: a workflow write
+# replaces only workflows/* in the file on disk (every other member is copied
+# from that file, not from the live globals), so it works for any document —
+# live, parked or closed — without touching its figure. Format: models.py
+# (workflows/uploads/**, workflows/blobs/<id>.<ext>, workflows/manifest.json).
+
+_WF_BLOB_ID = _re_wf.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+class WorkflowsWriteRequest(BaseModel):
+    path: str
+    # workflows/manifest.json. "uploads" is filled in by the sidecar.
+    manifest: dict
+    # {blob_id: {"kind": "png"|"csv"|"txt", "data"?: str}}; PNG data is
+    # base64. A blob WITHOUT data keeps the file's member of the same id
+    # (409 {"missing": [ids]} — file untouched — when the file has none).
+    blobs: Dict[str, dict] = Field(default_factory=dict)
+    # Analysis-store upload names whose original files are embedded.
+    uploads: List[str] = Field(default_factory=list)
+
+
+def _decode_workflow_blobs(raw: Dict[str, dict]) -> Dict[str, tuple]:
+    """{id: (kind, bytes | None)} from the wire format (None = keep)."""
+    out: Dict[str, tuple] = {}
+    for bid, b in (raw or {}).items():
+        if not isinstance(bid, str) or not _WF_BLOB_ID.match(bid):
+            raise HTTPException(400, f"Invalid workflow blob id: {bid!r}")
+        kind = b.get("kind") if isinstance(b, dict) else None
+        if kind not in WORKFLOW_BLOB_KINDS:
+            raise HTTPException(400, f"Workflow blob {bid}: unknown kind {kind!r}")
+        data = b.get("data")
+        if data is None:
+            out[bid] = (kind, None)
+        elif not isinstance(data, str):
+            raise HTTPException(400, f"Workflow blob {bid}: data must be a string")
+        elif kind == "png":
+            if data.startswith("data:") and "," in data:
+                data = data.split(",", 1)[1]
+            try:
+                out[bid] = (kind, base64.b64decode(data))
+            except Exception:
+                raise HTTPException(400, f"Workflow blob {bid}: invalid base64")
+        else:
+            out[bid] = (kind, data.encode("utf-8"))
+    return out
+
+
+def _existing_workflows_manifest(zs, members) -> Optional[dict]:
+    """The file's current manifest, or None (none, or unreadable — such a
+    section holds nothing usable and is replaced). A NEWER format is never
+    overwritten: 409 {"unsupported": true}."""
+    info = members.get(WORKFLOWS_MANIFEST)
+    if info is None:
+        return None
+    try:
+        m = _json_wf.loads(zs.read(info))
+    except Exception:
+        return None
+    status = workflows_manifest_status(m)
+    if status == "newer version":
+        raise HTTPException(409, {"unsupported": True, "version": m.get("version")})
+    return m if status is None else None
+
+
+def _member_holds(zs, info, data: bytes) -> bool:
+    """True if the existing member's content is exactly `data`."""
+    if info.file_size != len(data) or info.CRC != (_zlib_wf.crc32(data) & 0xFFFFFFFF):
+        return False
+    try:
+        return zs.read(info) == data
+    except Exception:
+        return False
+
+
+def _plan_workflow_blobs(zs, members, blobs: Dict[str, tuple]):
+    """-> (items, missing). Unchanged blobs keep their member (in file order,
+    ahead of new ones, so the tail rewrite can leave them in place)."""
+    kept, new, missing = [], [], []
+    for bid, (kind, data) in blobs.items():
+        m = workflow_blob_member(bid, kind)
+        info = members.get(m)
+        if data is None:
+            if info is None:
+                missing.append(bid)
+            else:
+                kept.append((m, info))
+        elif info is not None and _member_holds(zs, info, data):
+            kept.append((m, info))
+        else:
+            new.append((m, data))
+    kept.sort(key=lambda it: it[1].header_offset)
+    return kept + new, missing
+
+
+def _upload_member_filename(name: str) -> str:
+    base = name.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    return base if base not in ("", ".", "..") else "upload"
+
+
+def _plan_workflow_uploads(members, old_manifest, names, origs, shas, opened):
+    """-> (items, entries, missing). An upload the file already holds with the
+    same SHA-1 keeps its member; otherwise its original file (recorded at
+    upload time) is embedded. With no original left, the file's copy is kept;
+    with neither, the name is reported missing. Originals are opened here —
+    an open handle survives a concurrent delete — and added to `opened`."""
+    old: Dict[str, dict] = {}
+    max_idx = 0
+    for m in members:
+        if m.startswith(WORKFLOWS_UPLOADS):
+            seg = m[len(WORKFLOWS_UPLOADS):].split("/", 1)[0]
+            if seg.isdigit():
+                max_idx = max(max_idx, int(seg))
+    old_ups = (old_manifest or {}).get("uploads")
+    for e in old_ups if isinstance(old_ups, list) else []:
+        if (isinstance(e, dict) and isinstance(e.get("name"), str)
+                and isinstance(e.get("member"), str) and e["member"] in members
+                and e["member"].startswith(WORKFLOWS_UPLOADS)):
+            old.setdefault(e["name"], e)
+    kept, new, entries, missing, seen = [], [], [], [], set()
+
+    def keep(name, prev):
+        info = members[prev["member"]]
+        if all(it[1] is not info for it in kept):     # two names, one member
+            kept.append((prev["member"], info))
+        entries.append({"name": name, "member": prev["member"],
+                        "sha1": prev.get("sha1"), "size": int(info.file_size)})
+
+    for name in names:
+        if not isinstance(name, str) or not name or name in seen:
+            continue
+        seen.add(name)
+        prev, op, sha = old.get(name), origs.get(name), shas.get(name)
+        if prev is not None and (op is None or prev.get("sha1") == sha):
+            keep(name, prev)
+            continue
+        f = None
+        if op is not None:
+            try:
+                f = open(op, "rb")
+            except OSError:
+                f = None
+        if f is not None:
+            opened.append(f)
+            max_idx += 1
+            member = f"{WORKFLOWS_UPLOADS}{max_idx}/{_upload_member_filename(name)}"
+            new.append((member, f))
+            entries.append({"name": name, "member": member, "sha1": sha,
+                            "size": int(os.fstat(f.fileno()).st_size)})
+        elif prev is not None:
+            keep(name, prev)
+        else:
+            missing.append(name)
+    kept.sort(key=lambda it: it[1].header_offset)
+    return kept + new, entries, missing
+
+
+def _rewrite_workflows_full(path: str, zs, plan) -> str:
+    """Baseline rewrite: every non-workflows/ member copied into a new zip,
+    then the new workflows/ section. Returns the temp path."""
+    tmp = _mpf_temp_path(path)
+    try:
+        with _zipfile.ZipFile(tmp, "w", _zipfile.ZIP_DEFLATED) as zd:
+            zd.comment = zs.comment
+            for info in zs.infolist():
+                if not info.filename.startswith(WORKFLOWS_PREFIX):
+                    copy_zip_member(zs, info, zd)
+            write_zip_members(zd, plan, src_zf=zs)
+        return tmp
+    except BaseException:
+        _unlink_quiet(tmp)
+        raise
+
+
+def _rewrite_workflows_fast(path: str, src_f, zs, plan) -> Optional[str]:
+    """Tail rewrite (`zs` reads the open file `src_f`). When every workflows/
+    member sits contiguously at the end of the file (as this build writes
+    them), copy the file byte for byte, cut
+    it at the first workflows/ member that changes and append from there —
+    the figure's images are never recompressed. Returns the temp path, or
+    None when the layout doesn't allow it. The result is verified before
+    use: exactly the full rewrite's member list, in the same order, and a
+    clean CRC check of the appended members; anything else raises (the
+    caller falls back)."""
+    infos = sorted(zs.infolist(), key=lambda i: i.header_offset)
+    first = next((n for n, i in enumerate(infos) if i.filename.startswith(WORKFLOWS_PREFIX)),
+                 len(infos))
+    tail = infos[first:]
+    if any(not i.filename.startswith(WORKFLOWS_PREFIX) for i in tail):
+        return None
+    k = 0
+    while k < len(tail) and k < len(plan) and plan[k][1] is tail[k]:
+        k += 1
+    cut = tail[k].header_offset if k < len(tail) else zs.start_dir
+    keep = [i.filename for i in infos[:first + k]]
+    expected = ([i.filename for i in zs.infolist() if not i.filename.startswith(WORKFLOWS_PREFIX)]
+                + [m for m, _ in plan])
+    tmp = _mpf_temp_path(path)
+    try:
+        # Copy from the handle `zs` reads (the same file even if `path` was
+        # replaced meanwhile), then append in place.
+        with open(tmp, "wb") as out:
+            src_f.seek(0)
+            _shutil_wf.copyfileobj(src_f, out, 1 << 20)
+        with open(tmp, "r+b") as f:
+            with _zipfile.ZipFile(f, "a") as zd:
+                kept = [i for i in zd.filelist if i.header_offset < cut]
+                if sorted(i.filename for i in kept) != sorted(keep):
+                    raise RuntimeError("member layout differs from the source")
+                zd.filelist = kept
+                zd.NameToInfo = {i.filename: i for i in kept}
+                zd.start_dir = cut
+                zd._didModify = True
+                zd.fp.seek(cut)
+                write_zip_members(zd, plan[k:], src_zf=zs)
+            f.truncate()
+        with _zipfile.ZipFile(tmp, "r") as chk:
+            if chk.namelist() != expected:
+                raise RuntimeError("member list differs from a full rewrite")
+            # The copied head is the source's bytes; only the appended tail is
+            # CRC-checked (testzip() would re-read every image in the file).
+            for info in chk.infolist():
+                if info.header_offset >= cut:
+                    with chk.open(info) as m:
+                        while m.read(1 << 20):
+                            pass
+        return tmp
+    except BaseException:
+        _unlink_quiet(tmp)
+        raise
+
+
+# Tests flip this to compare the two strategies.
+_WF_TAIL_REWRITE = True
+
+
+def _rewrite_workflows(path: str, manifest: dict, blobs: Dict[str, tuple],
+                       uploads: List[str]) -> dict:
+    """Atomically replace the workflows/ section of the .mpf at `path`."""
+    st = _analysis_store
+    origs = dict(st.get("orig_files") or {})
+    shas = dict(st.get("orig_sha") or {})
+    opened: list = []
+    fast = False
+    with _mpf_write_lock:
+        try:
+            src_f = open(path, "rb")
+            try:
+                try:
+                    zs = _zipfile.ZipFile(src_f, "r")
+                except _zipfile.BadZipFile as e:
+                    raise HTTPException(400, f"Not a readable .mpf ({path}): {e}")
+                with zs:
+                    members = {i.filename: i for i in zs.infolist()}
+                    old_manifest = _existing_workflows_manifest(zs, members)
+                    blob_items, missing = _plan_workflow_blobs(zs, members, blobs)
+                    if missing:
+                        raise HTTPException(409, {"missing": missing})
+                    upload_items, entries, missing_uploads = _plan_workflow_uploads(
+                        members, old_manifest, uploads, origs, shas, opened)
+                    manifest = {**manifest, "uploads": entries}
+                    manifest.setdefault("format", WORKFLOWS_FORMAT)
+                    manifest.setdefault("version", WORKFLOWS_VERSION)
+                    plan = workflow_member_plan(manifest, blob_items, upload_items)
+                    new_bytes = sum(len(s) if isinstance(s, (bytes, bytearray))
+                                    else 0 if isinstance(s, _zipfile.ZipInfo)
+                                    else os.fstat(s.fileno()).st_size
+                                    for _, s in plan)
+                    _check_disk_space(os.path.dirname(path),
+                                      os.path.getsize(path) + new_bytes + 16 * 1024 * 1024,
+                                      "workflows/write")
+                    tmp = None
+                    if _WF_TAIL_REWRITE:
+                        try:
+                            tmp = _rewrite_workflows_fast(path, src_f, zs, plan)
+                        except Exception as e:
+                            print(f"[workflows/write] tail rewrite not used ({e}); full rewrite",
+                                  file=_sys.stderr, flush=True)
+                            tmp = None
+                    fast = tmp is not None
+                    if tmp is None:
+                        tmp = _rewrite_workflows_full(path, zs, plan)
+            finally:
+                src_f.close()
+            try:
+                with _zipfile.ZipFile(tmp, "r") as z:
+                    wf_bytes = sum(i.compress_size for i in z.infolist()
+                                   if i.filename.startswith(WORKFLOWS_PREFIX))
+                _commit_mpf(tmp, path)
+            except BaseException:
+                _unlink_quiet(tmp)
+                raise
+        finally:
+            for f in opened:
+                try:
+                    f.close()
+                except OSError:
+                    pass
+    return {"ok": True, "size_bytes": os.path.getsize(path), "workflows_bytes": wf_bytes,
+            "missing_uploads": missing_uploads, "fast_path": fast}
+
+
+@app.post("/api/project/workflows/write")
+def write_workflows(body: WorkflowsWriteRequest):
+    """Replace ONLY the workflows/ section of an existing .mpf on disk. The
+    document's unsaved figure edits, `unsaved` flag and stash are untouched.
+    Shared gate (default wrap): reads only disk and the Analysis store's
+    upload originals. 404 when the file is missing; 409 {"missing": [...]}
+    for kept blobs the file doesn't hold; 409 {"unsupported": true} for a
+    file whose workflows were written by a newer format."""
+    path = _norm_mpf_path(body.path, ensure_ext=False)
+    if not os.path.isfile(path):
+        raise HTTPException(404, f"Project file not found: {path}")
+    blobs = _decode_workflow_blobs(body.blobs)
+    return _rewrite_workflows(path, dict(body.manifest), blobs, list(body.uploads))
+
+
+class WorkflowsReadRequest(BaseModel):
+    path: str
+
+
+def _restore_target(name: str, sha: str):
+    """(name to use, reuse?) for an embedded upload restored into the
+    Analysis store: its own name when free, an existing entry with the same
+    content, else the first free (or same-content) `stem (n).ext`."""
+    st = _analysis_store
+    stem, ext = os.path.splitext(name)
+    cand, n = name, 1
+    while True:
+        if cand not in st["loaded_images"]:
+            return cand, False
+        if st["orig_sha"].get(cand) == sha:
+            return cand, True
+        n += 1
+        cand = f"{stem} ({n}){ext}"
+
+
+def _stream_upload_original(name: str, zf, info):
+    """Copy one embedded upload out of the open .mpf `zf` into a temp file
+    (its original, as `_write_upload_original` keeps it), hashing as it
+    streams: (path, sha1 hex). A CRC failure raises."""
+    fd, p = tempfile.mkstemp(prefix="mpf_orig_", suffix=Path(name).suffix[:16])
+    h = hashlib.sha1()
+    try:
+        with os.fdopen(fd, "wb") as f, zf.open(info) as src:
+            for chunk in iter(lambda: src.read(1 << 20), b""):
+                h.update(chunk)
+                f.write(chunk)
+    except BaseException:
+        _unlink_quiet(p)
+        raise
+    return p, h.hexdigest()
+
+
+def _register_restored_uploads(path: str, entries) -> dict:
+    """Restore a file's embedded uploads into the Analysis store through the
+    upload ingest path (z-stacks, channel groups, raw 16-bit arrays, OIR/ND2,
+    videos), so they behave exactly like fresh uploads. Before the gate each
+    upload is streamed to its temp original and hashed (none is held in
+    memory; one the store already holds, by the manifest's SHA-1, is not
+    read at all). Under the exclusive gate (bound to the store, as
+    upload_analysis_images) they are ingested one at a time."""
+    prepared, missing = [], []          # (name, member, sha)
+    origs: Dict[int, str] = {}
+    registered: set = set()
+    renamed: Dict[str, str] = {}
+    failed: List[dict] = []
+    images = []
+
+    def stream(zf, name, member):
+        info = zf.NameToInfo.get(member)
+        if info is None:
+            return None
+        try:
+            return _stream_upload_original(name, zf, info)
+        except Exception:
+            return None
+
+    try:
+        with _zipfile.ZipFile(path, "r") as zf:
+            for entry in entries:
+                name = entry.get("name") if isinstance(entry, dict) else None
+                if not isinstance(name, str) or not name:
+                    continue
+                member = entry.get("member")
+                if not (isinstance(member, str) and member.startswith(WORKFLOWS_UPLOADS)
+                        and member in zf.NameToInfo):
+                    missing.append(name)
+                    continue
+                esha = entry.get("sha1")
+                # Content the store already holds — a document opened again —
+                # needs no read (re-decided under the gate).
+                if isinstance(esha, str) and esha and _restore_target(name, esha)[1]:
+                    prepared.append((name, member, esha))
+                    continue
+                got = stream(zf, name, member)
+                if got is None:
+                    missing.append(name)
+                    continue
+                origs[len(prepared)] = got[0]
+                prepared.append((name, member, got[1]))
+        with _doc_gate.exclusive():
+            saved = _live_refs()
+            try:
+                _bind_refs(_analysis_store)
+                for i, (name, member, sha) in enumerate(prepared):
+                    target, reuse = _restore_target(name, sha)
+                    if not reuse:
+                        if i not in origs:
+                            # Held when checked, gone now: read it after all.
+                            with _zipfile.ZipFile(path, "r") as zf:
+                                got = stream(zf, target, member)
+                            if got is None:
+                                missing.append(name)
+                                continue
+                            origs[i] = got[0]
+                        try:
+                            with open(origs[i], "rb") as f:
+                                data = f.read()
+                            _ingest_upload_file(target, data)
+                        except Exception as e:
+                            failed.append({"name": name, "error": str(getattr(e, "detail", "") or e)})
+                            continue
+                        finally:
+                            data = None
+                        _set_upload_original(_analysis_store, target, origs[i], sha)
+                        registered.add(origs[i])
+                    if target != name:
+                        renamed[name] = target
+                    im = loaded_images.get(target)
+                    if im is not None:
+                        images.append((target, im))
+            finally:
+                _bind_refs(saved)
+    finally:
+        for op in origs.values():
+            if op not in registered:
+                _unlink_quiet(op)
+    restored = [{"name": n, "thumbnail": _thumb_b64(im),
+                 "size": [int(im.size[0]), int(im.size[1])]} for n, im in images]
+    return {"uploads": restored, "renamed": renamed, "missing_uploads": missing,
+            "failed_uploads": failed}
+
+
+@app.post("/api/project/workflows/read")
+def read_workflows(body: WorkflowsReadRequest):
+    """The workflows/ section of a .mpf: {manifest | null, blobs: {id: {kind,
+    data}}, unsupported, uploads: [{name, thumbnail, size}], renamed: {old:
+    new}, missing_uploads, failed_uploads}. Reads only workflows/* (never the
+    figure). Embedded uploads are restored into the Analysis store; a name
+    already taken by different content comes back as `stem (2).ext` in
+    `renamed`, for the caller to rewrite in that document's workflows.
+    Self-gated: parsed outside the gate, exclusive only around the ingest."""
+    path = _norm_mpf_path(body.path, ensure_ext=False)
+    if not os.path.isfile(path):
+        raise HTTPException(404, f"Project file not found: {path}")
+    try:
+        wf = read_workflow_members(path, with_uploads=False)
+    except _zipfile.BadZipFile as e:
+        raise HTTPException(400, f"Not a readable .mpf ({path}): {e}")
+    blobs_out: Dict[str, dict] = {}
+    for bid, (kind, raw) in wf["blobs"].items():
+        data = (base64.b64encode(raw).decode("ascii") if kind == "png"
+                else raw.decode("utf-8", errors="replace"))
+        blobs_out[bid] = {"kind": kind, "data": data}
+    out = {"manifest": wf["manifest"], "blobs": blobs_out, "unsupported": wf["unsupported"],
+           "version": wf["version"], "uploads": [], "renamed": {}, "missing_uploads": [],
+           "failed_uploads": []}
+    ups = wf["manifest"].get("uploads") if isinstance(wf["manifest"], dict) else None
+    if isinstance(ups, list) and ups:
+        try:
+            out.update(_register_restored_uploads(path, ups))
+        except _zipfile.BadZipFile as e:
+            raise HTTPException(400, f"Not a readable .mpf ({path}): {e}")
+    return out
 
 
 class ProjectLoadRequest(BaseModel):
@@ -5061,6 +5737,10 @@ def _blank_doc_state(resolution_entries=None) -> dict:
 # Session-wide store for standalone Analysis uploads — shaped like a document
 # state but belonging to no document (see upload_analysis_images).
 _analysis_store: dict = _blank_doc_state({})
+# Not per-document globals (_bind_refs ignores them): each upload's original
+# file, kept so a saved workflow can embed it, and that file's SHA-1.
+_analysis_store["orig_files"] = {}   # name -> temp file with the uploaded bytes
+_analysis_store["orig_sha"] = {}     # name -> SHA-1 hex of those bytes
 
 
 def _standalone_lookup(name: str):

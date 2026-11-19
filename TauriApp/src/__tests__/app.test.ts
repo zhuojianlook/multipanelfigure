@@ -26,6 +26,12 @@ const mockApi = vi.hoisted(() => ({
   getPreview: vi.fn(),
   saveProject: vi.fn(),
   loadProject: vi.fn(),
+  // The Analysis workflows written after a figure save (analysisWorkspaceStore).
+  readWorkflows: vi.fn(async () => ({
+    manifest: null, blobs: {}, unsupported: false, version: null, uploads: [], renamed: {},
+    missing_uploads: [], failed_uploads: [],
+  })),
+  writeWorkflows: vi.fn(async () => ({ ok: true, size_bytes: 1, workflows_bytes: 1, missing_uploads: [], fast_path: true })),
   saveFigure: vi.fn(),
   listFonts: vi.fn(),
   getResolutions: vi.fn(),
@@ -258,9 +264,9 @@ describe("API endpoint integration", () => {
 
     await useFigureStore.getState().saveProject("/tmp/test.mpfig");
 
-    // saveProject also forwards the Analysis snapshot as a second argument —
-    // null when the Analysis dialog hasn't published one.
-    expect(mockApi.saveProject).toHaveBeenCalledWith("/tmp/test.mpfig", null);
+    // The document's previous file (none: an Untitled document) is passed as
+    // carryFrom, so a file it overwrites passes no saved Analysis on.
+    expect(mockApi.saveProject).toHaveBeenCalledWith("/tmp/test.mpfig", { carryFrom: null });
   });
 
   it("loadProject restores config and images", async () => {

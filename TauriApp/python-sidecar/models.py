@@ -5,7 +5,7 @@ All state is held in plain dataclass objects — no Qt dependencies here.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Dict
-import json, copy, zipfile, base64
+import json, copy, zipfile, base64, os, shutil, time
 
 
 # ---------------------------------------------------------------------------
@@ -1309,3 +1309,168 @@ def load_project(path: str) -> tuple:
             "tables": analysis_tables,
         }
     return cfg, images, fonts, analysis, channel_data
+
+
+# ---------------------------------------------------------------------------
+# The `workflows/` section of a .mpf (saved Analysis workflows)
+# ---------------------------------------------------------------------------
+# Separate prefix from the legacy `analysis/`: load_project ignores it (old
+# builds load such files fine), so it is read only by read_workflow_members.
+# Member ORDER matters for the sidecar's tail rewrite: uploads first (largest,
+# change least), then blobs, then the manifest LAST.
+
+WORKFLOWS_PREFIX = "workflows/"
+WORKFLOWS_MANIFEST = WORKFLOWS_PREFIX + "manifest.json"
+WORKFLOWS_BLOBS = WORKFLOWS_PREFIX + "blobs/"
+WORKFLOWS_UPLOADS = WORKFLOWS_PREFIX + "uploads/"
+WORKFLOWS_FORMAT = "mpf-workflows"
+WORKFLOWS_VERSION = 1
+WORKFLOW_BLOB_KINDS = {"png": ".png", "csv": ".csv", "txt": ".txt"}
+
+# Already-compressed payloads are STORED (deflating them again only costs time).
+_STORED_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".npz", ".zip", ".gz",
+                ".mp4", ".avi", ".mov", ".mkv", ".webm", ".wmv", ".flv", ".m4v",
+                ".mpg", ".mpeg", ".3gp", ".ts", ".mts"}
+
+
+def workflow_blob_member(blob_id: str, kind: str) -> str:
+    return f"{WORKFLOWS_BLOBS}{blob_id}{WORKFLOW_BLOB_KINDS[kind]}"
+
+
+def member_compress_type(name: str) -> int:
+    ext = os.path.splitext(name)[1].lower()
+    return zipfile.ZIP_STORED if ext in _STORED_EXTS else zipfile.ZIP_DEFLATED
+
+
+def _clone_zipinfo(info: zipfile.ZipInfo, arcname: Optional[str] = None) -> zipfile.ZipInfo:
+    zi = zipfile.ZipInfo(arcname or info.filename, date_time=info.date_time)
+    zi.compress_type = info.compress_type
+    zi.external_attr = info.external_attr
+    zi.create_system = info.create_system
+    zi.file_size = info.file_size      # lets the writer pick zip64 up front
+    return zi
+
+
+def copy_zip_member(src_zf: zipfile.ZipFile, info: zipfile.ZipInfo,
+                    dst_zf: zipfile.ZipFile, arcname: Optional[str] = None) -> zipfile.ZipInfo:
+    """Stream one member from src_zf into dst_zf (same compression, same
+    timestamp; never the whole member in memory). Reading verifies its CRC."""
+    zi = _clone_zipinfo(info, arcname)
+    if info.is_dir():
+        dst_zf.writestr(zi, b"")
+        return zi
+    with src_zf.open(info) as r, dst_zf.open(zi, "w") as w:
+        shutil.copyfileobj(r, w, 1 << 20)
+    return zi
+
+
+def _new_zipinfo(name: str) -> zipfile.ZipInfo:
+    zi = zipfile.ZipInfo(name, date_time=time.localtime(time.time())[:6])
+    zi.compress_type = member_compress_type(name)
+    zi.external_attr = 0o600 << 16
+    return zi
+
+
+def write_zip_members(zf: zipfile.ZipFile, items, src_zf: Optional[zipfile.ZipFile] = None) -> None:
+    """Append `items` = [(member_name, src)] in order. src is bytes (new data),
+    a str path or a binary file object (streamed), or a ZipInfo of `src_zf`
+    (copied as-is, keeping its compression)."""
+    for name, src in items:
+        if isinstance(src, zipfile.ZipInfo):
+            if src_zf is None:
+                raise ValueError(f"{name}: a kept member needs its source zip")
+            copy_zip_member(src_zf, src, zf, name)
+        elif isinstance(src, (bytes, bytearray)):
+            zf.writestr(_new_zipinfo(name), bytes(src))
+        else:
+            zi = _new_zipinfo(name)
+            if isinstance(src, str):
+                zi.file_size = os.path.getsize(src)
+                with open(src, "rb") as r, zf.open(zi, "w") as w:
+                    shutil.copyfileobj(r, w, 1 << 20)
+            else:
+                src.seek(0)
+                zi.file_size = os.fstat(src.fileno()).st_size
+                with zf.open(zi, "w") as w:
+                    shutil.copyfileobj(src, w, 1 << 20)
+
+
+def workflow_member_plan(manifest: dict, blobs, upload_files) -> list:
+    """The workflows/ members in canonical order: uploads, blobs, manifest
+    LAST. `blobs` / `upload_files` are [(member_name, src)] as for
+    write_zip_members; the manifest is serialized here."""
+    data = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+    return [*upload_files, *blobs, (WORKFLOWS_MANIFEST, data)]
+
+
+def write_workflow_members(zf: zipfile.ZipFile, manifest: dict, blobs, upload_files,
+                           src_zf: Optional[zipfile.ZipFile] = None) -> None:
+    """Append a complete workflows/ section to `zf` (see workflow_member_plan)."""
+    write_zip_members(zf, workflow_member_plan(manifest, blobs, upload_files), src_zf)
+
+
+def workflows_manifest_status(manifest) -> Optional[str]:
+    """None if this build can read `manifest`, else why not ("newer version",
+    "unreadable")."""
+    if not isinstance(manifest, dict):
+        return "unreadable"
+    fmt = manifest.get("format", WORKFLOWS_FORMAT)
+    ver = manifest.get("version", WORKFLOWS_VERSION)
+    if fmt != WORKFLOWS_FORMAT or not isinstance(ver, int) or isinstance(ver, bool):
+        return "unreadable"
+    if ver > WORKFLOWS_VERSION:
+        return "newer version"
+    return None
+
+
+def read_workflow_members(path: str, with_uploads: bool = True) -> dict:
+    """Read ONLY the workflows/ section of a .mpf (never images or config).
+
+    Returns {"manifest": dict | None, "blobs": {id: (kind, bytes)},
+             "uploads": [(manifest_entry, bytes | None)],
+             "unsupported": bool, "version": int | None}.
+    A file without workflows/ gives manifest None; a manifest this build
+    can't read (newer version, unparseable) gives manifest None and
+    unsupported True, with no blobs or uploads. A member that fails its CRC
+    check is left out (an upload's bytes become None)."""
+    out = {"manifest": None, "blobs": {}, "uploads": [], "unsupported": False, "version": None}
+    with zipfile.ZipFile(path, "r") as zf:
+        members = {i.filename: i for i in zf.infolist()}
+        if WORKFLOWS_MANIFEST not in members:
+            return out
+        try:
+            manifest = json.loads(zf.read(WORKFLOWS_MANIFEST))
+        except Exception:
+            manifest = None
+        status = workflows_manifest_status(manifest)
+        if status is not None:
+            out["unsupported"] = True
+            if isinstance(manifest, dict) and isinstance(manifest.get("version"), int):
+                out["version"] = manifest["version"]
+            return out
+        out["manifest"] = manifest
+        out["version"] = manifest.get("version", WORKFLOWS_VERSION)
+        kinds = {ext: kind for kind, ext in WORKFLOW_BLOB_KINDS.items()}
+        for name, info in members.items():
+            if not name.startswith(WORKFLOWS_BLOBS) or info.is_dir():
+                continue
+            stem, ext = os.path.splitext(name[len(WORKFLOWS_BLOBS):])
+            kind = kinds.get(ext.lower())
+            if kind is None or not stem or "/" in stem:
+                continue
+            try:
+                out["blobs"][stem] = (kind, zf.read(info))
+            except Exception:
+                continue
+        ups = manifest.get("uploads")
+        if with_uploads and isinstance(ups, list):
+            for entry in ups:
+                data = None
+                member = entry.get("member") if isinstance(entry, dict) else None
+                if isinstance(member, str) and member.startswith(WORKFLOWS_UPLOADS) and member in members:
+                    try:
+                        data = zf.read(members[member])
+                    except Exception:
+                        data = None
+                out["uploads"].append((entry, data))
+    return out

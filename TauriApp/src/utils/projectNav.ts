@@ -11,6 +11,7 @@
 
 import { useFigureStore } from "../store/figureStore";
 import { useCollageStore, newDocId } from "../store/collageStore";
+import { useAnalysisWorkspaceStore, docHasAnalysis, untitledAnalysisDocIds } from "../store/analysisWorkspaceStore";
 import { api } from "../api/client";
 import { confirmThree, alert as alertDialog } from "../components/shared/ConfirmDialog";
 import { saveProjectDialog } from "../components/shared/SaveProjectDialog";
@@ -81,6 +82,67 @@ export { serializeDocOp, whenDocOpsIdle } from "./docOpQueue";
  *  the app-close guard to warn about tabs whose edits would be lost on quit. */
 export function hasUnsavedSnapshots(): boolean {
   return backendStashed.size > 0;
+}
+
+/** Untitled documents whose Analysis workflows have nowhere to auto-save —
+ *  close / quit / "Save all" treat them as unsaved (even with an empty
+ *  figure). Saved documents never count: their analysis auto-saves. */
+export function unsavedAnalysisDocIds(): string[] {
+  return untitledAnalysisDocIds();
+}
+
+/** Whether document `docId`'s figure edits would be thrown away right now
+ *  (it is the live doc with unsaved edits, or its edits are parked). */
+function figureDirty(docId: string): boolean {
+  return (useCollageStore.getState().activeDocId === docId && useFigureStore.getState().unsaved)
+    || backendStashed.has(docId);
+}
+
+/** Write document `docId`'s Analysis workflows into its .mpf (when they
+ *  changed). Resolves null on success / nothing to do, else a reason the
+ *  user should hear: the write failed, or the file's analysis could not be
+ *  read / is a newer format while this document holds analysis of its own. */
+async function persistWorkflowsOf(docId: string, figureDiscarded: boolean): Promise<string | null> {
+  try {
+    const out = await useAnalysisWorkspaceStore.getState().persistDocWorkflows(docId, { figureDiscarded });
+    if ((out === "unsupported" || out === "not-hydrated") && docHasAnalysis(docId)) {
+      return out === "unsupported"
+        ? "Its file holds Analysis saved by a newer version of the app, which this version can't update."
+        : "The Analysis already saved in its file could not be read, so it was not overwritten.";
+    }
+    return null;
+  } catch (e) {
+    console.error("[projectNav] saving analysis workflows failed for", docId, e);
+    return e instanceof Error && e.message ? e.message : "The file could not be written.";
+  }
+}
+
+/** Write every open document's changed Analysis workflows into its .mpf —
+ *  the app-quit step, after the save guard resolved. `figuresDiscarded`
+ *  ("Close without saving"): results of documents whose unsaved figure edits
+ *  are being dropped are stored as "needs re-run". Serialized as one doc op.
+ *  Returns the names of the documents that could not be written. */
+export function persistAllWorkflowsForQuit(opts: { figuresDiscarded?: boolean } = {}): Promise<string[]> {
+  return serializeDocOp(async () => {
+    const failed: string[] = [];
+    for (const d of useCollageStore.getState().openDocs) {
+      if (!d.path) continue;
+      const discarded = !!opts.figuresDiscarded && figureDirty(d.id);
+      if (await persistWorkflowsOf(d.id, discarded)) failed.push(d.name);
+    }
+    return failed;
+  });
+}
+
+/** The app's quit guard (AppShell registers it once the window exists): asks
+ *  about unsaved figures, then writes every document's Analysis workflows.
+ *  The in-app update runs it before stopping the sidecar. Resolves false
+ *  when the user stays; true when there is no guard (browser preview). */
+type QuitGuard = (action: "close" | "restart") => Promise<boolean>;
+let _quitGuard: QuitGuard | null = null;
+export function setQuitGuard(fn: QuitGuard | null): void { _quitGuard = fn; }
+export async function runQuitGuard(action: "close" | "restart"): Promise<boolean> {
+  return _quitGuard ? _quitGuard(action) : true;
 }
 
 /** Stash the currently-active builder doc's live state in the backend so
@@ -273,6 +335,7 @@ async function saveDocumentImpl(docId: string): Promise<boolean> {
     await alertDialog({ title: "Save failed", body: `Could not save "${doc.name}" to ${path}.` });
     return false;
   }
+  path = useFigureStore.getState().currentProjectPath || path;   // as written (".mpf" added…)
   // Newly-saved Untitled → adopt the chosen path + name on the tab. For an
   // overwrite (path unchanged) leave the tab name alone so a custom rename
   // sticks. saveProject already cleared `unsaved`, so the dirty dot/active
@@ -370,6 +433,7 @@ async function saveDocumentAs(docId: string): Promise<boolean> {
     await alertDialog({ title: "Save failed", body: `Could not save "${doc.name}" to ${path}.` });
     return false;
   }
+  path = useFigureStore.getState().currentProjectPath || path;   // as written (".mpf" added…)
   // Reflect a new location on the tab (leave the name alone when overwriting
   // the same path, so a custom rename sticks).
   if (path !== doc.path) useCollageStore.getState().docSetPath(docId, path);
@@ -397,8 +461,11 @@ export function saveAllOpenDocs(
   return queueDocSwap(async () => {
     const cs = useCollageStore.getState();
     const fs = useFigureStore.getState();
+    // Untitled documents holding Analysis work count too: a file is the only
+    // place their workflows can be saved.
+    const analysisOnly = new Set(unsavedAnalysisDocIds());
     const dirtyIds = cs.openDocs
-      .filter((d) => (cs.activeDocId === d.id && fs.unsaved) || backendStashed.has(d.id))
+      .filter((d) => (cs.activeDocId === d.id && fs.unsaved) || backendStashed.has(d.id) || analysisOnly.has(d.id))
       .map((d) => d.id);
     for (const id of dirtyIds) {
       const ok = opts.promptForLocation
@@ -410,11 +477,12 @@ export function saveAllOpenDocs(
   });
 }
 
-/** If the builder has unsaved changes, prompt Save / Don't save /
- *  Cancel. Returns true to proceed, false to abort. */
-export async function maybeSaveBeforeLeavingBuilder(): Promise<boolean> {
+/** If the builder has unsaved changes, prompt Save / Don't save / Cancel.
+ *  "clean" = nothing to save, "saved", "discarded" (Don't save), "cancel"
+ *  (cancelled, or the save did not happen). */
+async function promptSaveLiveDoc(): Promise<"clean" | "saved" | "discarded" | "cancel"> {
   const { unsaved, currentProjectPath } = useFigureStore.getState();
-  if (!unsaved) return true;
+  if (!unsaved) return "clean";
   const name = currentProjectPath ? currentProjectPath.split(/[\\/]/).pop() : "this figure";
   const choice = await confirmThree({
     title: "Unsaved changes",
@@ -423,12 +491,15 @@ export async function maybeSaveBeforeLeavingBuilder(): Promise<boolean> {
     tertiaryLabel: "Don't save",
     cancelLabel: "Cancel",
   });
-  if (choice === "cancel") return false;
-  if (choice === "confirm") {
-    const saved = await ensureProjectSaved();
-    if (!saved) return false;
-  }
-  return true;
+  if (choice === "cancel") return "cancel";
+  if (choice === "confirm") return (await ensureProjectSaved()) ? "saved" : "cancel";
+  return "discarded";
+}
+
+/** If the builder has unsaved changes, prompt Save / Don't save /
+ *  Cancel. Returns true to proceed, false to abort. */
+export async function maybeSaveBeforeLeavingBuilder(): Promise<boolean> {
+  return (await promptSaveLiveDoc()) !== "cancel";
 }
 
 /** Switch into the Collage Assembly. Tab switches are seamless — no
@@ -582,14 +653,18 @@ async function closeDocImpl(docId: string): Promise<boolean> {
 
   // The doc whose state the backend currently holds (regardless of whether
   // the builder or the collage is on screen).
-  const isActiveDoc = cs.activeDocId === docId;
+  let isActiveDoc = cs.activeDocId === docId;
+  // Its unsaved figure edits are being thrown away: Analysis results that
+  // read its images are saved as "needs re-run".
+  let figureDiscarded = false;
 
   if (isActiveDoc && fs.unsaved) {
     // Closing the live doc with unsaved changes — guard it (Save / Don't
     // save / Cancel; Save opens the file dialog so the user picks where +
     // what name).
-    const ok = await maybeSaveBeforeLeavingBuilder();
-    if (!ok) return false;
+    const choice = await promptSaveLiveDoc();
+    if (choice === "cancel") return false;
+    figureDiscarded = choice === "discarded";
   } else if (!isActiveDoc && backendStashed.has(docId)) {
     // A non-active tab with unsaved edits held only as an in-memory
     // stash. We can't save it without making it active first, so offer
@@ -603,6 +678,38 @@ async function closeDocImpl(docId: string): Promise<boolean> {
       cancelLabel: "Cancel",
     });
     if (choice !== "confirm") return false;
+    figureDiscarded = true;
+  } else if (!doc.path && unsavedAnalysisDocIds().includes(docId)) {
+    // An Untitled document holding Analysis work: its workflows can only be
+    // saved with a file, so it gets the normal prompt even with an empty
+    // figure. Save switches to it (if needed) and asks where.
+    const choice = await confirmThree({
+      title: "Unsaved analysis",
+      body: `"${doc.name}" has Analysis workflows that are saved only with the document, `
+        + "and it has never been saved.\n\nSave it before closing?",
+      confirmLabel: "Save",
+      tertiaryLabel: "Don't save",
+      cancelLabel: "Cancel",
+    });
+    if (choice === "cancel") return false;
+    if (choice === "confirm" && !(await saveDocumentImpl(docId))) return false;
+  }
+  // Saving may have switched to the document.
+  isActiveDoc = useCollageStore.getState().activeDocId === docId;
+
+  // Its Analysis workflows auto-save into its .mpf (no prompt). A failure is
+  // reported before anything is closed.
+  const failure = await persistWorkflowsOf(docId, figureDiscarded);
+  if (failure) {
+    const choice = await confirmThree({
+      title: "Analysis not saved",
+      body: `The Analysis workflows of "${doc.name}" could not be saved into its file.\n\n${failure}\n\n`
+        + "Close anyway (they are lost), or cancel and keep the document open?",
+      confirmLabel: "Close anyway",
+      cancelLabel: "Cancel",
+      destructive: true,
+    });
+    if (choice !== "confirm") return false;
   }
 
   // Drop any in-memory stash for the closed doc.
@@ -610,6 +717,9 @@ async function closeDocImpl(docId: string): Promise<boolean> {
   syncSnapshotDirty();
 
   const remaining = useCollageStore.getState().openDocs.filter((d) => d.id !== docId);
+  // Its workflows leave the Analysis workspace (shared ones stay, locked),
+  // in the same tick as the tab.
+  useAnalysisWorkspaceStore.getState().closeDoc(docId);
   useCollageStore.getState().docRemove(docId);
 
   if (isActiveDoc) {

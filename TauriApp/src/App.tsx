@@ -2,6 +2,7 @@ import { ThemeProvider, createTheme, CssBaseline } from "@mui/material";
 import { AppShell } from "./components/layout/AppShell";
 import { ConfirmHost } from "./components/shared/ConfirmDialog";
 import { SaveProjectHost } from "./components/shared/SaveProjectDialog";
+import { ChooseDocumentHost } from "./components/shared/ChooseDocumentDialog";
 
 const darkTheme = createTheme({
   palette: {
@@ -61,6 +62,9 @@ export default function App() {
           the one shared "Save Project" modal used by the Sidebar button,
           the close-tab save guard, and Add to Collage. */}
       <SaveProjectHost />
+      {/* Singleton host for chooseDocument() — which document an Analysis
+          workflow using only uploaded images is saved in. */}
+      <ChooseDocumentHost />
     </ThemeProvider>
   );
 }

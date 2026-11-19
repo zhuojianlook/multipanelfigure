@@ -11,8 +11,13 @@ import type {
   ImagesListResponse,
   PreviewResponse,
   ProjectLoadResponse,
+  ProjectSaveResponse,
   RDepsStatus,
   RDepTool,
+  SaveProjectOptions,
+  WorkflowsPayload,
+  WorkflowsReadResponse,
+  WorkflowsWriteResult,
 } from "./types";
 
 /** Backend origin — the ONE place the sidecar's base URL is decided.
@@ -330,12 +335,47 @@ class ApiClient {
 
   // ── Save / Load project ────────────────────────────────
 
-  async saveProject(path: string, analysis?: import("./types").AnalysisPayload | null): Promise<{ ok: boolean }> {
-    return apiJson(
-      "/api/project/save",
-      "POST",
-      JSON.stringify({ path, analysis: analysis ?? null }),
-    );
+  /** Save the live document to `path` (atomic). `opts.carryFrom`: see
+   *  SaveProjectOptions — the document's previous file, whose saved
+   *  Analysis is carried into the new one (omit for a plain re-save, null
+   *  for a document that never had a file). */
+  async saveProject(path: string, opts: SaveProjectOptions | null = null): Promise<ProjectSaveResponse> {
+    const body: Record<string, unknown> = { path, analysis: opts?.analysis ?? null };
+    // The sidecar reads an omitted/null carry_from as "carry from `path`"
+    // and "" as "carry nothing".
+    if (opts && opts.carryFrom !== undefined) body.carry_from = opts.carryFrom ?? "";
+    return apiJson<ProjectSaveResponse>("/api/project/save", "POST", JSON.stringify(body));
+  }
+
+  /** Replace ONLY the `workflows/` section of the .mpf at `path` on disk
+   *  (atomic). Every other member is copied from that file, never from the
+   *  live document, so this is safe for any open document — live, parked or
+   *  not loaded — and leaves its figure edits alone. Resolves
+   *  `{ok: false, missing}` for kept blobs the file lacks and
+   *  `{ok: false, unsupported: true}` for a newer-format file (in both cases
+   *  nothing was written); other failures reject. */
+  async writeWorkflows(path: string, payload: WorkflowsPayload): Promise<WorkflowsWriteResult> {
+    const text = await apiRequest("/api/project/workflows/write", "POST", JSON.stringify({
+      path, manifest: payload.manifest, blobs: payload.blobs, uploads: payload.uploads,
+    }));
+    const parsed = JSON.parse(text);
+    const detail = parsed?.detail;
+    if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+      if (Array.isArray(detail.missing)) return { ok: false, missing: detail.missing as string[] };
+      if (detail.unsupported) {
+        return { ok: false, unsupported: true, version: typeof detail.version === "number" ? detail.version : undefined };
+      }
+    }
+    if (detail) throw new Error(`API error: ${JSON.stringify(detail)}`);
+    return parsed as WorkflowsWriteResult;
+  }
+
+  /** Read the `workflows/` section of the .mpf at `path` (never its figure)
+   *  and restore its embedded uploads into the Analysis store. Names taken
+   *  by different content come back in `renamed`. Rejects when the file is
+   *  missing or not a readable .mpf. */
+  async readWorkflows(path: string): Promise<WorkflowsReadResponse> {
+    return apiJson<WorkflowsReadResponse>("/api/project/workflows/read", "POST", JSON.stringify({ path }));
   }
 
   /** `docId` = the tab the project is opened into, so the sidecar knows

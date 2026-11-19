@@ -475,6 +475,118 @@ export interface AnalysisPayload {
   tables: Record<string, string>;  // {id: CSV text}
 }
 
+/** Options of `api.saveProject`. */
+export interface SaveProjectOptions {
+  /** The file this document was last saved to / opened from. Its saved
+   *  Analysis (`workflows/`) and legacy `analysis/` members are carried into
+   *  the saved file. Omit (undefined) for a plain re-save: they are carried
+   *  from the target path itself. `null` = the document never had a file
+   *  (Untitled): nothing is carried, so a file it overwrites passes nothing on. */
+  carryFrom?: string | null;
+  /** Legacy analysis payload; when given it replaces the file's `analysis/`. */
+  analysis?: AnalysisPayload | null;
+}
+
+export interface ProjectSaveResponse {
+  ok: boolean;
+  path?: string;
+  size_bytes?: number;
+  /** Set when the previous file could not be read: the figure was saved
+   *  without its carried members. */
+  carry_error?: string;
+  /** Whether the saved file holds a workflows/ section carried from the
+   *  previous file (absent from older sidecars). */
+  workflows_carried?: boolean;
+}
+
+// ── Saved Analysis workflows: the .mpf's `workflows/` section ──────────────
+
+/** Stored result payloads (`workflows/blobs/<id>.png|.csv|.txt`). */
+export type WorkflowBlobKind = "png" | "csv" | "txt";
+
+/** One blob on the write wire. `data` is base64 for png, text for csv/txt.
+ *  OMIT `data` to keep the member of the same id (and kind) already in the
+ *  file. Blob ids: 1-128 chars of `[A-Za-z0-9_-]`. */
+export interface WorkflowBlob {
+  kind: WorkflowBlobKind;
+  data?: string;
+}
+
+/** An upload embedded in the file (`workflows/uploads/<n>/<filename>`),
+ *  listed in the manifest's `uploads` — filled in by the sidecar on write. */
+export interface WorkflowUploadEntry {
+  name: string;
+  member: string;
+  sha1: string | null;
+  size: number;
+}
+
+/** `workflows/manifest.json`, format version 1. Only the envelope is typed
+ *  here; the workflow serializer owns the shape of `workflows`, `meta`, … */
+export interface WorkflowsManifest {
+  format: "mpf-workflows";
+  version: number;
+  savedWith?: string;
+  docUid?: string;
+  docs?: Record<string, { name?: string; path?: string; rel?: string; sessionId?: string }>;
+  workflows?: unknown[];
+  tombstones?: Record<string, number>;
+  uploads?: WorkflowUploadEntry[];
+  meta?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+/** Everything one document's `workflows/` section is written from. */
+export interface WorkflowsPayload {
+  manifest: WorkflowsManifest;
+  blobs: Record<string, WorkflowBlob>;
+  /** Analysis-store upload names whose ORIGINAL files are embedded. */
+  uploads: string[];
+}
+
+export type WorkflowsWriteResult =
+  | {
+      ok: true;
+      size_bytes: number;
+      /** On-disk (compressed) size of the workflows/ section. */
+      workflows_bytes: number;
+      /** Upload names with neither a live original nor a copy in the file. */
+      missing_uploads: string[];
+      /** True when only the tail of the file was rewritten. */
+      fast_path: boolean;
+    }
+  /** Kept blobs (sent without data) the file doesn't hold — nothing was
+   *  written; resend them with data. */
+  | { ok: false; missing: string[] }
+  /** The file's workflows were written by a newer format — never overwrite. */
+  | { ok: false; unsupported: true; version?: number };
+
+/** An embedded upload restored into the Analysis store (tile data). */
+export interface RestoredUpload {
+  name: string;
+  thumbnail: string;           // base64 PNG
+  size: [number, number];      // [width, height]
+}
+
+export interface WorkflowsReadResponse {
+  /** null: the file has no saved workflows, or `unsupported`. */
+  manifest: WorkflowsManifest | null;
+  /** Every stored blob; png data is base64, csv/txt text. */
+  blobs: Record<string, { kind: WorkflowBlobKind; data: string }>;
+  /** Written by a newer format (or unreadable): show nothing, never overwrite. */
+  unsupported: boolean;
+  version: number | null;
+  /** Restored uploads under their FINAL names (see `renamed`). */
+  uploads: RestoredUpload[];
+  /** {name in file: name restored under} for uploads whose name was taken
+   *  by different content — rewrite them in that document's workflows. */
+  renamed: Record<string, string>;
+  /** Uploads listed in the manifest whose member is absent or corrupt. */
+  missing_uploads: string[];
+  /** Uploads whose bytes could not be decoded. */
+  failed_uploads: { name: string; error: string }[];
+}
+
 /** A named subgroup divider inside an image group's drawer. Its images are
  *  shown right after its header, in this order. Every name here is ALSO in
  *  the owning group's `imageNames` (and in at most one divider). */

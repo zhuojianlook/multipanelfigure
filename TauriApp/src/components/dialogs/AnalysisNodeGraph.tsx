@@ -87,10 +87,31 @@ import { useCollageStore } from "../../store/collageStore";
 import { switchToDocument, whenDocOpsIdle, uploadIntoDocument } from "../../utils/projectNav";
 import { backendTracksLiveDoc } from "../../utils/docOpQueue";
 import { DEFAULT_FIGURE_ID } from "../../utils/figures";
-import { figKey, nsKey } from "../../utils/analysisKeys";
+import { figKey, nsKey, rawKeyOf, measRefsOf, measHandleId, measIndexFromHandle } from "../../utils/analysisKeys";
 import { useSourceEditStore } from "../../store/sourceEditStore";
+import {
+  useAnalysisWorkspaceStore, newSourceNode, newWorkflowTab, ownerChip, workspaceOwnershipCtx,
+  ANALYSIS_KEYS_MOVED_EVENT, workflowLockedNow, missingDocsOf, claimLockedPrompt, uploadHomeOptions,
+  type TabWriteOptions,
+} from "../../store/analysisWorkspaceStore";
+import { UploadHomeMenu } from "../analysis/UploadHomeMenu";
+import { CLOSED_KEY_PREFIX, isLocked, isPristineTab } from "../../utils/workflowOwnership";
+import { confirm as confirmShared } from "../shared/ConfirmDialog";
+import { LockedWorkflowBanner } from "../analysis/LockedWorkflowBanner";
+import LockIcon from "@mui/icons-material/Lock";
+import { newBlobId } from "../../utils/workflowPersist";
 import { computeStale, ranWithFor, sourcesWithResults, upstreamSourceKeys } from "../../utils/analysisStale";
-export { figKey, nsKey };
+import type {
+  DataKind, EngineKind, InsetSource, MeasurementRef, RTextOverride, NodeOutput,
+  DeclaredOutput, NodeData, WorkflowTab,
+} from "../../utils/analysisTypes";
+export { figKey, nsKey, rawKeyOf };
+/* The graph's data model lives in utils/analysisTypes so the workspace store
+   and the persistence helpers can share it without importing this component. */
+export type {
+  DataKind, EngineKind, InsetSource, MeasurementRef, RTextOverride, NodeOutput,
+  DeclaredOutput, NodeData, WorkflowTab,
+};
 import BandPickerDialog, {
   type BandPickerConfig,
   type BandImageConfig,
@@ -239,7 +260,7 @@ function NodeConsolePanel({ nodeId, text, status }: {
 // Drop target for output cards from the left grid.  Lists the
 // staged items as small chips with an × to unstage; a Commit
 // button at the bottom pushes the whole batch to its destination.
-function StagingZone({ title, hint, bucket, staged, allOutputs, onAdd, onRemove, onCommit, openDocs, defaultTargetDocId, onTargetDocChange, targetDocId }: {
+function StagingZone({ title, hint, bucket, staged, allOutputs, onAdd, onRemove, onCommit, openDocs, defaultTargetDocId, onTargetDocChange, targetDocId, commitDisabled }: {
   title: string;
   hint: string;
   bucket: "main" | "collage";
@@ -253,6 +274,8 @@ function StagingZone({ title, hint, bucket, staged, allOutputs, onAdd, onRemove,
   defaultTargetDocId?: string | null;
   onTargetDocChange?: (id: string) => void;
   targetDocId?: string;
+  /** Sending is off (the workflow is locked / read-only). */
+  commitDisabled?: boolean;
 }) {
   const [hovered, setHovered] = useState(false);
   const stagedList = allOutputs.filter((o) => staged.has(`${o.nodeId}-${o.outputId}`));
@@ -346,7 +369,7 @@ function StagingZone({ title, hint, bucket, staged, allOutputs, onAdd, onRemove,
       )}
       <Button size="small" variant="contained" color="primary"
         onClick={onCommit}
-        disabled={stagedList.length === 0}
+        disabled={stagedList.length === 0 || !!commitDisabled}
         sx={{ mt: 0.5, fontSize: "0.6rem", textTransform: "none", py: 0.25 }}>
         Send {stagedList.length || ""} to {bucket === "main"
           ? (targetDocName ? `MPF · ${targetDocName}` : "main timeline")
@@ -858,67 +881,16 @@ function ConfirmDialogBody({ request, setRequest }: {
 // let those nodes call back into the parent (drop-to-attach, output
 // chip clicks, etc.) we use a React context that the canvas wraps
 // around its ReactFlow tree.
-/** A figure's measurements table attached to a SourceNode — carries the
- *  source figure id/name (for the port label + per-MPF folder) and the
- *  CSV the node feeds downstream when its 📋 port is wired. */
-interface MeasurementRef {
-  mpfId: string;
-  mpf: string;
-  label: string;
-  csv: string;
-}
-
-/** Every measurement table attached to a node, oldest first.
- *
- *  Normalises the two shapes a node can carry: the legacy single
- *  `measurementsRef` (all that saved workflows / stored sessions ever wrote)
- *  and the newer `measurementRefs` list. Slot 0 is always the legacy field, so
- *  the first table keeps the stable `out_table_measurements` handle id and old
- *  edges stay connected. */
-function measRefsOf(
-  data: { measurementsRef?: MeasurementRef; measurementRefs?: MeasurementRef[] } | undefined,
-): MeasurementRef[] {
-  if (!data) return [];
-  if (data.measurementRefs && data.measurementRefs.length) return data.measurementRefs;
-  return data.measurementsRef ? [data.measurementsRef] : [];
-}
-
-/** Handle id for the i-th measurement table. Index 0 keeps the original id so
- *  every previously-saved edge keeps resolving. */
-function measHandleId(i: number): string {
-  return i === 0 ? "out_table_measurements" : `out_table_measurements_${i}`;
-}
-
-/** Inverse of measHandleId — the bare id (and anything unparseable) is slot 0,
- *  which is what keeps legacy edges pointing at the first table. */
-function measIndexFromHandle(handle: string | null | undefined): number {
-  const m = /^out_table_measurements_(\d+)$/.exec(handle || "");
-  return m ? Number(m[1]) : 0;
-}
+/* MeasurementRef, measRefsOf, measHandleId and measIndexFromHandle live in
+   utils/analysisTypes / utils/analysisKeys (shared with the persistence
+   helpers). */
 
 /** The parts of a collageStore DocTab this module binds against. */
 type DocTabLike = { id: string; name: string; path?: string | null };
 
-/* figKey / nsKey live in utils/analysisKeys (re-exported below) so the
-   figure store can key source edits without importing this component. */
-
-/** The backend's own key for an inset — bare grid coords, e.g. "r0c0_i0".
- *  Unique within a figure and identical ACROSS figures, which is why every
- *  key that leaves this module is namespaced by figKey. */
-export function rawKeyOf(s: { key: string; rawKey?: string; name?: string }): string {
-  if (s.rawKey) return s.rawKey;
-  // Standalone uploads ("img:<filename>") belong to no figure, are never
-  // namespaced, and their key is already raw. Check this FIRST: a filename can
-  // contain "__", which the legacy split below would chop.
-  if (s.name) return s.key;
-  const ns = s.key.lastIndexOf("::");
-  if (ns >= 0) return s.key.slice(ns + 2);
-  // Legacy: either bare ("r0c0_i0") or doc-id-namespaced ("doc_x__r0c0_i0").
-  // Doc ids contain underscores, so split on the LAST "__" — no backend key
-  // contains one (r{r}c{c}_i{n} / _panel / _area{n}).
-  const i = s.key.lastIndexOf("__");
-  return i >= 0 ? s.key.slice(i + 2) : s.key;
-}
+/* figKey / nsKey / rawKeyOf live in utils/analysisKeys (re-exported above) so
+   the figure store and the persistence helpers can key sources without
+   importing this component. */
 
 /** The key the sidecar exposes a source under in the user's `inputs` dict.
  *
@@ -1217,6 +1189,13 @@ function MeasurementFigureFolder({
 
   /** User-assigned group labels for this figure's rows (persisted). */
   const [groupMap, setGroupMap] = useState<MeasGroupMap>(() => loadMeasGroups());
+  // A document was saved under a new path: the store moved its labels'
+  // keys in localStorage — reload, so a later edit doesn't write old keys back.
+  useEffect(() => {
+    const reload = () => setGroupMap(loadMeasGroups());
+    window.addEventListener(ANALYSIS_KEYS_MOVED_EVENT, reload);
+    return () => window.removeEventListener(ANALYSIS_KEYS_MOVED_EVENT, reload);
+  }, []);
   const groupOf = useCallback(
     (r: Record<string, unknown>) => groupMap[measRowKey(figKeyStr, r)] || "",
     [groupMap, figKeyStr],
@@ -1225,8 +1204,11 @@ function MeasurementFigureFolder({
   const assignGroup = (label: string) => {
     const keys = keyed.filter(({ key }) => sel.has(key));
     if (!keys.length) return;
-    setGroupMap((prev) => {
-      const next = { ...prev };
+    // Onto what localStorage holds NOW, not this folder's copy: every
+    // figure's folder (and a document's file, read on open) writes the same
+    // map, and a stale copy would drop their labels — which are saved per .mpf.
+    setGroupMap(() => {
+      const next = { ...loadMeasGroups() };
       for (const { r } of keys) {
         const k = measRowKey(figKeyStr, r);
         if (label) next[k] = label; else delete next[k];
@@ -1516,6 +1498,9 @@ interface GraphCallbacks {
   /** Per-node declared outputs (parsed from code).  Surfaced as
    *  outlined chips on the node card BEFORE the first run lands. */
   declaredByNode: Map<string, DeclaredOutput[]>;
+  /** The workflow on screen is locked (greyed out, read-only: one of its
+   *  documents is closed) — cards hide their attach / detach / × controls. */
+  locked: boolean;
 }
 const GraphCallbacksContext = createContext<GraphCallbacks | null>(null);
 function useGraphCallbacks(): GraphCallbacks | null {
@@ -1523,85 +1508,8 @@ function useGraphCallbacks(): GraphCallbacks | null {
 }
 
 // ── Types ────────────────────────────────────────────────────
-
-export type DataKind = "image" | "table" | "plot";
-export type EngineKind = "python" | "matlab" | "r" | "imagej" | "cellpose";
-
-export interface InsetSource {
-  /** Globally unique: `${figKey}::${rawKey}`. The backend's own key is bare
-   *  grid coords and is IDENTICAL across figures, so an un-namespaced key
-   *  silently matches another figure's inset — see the refresh in the
-   *  sources effect, which rebinds attached sources by key equality. */
-  key: string;
-  /** The backend's key for this inset, as the run payload needs it. */
-  rawKey?: string;
-  /** The key the sidecar exposes this source under in `inputs` — see
-   *  runtimeKeyFor. Filesystem-safe and bare for the active figure, so
-   *  existing single-figure scripts keep working. Recomputed whenever the
-   *  active doc changes, which is why it is carried rather than derived at
-   *  each use site. */
-  runKey?: string;
-  /** Stable identity of the owning figure (figKey) — survives a restart for
-   *  saved docs. This, not mpfId, is what binds a source to its figure. */
-  figKey?: string;
-  /** Which MPF this source comes from (doc id) + its display name, so the
-   *  Sources panel can group sources into a drawer per loaded MPF and the
-   *  project save can tell which MPF a workflow's data belongs to.
-   *  mpfId is SESSION-SCOPED (openDocs is not persisted) — never bind on it. */
-  mpfId?: string;
-  mpf?: string;
-  /** Figure tab of that document the source belongs to (utils/figures.ts).
-   *  Absent on sources saved before figure tabs = the project's first
-   *  figure (DEFAULT_FIGURE_ID) — see figKey. */
-  figureId?: string;
-  figureName?: string;
-  /** Set for STANDALONE analysis images uploaded directly into the Analysis
-   *  tab (not a builder inset). When present, the backend resolves the WHOLE
-   *  uploaded image (by this loaded-image name) at full bit depth, and row/col/
-   *  inset_index are -1. */
-  name?: string;
-  row: number;
-  col: number;
-  inset_index: number;
-  label: string;
-  /** The panel's name from its row/column labels + headers ("1hr, Sample 1").
-   *  Display only — the key stays grid coordinates. Absent on older sidecars. */
-  panel_name?: string;
-  natural_width: number;
-  natural_height: number;
-  thumbnail: string;
-  // Parent panel preview — set by the backend when available.  Used
-  // by the library's hover popover to show the inset's location on
-  // the host panel so the user knows which region they're picking.
-  // bbox is in `parent_natural_*` pixel coordinates.
-  parent_thumbnail?: string;
-  parent_natural_width?: number;
-  parent_natural_height?: number;
-  parent_bbox?: [number, number, number, number]; // [x, y, w, h]
-  // Whole-figure preview — a tiled thumbnail of every panel in the
-  // grid so the hover popover can show WHERE in the figure this
-  // source comes from (not just within its own panel).  bbox + cell
-  // are in the figure thumbnail's own pixel coordinates.
-  figure_thumbnail?: string;
-  figure_natural_width?: number;
-  figure_natural_height?: number;
-  figure_bbox?: [number, number, number, number];
-  figure_cell_bbox?: [number, number, number, number];
-}
-
-/** Per-slot ggplot text styling for an R-plot output — mirrors the
- *  collage's RTextOverride and the backend's _r_text_override_block.
- *  `text` is honoured only for the editable label slots (title, axes,
- *  legend title, caption); the tick/legend-label slots take styling
- *  only (they're data-driven). */
-export interface RTextOverride {
-  text?: string;
-  size?: number;
-  color?: string;
-  bold?: boolean;
-  italic?: boolean;
-  font?: string;
-}
+// DataKind, EngineKind, InsetSource, RTextOverride, NodeOutput,
+// DeclaredOutput and NodeData: utils/analysisTypes (re-exported above).
 
 /** The R text slots the editor exposes — keys match the backend
  *  _r_text_override_block mapping exactly. */
@@ -1616,124 +1524,6 @@ export const R_TEXT_SLOTS: { key: string; label: string; editable: boolean }[] =
   { key: "yticks",       label: "Y tick labels",  editable: false },
   { key: "legend_text",  label: "Legend labels",  editable: false },
 ];
-
-export interface NodeOutput {
-  /** Stable id within a node — `out_image_<idx>`, `out_table_<name>`,
-   *  `out_plot_<idx>`. Used as the handle id. Archived previous-run
-   *  outputs append a __v<N> suffix to keep them distinct from the
-   *  newest run's outputs (which use the canonical id). */
-  id: string;
-  kind: DataKind;
-  name: string;
-  /** PNG bytes (base64) for `image` / `plot`, CSV text for `table`. */
-  payload: string;
-  /** Whether the user pinned this output (sticky in the drawer's
-   *  summary view; pinned items survive node re-runs). */
-  pinned?: boolean;
-  /** For R plot outputs: the self-contained R script that produced this
-   *  plot (upstream input CSVs inlined into the prelude), so the collage
-   *  can re-run it at a new font size via "Synchronize headers". */
-  rCode?: string;
-  rInterpreter?: string | null;
-  rPlotIndex?: number;
-  /** Destinations this output has already been committed to (one entry
-   *  per "Send" click). Surfaced as small chips on the output card so
-   *  the user can see at a glance "sent to → My Figure / Collage".
-   *  The output stays in the drawer after a send so it can be re-used
-   *  on a different destination later. */
-  sentTo?: string[];
-  /** Empty/undefined = current run. Set to "v1", "v2", ... when a node
-   *  re-run pushes the previous output here so the user can compare
-   *  old vs new without losing the old one. Capped at v2 per output
-   *  slot (older versions drop on the next re-run). Image / plot only;
-   *  tables aren't archived. */
-  versionLabel?: string;
-  /** Per-slot R text styling applied to THIS plot output (Edit text…).
-   *  Re-applied on top of rCode via the override re-render so the edits
-   *  survive in the drawer; cleared/replaced on the next node run. */
-  rTextOverrides?: Record<string, RTextOverride>;
-}
-
-/** Placeholder output entry — what the code DECLARES it will produce.
- *  Surfaced on the node card as outlined chips before a run lands so
- *  users can plan downstream wiring while still drafting their code. */
-export interface DeclaredOutput {
-  kind: DataKind;
-  name: string;
-}
-
-export interface NodeData {
-  /** Display label on the node card. */
-  label: string;
-  /** "source" | "python" | "matlab" | "r" */
-  kind: "source" | EngineKind;
-  /** Engine-specific code (only relevant for python/matlab/r). */
-  code?: string;
-  /** Last-run outputs, populated after a successful execution. */
-  outputs?: NodeOutput[];
-  /** Per-input handle: which upstream `nodeId:outputId` it's
-   *  connected to. Populated from edges; cached so the runner
-   *  knows what to feed in. */
-  inputs?: { name: string; sourceNodeId: string; sourceOutputId: string; kind: DataKind }[];
-  status?: "idle" | "running" | "ok" | "error" | "stale";
-  /** Revision of each upstream image source when this node last ran
-   *  successfully (store/sourceEditStore). A source edited in Edit Panel
-   *  since then makes this node's results stale (utils/analysisStale). */
-  ranWith?: Record<string, number>;
-  /** Last error message (when status === "error"). */
-  error?: string;
-  /** Per-node combined stdout / stderr from the most recent run.
-   *  Rendered as a collapsible Console panel under the code editor
-   *  in the detail panel — keeps run output close to the code that
-   *  produced it instead of dumped into the (deprecated) global
-   *  console at the bottom of the canvas. */
-  consoleOut?: string;
-  /** Outputs the user's code DECLARES it will produce — parsed from
-   *  `mpfig_data(...)` / `mpfig_image(...)` / `mpfig_plot(...)` calls.
-   *  Shown as outlined placeholder chips on the node card so the user
-   *  can plan downstream wiring before they hit Run. */
-  declaredOutputs?: DeclaredOutput[];
-  /** Currently-loaded preset descriptor, or `"custom"` once the user
-   *  has hand-edited the code away from any known preset.  Format:
-   *  `"b:<idx>"` for built-in, `"u:<idx>"` for user-saved.  Lets the
-   *  preset Select render the active preset's name instead of always
-   *  reading "Load preset…". */
-  currentPreset?: string;
-  /** For source nodes only — list of inset sources to expose as
-   *  output handles. */
-  sources?: InsetSource[];
-  /** For source nodes — the figure's measurements table attached by
-   *  dragging the 📋 Measurements tile onto the node. When set, the node
-   *  exposes its 📋 (out_table_measurements) port carrying this CSV. */
-  measurementsRef?: MeasurementRef;
-  /** Additional measurement tables attached to the same source node. A node
-   *  used to hold exactly ONE table, so a second drop silently replaced the
-   *  first — wiring e.g. "control readings" and "treated readings" into one
-   *  script was impossible. `measurementsRef` is kept as the FIRST slot so
-   *  saved workflows / sessions (which stored only that field) still load and
-   *  keep their existing `out_table_measurements` edge valid. */
-  measurementRefs?: MeasurementRef[];
-  /** When true, the user has explicitly removed the node from
-   *  the canvas — used to no-op stale auto-edges. */
-  deleted?: boolean;
-  /** Marks a specialised interactive node:
-   *    "wb_bands"        → western-blot band picker (Python).
-   *    "fluor_intensity" → fluorescence channel intensity picker (Python).
-   *    "cellpose_seg"    → Cellpose segmentation config + preview (Cellpose).
-   *  The node's `code` is auto-generated from the config (`roi` /
-   *  `intensity` / `cellposeSeg`) — manual edits are overwritten on the
-   *  next save. Unlike the two Python markers, "cellpose_seg" sits on a
-   *  `kind:"cellpose"` node: it configures the JSON that node runs and does
-   *  NOT change the engine or the downstream (labels → ImageJ → plot). */
-  interactive?: "wb_bands" | "fluor_intensity" | "cellpose_seg";
-  /** Band-picker ROI config (only when interactive === "wb_bands"). */
-  roi?: BandPickerConfig;
-  /** Fluorescence-intensity config (only when interactive === "fluor_intensity"). */
-  intensity?: FluorIntensityConfig;
-  /** Cellpose segmentation config (only when interactive === "cellpose_seg"). */
-  cellposeSeg?: CellposeSegConfig;
-  [key: string]: unknown;  // index signature for ReactFlow's Record
-}
 
 // ── Helpers ──────────────────────────────────────────────────
 
@@ -1892,7 +1682,11 @@ function SourceNode({ data, id }: NodeCardProps) {
     };
   }, [id, sources.length, measRefs.length, updateNodeInternals]);
 
+  const locked = !!cbs?.locked;
   const onDragOver = (e: React.DragEvent) => {
+    // A locked workflow takes no drops (the document-level guard still ends
+    // the drag session, so WKWebView can't soft-lock).
+    if (locked) return;
     const t = e.dataTransfer.types;
     if (t.includes("application/x-mpfig-source") || t.includes("application/x-mpfig-measurements")) {
       e.preventDefault();
@@ -1905,6 +1699,7 @@ function SourceNode({ data, id }: NodeCardProps) {
     e.preventDefault();
     e.stopPropagation();
     setDragOver(false);
+    if (locked) return;
     const key = e.dataTransfer.getData("application/x-mpfig-source");
     if (key && cbs) { cbs.addSourceToNode(id, key); return; }
     // 📋 Measurements tile dropped onto this source node → attach it.
@@ -1970,13 +1765,15 @@ function SourceNode({ data, id }: NodeCardProps) {
                 )}
               </Box>
               {cbs?.staleSourceKeys.has(s.key) && <StaleBadge title={STALE_SOURCE_TIP} />}
-              <Box
-                component="span"
-                onClick={(e) => { e.stopPropagation(); cbs?.removeSourceFromNode(id, idx); }}
-                sx={{ fontSize: "0.55rem", cursor: "pointer", color: "text.disabled", px: 0.25, "&:hover": { color: "error.main" } }}
-              >
-                ×
-              </Box>
+              {!locked && (
+                <Box
+                  component="span"
+                  onClick={(e) => { e.stopPropagation(); cbs?.removeSourceFromNode(id, idx); }}
+                  sx={{ fontSize: "0.55rem", cursor: "pointer", color: "text.disabled", px: 0.25, "&:hover": { color: "error.main" } }}
+                >
+                  ×
+                </Box>
+              )}
               <Handle
                 type="source"
                 position={Position.Right}
@@ -1995,11 +1792,13 @@ function SourceNode({ data, id }: NodeCardProps) {
             <Typography variant="caption" sx={{ fontSize: "0.55rem", fontWeight: 600, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               📋 {mr.label || "measurements"}
             </Typography>
-            <Box
-              component="span"
-              onClick={(e) => { e.stopPropagation(); cbs?.detachMeasurements(id, mi); }}
-              sx={{ fontSize: "0.55rem", cursor: "pointer", color: "text.disabled", px: 0.25, "&:hover": { color: "error.main" } }}
-            >×</Box>
+            {!locked && (
+              <Box
+                component="span"
+                onClick={(e) => { e.stopPropagation(); cbs?.detachMeasurements(id, mi); }}
+                sx={{ fontSize: "0.55rem", cursor: "pointer", color: "text.disabled", px: 0.25, "&:hover": { color: "error.main" } }}
+              >×</Box>
+            )}
             <Handle
               type="source"
               position={Position.Right}
@@ -2209,7 +2008,8 @@ function DeletableEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition,
       <BaseEdge id={id} path={edgePath} style={style} markerEnd={markerEnd} />
       {/* Wide invisible hit area for easy selection of an otherwise-thin line. */}
       <path d={edgePath} fill="none" stroke="transparent" strokeWidth={18} style={{ cursor: "pointer" }} />
-      <EdgeLabelRenderer>
+      {/* No × on a locked (read-only) workflow. */}
+      {!cbs?.locked && <EdgeLabelRenderer>
         <button
           className="nodrag nopan"
           title="Remove this connection"
@@ -2231,7 +2031,7 @@ function DeletableEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition,
         >
           ×
         </button>
-      </EdgeLabelRenderer>
+      </EdgeLabelRenderer>}
     </>
   );
 }
@@ -2935,61 +2735,9 @@ export function measRowKey(fig: string, r: Record<string, unknown>): string {
 }
 
 // Analysis-tab uploads (standalone images dropped directly onto the Analysis
-// tab via "+ Upload") live in component-local React state. When the user
-// switches tabs (Analysis → Collage → back), the AnalysisView UNMOUNTS, that
-// state is destroyed, and on remount the backend's listInsetAnalysisSources()
-// only returns BUILDER inset sources — so user uploads vanish.
-// Fix: persist their metadata to localStorage. The underlying image bytes
-// stay on the backend's loaded_images for the session, so on remount we can
-// re-show the tiles immediately and the workflow's name-based source
-// resolution still works. Stored key holds an array of upload InsetSource
-// entries (the subset where `name` is set and row/col are -1).
-const ANALYSIS_UPLOADS_KEY = "mpfig.analysis.uploads";
-// Per-source name-overrides (rename source in the Sources panel) persist too,
-// so the displayed labels survive a tab switch (the Sources panel re-renders
-// from the restored uploads + the override map).
-// Session marker (sessionStorage) — present for the lifetime of ONE
-// app run (survives tab-switch component remounts + soft reloads),
-// wiped when the app process exits.  We use its ABSENCE to detect a
-// fresh launch.
-const ANALYSIS_SESSION_MARKER = "mpfig.analysis.sessionMarker";
-function loadAnalysisUploads(): InsetSource[] {
-  try {
-    // Fresh app launch?  On a new process the backend sidecar has
-    // restarted too, so any previously-uploaded analysis images are
-    // GONE from its in-memory store — the persisted upload tiles would
-    // be ghosts that 404 on click.  Discard them on a fresh launch.
-    // The earlier clear in restoreSessionUnlessFreshLaunch ran AFTER
-    // this useState initializer, so the stale uploads were loaded into
-    // state before that clear fired — hence they survived restarts.
-    // Doing the check HERE (at load time) fixes the ordering.
-    // sessionStorage is empty on a fresh window and persists across
-    // tab-switch remounts within a run, so it's the right session
-    // signal.
-    let freshLaunch = false;
-    try {
-      freshLaunch = !sessionStorage.getItem(ANALYSIS_SESSION_MARKER);
-      sessionStorage.setItem(ANALYSIS_SESSION_MARKER, "1");
-    } catch { /* sessionStorage disabled — fall through, keep uploads */ }
-    if (freshLaunch) {
-      try { localStorage.removeItem(ANALYSIS_UPLOADS_KEY); } catch { /* ignore */ }
-      return [];
-    }
-    const raw = localStorage.getItem(ANALYSIS_UPLOADS_KEY);
-    if (!raw) return [];
-    const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) return [];
-    // Light shape validation — drop entries that don't look like an upload.
-    return arr.filter((s): s is InsetSource =>
-      s && typeof s.key === "string" && typeof s.name === "string"
-      && (s.row === -1 || s.row === undefined),
-    );
-  } catch { return []; }
-}
-function saveAnalysisUploads(uploads: InsetSource[]) {
-  try { localStorage.setItem(ANALYSIS_UPLOADS_KEY, JSON.stringify(uploads)); }
-  catch { /* localStorage quota / disabled */ }
-}
+// tab via "+ Upload"): their Sources-panel tiles live in the analysis
+// workspace store (`uploads`), so they survive the view unmounting on a tab
+// switch. The image bytes stay in the sidecar's Analysis store for the session.
 
 interface SavedWorkflow {
   id: string;
@@ -4975,128 +4723,19 @@ const BUILTIN_WORKFLOWS: SavedWorkflow[] = [
 ];
 
 // ── Workflow tabs (in-session) ──────────────────────────────
-// Each tab is an independent graph (nodes + edges). The user can
-// add multiple to run the same analysis on different image sets.
-interface WorkflowTab {
-  id: string;
-  name: string;
-  nodes: Node<NodeData>[];
-  edges: Edge[];
-}
+// WorkflowTab: utils/analysisTypes (re-exported above).
 
-// ── In-session workflow persistence ─────────────────────────
-// We persist the currently-open workflow tabs (including each
-// node's code, label, attached sources, currentPreset and position)
-// to localStorage on every change so closing and reopening the
-// Analysis dialog doesn't blow away in-flight work.  Output
-// payloads (PNG / CSV base64) are stripped before save — they're
-// large, regenerable, and saving them blows past localStorage's
-// ~5 MB per-origin quota.  Status is reset to "stale" so users see
-// the cached payloads are no longer authoritative.
-const SESSION_KEY = "mpfig.workflow_session";
+// ── Workflow tabs live in store/analysisWorkspaceStore ──────
+// Tabs, the active tab and every node's outputs are held by the workspace
+// store, so they survive this view unmounting (Builder / Collage mode) and
+// save / close can read them; that replaced the former localStorage session
+// and module-level outputs cache. newSourceNode lives there too.
+
 // Code-editor font size (px) for the node detail panel — a display preference
 // that persists across sessions.
 const CODE_FONT_KEY = "mpfig.analysis.code_font";
 const CODE_FONT_MIN = 9;
 const CODE_FONT_MAX = 28;
-interface WorkflowSession {
-  tabs: WorkflowTab[];
-  activeId: string;
-}
-function sanitizeNodeForSave(n: Node<NodeData>): Node<NodeData> {
-  // Drop the huge `outputs[].payload` blobs; cap `consoleOut`.
-  const co = n.data.consoleOut;
-  const trimmedOut = (co && co.length > 4000) ? co.slice(0, 4000) + "\n…(truncated)" : co;
-  return {
-    ...n,
-    data: {
-      ...n.data,
-      outputs: [],
-      consoleOut: trimmedOut,
-      status: n.data.status === "running" ? "stale" : (n.data.status === "ok" ? "stale" : n.data.status),
-    } as NodeData,
-  };
-}
-function loadWorkflowSession(): WorkflowSession | null {
-  try {
-    const raw = localStorage.getItem(SESSION_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<WorkflowSession>;
-    if (!parsed || !Array.isArray(parsed.tabs) || parsed.tabs.length === 0) return null;
-    // Light shape validation.
-    const tabs = (parsed.tabs.filter((t) =>
-      t && typeof t.id === "string" && typeof t.name === "string" &&
-      Array.isArray(t.nodes) && Array.isArray(t.edges),
-    ) as WorkflowTab[]).map((t) => ({
-      // Upgrade pre-existing edges to the custom "deletable" type so their
-      // × remove button + wide hit area appear after this version too.
-      ...t,
-      edges: t.edges.map((e) => ({ ...e, type: "deletable" })),
-    }));
-    if (tabs.length === 0) return null;
-    return { tabs, activeId: typeof parsed.activeId === "string" ? parsed.activeId : tabs[0].id };
-  } catch { return null; }
-}
-function saveWorkflowSession(s: WorkflowSession) {
-  try {
-    const stripped: WorkflowSession = {
-      activeId: s.activeId,
-      tabs: s.tabs.map((t) => ({ ...t, nodes: t.nodes.map(sanitizeNodeForSave) })),
-    };
-    localStorage.setItem(SESSION_KEY, JSON.stringify(stripped));
-  } catch { /* localStorage quota / disabled — give up silently */ }
-}
-
-// True once the Analysis UI has mounted in THIS page load. A full app restart
-// reloads the page → this module re-evaluates → the flag resets, so we treat
-// that first mount as a FRESH LAUNCH: we do NOT carry over the previous run's
-// workflow (we clear it and start with an empty graph). Within the SAME run
-// (e.g. leaving and returning to the Analysis tab) the flag is already set, so
-// we DO restore the in-session save and don't lose in-flight work.
-let analysisSessionStarted = false;
-function restoreSessionUnlessFreshLaunch(): WorkflowSession | null {
-  if (!analysisSessionStarted) {
-    analysisSessionStarted = true;
-    try {
-      localStorage.removeItem(SESSION_KEY);
-      // The backend's loaded_images is in-memory and doesn't survive a
-      // sidecar restart, so persisted analysis-upload tiles from a previous
-      // app run would be ghosts (clicking them would 404). Clear them on a
-      // fresh app launch — within a SINGLE run, leaving + returning to the
-      // Analysis tab still restores them (the flag is already set).
-      localStorage.removeItem(ANALYSIS_UPLOADS_KEY);
-    } catch { /* ignore */ }
-    // Fresh launch — also reset the outputs cache since the matching
-    // workflow tabs are gone.
-    nodeOutputsCache.clear();
-    return null;
-  }
-  return loadWorkflowSession();
-}
-
-/** Module-level cache of every node's outputs, keyed by `${tabId}:${nodeId}`.
- *  Survives the AnalysisView unmount that happens when the user navigates to
- *  Collage / Builder, so on return the drawer shows the same plots / tables
- *  it had before (instead of an empty state — outputs are stripped from the
- *  localStorage session-save because of their size). Within a SINGLE app
- *  run this map sits in process memory; it's cleared on fresh-launch. */
-const nodeOutputsCache = new Map<string, NodeOutput[]>();
-function outputsCacheKey(tabId: string, nodeId: string): string {
-  return `${tabId}:${nodeId}`;
-}
-
-function newSourceNode(sources: InsetSource[], opts?: { id?: string; label?: string; position?: { x: number; y: number } }): Node<NodeData> {
-  const id = opts?.id ?? "source";
-  return {
-    id,
-    type: "source",
-    position: opts?.position ?? { x: 30, y: 30 },
-    data: { label: opts?.label ?? "Source", kind: "source", sources, status: "ok" } as NodeData,
-    draggable: true,
-    // Only the primary source is undeletable — extra sources can be removed.
-    deletable: id !== "source",
-  };
-}
 
 // ── Main component ───────────────────────────────────────────
 
@@ -5137,11 +4776,16 @@ export interface AggregatedOutput {
 }
 
 export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutputsChanged }: Props) {
-  // Inset sources from the backend (image ports for the source node). On
-  // mount we restore any analysis-tab uploads that were persisted before the
-  // last tab switch — they live in component-local state, so without this
-  // the user's uploaded files disappear every time the tab is left.
-  const [insetSources, setInsetSources] = useState<InsetSource[]>(() => loadAnalysisUploads());
+  // Inset sources (image ports for the source node): the standalone Analysis
+  // uploads — held by the workspace store, so a tab switch can't lose them —
+  // on top of the figure insets the backend lists (`liveSources`).
+  const uploadTiles = useAnalysisWorkspaceStore((s) => s.uploads);
+  const [liveSources, setLiveSources] = useState<InsetSource[]>([]);
+  const insetSources = useMemo<InsetSource[]>(() => {
+    if (!uploadTiles.length) return liveSources;
+    const liveKeys = new Set(liveSources.map((l) => l.key));
+    return [...uploadTiles.filter((s) => !liveKeys.has(s.key)), ...liveSources];
+  }, [uploadTiles, liveSources]);
   // True once the live source list has arrived — an "Update" re-run
   // requested from the Edit Panel waits for it (utils/analysisStale).
   const [sourcesLoaded, setSourcesLoaded] = useState(false);
@@ -5176,24 +4820,13 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   // to run the same analysis topology on a different image set,
   // or loads a previously-saved workflow from localStorage.
   //
-  // Hydrate from the in-session save (mpfig.workflow_session) so
-  // closing and reopening the Analysis dialog doesn't blow away
-  // the user's open tabs, attached insets, and code edits.  Falls
-  // back to a single empty workflow when there's nothing saved.
-  const [workflowTabs, setWorkflowTabs] = useState<WorkflowTab[]>(() => {
-    const restored = restoreSessionUnlessFreshLaunch();
-    if (restored && restored.tabs.length > 0) return restored.tabs;
-    return [{
-      id: newId("wf"),
-      name: "Workflow 1",
-      nodes: [newSourceNode([])],
-      edges: [],
-    }];
-  });
-  const [activeWfId, setActiveWfId] = useState<string>(() => {
-    const restored = restoreSessionUnlessFreshLaunch();
-    return restored?.activeId || "";
-  });
+  // The tabs live in the analysis workspace store (never empty), so they —
+  // outputs included — survive this view unmounting. setWorkflowTabs keeps
+  // useState's contract: value or updater, same reference = no-op.
+  const workflowTabs = useAnalysisWorkspaceStore((s) => s.tabs);
+  const setWorkflowTabs = useAnalysisWorkspaceStore((s) => s.setTabs);
+  const activeWfId = useAnalysisWorkspaceStore((s) => s.activeId);
+  const setActiveWfId = useAnalysisWorkspaceStore((s) => s.setActive);
   const activeWf = useMemo(() => workflowTabs.find((w) => w.id === activeWfId) || workflowTabs[0], [workflowTabs, activeWfId]);
   // Reactive references to the active tab's nodes / edges so the
   // existing handlers below (which were written against a single
@@ -5206,32 +4839,21 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   // no-op update. Combined with the parseDeclaredOutputs effect
   // (which runs on every node-state change), the lack of a bailout
   // produces an "infinite update" crash that blanks the dialog.
-  const setNodes = useCallback((updater: (n: Node<NodeData>[]) => Node<NodeData>[]) => {
-    setWorkflowTabs((tabs) => {
-      let touched = false;
-      const next = tabs.map((t) => {
-        if (t.id !== activeWf.id) return t;
-        const nn = updater(t.nodes);
-        if (nn === t.nodes) return t;
-        touched = true;
-        return { ...t, nodes: nn };
-      });
-      return touched ? next : tabs;
-    });
+  // The bail-out lives in the store's setTabNodes / setTabEdges (unit-tested
+  // there): the same per-tab map + `touched` check this component had.
+  // So does the lock guard: a locked workflow (one of its documents is
+  // closed) keeps its graph unless the update is view-only ({ view: true }:
+  // selection, measured size).
+  const setNodes = useCallback((updater: (n: Node<NodeData>[]) => Node<NodeData>[], opts?: TabWriteOptions) => {
+    useAnalysisWorkspaceStore.getState().setTabNodes(activeWf.id, updater, opts);
   }, [activeWf.id]);
-  const setEdges = useCallback((updater: (e: Edge[]) => Edge[]) => {
-    setWorkflowTabs((tabs) => {
-      let touched = false;
-      const next = tabs.map((t) => {
-        if (t.id !== activeWf.id) return t;
-        const ne = updater(t.edges);
-        if (ne === t.edges) return t;
-        touched = true;
-        return { ...t, edges: ne };
-      });
-      return touched ? next : tabs;
-    });
+  const setEdges = useCallback((updater: (e: Edge[]) => Edge[], opts?: TabWriteOptions) => {
+    useAnalysisWorkspaceStore.getState().setTabEdges(activeWf.id, updater, opts);
   }, [activeWf.id]);
+  /** The workflow these handlers write to is locked right now — read at call
+   *  time, so a document closing mid-session is seen at once. Edit handlers
+   *  return early on it (the store's guard would drop their writes anyway). */
+  const activeWfLocked = useCallback(() => workflowLockedNow(activeWf.id), [activeWf.id]);
 
   useEffect(() => {
     // Initial active id wire-up — first render sets it to the
@@ -5294,70 +4916,6 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   // any edge the user deleted, making "exclude this group from the ANOVA"
   // impossible. Table wiring is therefore mirrored ONCE per drop, inside
   // attachMeasurements, and re-indexed (not dropped) in detachMeasurements.
-
-  // Persist the open tabs + active id to localStorage on every change so
-  // leaving and returning to the Analysis tab WITHIN A RUN restores in-flight
-  // work. A fresh app launch deliberately starts empty (see
-  // restoreSessionUnlessFreshLaunch). Debounced so a flurry of node-position
-  // drag updates doesn't hammer JSON.stringify on a multi-megabyte tabs array.
-  const sessionSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    if (sessionSaveTimerRef.current) clearTimeout(sessionSaveTimerRef.current);
-    sessionSaveTimerRef.current = setTimeout(() => {
-      saveWorkflowSession({ tabs: workflowTabs, activeId: activeWfId });
-    }, 400);
-    return () => {
-      if (sessionSaveTimerRef.current) clearTimeout(sessionSaveTimerRef.current);
-    };
-  }, [workflowTabs, activeWfId]);
-
-  // ── Outputs survival cache ─────────────────────────────────────
-  // localStorage's session-save STRIPS outputs (they're often multi-MB
-  // PNGs that would blow the 5 MB quota in a couple of runs). To make
-  // outputs survive a tab switch (Analysis → Collage → Analysis), we
-  // also mirror them into a module-level Map keyed by (tabId, nodeId).
-  //
-  // Ordering matters: we MUST hydrate from the cache BEFORE we start
-  // mirroring workflowTabs into it. Otherwise the freshly-restored
-  // stripped tabs from localStorage (which have outputs=[]) would
-  // overwrite the cache's real outputs with empty arrays on the very
-  // first mirror pass — which is exactly why the previous version
-  // lost outputs on Analysis→Collage→Analysis. The hydration effect
-  // runs FIRST and flips outputsHydratedRef.current = true; the
-  // mirror effect bails out until then.
-  const outputsHydratedRef = useRef(false);
-  // Hydration: one-time rehydration on mount — paint cached outputs
-  // back onto the freshly-restored (stripped) nodes. Declared first
-  // so it runs before the mirror effect below on the initial commit.
-  useEffect(() => {
-    if (outputsHydratedRef.current) return;
-    if (workflowTabs.length === 0) return;
-    setWorkflowTabs((tabs) => tabs.map((t) => ({
-      ...t,
-      nodes: t.nodes.map((n) => {
-        const cached = nodeOutputsCache.get(outputsCacheKey(t.id, n.id));
-        if (!cached || cached.length === 0) return n;
-        if (n.data.outputs && n.data.outputs.length > 0) return n;  // don't trample
-        return { ...n, data: { ...n.data, outputs: cached } };
-      }),
-    })));
-    outputsHydratedRef.current = true;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  // Mirror: keep the cache in sync with subsequent state changes. Gate
-  // on outputsHydratedRef so we don't trample the cache with the
-  // stripped tabs during initial mount. After hydration runs once,
-  // every subsequent workflowTabs change writes through to the cache,
-  // including emptied lists (so a user deletion persists across
-  // tab-switches just like it should).
-  useEffect(() => {
-    if (!outputsHydratedRef.current) return;
-    for (const t of workflowTabs) {
-      for (const n of t.nodes) {
-        nodeOutputsCache.set(outputsCacheKey(t.id, n.id), n.data.outputs || []);
-      }
-    }
-  }, [workflowTabs]);
 
   // Drag soft-lock guard (WKWebView). A native HTML5 drag of a source /
   // measurement / output chip hangs the whole app — the cursor stays stuck
@@ -5514,6 +5072,21 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   // Open MPF docs from the collage store (the tab strip is rendered there).
   const openDocs = useCollageStore((s) => s.openDocs);
   const activeDocId = useCollageStore((s) => s.activeDocId);
+
+  // ── Locked (greyed-out) workflows ────────────────────────────
+  // A workflow reading figures of several documents is read-only while one
+  // of them is closed: its results can't be refreshed and its copy in the
+  // closed file can't follow an edit. Pan / zoom / select / read stay.
+  const docUids = useAnalysisWorkspaceStore((s) => s.docUids);
+  const knownDocs = useAnalysisWorkspaceStore((s) => s.knownDocs);
+  const ownershipCtx = useMemo(
+    () => workspaceOwnershipCtx({ docUids, knownDocs }, openDocs), [docUids, knownDocs, openDocs]);
+  const lockedTabIds = useMemo(
+    () => new Set(workflowTabs.filter((t) => isLocked(t, ownershipCtx)).map((t) => t.id)),
+    [workflowTabs, ownershipCtx]);
+  const activeLocked = lockedTabIds.has(activeWf.id);
+  const activeMissing = useMemo(
+    () => (activeLocked ? missingDocsOf(activeWf, ownershipCtx) : []), [activeLocked, activeWf, ownershipCtx]);
   // The active document's figure tab on screen, and all its tabs — sources
   // carry a figure id, and the figure on screen keeps the bare runtime key.
   const activeFigureId = useFigureStore((s) => s.activeFigureId);
@@ -5645,8 +5218,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   // ("R1C1·1 (Standard Zoom)") when absent.
   const [sourceNameOverrides, setSourceNameOverrides] = useState<Record<string, string>>(() => loadSourceNames());
   const persistSourceName = useCallback((key: string, name: string | null) => {
-    setSourceNameOverrides((cur) => {
-      const next = { ...cur };
+    // Onto what localStorage holds now (a document's file may have brought
+    // names since this view loaded them) — names are saved per .mpf.
+    setSourceNameOverrides(() => {
+      const next = { ...loadSourceNames() };
       const trimmed = (name || "").trim();
       if (trimmed) next[key] = trimmed;
       else delete next[key];
@@ -5669,6 +5244,14 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   // ── User-defined source-library groups ───────────────────────
   // Hydrated from localStorage on mount; each mutation persists back.
   const [sourceGroups, setSourceGroups] = useState<SourceGroup[]>(() => loadSourceGroups());
+  // A document was saved under a new path: the workspace store moved its
+  // source names / folders to the new keys in localStorage — reload both, so
+  // the next edit doesn't write the old keys back.
+  useEffect(() => {
+    const reload = () => { setSourceNameOverrides(loadSourceNames()); setSourceGroups(loadSourceGroups()); };
+    window.addEventListener(ANALYSIS_KEYS_MOVED_EVENT, reload);
+    return () => window.removeEventListener(ANALYSIS_KEYS_MOVED_EVENT, reload);
+  }, []);
   const persistSourceGroups = useCallback((next: SourceGroup[]) => {
     setSourceGroups(next);
     saveSourceGroups(next);
@@ -5737,16 +5320,6 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   const removeImage = useFigureStore((s) => s.removeImage);
   const addCollageItem = useCollageStore((s) => s.addItem);
   void removeImage;  // wired below in discard flow
-
-  // Persist the analysis-upload subset of insetSources to localStorage so it
-  // survives a tab switch (the AnalysisView component unmounts when the user
-  // navigates to Collage or a builder tab, destroying all local React state).
-  // Filter: only entries with `name` set AND row === -1 — those are the
-  // standalone analysis uploads. Builder insets re-fetch from the backend.
-  useEffect(() => {
-    const uploads = insetSources.filter((s) => s.name && s.row === -1);
-    saveAnalysisUploads(uploads);
-  }, [insetSources]);
 
   // Bumped on every run / cleanup of the sources effect below, so a listing
   // that resolves after a newer one started (or after unmount) is dropped.
@@ -5851,14 +5424,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         .then((groups) => {
           if (seq !== sourcesSeq.current) return;   // a newer listing (or unmount) superseded this one
           const list = groups.flat();
-          // Preserve user-uploaded standalone sources (name-based) across the
-          // refresh — they live in loaded_images for the session, not in the
-          // builder inset list the backend returns here.
-          setInsetSources((prev) => {
-            const liveKeys = new Set(list.map((l) => l.key));
-            const uploads = prev.filter((s) => s.name && !liveKeys.has(s.key));
-            return [...uploads, ...list];
-          });
+          // User-uploaded standalone sources aren't in this listing — their
+          // tiles live in the workspace store and are merged in on top
+          // (insetSources), so the refresh can't drop them.
+          setLiveSources(list);
           setSourcesLoaded(true);
           setExtraMeasurements(_measAccum);
           // Do NOT auto-populate the Source node — the user picks
@@ -5878,6 +5447,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
               const refreshed = (n.data.sources || []).map((s) => {
                 // Standalone uploads aren't figure-bound; leave them alone.
                 if (s.name) return s;
+                // A closed document's source ("u:<uid>", locked workflow):
+                // nothing open can match it — it waits for its document.
+                if (s.figKey?.startsWith(CLOSED_KEY_PREFIX)) return s;
                 const bound = s.figKey ? s : migrateLegacySource(s, _docs, _active, _activeFig);
                 const live = list.find((l) => l.key === bound.key);
                 // No match → the owning figure is closed, or is an Untitled whose
@@ -5890,7 +5462,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
             }),
           })));
         })
-        .catch(() => setInsetSources([]));
+        .catch(() => setLiveSources([]));
     });
     // Probe MATLAB / ImageJ with the user's pinned binary (if any).
     // The sidecar accepts a `?path=` query — empty falls back to
@@ -5960,12 +5532,20 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
 
   // ── Graph handlers ─────────────────────────────────────────
 
+  // Selection and measured size are view state: flagged { view: true } so they
+  // still apply on a locked workflow, whose every other change is dropped.
   const onNodesChange = useCallback((changes: NodeChange<Node<NodeData>>[]) => {
-    setNodes((nds) => applyNodeChanges(changes, nds));
-  }, [setNodes]);
+    const view = changes.filter((c) => c.type === "select" || c.type === "dimensions");
+    if (view.length === changes.length) setNodes((nds) => applyNodeChanges(changes, nds), { view: true });
+    else if (activeWfLocked()) { if (view.length) setNodes((nds) => applyNodeChanges(view, nds), { view: true }); }
+    else setNodes((nds) => applyNodeChanges(changes, nds));
+  }, [setNodes, activeWfLocked]);
   const onEdgesChange = useCallback((changes: EdgeChange[]) => {
-    setEdges((eds) => applyEdgeChanges(changes, eds));
-  }, [setEdges]);
+    const view = changes.filter((c) => c.type === "select");
+    if (view.length === changes.length) setEdges((eds) => applyEdgeChanges(changes, eds), { view: true });
+    else if (activeWfLocked()) { if (view.length) setEdges((eds) => applyEdgeChanges(view, eds), { view: true }); }
+    else setEdges((eds) => applyEdgeChanges(changes, eds));
+  }, [setEdges, activeWfLocked]);
 
   // Derived data — computed via useMemo and exposed through the
   // GraphCallbacksContext so the node renderers can read counts /
@@ -6018,6 +5598,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   }, []);
 
   const onConnect = useCallback((connection: Connection) => {
+    if (activeWfLocked()) return;
     if (!isValidConnection(connection)) return;
     const srcHandle = connection.sourceHandle || "";
     const kind: DataKind = srcHandle.includes("image") ? "image" : "table";
@@ -6027,7 +5608,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       animated: false,
       style: { stroke: PORT_COLOR[kind], strokeWidth: 2 },
     }, eds));
-  }, [isValidConnection]);
+    // setEdges is per workflow tab: without it here a connection drawn on a
+    // later tab landed in the tab this view mounted on.
+  }, [isValidConnection, setEdges, activeWfLocked]);
 
   // Delete a single connection (the edge's × button). Edge removal doesn't
   // change any handle set, so no handleRev bump is needed.
@@ -6043,6 +5626,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   // ── Add a new node ─────────────────────────────────────────
 
   const addProcessNode = useCallback((engine: EngineKind, presetIdx: number = 0) => {
+    if (activeWfLocked()) return;
     const id = newId(engine);
     const preset = BUILTIN_PRESETS[engine][presetIdx];
     const defaultCode = preset?.code
@@ -6103,7 +5687,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       },
     ]);
     setSelectedNodeId(id);
-  }, [setNodes]);
+  }, [setNodes, activeWfLocked]);
 
   // Spawn a western-blot band-picker node.  It's a Python node under
   // the hood (renders + runs like one) but flagged `interactive:
@@ -6222,6 +5806,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
    *  📋 Measurements tile onto it). The node then exposes its 📋 port
    *  carrying that figure's CSV. */
   const attachMeasurements = useCallback((nodeId: string, ref: MeasurementRef) => {
+    if (activeWfLocked()) return;
     const src = nodes.find((n) => n.id === nodeId);
     const existingRefs = src?.data.kind === "source" ? measRefsOf(src.data) : [];
     // Dedup on the READINGS, not the raw csv: a re-drop after assigning Group
@@ -6353,11 +5938,12 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     // data on the source, try to wire source → first node" only worked after
     // leaving the Analysis tab and coming back.
     setHandleRev((r) => r + 1);
-  }, [nodes, setNodes, setEdges]);
+  }, [nodes, setNodes, setEdges, activeWfLocked]);
 
   /** Detach one measurements table from a source node (the 📋 row's ×), or all
    *  of them when no index is given. */
   const detachMeasurements = useCallback((nodeId: string, index?: number) => {
+    if (activeWfLocked()) return;
     setNodes((cur) => cur.map((n) => {
       if (n.id !== nodeId) return n;
       if (index == null) {
@@ -6400,10 +5986,11 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     // Detaching shrinks the handle set — same staleness hazard, same fix as
     // removeSourceFromNode.
     setHandleRev((r) => r + 1);
-  }, [setNodes, setEdges]);
+  }, [setNodes, setEdges, activeWfLocked]);
 
   /** Attach an inset (looked up by InsetSource.key) to a source node. */
   const addSourceToNode = useCallback((nodeId: string, sourceKey: string) => {
+    if (activeWfLocked()) return;
     const inset = insetSources.find((s) => s.key === sourceKey);
     if (!inset) return;
     // Snapshot the BEFORE-attach state so we can decide whether to auto-wire.
@@ -6467,11 +6054,19 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     // definitively kills the "have to exit + re-enter analysis to
     // connect source → first node" bug.
     setHandleRev((r) => r + 1);
-  }, [insetSources, nodes, setNodes, setEdges]);
+    // An uploaded image on a workflow that reads no figure document: ask
+    // (once) which document saves it — its uploads are embedded there.
+    if (inset.name) {
+      void useAnalysisWorkspaceStore.getState().askUploadHome(activeWf.id, {
+        label: (id) => figureLabels(useCollageStore.getState().openDocs)[id],
+      });
+    }
+  }, [insetSources, nodes, setNodes, setEdges, activeWfLocked, activeWf.id]);
 
   /** Detach the inset at `idx` from a source node. Also removes
    *  any edges that were wired off the now-defunct output handle. */
   const removeSourceFromNode = useCallback((nodeId: string, idx: number) => {
+    if (activeWfLocked()) return;
     setNodes((cur) => cur.map((n) => {
       if (n.id !== nodeId || n.data.kind !== "source") return n;
       const next = (n.data.sources || []).filter((_, i) => i !== idx);
@@ -6495,7 +6090,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     // tree with the now-smaller handle map (and discard any cached
     // edges that referenced the dropped handle).
     setHandleRev((r) => r + 1);
-  }, [setNodes, setEdges]);
+  }, [setNodes, setEdges, activeWfLocked]);
 
   /** Spawn an empty source node beside the primary one. */
   const addEmptySourceNode = useCallback(() => {
@@ -6550,7 +6145,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     try { await api.deleteAnalysisImage(name); }
     catch (e) { logUpload(`[upload] backend delete failed for ${name}: ${e instanceof Error ? e.message : String(e)}`); }
     // Drop from the library list.
-    setInsetSources((cur) => cur.filter((x) => x.key !== key));
+    useAnalysisWorkspaceStore.getState().removeUpload(key);
     // Pull out of any group (Direct upload, etc.) — keeps the localStorage
     // group state consistent with what's now in the library.
     persistSourceGroups(sourceGroups.map((g) => ({
@@ -6581,12 +6176,8 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         label: name, natural_width: w, natural_height: h, thumbnail: res.thumbnails?.[name] || "",
       };
     });
-    setInsetSources((cur) => {
-      // A re-upload of the same filename replaced the backend image — refresh
-      // its card (thumbnail / size) instead of keeping the stale one.
-      const fresh = new Set(entries.map((e) => e.key));
-      return [...entries, ...cur.filter((s) => !fresh.has(s.key))];
-    });
+    // Newest on top; a re-upload of the same filename refreshes its card.
+    useAnalysisWorkspaceStore.getState().addUploads(entries);
     // Auto-park direct uploads under a dedicated "Direct upload" folder so
     // they're visually separated from builder-flagged insets (which appear
     // in the "All sources" / Ungrouped section). Folder is created on first
@@ -6753,30 +6344,28 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
 
   // ── Layer-2 workflow tab management ─────────────────────────
 
-  const addWorkflowTab = useCallback(() => {
-    const id = newId("wf");
-    const idx = workflowTabs.length + 1;
-    setWorkflowTabs((tabs) => [...tabs, {
-      id, name: `Workflow ${idx}`,
-      nodes: [newSourceNode([])], edges: [],
-    }]);
-    setActiveWfId(id);
-    setSelectedNodeId(null);
-  }, [workflowTabs.length]);
+  /** Uid of the document new workflows are saved in: the active one. */
+  const homeForNewTab = useCallback((): string | undefined => {
+    const docId = useCollageStore.getState().activeDocId;
+    return docId ? useAnalysisWorkspaceStore.getState().uidFor(docId) : undefined;
+  }, []);
 
+  const addWorkflowTab = useCallback(() => {
+    const tab = newWorkflowTab(`Workflow ${workflowTabs.length + 1}`, homeForNewTab(), newId("wf"));
+    setWorkflowTabs((tabs) => [...tabs, tab]);
+    setActiveWfId(tab.id);
+    setSelectedNodeId(null);
+  }, [workflowTabs.length, homeForNewTab]);
+
+  /** Delete a workflow (tombstoned in its open documents' files; the last
+   *  one is replaced by a fresh empty workflow). A locked one is refused by
+   *  the store (its × is hidden). */
   const removeWorkflowTab = useCallback((id: string) => {
-    setWorkflowTabs((tabs) => {
-      if (tabs.length <= 1) return tabs;  // keep at least one
-      const idx = tabs.findIndex((t) => t.id === id);
-      const next = tabs.filter((t) => t.id !== id);
-      if (id === activeWfId) {
-        setActiveWfId(next[Math.max(0, idx - 1)]?.id || next[0]?.id || "");
-      }
-      return next;
-    });
-  }, [activeWfId]);
+    useAnalysisWorkspaceStore.getState().deleteWorkflow(id);
+  }, []);
 
   const renameWorkflowTab = useCallback((id: string, name: string) => {
+    if (workflowLockedNow(id)) return;                 // read-only while greyed out
     setWorkflowTabs((tabs) => tabs.map((t) => t.id === id ? { ...t, name } : t));
   }, []);
 
@@ -6825,12 +6414,14 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       });
       return { ...n, data: { ...n.data, sources: refreshed } };
     });
+    const home = homeForNewTab();
     setWorkflowTabs((tabs) => [...tabs, {
       id: newWfId, name: wf.name, nodes: refreshedNodes, edges: wf.edges,
+      ...(home ? { home } : {}),
     }]);
     setActiveWfId(newWfId);
     setSelectedNodeId(null);
-  }, [savedWorkflows, insetSources]);
+  }, [savedWorkflows, insetSources, homeForNewTab]);
 
   const deleteSavedWorkflow = useCallback((id: string) => {
     setSavedWorkflows((cur) => {
@@ -7339,6 +6930,8 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   }, [openCellposePicker]);
 
   const runNode = useCallback(async (node: Node<NodeData>, nodeMap: Map<string, Node<NodeData>>) => {
+    // A locked workflow can't run: its results couldn't be written back.
+    if (activeWfLocked()) return;
     const engine = node.data.kind as EngineKind;
     if (engine !== "python" && engine !== "matlab" && engine !== "r" && engine !== "imagej" && engine !== "cellpose") return;
     // Interactive band-picker with no lanes defined yet → open the "Pick bands…"
@@ -7742,8 +7335,10 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         };
         const maxV = prev.reduce((acc, o) => Math.max(acc, versionOf(o)), 0);
         const newV = maxV + 1;
+        // A fresh blobId per produced payload: it names the bytes in the
+        // .mpf, so an unchanged id always means unchanged bytes.
         const tagged: NodeOutput[] = newOutputs.map((o) => ({
-          ...o, id: `${o.id}__v${newV}`, versionLabel: `v${newV}`,
+          ...o, id: `${o.id}__v${newV}`, versionLabel: `v${newV}`, blobId: newBlobId(),
         }));
         // Keep previous 2 versions of EVERY output kind (current = v(newV)
         // → keep v(newV-1), v(newV-2); drop anything older).
@@ -7774,11 +7369,12 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       } : n));
     }
   }, [collectInputs, insetSources, enginePaths, setNodes, sourceNameOverrides, openBandPickerAndWait,
-      openDocs, activeDocId, activeFigureId, figureTabs, edges]);
+      openDocs, activeDocId, activeFigureId, figureTabs, edges, activeWfLocked]);
 
   /** Run the active workflow's process nodes in dependency order — all of
    *  them, or only those in `only` (the Edit Panel's "Update" re-run). */
   const runOrdered = useCallback(async (only?: ReadonlySet<string>) => {
+    if (activeWfLocked()) return;                       // read-only while greyed out
     setRunningGraph(true);
     consoleRef.current += only
       ? `\n──────────── RE-RUN (edited in Edit Panel) ────────────\n`
@@ -7807,7 +7403,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       if (runAbortRef.current) { runAbortRef.current = false; break; }
     }
     setRunningGraph(false);
-  }, [topoOrder, runNode]);
+  }, [topoOrder, runNode, activeWfLocked]);
   const runGraph = useCallback(() => runOrdered(), [runOrdered]);
 
   // ── Results made stale by Edit Panel changes (utils/analysisStale) ──
@@ -7886,17 +7482,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
     setStagedForMain((s) => { if (!s.has(key)) return s; const n = new Set(s); n.delete(key); return n; });
     setStagedForCollage((s) => { if (!s.has(key)) return s; const n = new Set(s); n.delete(key); return n; });
     setSelectedOutputKeys((s) => { if (!s.has(key)) return s; const n = new Set(s); n.delete(key); return n; });
-    // Mirror the deletion into the outputs cache too, so navigating away
-    // from the Analysis tab and back doesn't resurrect the just-deleted
-    // entry from a stale snapshot. (The workflowTabs-mirror useEffect
-    // will also catch this on the next tick, but doing it here is
-    // immediate + avoids a flash if the user switches tabs fast.)
-    const tabId = activeWf?.id;
-    if (tabId) {
-      const cur = nodeOutputsCache.get(outputsCacheKey(tabId, nodeId));
-      if (cur) nodeOutputsCache.set(outputsCacheKey(tabId, nodeId), cur.filter((o) => o.id !== outputId));
-    }
-  }, [setNodes, activeWf]);
+  }, [setNodes]);
 
   // ── Per-element R text editor (Edit text… on an R plot output) ──
   // Re-renders the SAME plot with title/axis/legend styling overrides via
@@ -7968,7 +7554,8 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           data: {
             ...n.data,
             outputs: (n.data.outputs || []).map((o) =>
-              o.id === ed.outputId ? { ...o, payload: newPng, rTextOverrides: storeOv } : o),
+              // New bytes → new blobId (the .mpf keys stored payloads by it).
+              o.id === ed.outputId ? { ...o, payload: newPng, rTextOverrides: storeOv, blobId: newBlobId() } : o),
           },
         }));
         setRTextEditor(null);
@@ -8070,6 +7657,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
   }, [setNodes]);
 
   const commitStaged = useCallback(async (bucket: "main" | "collage", mainTargetDocId?: string) => {
+    if (activeWfLocked()) return;                       // "send output" is off while greyed out
     const keys = bucket === "main" ? stagedForMain : stagedForCollage;
     const list = allOutputsRef.current.filter(
       (o) => keys.has(`${o.nodeId}-${o.outputId}`) && (o.kind === "plot" || o.kind === "image")
@@ -8132,7 +7720,85 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
       setStagedForCollage(new Set());
     }
     setConsoleOut(consoleRef.current);
-  }, [stagedForMain, stagedForCollage, outputFilename, uploadImages, addCollageItem, tagSentTo]);
+  }, [stagedForMain, stagedForCollage, outputFilename, uploadImages, addCollageItem, tagSentTo, activeWfLocked]);
+
+  // Owner chip per workflow tab: the document it is saved with ("a"), or
+  // "a + b · results not saved" when it reads figures of several.
+  const ownerChips = useMemo(() => {
+    const labels = figureLabels(openDocs);
+    const out: Record<string, { text: string; shared: boolean } | null> = {};
+    for (const t of workflowTabs) out[t.id] = ownerChip(t, ownershipCtx, (id) => labels[id]);
+    return out;
+  }, [workflowTabs, ownershipCtx, openDocs]);
+
+  // ── Tab menu: where a workflow's uploaded images are saved ──
+  // Right-click a tab (or click its owner chip): a shared workflow picks
+  // which of its documents embeds its uploads ("Store uploaded images in ▸");
+  // one using uploads only reopens the choose-document dialog.
+  const uploadMenuTabs = useMemo(
+    () => new Set(workflowTabs.filter((t) => uploadHomeOptions(t, ownershipCtx)).map((t) => t.id)),
+    [workflowTabs, ownershipCtx]);
+  const [tabMenu, setTabMenu] = useState<{ wfId: string; top: number; left: number } | null>(null);
+  const tabMenuOpts = useMemo(() => {
+    const t = tabMenu ? workflowTabs.find((x) => x.id === tabMenu.wfId) : undefined;
+    return t ? uploadHomeOptions(t, ownershipCtx) : null;
+  }, [tabMenu, workflowTabs, ownershipCtx]);
+  const openTabMenu = useCallback((e: React.MouseEvent, wfId: string) => {
+    if (!uploadMenuTabs.has(wfId)) return;            // nothing to offer: leave the click alone
+    e.preventDefault();
+    e.stopPropagation();
+    setTabMenu({ wfId, top: e.clientY, left: e.clientX });
+  }, [uploadMenuTabs]);
+  const docLabelOf = useCallback(
+    (id: string) => figureLabels(useCollageStore.getState().openDocs)[id], []);
+
+  // ── Locked workflow: banner actions + the once-per-session prompt ──
+  const [lockBusy, setLockBusy] = useState(false);
+  const openMissingDocs = useCallback(async (wfId: string) => {
+    setLockBusy(true);
+    try { await useAnalysisWorkspaceStore.getState().openMissing(wfId); }
+    catch (e) { console.error("[analysis] open missing documents failed:", e); }
+    finally { setLockBusy(false); }
+  }, []);
+  const locateMissingDoc = useCallback(async (wfId: string, uid: string) => {
+    setLockBusy(true);
+    try { await useAnalysisWorkspaceStore.getState().locate(wfId, uid); }
+    catch (e) { console.error("[analysis] locate failed:", e); }
+    finally { setLockBusy(false); }
+  }, []);
+  const removeMissingSources = useCallback(async () => {
+    const names = activeMissing.map((m) => m.label).join(", ");
+    const ok = await confirm({
+      title: "Remove their sources",
+      message: `Remove the images and measurement tables of ${names} from "${activeWf.name}"? `
+        + "It then uses only the open documents' figures and can be edited and re-run again.",
+      okLabel: "Remove",
+    });
+    if (!ok) return;
+    useAnalysisWorkspaceStore.getState().removeMissingSources(activeWf.id);
+    // Source handles changed: same remount as a detach.
+    setHandleRev((r) => r + 1);
+  }, [activeMissing, activeWf.id, activeWf.name, confirm]);
+  // The first time a locked workflow is on screen this session, offer to open
+  // the documents it needs (the banner keeps offering it afterwards).
+  useEffect(() => {
+    if (!open || !activeLocked) return;
+    const findable = activeMissing.filter((m) => m.locatable);
+    if (!findable.length || !claimLockedPrompt(activeWf.id)) return;
+    const wfId = activeWf.id;
+    const list = findable.map((m) => m.label).join(" and ");
+    void (async () => {
+      const ok = await confirmShared({
+        title: "Open the other documents?",
+        body: `"${activeWf.name}" also uses ${list}. It stays read-only (greyed out) until `
+          + `${findable.length > 1 ? "they are" : "it is"} open.\n\nOpen ${list}?`,
+        confirmLabel: "Open",
+        cancelLabel: "Not now",
+      });
+      if (ok) await openMissingDocs(wfId);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, activeLocked, activeWf.id]);
 
   // ── Render ─────────────────────────────────────────────────
 
@@ -8153,10 +7819,35 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           sx={{ minHeight: 28, "& .MuiTab-root": { minHeight: 28, fontSize: "0.7rem", py: 0, px: 1, textTransform: "none" } }}
         >
           {workflowTabs.map((t) => (
-            <Tab key={t.id} value={t.id} label={
+            <Tab key={t.id} value={t.id} onContextMenu={(e) => openTabMenu(e, t.id)} label={
               <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-                <span>{t.name}</span>
-                {workflowTabs.length > 1 && (
+                {lockedTabIds.has(t.id) && (
+                  <Tooltip placement="bottom" title="Read-only: it also uses a document that is closed — open it to edit and re-run">
+                    <LockIcon data-testid="workflow-locked" sx={{ fontSize: 11, color: "text.disabled" }} />
+                  </Tooltip>
+                )}
+                <span style={lockedTabIds.has(t.id) ? { opacity: 0.6 } : undefined}>{t.name}</span>
+                {ownerChips[t.id] && (
+                  <Box
+                    component="span"
+                    data-testid="workflow-owner-chip"
+                    onClick={uploadMenuTabs.has(t.id) ? (e: React.MouseEvent) => openTabMenu(e, t.id) : undefined}
+                    title={(ownerChips[t.id]!.shared
+                      ? "Uses figures from several documents: saved in each of them as graph and settings only — results are not saved"
+                      : `Saved with ${ownerChips[t.id]!.text}`)
+                      + (uploadMenuTabs.has(t.id) ? " — click to choose where its uploaded images are saved" : "")}
+                    sx={{
+                      fontSize: "0.6rem", lineHeight: 1.4, px: 0.5, borderRadius: 1,
+                      bgcolor: "action.hover", color: "text.secondary",
+                      maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      ...(uploadMenuTabs.has(t.id) ? { cursor: "pointer", "&:hover": { color: "text.primary" } } : {}),
+                    }}
+                  >{ownerChips[t.id]!.text}</Box>
+                )}
+                {/* The last tab can go too (a fresh one replaces it) — unless
+                    it is already empty, where × would change nothing. Not
+                    while locked (the closed document couldn't record it). */}
+                {!lockedTabIds.has(t.id) && (workflowTabs.length > 1 || !isPristineTab(t)) && (
                   <Box
                     component="span"
                     onClick={(e) => { e.stopPropagation(); removeWorkflowTab(t.id); }}
@@ -8167,11 +7858,25 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
             } />
           ))}
         </Tabs>
+        <UploadHomeMenu
+          anchor={tabMenu && tabMenuOpts ? { top: tabMenu.top, left: tabMenu.left } : null}
+          onClose={() => setTabMenu(null)}
+          choices={tabMenuOpts?.kind === "shared"
+            ? tabMenuOpts.choices.map((d) => ({ uid: d.uid, label: docLabelOf(d.id) || d.name || "Untitled" }))
+            : undefined}
+          home={tabMenuOpts?.home}
+          disabled={!!tabMenu && lockedTabIds.has(tabMenu.wfId)}
+          onPick={(uid) => { if (tabMenu) useAnalysisWorkspaceStore.getState().setUploadHome(tabMenu.wfId, uid); }}
+          onChooseDocument={tabMenu && tabMenuOpts?.kind === "uploads-only"
+            ? () => { void useAnalysisWorkspaceStore.getState().askUploadHome(tabMenu.wfId, { force: true, label: docLabelOf }); }
+            : undefined}
+        />
         <IconButton size="small" onClick={addWorkflowTab} title="Add a new workflow tab">
           <AddIcon sx={{ fontSize: 16 }} />
         </IconButton>
         <Button
           size="small"
+          disabled={activeLocked}
           onClick={async () => {
             const newName = await prompt({ title: "Rename workflow", label: "Name", defaultValue: activeWf.name, okLabel: "Rename" });
             if (newName && newName !== activeWf.name) renameWorkflowTab(activeWf.id, newName);
@@ -8234,6 +7939,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
         hasMeasurements, highlightedUpstreamIds,
         inputCountsByNode, declaredByNode,
         staleNodeIds: stale.nodeIds, staleSourceKeys: stale.sourceKeys,
+        locked: activeLocked,
       }}>
       <Box sx={{ flex: 1, display: "flex", minHeight: 0, position: "relative" }}>
       {/* Far left: source library panel.  Lists every flagged inset
@@ -8472,6 +8178,11 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
+          // Locked (one of its documents is closed): greyed out and
+          // read-only — pan / zoom / select still work.
+          nodesDraggable={!activeLocked}
+          nodesConnectable={!activeLocked}
+          style={activeLocked ? { opacity: 0.55, filter: "grayscale(1)" } : undefined}
           // Belt-and-braces: still refresh handle internals on
           // connect-start, in case any drag begins before the
           // remount has fully settled.
@@ -8513,7 +8224,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           minZoom={0.15}
           maxZoom={2}
           defaultViewport={{ x: 0, y: 0, zoom: 0.7 }}
-          deleteKeyCode={["Backspace", "Delete"]}
+          deleteKeyCode={activeLocked ? null : ["Backspace", "Delete"]}
           edgesFocusable
           elementsSelectable
         >
@@ -8599,23 +8310,29 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           gap: 0.5, zIndex: 5, "& > *": { flexShrink: 0 },
         }}>
           <Tooltip placement="bottom" title="Add an empty Source node — drop image insets onto it to feed the graph">
-            <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
-              onClick={addEmptySourceNode}
-              sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.source, "&:hover": { bgcolor: KIND_COLOR.source, filter: "brightness(0.9)" } }}>
-              🖼 Source
-            </Button>
+            <span>
+              <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
+                disabled={activeLocked}
+                onClick={addEmptySourceNode}
+                sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.source, "&:hover": { bgcolor: KIND_COLOR.source, filter: "brightness(0.9)" } }}>
+                🖼 Source
+              </Button>
+            </span>
           </Tooltip>
           <Tooltip placement="bottom" title="Add a Python node">
-            <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
-              onClick={() => addProcessNode("python")}
-              sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.python, "&:hover": { bgcolor: KIND_COLOR.python, filter: "brightness(0.9)" } }}>
-              🐍 Python
-            </Button>
+            <span>
+              <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
+                disabled={activeLocked}
+                onClick={() => addProcessNode("python")}
+                sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.python, "&:hover": { bgcolor: KIND_COLOR.python, filter: "brightness(0.9)" } }}>
+                🐍 Python
+              </Button>
+            </span>
           </Tooltip>
           <Tooltip placement="bottom" title={matlabKind ? `Add a MATLAB node (uses ${matlabKind})` : "Octave / MATLAB not detected — install Octave to enable"}>
             <span>
               <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
-                disabled={!matlabKind}
+                disabled={!matlabKind || activeLocked}
                 onClick={() => addProcessNode("matlab")}
                 sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.matlab, "&:hover": { bgcolor: KIND_COLOR.matlab, filter: "brightness(0.9)" } }}>
                 📐 MATLAB
@@ -8623,11 +8340,14 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
             </span>
           </Tooltip>
           <Tooltip placement="bottom" title="Add an R node — receives tables, produces plots">
-            <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
-              onClick={() => addProcessNode("r")}
-              sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.r, "&:hover": { bgcolor: KIND_COLOR.r, filter: "brightness(0.9)" } }}>
-              📊 R Plot
-            </Button>
+            <span>
+              <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
+                disabled={activeLocked}
+                onClick={() => addProcessNode("r")}
+                sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.r, "&:hover": { bgcolor: KIND_COLOR.r, filter: "brightness(0.9)" } }}>
+                📊 R Plot
+              </Button>
+            </span>
           </Tooltip>
           {/* Band picker lives in the Plugins menu (Picker tools) alongside
               the Intensity picker — no separate toolbar button needed. */}
@@ -8636,7 +8356,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
             : "ImageJ / Fiji not detected — install Fiji and ensure ImageJ-* is on PATH"}>
             <span>
               <Button size="small" variant="contained" startIcon={<AddIcon sx={{ fontSize: 14 }} />}
-                disabled={!imagejKind}
+                disabled={!imagejKind || activeLocked}
                 onClick={() => addProcessNode("imagej")}
                 sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25, bgcolor: KIND_COLOR.imagej, "&:hover": { bgcolor: KIND_COLOR.imagej, filter: "brightness(0.9)" } }}>
                 🔬 ImageJ
@@ -8644,11 +8364,14 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
             </span>
           </Tooltip>
           <Tooltip placement="bottom" title="Plugins — reusable picker tools (band / intensity) + analysis engines (Cellpose). Add one to the canvas and wire it into any pipeline.">
-            <Button size="small" variant="outlined" startIcon={<ExtensionIcon sx={{ fontSize: 14 }} />}
-              onClick={(e) => setPluginsAnchor(e.currentTarget)}
-              sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25 }}>
-              Plugins
-            </Button>
+            <span>
+              <Button size="small" variant="outlined" startIcon={<ExtensionIcon sx={{ fontSize: 14 }} />}
+                disabled={activeLocked}
+                onClick={(e) => setPluginsAnchor(e.currentTarget)}
+                sx={{ fontSize: "0.65rem", textTransform: "none", py: 0.25 }}>
+                Plugins
+              </Button>
+            </span>
           </Tooltip>
           <Menu
             anchorEl={pluginsAnchor}
@@ -8732,7 +8455,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
               selected (click a node or an edge first; Shift+click for
               multi-select). Tooltip surfaces the Backspace shortcut
               for keyboard-driven users. */}
-          {(rfSelection.nodeIds.size + rfSelection.edgeIds.size) > 0 && (
+          {!activeLocked && (rfSelection.nodeIds.size + rfSelection.edgeIds.size) > 0 && (
             <Tooltip placement="bottom" title="Delete selected node(s) and edge(s) — Backspace / Delete also works">
               <Button size="small" variant="outlined" color="error"
                 startIcon={<DeleteOutlineIcon sx={{ fontSize: 14 }} />}
@@ -8786,12 +8509,27 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
           </Tooltip>
           <Button size="small" variant="contained" color="primary"
             startIcon={runningGraph ? <CircularProgress size={12} /> : <PlayArrowIcon sx={{ fontSize: 14 }} />}
-            disabled={runningGraph}
+            disabled={runningGraph || activeLocked}
             onClick={runGraph}
             sx={{ fontSize: "0.7rem", textTransform: "none", py: 0.25, ml: 1 }}>
             {runningGraph ? "Running…" : "Run graph"}
           </Button>
         </Box>
+        {/* Locked workflow: what it waits for, and the ways out. Sits over
+            the (greyed) canvas, below the toolbar, clear of the minimap. */}
+        {activeLocked && activeMissing.length > 0 && (
+          <Box sx={{ position: "absolute", top: 44, left: 8, right: 192, zIndex: 6, display: "flex", justifyContent: "center", pointerEvents: "none" }}>
+            <Box sx={{ pointerEvents: "auto", maxWidth: "100%" }}>
+              <LockedWorkflowBanner
+                missing={activeMissing}
+                busy={lockBusy}
+                onOpenMissing={() => { void openMissingDocs(activeWf.id); }}
+                onLocate={(uid) => { void locateMissingDoc(activeWf.id, uid); }}
+                onRemoveSources={() => { void removeMissingSources(); }}
+              />
+            </Box>
+          </Box>
+        )}
       </Box>
 
       {/* Right: selected-node detail panel — source nodes get a
@@ -8812,6 +8550,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
             <TextField
               size="small"
               value={selectedNode.data.label}
+              disabled={activeLocked}
               onChange={(e) => {
                 const v = e.target.value.slice(0, 40);
                 setNodes((cur) => cur.map((n) => n.id === selectedNode.id ? { ...n, data: { ...n.data, label: v } } : n));
@@ -8819,7 +8558,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
               sx={{ flex: 1, "& .MuiInputBase-input": { fontSize: "0.75rem", py: 0.4 } }}
             />
             {selectedNode.id !== "source" && (
-              <IconButton size="small" onClick={() => removeNode(selectedNode.id)} title="Remove source node">
+              <IconButton size="small" disabled={activeLocked} onClick={() => removeNode(selectedNode.id)} title="Remove source node">
                 <DeleteOutlineIcon sx={{ fontSize: 14 }} />
               </IconButton>
             )}
@@ -8848,7 +8587,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                       {!s.name && s.mpf ? `${s.mpf} · ` : ""}{s.name ? "" : `R${s.row + 1}C${s.col + 1}${s.inset_index >= 0 ? ` · inset ${s.inset_index + 1}` : ""} · `}{s.natural_width}×{s.natural_height}
                     </Typography>
                   </Box>
-                  <IconButton size="small" onClick={() => removeSourceFromNode(selectedNode.id, idx)} title="Detach this inset">
+                  <IconButton size="small" disabled={activeLocked} onClick={() => removeSourceFromNode(selectedNode.id, idx)} title="Detach this inset">
                     <DeleteOutlineIcon sx={{ fontSize: 14 }} />
                   </IconButton>
                 </Box>
@@ -8882,6 +8621,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
               <TextField
                 size="small"
                 value={selectedNode.data.label}
+                disabled={activeLocked}
                 onChange={(e) => {
                   const v = e.target.value.slice(0, 40);
                   setNodes((cur) => cur.map((n) => n.id === selectedNode.id ? { ...n, data: { ...n.data, label: v } } : n));
@@ -8891,7 +8631,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
             </Tooltip>
             <Button size="small" variant="outlined"
               startIcon={selectedNode.data.status === "running" ? <CircularProgress size={11} /> : <PlayArrowIcon sx={{ fontSize: 13 }} />}
-              disabled={selectedNode.data.status === "running"}
+              disabled={selectedNode.data.status === "running" || activeLocked}
               onClick={async () => {
                 const nm = new Map(nodes.map((n) => [n.id, n]));
                 await runNode(selectedNode, nm);
@@ -8899,7 +8639,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
               sx={{ fontSize: "0.6rem", textTransform: "none", py: 0.25 }}>
               Run this node
             </Button>
-            <IconButton size="small" onClick={() => removeNode(selectedNode.id)} title="Remove node">
+            <IconButton size="small" disabled={activeLocked} onClick={() => removeNode(selectedNode.id)} title="Remove node">
               <DeleteOutlineIcon sx={{ fontSize: 14 }} />
             </IconButton>
           </Box>
@@ -8909,7 +8649,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
               hand-editing the code. */}
           {selectedNode.data.interactive === "wb_bands" && (
             <Box sx={{ display: "flex", alignItems: "center", gap: 1, px: 1, py: 0.75, borderBottom: "1px solid", borderColor: "divider", bgcolor: "action.hover" }}>
-              <Button size="small" variant="contained" onClick={() => openBandPicker(selectedNode.id)}
+              <Button size="small" variant="contained" disabled={activeLocked} onClick={() => openBandPicker(selectedNode.id)}
                 sx={{ textTransform: "none", fontSize: "0.7rem" }}>
                 🩻 Pick bands…
               </Button>
@@ -8924,7 +8664,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
             const mode = ic?.mode === "cellpose" ? "Cellpose per-cell" : "Simple (mean intensity)";
             return (
               <Box sx={{ display: "flex", alignItems: "center", gap: 1, px: 1, py: 0.75, borderBottom: "1px solid", borderColor: "divider", bgcolor: "action.hover" }}>
-                <Button size="small" variant="contained" onClick={() => openIntensityPicker(selectedNode.id)}
+                <Button size="small" variant="contained" disabled={activeLocked} onClick={() => openIntensityPicker(selectedNode.id)}
                   sx={{ textTransform: "none", fontSize: "0.7rem" }}>
                   🌈 Configure intensity…
                 </Button>
@@ -8941,7 +8681,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
               : "not configured yet";
             return (
               <Box sx={{ display: "flex", alignItems: "center", gap: 1, px: 1, py: 0.75, borderBottom: "1px solid", borderColor: "divider", bgcolor: "action.hover" }}>
-                <Button size="small" variant="contained" onClick={() => openCellposePicker(selectedNode.id)}
+                <Button size="small" variant="contained" disabled={activeLocked} onClick={() => openCellposePicker(selectedNode.id)}
                   sx={{ textTransform: "none", fontSize: "0.7rem" }}>
                   🔬 Configure segmentation…
                 </Button>
@@ -8973,6 +8713,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
               size="small"
               value={cp}
               displayEmpty
+              disabled={activeLocked}
               renderValue={() => cpLabel}
               onChange={(e) => {
                 const val = String(e.target.value);
@@ -9137,6 +8878,9 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                 }))}
                 theme={oneDark}
                 height="100%"
+                // Readable (and copyable) but not editable while locked.
+                editable={!activeLocked}
+                readOnly={activeLocked}
                 extensions={selectedNode.data.kind === "r"
                   ? [StreamLanguage.define(cmR), codeFontTheme]
                   : [cmPython(), codeFontTheme]}
@@ -9173,7 +8917,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                         <Box component="img" src={`data:image/png;base64,${o.payload}`} alt={o.name}
                           sx={{ display: "block", width: 60, height: 60, objectFit: "contain", mt: 0.25 }} />
                       )}
-                      <IconButton size="small" onClick={() => togglePin(selectedNode.id, o.id)} sx={{ p: 0 }}>
+                      <IconButton size="small" disabled={activeLocked} onClick={() => togglePin(selectedNode.id, o.id)} sx={{ p: 0 }}>
                         {o.pinned ? <StarIcon sx={{ fontSize: 12, color: "warning.main" }} /> : <StarBorderIcon sx={{ fontSize: 12 }} />}
                       </IconButton>
                     </Box>
@@ -9313,7 +9057,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                             onChange={() => toggleOutputSelected(key)}
                             sx={{ position: "absolute", top: 0, left: 0, p: 0.25 }}
                           />
-                          <IconButton size="small" onClick={() => togglePin(o.nodeId, o.outputId)} sx={{ position: "absolute", top: 2, right: 2, p: 0 }}>
+                          <IconButton size="small" disabled={activeLocked} onClick={() => togglePin(o.nodeId, o.outputId)} sx={{ position: "absolute", top: 2, right: 2, p: 0 }}>
                             {o.pinned ? <StarIcon sx={{ fontSize: 14, color: "warning.main" }} /> : <StarBorderIcon sx={{ fontSize: 14 }} />}
                           </IconButton>
                           <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, pl: 2.5, pr: 2, minWidth: 0 }}>
@@ -9412,7 +9156,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                             {/* Per-element R text styling — only for R plot
                                 outputs (they carry the self-contained rCode
                                 needed to re-render with theme overrides). */}
-                            {o.kind === "plot" && o.rCode && (
+                            {!activeLocked && o.kind === "plot" && o.rCode && (
                               <Tooltip placement="top" title="Edit the plot's text — title, axis & legend labels, ticks: font, size, colour, bold/italic. Re-renders this plot only.">
                                 <IconButton size="small"
                                   onClick={(e) => { e.preventDefault(); e.stopPropagation(); openRTextEditor(o); }}
@@ -9422,14 +9166,16 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                                 </IconButton>
                               </Tooltip>
                             )}
-                            <Tooltip placement="top" title="Remove this output from the drawer. The next node re-run will produce a fresh one (the version-archive keeps prior runs separately).">
-                              <IconButton size="small"
-                                onClick={(e) => { e.preventDefault(); e.stopPropagation(); deleteOutput(o.nodeId, o.outputId); }}
-                                onMouseDown={(e) => { e.stopPropagation(); }}
-                                sx={{ p: 0.25, color: "text.disabled", "&:hover": { color: "error.main" } }}>
-                                <DeleteOutlineIcon sx={{ fontSize: 14 }} />
-                              </IconButton>
-                            </Tooltip>
+                            {!activeLocked && (
+                              <Tooltip placement="top" title="Remove this output from the drawer. The next node re-run will produce a fresh one (the version-archive keeps prior runs separately).">
+                                <IconButton size="small"
+                                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); deleteOutput(o.nodeId, o.outputId); }}
+                                  onMouseDown={(e) => { e.stopPropagation(); }}
+                                  sx={{ p: 0.25, color: "text.disabled", "&:hover": { color: "error.main" } }}>
+                                  <DeleteOutlineIcon sx={{ fontSize: 14 }} />
+                                </IconButton>
+                              </Tooltip>
+                            )}
                           </Box>
                         </Box>
                       );
@@ -9448,6 +9194,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                   onAdd={(k) => toggleStaged("main", k)}
                   onRemove={(k) => toggleStaged("main", k)}
                   onCommit={() => commitStaged("main", mainTargetDocId || activeDocId || undefined)}
+                  commitDisabled={activeLocked}
                   openDocs={openDocs}
                   defaultTargetDocId={activeDocId}
                   targetDocId={mainTargetDocId || activeDocId || undefined}
@@ -9462,6 +9209,7 @@ export function AnalysisNodeGraph({ open, measurementsCsv, measurements, onOutpu
                   onAdd={(k) => toggleStaged("collage", k)}
                   onRemove={(k) => toggleStaged("collage", k)}
                   onCommit={() => commitStaged("collage")}
+                  commitDisabled={activeLocked}
                 />
               </Box>
             </Box>

@@ -16,7 +16,7 @@ import { PanelGrid } from "../grid/PanelGrid";
 import { PreviewPane } from "../preview/PreviewPane";
 import { CollageView } from "../collage/CollageView";
 import { AnalysisView } from "../analysis/AnalysisView";
-import { hasUnsavedSnapshots } from "../../utils/projectNav";
+import { hasUnsavedSnapshots, persistAllWorkflowsForQuit, setQuitGuard, unsavedAnalysisDocIds } from "../../utils/projectNav";
 import { maybeRestoreSession, persistOpenDocs, getReopenPref, setReopenPref } from "../../utils/sessionRestore";
 import { Alert, CircularProgress } from "@mui/material";
 
@@ -95,7 +95,7 @@ export function AppShell() {
   // between clicking "Save all & close"/"Overwrite" and the window actually
   // closing. Sits BELOW MUI dialogs (z 1300) so the per-file save prompts stay
   // clickable above it.
-  const [closing, setClosing] = useState(false);
+  const [closing, setClosing] = useState<string | null>(null);
   // True while a document swap (stash → activate/load/new) is in flight. The
   // window is made non-interactive so no click or shortcut edits the outgoing
   // doc after it was stashed, or lands in the incoming one.
@@ -166,11 +166,19 @@ export function AppShell() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
+    // Untitled documents holding Analysis work whose figure isn't otherwise
+    // flagged — their workflows can only be saved with a file.
+    const analysisOnlyDocs = () => {
+      const { activeDocId, snapshotDirtyDocIds } = useCollageStore.getState();
+      const dirtyBuilder = useFigureStore.getState().unsaved;
+      return unsavedAnalysisDocIds()
+        .filter((id) => !(id === activeDocId && dirtyBuilder) && !snapshotDirtyDocIds.includes(id));
+    };
     const hasUnsaved = () => {
       const dirtyBuilder = useFigureStore.getState().unsaved;
       const collageItems = useCollageStore.getState().items.length > 0;
       // Other open tabs may hold unsaved edits parked in in-memory snapshots.
-      return dirtyBuilder || collageItems || hasUnsavedSnapshots();
+      return dirtyBuilder || collageItems || hasUnsavedSnapshots() || analysisOnlyDocs().length > 0;
     };
     (async () => {
       try {
@@ -188,17 +196,26 @@ export function AppShell() {
             await win.destroy();
           }
         };
-        const off = await win.onCloseRequested(async (event) => {
-          // Always take control of the close so we can guarantee a real quit.
-          event.preventDefault();
+        // The quit guard: unsaved figures ask Save / Discard / Cancel, then every
+        // saved document's Analysis workflows are written into its .mpf. Shared
+        // by the window close and the in-app update's restart (which stops the
+        // sidecar, so it must run first). False = stay open.
+        const guardQuit = async (action: "close" | "restart"): Promise<boolean> => {
+          const restart = action === "restart";
+          const busyLabel = restart ? "Saving before the update…" : "Saving and closing…";
+          // "Close without saving": unsaved figure edits are dropped, so the
+          // Analysis results that read them are saved as "needs re-run".
+          let figuresDiscarded = false;
           if (hasUnsaved()) {
             const dirtyBuilder = useFigureStore.getState().unsaved;
             const collageItems = useCollageStore.getState().items.length > 0;
-            const otherTabs = hasUnsavedSnapshots();
-            // How many .mpf documents (current + parked tabs) are dirty — drives
-            // singular/plural wording and whether there's anything to save.
+            const analysisOnly = analysisOnlyDocs().length;
+            const otherTabs = hasUnsavedSnapshots() || analysisOnly > 0;
+            // How many .mpf documents (current + parked tabs + Untitled ones
+            // holding analysis) are dirty — drives singular/plural wording and
+            // whether there's anything to save.
             const dirtyDocs = (dirtyBuilder ? 1 : 0)
-              + useCollageStore.getState().snapshotDirtyDocIds.length;
+              + useCollageStore.getState().snapshotDirtyDocIds.length + analysisOnly;
             const parts: string[] = [];
             if (dirtyBuilder && otherTabs) parts.push(`${dirtyDocs} open figures have unsaved changes`);
             else if (dirtyBuilder) parts.push("the current figure has unsaved changes");
@@ -209,13 +226,13 @@ export function AppShell() {
             const { confirmThree } = await import("../shared/ConfirmDialog");
             const { saveAllOpenDocs } = await import("../../utils/projectNav");
             const choice = await confirmThree({
-              title: "Save before closing?",
-              body: `Before you close, ${parts.join(" and ")}.\n\n`
+              title: restart ? "Save before restarting?" : "Save before closing?",
+              body: `Before ${restart ? "the app restarts" : "you close"}, ${parts.join(" and ")}.\n\n`
                 + "Save all open figures now? You'll be asked where to save each "
                 + "one. (The collage auto-saves to this app's local storage; export "
                 + "it via Save Collage if you need a file.)",
-              confirmLabel: "Save all & close",
-              tertiaryLabel: "Close without saving",
+              confirmLabel: restart ? "Save all & restart" : "Save all & close",
+              tertiaryLabel: restart ? "Restart without saving" : "Close without saving",
               cancelLabel: "Cancel",
               // Inline toggle so the session-restore preference is discoverable
               // right where the user is thinking about their open tabs.
@@ -225,14 +242,14 @@ export function AppShell() {
                 onChange: (v) => setReopenPref(v),
               },
             });
-            if (choice === "cancel") return;            // stay open
+            if (choice === "cancel") return false;      // stay open
             if (choice === "confirm") {
               // Block the UI while we save — saving an .mpf re-encodes every
               // image, which can take seconds, and we must not let the user keep
               // editing (or lose those edits) in the gap before the window
               // closes. The overlay sits below the per-file save prompts so
               // those stay interactive.
-              setClosing(true);
+              setClosing(busyLabel);
               let saved = false;
               try {
                 // Save every dirty .mpf (current + parked tabs), prompting for a
@@ -241,16 +258,47 @@ export function AppShell() {
               } catch (e) {
                 console.error("[close] save-all failed", e);
               }
-              if (!saved) { setClosing(false); return; } // cancelled/failed → stay
+              if (!saved) { setClosing(null); return false; } // cancelled/failed → stay
+            } else {
+              figuresDiscarded = true;
             }
           }
           // Keep (or show) the overlay through the quit so nothing is clickable
           // in the final beat before the window tears down.
-          setClosing(true);
+          setClosing(busyLabel);
+          // Every saved document's Analysis workflows auto-save into its .mpf
+          // (only those that changed are written). A failure asks first.
+          let failed: string[] = [];
+          try {
+            failed = await persistAllWorkflowsForQuit({ figuresDiscarded });
+          } catch (e) {
+            console.error("[close] saving analysis workflows failed", e);
+            failed = ["an open document"];
+          }
+          if (failed.length) {
+            const { confirmThree } = await import("../shared/ConfirmDialog");
+            const choice = await confirmThree({
+              title: "Analysis not saved",
+              body: `The Analysis workflows of ${failed.map((n) => `"${n}"`).join(", ")} could not be `
+                + `saved into their files.\n\n${restart ? "Restart" : "Quit"} anyway (they are lost), or cancel and stay open?`,
+              confirmLabel: restart ? "Restart anyway" : "Quit anyway",
+              cancelLabel: "Cancel",
+              destructive: true,
+            });
+            if (choice !== "confirm") { setClosing(null); return false; }
+          }
+          if (restart) setClosing(null);
+          return true;
+        };
+        setQuitGuard(guardQuit);
+        const off = await win.onCloseRequested(async (event) => {
+          // Always take control of the close so we can guarantee a real quit.
+          event.preventDefault();
+          if (!(await guardQuit("close"))) return;
           await quit();
         });
-        if (cancelled) off();
-        else unlisten = off;
+        if (cancelled) { off(); setQuitGuard(null); }
+        else unlisten = () => { off(); setQuitGuard(null); };
       } catch {
         // Browser preview — generic beforeunload prompt. Skipped when an
         // intentional reload was just requested (window.__mpfigAllowUnload).
@@ -379,7 +427,7 @@ export function AppShell() {
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 14 }}>
             <CircularProgress size={40} sx={{ color: "#fff" }} />
             <span style={{ fontSize: 14, fontWeight: 500, color: "#fff", letterSpacing: 0.3 }}>
-              Saving and closing…
+              {closing}
             </span>
           </div>
         </div>

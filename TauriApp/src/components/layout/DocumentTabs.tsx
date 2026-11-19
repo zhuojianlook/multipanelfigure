@@ -20,6 +20,7 @@ import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
 import InfoIcon from "@mui/icons-material/Info";
 import { useFigureStore } from "../../store/figureStore";
 import { useCollageStore } from "../../store/collageStore";
+import { useAnalysisWorkspaceStore, untitledAnalysisDocIds } from "../../store/analysisWorkspaceStore";
 import { enterCollage, enterAnalysis, switchToDocument, newBlankDoc, closeDoc, saveDocument } from "../../utils/projectNav";
 import { getReopenPref, setReopenPref } from "../../utils/sessionRestore";
 import { RecordAppButton, DEV_OPTIONS_KEY } from "./Toolbar";
@@ -86,6 +87,10 @@ export function DocumentTabs() {
   const snapshotDirtyDocIds = useCollageStore((s) => s.snapshotDirtyDocIds);
   const docRename = useCollageStore((s) => s.docRename);
   const unsaved = useFigureStore((s) => s.unsaved);
+  // Untitled documents holding Analysis work (only a file can save it).
+  // Saved documents get no analysis dot: their analysis auto-saves. A string
+  // so the strip re-renders only when the set changes, not on every graph edit.
+  const untitledAnalysis = useAnalysisWorkspaceStore((s) => untitledAnalysisDocIds(s, openDocs).join("\n"));
 
   // Inline tab rename: id of the tab being renamed + its draft text.
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -180,9 +185,11 @@ export function DocumentTabs() {
         const active = mode === "builder" && activeDocId === doc.id;
         // Dirty when: the live active doc has unsaved edits, OR this tab
         // holds unsaved edits parked in an in-memory snapshot (the user
-        // switched away from it without saving).
+        // switched away from it without saving), OR it is Untitled and holds
+        // Analysis work.
         const dirty = (activeDocId === doc.id && unsaved)
-          || snapshotDirtyDocIds.includes(doc.id);
+          || snapshotDirtyDocIds.includes(doc.id)
+          || (!doc.path && untitledAnalysis.split("\n").includes(doc.id));
         const editing = editingId === doc.id;
         return (
           <Tooltip key={doc.id} title={editing ? "" : `${doc.path || "Unsaved document"} — double-click to rename`}>

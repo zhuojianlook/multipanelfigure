@@ -14,6 +14,7 @@ import type {
   PanelInfo,
   ImageGroup,
   FigureTab,
+  ProjectSaveResponse,
 } from "../api/types";
 import { api, checkHealth, lastHealthError, settleConfigWrites } from "../api/client";
 import { niceScaleBarUm } from "../utils/scaleBarRounding";
@@ -2067,19 +2068,25 @@ export const useFigureStore = create<FigureState>()(
     // ── Project save/load ─────────────────────────────────
 
     saveProject: async (path) => {
+      // The live document and the file it had before this save (null for
+      // Untitled): the file's saved Analysis (`workflows/`) is carried into
+      // the new one, and its workflows follow the document to `path`.
+      const cs = useCollageStore.getState();
+      const docId = cs.activeDocId;
+      const prevPath = cs.openDocs.find((d) => d.id === docId)?.path || get().currentProjectPath || null;
+      let saved: ProjectSaveResponse;
       try {
         await get().syncToBackend();
-        // Pull the latest analysis snapshot from the dedicated bridge
-        // store — the AnalysisDialog publishes it on every state change.
-        // Imported lazily to avoid a circular import on module load.
-        const analysisSnapshot = (await import("./analysisStore")).useAnalysisStore.getState().snapshot;
-        await api.saveProject(path, analysisSnapshot ?? null);
+        saved = await api.saveProject(path, { carryFrom: prevPath });
+        // The file the sidecar actually wrote (".mpf" added, "~" expanded, a
+        // bare name placed in ~/Documents) — the tab and its Analysis follow
+        // that path, never the raw text typed in the dialog.
+        if (saved?.path) path = saved.path;
         // Remember the path so subsequent "Add to Collage" actions can
         // associate the rendered figure with this on-disk project,
         // and so the collage's Multi-Panel Builder button can offer
         // to reload it.
         set((s) => { s.currentProjectPath = path; s.configDirty = false; s.unsaved = false; });
-        return true;
       } catch (err) {
         // Return false (rather than swallowing silently) so callers — e.g. the
         // app-close save-all flow — can surface the failure and NOT treat the
@@ -2088,6 +2095,21 @@ export const useFigureStore = create<FigureState>()(
         console.error("Save project failed", err);
         return false;
       }
+      // The figure is saved. Its Analysis workflows: on a new path, re-key
+      // them to it (and a new document uid on Save As), then write them into
+      // the file. A failure here doesn't undo the figure save — the workflows
+      // stay unsaved and close / quit write (or report) them again.
+      // Imported lazily: the workspace store imports the collage store.
+      if (docId) {
+        try {
+          const { useAnalysisWorkspaceStore } = await import("./analysisWorkspaceStore");
+          await useAnalysisWorkspaceStore.getState().afterDocSaved(docId, prevPath, path,
+            { workflowsCarried: saved?.workflows_carried });
+        } catch (err) {
+          console.error("Saving the Analysis workflows failed", err);
+        }
+      }
+      return true;
     },
 
     newBlankFigure: async (docId) => {
@@ -2163,19 +2185,10 @@ export const useFigureStore = create<FigureState>()(
           s.configDirty = false;
           s.unsaved = false;
         });
-        // Push any analysis blob into the bridge store; the dialog
-        // observes `hydrate` and rebuilds its tabs/plots from it.
-        if (resp.analysis) {
-          (await import("./analysisStore")).useAnalysisStore.getState().requestHydrate(resp.analysis);
-        } else {
-          // Loaded a project that has no analysis state — clear out
-          // whatever was hanging around so the dialog is empty too.
-          (await import("./analysisStore")).useAnalysisStore.getState().requestHydrate({
-            manifest: { version: 1, tabs: [], activeTabId: "", tableMeta: {} },
-            plots: {},
-            tables: {},
-          });
-        }
+        // Analysis workflows are NOT loaded here: this also runs for every
+        // tab switch that reloads a document from disk. The analysis
+        // workspace reads each open document's `workflows/` once per tab
+        // (analysisWorkspaceStore's openDocs subscriber).
         get().requestPreview();
         // Repopulate per-panel processed thumbnails (crop, levels,
         // pseudocolor, etc.). Without this, every panel cell falls back
