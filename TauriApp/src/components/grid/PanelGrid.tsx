@@ -51,6 +51,8 @@ import { PanelCell } from "./PanelCell";
 import { FloatingToolbar } from "./FloatingToolbar";
 import { HeaderEditor, type HeaderEditorTarget } from "./HeaderEditor";
 import { type StyledTextEditorHandle } from "./StyledTextEditor";
+import { PivotButton } from "./PivotButton";
+import { pivotFigure } from "../../utils/projectNav";
 import type { HeaderGroup, PanelInfo } from "../../api/types";
 import { api } from "../../api/client";
 
@@ -280,6 +282,20 @@ export function PanelGrid() {
   const [dragState, setDragState] = useState<DragState | null>(null);
   const [dragPreviewIndices, setDragPreviewIndices] = useState<number[] | null>(null);
   const gridRef = useRef<HTMLDivElement>(null);
+
+  // Pivot (rows ↔ columns): busy while it runs; the nonce remounts the grid
+  // afterwards so every header / label editor shows its swapped content.
+  const [pivoting, setPivoting] = useState(false);
+  const [pivotNonce, setPivotNonce] = useState(0);
+  // Keyboard users: the Pivot button is disabled while busy and then
+  // remounted with the grid, so its focus would drop to <body> and pressing
+  // it again (its own undo) would do nothing. Remember it, put it back.
+  const refocusPivotRef = useRef(false);
+  useEffect(() => {
+    if (pivoting || !refocusPivotRef.current) return;
+    refocusPivotRef.current = false;
+    gridRef.current?.querySelector<HTMLButtonElement>("[data-pivot-button]")?.focus();
+  }, [pivoting, pivotNonce]);
 
   /* ── Context menu handlers ──────────────────────────── */
 
@@ -1304,6 +1320,33 @@ export function PanelGrid() {
     });
   };
 
+  /* ── Pivot ─────────────────────────────────────────── */
+
+  // Swap rows and columns. Everything open here that points at a header or
+  // label by axis / level / index (toolbar, menus, dialogs, the active
+  // editor) is closed first — after the pivot it would point at another one.
+  const handlePivot = async () => {
+    if (pivoting || dragState) return;
+    refocusPivotRef.current = !!(document.activeElement as HTMLElement | null)?.closest?.("[data-pivot-button]");
+    closeToolbar();
+    closeCtxMenu();
+    setSpanDialog(null);
+    setHeaderPropsDialog(null);
+    setLabelPropsDialog(null);
+    setDragPreviewIndices(null);
+    activeEditorRef.current = null;
+    activeEditorTargetRef.current = null;
+    toolbarSelectionRef.current = null;
+    setPivoting(true);
+    try {
+      if (await pivotFigure()) setPivotNonce((n) => n + 1);
+    } catch (e) {
+      console.error("[PanelGrid] pivot failed", e);
+    } finally {
+      setPivoting(false);
+    }
+  };
+
   /* ── Layout math ───────────────────────────────────── */
 
   const colHdrTiers = column_headers.length;
@@ -1433,6 +1476,7 @@ export function PanelGrid() {
       style={dragState ? { cursor: dragState.axis === "col" ? "col-resize" : "row-resize" } : undefined}
     >
       <div
+        key={pivotNonce}
         ref={gridRef}
         className="inline-grid gap-[3px]"
         style={{
@@ -1498,6 +1542,27 @@ export function PanelGrid() {
           >
             +
           </button>
+        </div>
+
+        {/* ── Corner: Pivot button ─────────────────────────
+            Where the column-label row meets the row-label column, diagonally
+            touching the first panel. Nothing else sits in this corner (the
+            column-level arrows are in the rows above, the row-label X below). */}
+        <div
+          style={{
+            gridRow: labelRow,
+            gridColumn: `${addRowBtnCol} / ${labelCol + 1}`,
+            display: "flex",
+            justifyContent: "flex-end",
+            alignItems: "center",
+          }}
+        >
+          <PivotButton
+            rows={rows}
+            cols={cols}
+            disabled={pivoting || !!dragState}
+            onPivot={() => { void handlePivot(); }}
+          />
         </div>
 
         {/* ── Column header tiers ──────────────────────── */}

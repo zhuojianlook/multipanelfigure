@@ -16,7 +16,7 @@ import { PanelGrid } from "../grid/PanelGrid";
 import { PreviewPane } from "../preview/PreviewPane";
 import { CollageView } from "../collage/CollageView";
 import { AnalysisView } from "../analysis/AnalysisView";
-import { hasUnsavedSnapshots, persistAllWorkflowsForQuit, setQuitGuard, unsavedAnalysisDocIds } from "../../utils/projectNav";
+import { hasUnsavedSnapshots, persistAllWorkflowsForQuit, redoQuitPivots, setQuitGuard, unsavedAnalysisDocIds } from "../../utils/projectNav";
 import { maybeRestoreSession, persistOpenDocs, getReopenPref, setReopenPref } from "../../utils/sessionRestore";
 import { Alert, CircularProgress } from "@mui/material";
 
@@ -286,7 +286,13 @@ export function AppShell() {
               cancelLabel: "Cancel",
               destructive: true,
             });
-            if (choice !== "confirm") { setClosing(null); return false; }
+            if (choice !== "confirm") {
+              // Staying open with the pivoted figures on screen: the Pivots
+              // the write undid in the Analysis keys are redone.
+              redoQuitPivots();
+              setClosing(null);
+              return false;
+            }
           }
           if (restart) setClosing(null);
           return true;

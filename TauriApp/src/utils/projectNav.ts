@@ -123,6 +123,29 @@ async function persistWorkflowsOf(docId: string, figureDiscarded: boolean): Prom
   }
 }
 
+/** Redo the Analysis key moves of the Pivots revertPendingPivots undid for a
+ *  write (`figureIds`), when document `docId` stays open with its pivoted
+ *  figure after all. */
+function redoPivots(docId: string, figureIds: readonly string[]): void {
+  const doc = openDoc(docId);
+  if (!doc) return;
+  for (const figureId of figureIds) useAnalysisWorkspaceStore.getState().pivotFigureKeys(doc, figureId);
+}
+
+/** The Pivots the last quit write undid, per document (figure ids). Redone
+ *  only when the quit is called off (redoQuitPivots): a quit that goes ahead
+ *  leaves them undone, so the panel's labels left in localStorage match the
+ *  files as they were written. */
+let quitPivotsUndone: Array<[string, string[]]> = [];
+
+/** The quit was called off after its Analysis write: the documents still
+ *  show their pivoted figures, so their Analysis keys are pivoted again. */
+export function redoQuitPivots(): void {
+  const todo = quitPivotsUndone;
+  quitPivotsUndone = [];
+  for (const [docId, figureIds] of todo) redoPivots(docId, figureIds);
+}
+
 /** Write every open document's changed Analysis workflows into its .mpf —
  *  the app-quit step, after the save guard resolved. `figuresDiscarded`
  *  ("Close without saving"): results of documents whose unsaved figure edits
@@ -131,10 +154,22 @@ async function persistWorkflowsOf(docId: string, figureDiscarded: boolean): Prom
 export function persistAllWorkflowsForQuit(opts: { figuresDiscarded?: boolean } = {}): Promise<string[]> {
   return serializeDocOp(async () => {
     const failed: string[] = [];
-    for (const d of useCollageStore.getState().openDocs) {
-      if (!d.path) continue;
-      const discarded = !!opts.figuresDiscarded && figureDirty(d.id);
-      if (await persistWorkflowsOf(d.id, discarded)) failed.push(d.name);
+    const docs = useCollageStore.getState().openDocs.filter((d) => !!d.path);
+    const discarded = new Set(docs.filter((d) => !!opts.figuresDiscarded && figureDirty(d.id)).map((d) => d.id));
+    // A file whose figure edits are dropped keeps the figure as it was: the
+    // Pivots it never saw are undone in the Analysis keys — for every such
+    // document before ANY file is written, since a workflow shared with
+    // another open document goes into that document's file too and must not
+    // carry the moved keys there either. They stay undone while the app goes
+    // (redoQuitPivots puts them back if the quit is called off).
+    quitPivotsUndone = [];
+    for (const id of discarded) {
+      const figureIds = useAnalysisWorkspaceStore.getState().revertPendingPivots(id);
+      if (figureIds.length) quitPivotsUndone.push([id, figureIds]);
+    }
+    for (const d of docs) {
+      const failure = await persistWorkflowsOf(d.id, discarded.has(d.id));
+      if (failure) failed.push(d.name);
     }
     return failed;
   });
@@ -269,6 +304,9 @@ async function activateDoc(target: { id: string; path: string | null; name?: str
       cleanCached.delete(doc.id);
       syncSnapshotDirty();
       if (wasDirty) {
+        // The figure comes back as its file has it: so do the Analysis keys
+        // of a Pivot made in the lost edits.
+        useAnalysisWorkspaceStore.getState().revertPendingPivots(doc.id);
         await alertDialog({
           title: "Unsaved changes lost",
           body: `The unsaved changes in "${doc.name || "this document"}" are no longer available `
@@ -1020,6 +1058,10 @@ async function closeDocImpl(docId: string): Promise<boolean> {
   // Saving may have switched to the document.
   isActiveDoc = useCollageStore.getState().activeDocId === docId;
 
+  // Its file keeps the figure as it was: the Analysis keys of a Pivot made
+  // in the edits being thrown away are moved back before they are written.
+  const pivotsUndone = figureDiscarded ? useAnalysisWorkspaceStore.getState().revertPendingPivots(docId) : [];
+
   // Its Analysis workflows auto-save into its .mpf (no prompt). A failure is
   // reported before anything is closed.
   const failure = await persistWorkflowsOf(docId, figureDiscarded);
@@ -1032,7 +1074,11 @@ async function closeDocImpl(docId: string): Promise<boolean> {
       cancelLabel: "Cancel",
       destructive: true,
     });
-    if (choice !== "confirm") return false;
+    if (choice !== "confirm") {
+      // It stays open with its pivoted figure: so do the moved keys.
+      redoPivots(docId, pivotsUndone);
+      return false;
+    }
   }
 
   // Drop any in-memory stash for the closed doc.
@@ -1141,4 +1187,51 @@ export function renameFigure(figureId: string, name: string): Promise<void> {
 
 export function moveFigure(figureId: string, dir: -1 | 1): Promise<void> {
   return serializeDocOp(() => useFigureStore.getState()._moveFigure(figureId, dir));
+}
+
+/** The planner's Pivot button: swap the rows and columns of the figure on
+ *  screen (an R×C grid becomes C×R; utils/pivotGrid) and move its Analysis
+ *  keys with its panels in the same step. Joins the doc-op queue, so a tab or
+ *  figure switch can't slip in between. Resolves whether it pivoted.
+ *
+ *  The document's saved Analysis is read first (an online-only file is
+ *  downloaded for it): workflows that come in later would still name the old
+ *  cells. When it can't be read, the user decides. */
+export async function pivotFigure(): Promise<boolean> {
+  const cs = useCollageStore.getState();
+  const docId = cs.activeDocId;
+  // The figure on screen when Pivot was pressed: a figure tab clicked while
+  // the saved Analysis is read below (or queued before this op) must not be
+  // pivoted in its place.
+  const figureId = useFigureStore.getState().activeFigureId;
+  const doc = docId ? openDoc(docId) : undefined;
+  if (doc?.path) {
+    try {
+      await useAnalysisWorkspaceStore.getState().ensureDocLoaded(doc.id, doc.path, { download: true });
+    } catch (e) {
+      console.error("[projectNav] reading the saved analysis before a pivot failed", e);
+    }
+  }
+  const read = doc ? useAnalysisWorkspaceStore.getState().hydrated[doc.id] : undefined;
+  if (read === "failed" || read === "unsupported") {
+    const ok = await confirmDialog({
+      title: "Pivot rows and columns?",
+      body: (read === "unsupported"
+        ? "The Analysis saved in this file is from a newer version of the app."
+        : "The Analysis saved in this file could not be read.")
+        + " If you pivot, that saved Analysis may read the wrong panels.\n\nPivot anyway?",
+      confirmLabel: "Pivot",
+      cancelLabel: "Cancel",
+    });
+    if (!ok) return false;
+  }
+  return serializeDocOp(async () => {
+    if (useCollageStore.getState().activeDocId !== docId) return false;        // switched meanwhile
+    if (useFigureStore.getState().activeFigureId !== figureId) return false;   // another figure meanwhile
+    return useFigureStore.getState()._pivotGrid(() => {
+      // As they are now: the figure that was pivoted, under its current path.
+      const now = docId ? openDoc(docId) : undefined;
+      if (now) useAnalysisWorkspaceStore.getState().pivotFigureKeys(now, figureId);
+    });
+  });
 }

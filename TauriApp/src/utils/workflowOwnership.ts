@@ -28,8 +28,9 @@
 
 import type { Edge } from "@xyflow/react";
 import type { InsetSource, MeasurementRef, NodeData, WorkflowTab } from "./analysisTypes";
-import { figKey, measHandleId, measIndexFromHandle, measRefsOf } from "./analysisKeys";
+import { figKey, measHandleId, measIndexFromHandle, measRefsOf, nsKey, rawKeyOf } from "./analysisKeys";
 import { DEFAULT_FIGURE_ID } from "./figures";
+import { pivotAnalysisKey, pivotRawKey } from "./pivotGrid";
 
 /** An OPEN document as ownership sees it: session id + path (its key base)
  *  and its durable uid. */
@@ -328,6 +329,137 @@ export function rekeyTabs(tabs: readonly WorkflowTab[], oldBase: string, newBase
   if (oldBase === newBase) return tabs as WorkflowTab[];
   const fn = (k: string) => rekeyKey(k, oldBase, newBase);
   return mapTabNodes(tabs, (d) => rekeyNodeData(d, fn));
+}
+
+// ── Pivot (the planner swapped a figure's rows and columns) ─────
+
+/** The figure that was pivoted: its figKey, and the session doc id and
+ *  figure tab its runtime keys (runtimeKeyFor) are minted from. */
+export interface PivotKeyCtx {
+  fk: string;
+  docId: string;
+  figureId: string;
+}
+
+/** A picker image id (a runtime key, see runtimeKeyFor — or a source key, the
+ *  Cellpose fallback) for the panel's new position:
+ *    1. `${fk}::raw`                         → pivotAnalysisKey;
+ *    2. `${docId}-${figureId}__raw`, and `${docId}__raw` for the project's
+ *       first figure                         → the prefix + the moved raw key;
+ *    3. `${figureId}__raw`                   → moved only when `ids.fig` has raw;
+ *    4. a bare raw key                       → moved only when `ids.bare` has it.
+ *  Session doc ids are unique, so (2) names this document for sure. (3) was
+ *  minted while ITS document was the active one — possibly another document
+ *  with the same figure id (every document has "fig-1"; a Save As copy has
+ *  them all). A bare key is the figure that was on screen when it was minted —
+ *  possibly another one. Hence the explicit lists (pivotTabs builds them). */
+export function pivotRuntimeKey(k: string, ctx: PivotKeyCtx, ids: PivotIdSets): string {
+  const viaFk = pivotAnalysisKey(k, ctx.fk);
+  if (viaFk !== k) return viaFk;
+  const prefixes = [`${ctx.docId}-${ctx.figureId}__`];
+  if (ctx.figureId === DEFAULT_FIGURE_ID) prefixes.push(`${ctx.docId}__`);
+  for (const p of prefixes) {
+    if (!k.startsWith(p)) continue;
+    const raw = k.slice(p.length);
+    const moved = pivotRawKey(raw);
+    if (moved !== raw) return p + moved;
+  }
+  const fp = `${ctx.figureId}__`;
+  if (k.startsWith(fp)) {
+    const raw = k.slice(fp.length);
+    return ids.fig.has(raw) ? fp + pivotRawKey(raw) : k;
+  }
+  return ids.bare.has(k) ? pivotRawKey(k) : k;
+}
+
+/** The raw key of a source of figure `fk` that a pivot moves (its key is
+ *  `${fk}::raw`); null for uploads and other figures' sources. */
+function pivotedSourceRaw(s: InsetSource, fk: string): string | null {
+  if (s.name || s.figKey !== fk) return null;
+  const raw = rawKeyOf(s);
+  return s.key === nsKey(fk, raw) ? raw : null;
+}
+
+/** The raw keys a tab's picker ids may name the pivoted figure by. `bare`
+ *  for a bare id; `fig` for a `${figureId}__raw` id. */
+export interface PivotIdSets {
+  bare: ReadonlySet<string>;
+  fig: ReadonlySet<string>;
+}
+
+/** The raw keys of the tab's sources of `ctx.fk`, each with its pivoted twin,
+ *  unless either of the two is also the raw key of a source that the id could
+ *  equally name: for `bare`, a source of any other figure; for `fig`, a source
+ *  of another document's figure with the same figure id. Such ids can't be told
+ *  apart and are left alone. Closed under the pivot, so the remap is a
+ *  permutation (no two ids land on one) and a second pivot undoes it. Null
+ *  when the tab reads nothing of `ctx.fk`: its pickers are left alone. */
+function pivotIdSets(t: WorkflowTab, ctx: PivotKeyCtx): PivotIdSets | null {
+  const mine = new Set<string>();
+  const others = new Set<string>();
+  const sameFigId = new Set<string>();
+  for (const n of t.nodes) {
+    if (n.data.kind !== "source") continue;
+    for (const s of n.data.sources || []) {
+      if (s.name) continue;
+      const raw = pivotedSourceRaw(s, ctx.fk);
+      if (raw !== null) { mine.add(raw); continue; }
+      const r = rawKeyOf(s);
+      others.add(r);
+      if ((s.figureId || DEFAULT_FIGURE_ID) === ctx.figureId) sameFigId.add(r);
+    }
+  }
+  if (!mine.size) return null;
+  const closed = (blocked: ReadonlySet<string>) => {
+    const ok = new Set<string>();
+    for (const k of mine) {
+      const twin = pivotRawKey(k);
+      if (blocked.has(k) || blocked.has(twin)) continue;
+      ok.add(k);
+      ok.add(twin);
+    }
+    return ok;
+  };
+  return { bare: closed(others), fig: closed(sameFigId) };
+}
+
+/** Figure `ctx.fk` was pivoted (panel (r, c) is now at (c, r)): every key the
+ *  tabs hold for one of its panels follows the panel — its sources (key,
+ *  rawKey, runKey, row/col), `ranWith`, and the pickers' image ids. Other
+ *  figures, other documents and uploads are untouched. Applying it twice
+ *  gives the tabs back. Returns `tabs` itself when nothing moved. */
+export function pivotTabs(tabs: readonly WorkflowTab[], ctx: PivotKeyCtx): WorkflowTab[] {
+  const { fk } = ctx;
+  if (!fk) return tabs as WorkflowTab[];
+  const idsByTab = new Map<WorkflowTab, PivotIdSets | null>();
+  const idsOf = (t: WorkflowTab) => {
+    if (!idsByTab.has(t)) idsByTab.set(t, pivotIdSets(t, ctx));
+    return idsByTab.get(t)!;
+  };
+  const moveKey = (k: string) => pivotAnalysisKey(k, fk);
+  return mapTabNodes(tabs, (d, t) => {
+    let out = d;
+    if (d.sources && d.sources.length) {
+      const sources = mapArr(d.sources, (s) => {
+        const raw = pivotedSourceRaw(s, fk);
+        if (raw === null) return s;
+        const moved = pivotRawKey(raw);
+        if (moved === raw) return s;                       // a diagonal panel stays put
+        const rk = s.runKey;
+        const runKey = rk === raw ? moved
+          : rk && rk.endsWith(`__${raw}`) ? rk.slice(0, rk.length - raw.length) + moved
+            : rk;
+        return { ...s, key: nsKey(fk, moved), rawKey: moved, runKey, row: s.col, col: s.row };
+      });
+      if (sources !== d.sources) out = { ...out, sources };
+    }
+    if (d.ranWith) {
+      const ranWith = mapRecordKeys(d.ranWith, moveKey);
+      if (ranWith !== d.ranWith) out = { ...out, ranWith };
+    }
+    const ids = idsOf(t);
+    return ids ? mapPickerKeys(out, (k) => pivotRuntimeKey(k, ctx, ids)) : out;
+  });
 }
 
 function withMeasRefs(data: NodeData, refs: MeasurementRef[]): NodeData {

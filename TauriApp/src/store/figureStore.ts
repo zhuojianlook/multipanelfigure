@@ -44,6 +44,7 @@ import {
 } from "../utils/figures";
 import { analysisSourceSigs, changedSourceRawKeys } from "../utils/analysisStale";
 import { figKey, nsKey } from "../utils/analysisKeys";
+import { pivotCellRecord, pivotFigureConfig } from "../utils/pivotGrid";
 import { useCollageStore } from "./collageStore";
 import { useSourceEditStore } from "./sourceEditStore";
 import { serializeDocOp, backendTracksLiveDoc, setBackendTracksLiveDoc } from "../utils/docOpQueue";
@@ -281,6 +282,12 @@ interface FigureState {
   _moveFigure: (id: string, dir: -1 | 1) => Promise<void>;
   /** Commit a figure-tab state computed by utils/figures (internal). */
   _applyFigureState: (next: FiguresState, opts: { dirty: boolean }) => Promise<void>;
+  /** Swap the rows and columns of the figure on screen (utils/pivotGrid) —
+   *  call it through utils/projectNav.pivotFigure, which serializes it and
+   *  moves the Analysis keys (`onPivoted`, run synchronously right after the
+   *  store holds the pivoted config). Resolves false when there is nothing
+   *  to pivot. */
+  _pivotGrid: (onPivoted?: () => void) => Promise<boolean>;
   saveFigure: (path: string, format?: string, background?: string, dpi?: number) => Promise<void>;
 
   // Check if reducing grid would lose images
@@ -313,15 +320,22 @@ function _autoLetterFor(row: number, col: number, cols: number): string {
  *    - current text matches /^[a-z]{1,2}$/ (so manually-typed strings
  *      survive even if linked_to_header was left on).
  *  Clears styled_segments since they referenced characters that no
- *  longer exist in the new text. */
-function _relabelAutoLetter(panel: { labels?: { text: string; linked_to_header?: boolean; styled_segments?: unknown[] }[] }, row: number, col: number, cols: number): boolean {
+ *  longer exist in the new text — unless `keepStyle` (Pivot): then the
+ *  letter keeps the look of its first run, now carrying the new letter. */
+function _relabelAutoLetter(panel: { labels?: { text: string; linked_to_header?: boolean; styled_segments?: unknown[] }[] }, row: number, col: number, cols: number, keepStyle = false): boolean {
   const lbl = panel.labels?.[0];
   if (!lbl || !lbl.linked_to_header) return false;
   if (!/^[a-z]{1,2}$/.test(lbl.text || "")) return false;
   const wanted = _autoLetterFor(row, col, cols);
   if (lbl.text === wanted) return false;
   lbl.text = wanted;
-  if (lbl.styled_segments && lbl.styled_segments.length) lbl.styled_segments = [];
+  if (lbl.styled_segments && lbl.styled_segments.length) {
+    // A pivot is undone by pivoting again, so there a bold or coloured
+    // letter keeps its formatting instead of going back to plain.
+    lbl.styled_segments = keepStyle
+      ? [{ ...(lbl.styled_segments[0] as Record<string, unknown>), text: wanted }]
+      : [];
+  }
   return true;
 }
 
@@ -397,8 +411,9 @@ function _ensureZoomTargetLabel(
  *  target cell gets its letter immediately). Promoting image-bearing
  *  panels here is a safety net for cases where setPanelImage's
  *  auto-label didn't run (loaded projects, direct config edits, …).
+ *  `keepStyle`: see _relabelAutoLetter (Pivot only).
  */
-function _renumberAllAutoLetters(cfg: { rows: number; cols: number; panels: { image_name?: string; labels?: { text: string; linked_to_header?: boolean; styled_segments?: unknown[] }[]; add_zoom_inset?: boolean; zoom_inset?: { inset_type?: string; side?: string } | null; zoom_insets?: { inset_type?: string; side?: string }[] }[][] } | null) {
+function _renumberAllAutoLetters(cfg: { rows: number; cols: number; panels: { image_name?: string; labels?: { text: string; linked_to_header?: boolean; styled_segments?: unknown[] }[]; add_zoom_inset?: boolean; zoom_inset?: { inset_type?: string; side?: string } | null; zoom_insets?: { inset_type?: string; side?: string }[] }[][] } | null, keepStyle = false) {
   if (!cfg) return;
   for (let r = 0; r < cfg.rows; r++) {
     for (let c = 0; c < cfg.cols; c++) {
@@ -421,7 +436,7 @@ function _renumberAllAutoLetters(cfg: { rows: number; cols: number; panels: { im
       if (isZoomTargetCell) {
         _ensureZoomTargetLabel(p, r, c, cfg.cols);
       }
-      _relabelAutoLetter(p, r, c, cfg.cols);
+      _relabelAutoLetter(p, r, c, cfg.cols, keepStyle);
     }
   }
 }
@@ -589,6 +604,11 @@ function cancelConfigDebounce() {
    panel thumbnail rendered for the previous tab — are dropped instead of
    being painted into the new document's grid. */
 let docEpoch = 0;
+/* Panel thumbnails being rendered right now, by "r-c" (a count, as one cell
+   can have two in flight). A Pivot drops their late responses (docEpoch) —
+   they show the old layout's cell — and renders those cells again where
+   their panels went, since the thumbnail they were replacing is out of date. */
+const thumbsInFlight = new Map<string, number>();
 // Monotonic sequence for preview requests so an older in-flight GET
 // response can't overwrite a newer one (race condition seen as a
 // "ghost" of the previous header state appearing in the preview).
@@ -1133,6 +1153,8 @@ export const useFigureStore = create<FigureState>()(
 
     refreshPanelThumbnail: async (row, col) => {
       const ep = docEpoch;
+      const cell = `${row}-${col}`;
+      thumbsInFlight.set(cell, (thumbsInFlight.get(cell) ?? 0) + 1);
       try {
         const resp = await api.getPanelPreview(row, col);
         if (ep !== docEpoch) return;   // rendered for a document that's no longer shown
@@ -1151,6 +1173,9 @@ export const useFigureStore = create<FigureState>()(
         }
       } catch {
         // ignore — cell will show raw thumbnail
+      } finally {
+        const n = (thumbsInFlight.get(cell) ?? 1) - 1;
+        if (n > 0) thumbsInFlight.set(cell, n); else thumbsInFlight.delete(cell);
       }
     },
 
@@ -2406,6 +2431,54 @@ export const useFigureStore = create<FigureState>()(
       const figures = moveFigureList(cur.figures, id, dir);
       if (figures === cur.figures) return;
       await get()._applyFigureState({ ...cur, figures }, { dirty: true });
+    },
+
+    _pivotGrid: async (onPivoted) => {
+      // Every pending and in-flight write first: a late patchPanel(r, c) of
+      // the old layout landing after the PUT below would write a panel into
+      // the transposed cell. Never through patchGrid either — the sidecar's
+      // ensure_grid would trim the extra row (or column) of a 4×3 grid before
+      // it could be transposed. The whole pivoted config goes in one PUT.
+      await get().flushConfigWrites();
+      const before = get().config;
+      if (!before) return false;
+      docEpoch++;   // a thumbnail rendered for the old (r, c) must not land in the new one
+      const next = pivotFigureConfig(before);
+      // Auto letters stay row-major by position, as after any rearrangement —
+      // keeping their formatting, so pivoting back gives the same figure.
+      _renumberAllAutoLetters(next as unknown as Parameters<typeof _renumberAllAutoLetters>[0], true);
+      // A panel's thumbnail doesn't depend on where it sits: it moves with it.
+      // One that was being re-rendered is out of date, and its new render is
+      // dropped (docEpoch): left out, so it is rendered again below.
+      const thumbs = pivotCellRecord(get().panelThumbnails);
+      const sizes = pivotCellRecord(get().panelProcessedSizes);
+      for (const cell of thumbsInFlight.keys()) {
+        const [r, c] = cell.split("-");
+        delete thumbs[`${c}-${r}`];
+      }
+      set((s) => {
+        s.config = next;
+        s.panelThumbnails = thumbs;
+        s.panelProcessedSizes = sizes;
+        s.configDirty = true; s.unsaved = true;
+      });
+      // The Analysis keys move in the same tick, so the layout and the keys
+      // never disagree across an await.
+      onPivoted?.();
+      await get().syncToBackend();
+      get().requestPreview();
+      const cfg = get().config;
+      const have = get().panelThumbnails;
+      if (cfg) {
+        for (let r = 0; r < cfg.rows; r++) {
+          for (let c = 0; c < cfg.cols; c++) {
+            if (cfg.panels[r]?.[c]?.image_name && !have[`${r}-${c}`]) {
+              get().refreshPanelThumbnail(r, c).catch(console.error);
+            }
+          }
+        }
+      }
+      return true;
     },
 
     saveFigure: async (path, format = "TIFF", background?: string, dpi = 300) => {

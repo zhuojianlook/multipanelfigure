@@ -1,0 +1,880 @@
+{
+  "before": {
+    "rows": 2,
+    "cols": 3,
+    "spacing": 0.02,
+    "output_format": "TIFF",
+    "background": "White",
+    "panels": [
+      [
+        {
+          "image_name": "r0c0.png",
+          "crop_image": true,
+          "crop": null,
+          "labels": [
+            {
+              "text": "a",
+              "font_path": null,
+              "font_name": "arial.ttf",
+              "font_size": 20,
+              "font_style": [],
+              "color": "#FFFFFF",
+              "position_x": 3,
+              "position_y": 3,
+              "rotation": 0,
+              "default_color": "#FFFFFF",
+              "position_preset": "Top-Left",
+              "edge_distance": 3,
+              "linked_to_header": true,
+              "styled_segments": []
+            }
+          ],
+          "symbols": [],
+          "lines": [],
+          "areas": [],
+          "thickness_measurements": [],
+          "add_scale_bar": false,
+          "scale_bar": null,
+          "zoom_inset": null,
+          "add_zoom_inset": false,
+          "zoom_insets": [],
+          "rotation": 0,
+          "flip_horizontal": false,
+          "flip_vertical": false
+        },
+        {
+          "image_name": "r0c1.png",
+          "crop_image": true,
+          "crop": null,
+          "labels": [
+            {
+              "text": "b",
+              "font_path": null,
+              "font_name": "arial.ttf",
+              "font_size": 20,
+              "font_style": [],
+              "color": "#FFFFFF",
+              "position_x": 3,
+              "position_y": 3,
+              "rotation": 0,
+              "default_color": "#FFFFFF",
+              "position_preset": "Top-Left",
+              "edge_distance": 3,
+              "linked_to_header": true,
+              "styled_segments": []
+            }
+          ],
+          "symbols": [],
+          "lines": [],
+          "areas": [],
+          "thickness_measurements": [],
+          "add_scale_bar": false,
+          "scale_bar": null,
+          "zoom_inset": null,
+          "add_zoom_inset": true,
+          "zoom_insets": [
+            {
+              "inset_type": "Adjacent Panel",
+              "zoom_factor": 2,
+              "x": 10,
+              "y": 12,
+              "width": 20,
+              "height": 16,
+              "side": "Right",
+              "margin_offset": 20,
+              "scale_bar": null,
+              "zoom_label": null,
+              "include_in_analysis": true,
+              "adjacent_panel_row": 0,
+              "adjacent_panel_col": 2
+            }
+          ],
+          "rotation": 0,
+          "flip_horizontal": false,
+          "flip_vertical": false
+        },
+        {
+          "image_name": "r0c2.png",
+          "crop_image": true,
+          "crop": null,
+          "labels": [
+            {
+              "text": "c",
+              "font_path": null,
+              "font_name": "arial.ttf",
+              "font_size": 20,
+              "font_style": [],
+              "color": "#FFFFFF",
+              "position_x": 3,
+              "position_y": 3,
+              "rotation": 0,
+              "default_color": "#FFFFFF",
+              "position_preset": "Top-Left",
+              "edge_distance": 3,
+              "linked_to_header": true,
+              "styled_segments": []
+            }
+          ],
+          "symbols": [],
+          "lines": [],
+          "areas": [],
+          "thickness_measurements": [],
+          "add_scale_bar": false,
+          "scale_bar": null,
+          "zoom_inset": null,
+          "add_zoom_inset": false,
+          "zoom_insets": [],
+          "rotation": 0,
+          "flip_horizontal": false,
+          "flip_vertical": false,
+          "zoom_source_row": 0,
+          "zoom_source_col": 1
+        }
+      ],
+      [
+        {
+          "image_name": "r1c0.png",
+          "crop_image": true,
+          "crop": null,
+          "labels": [
+            {
+              "text": "d",
+              "font_path": null,
+              "font_name": "arial.ttf",
+              "font_size": 20,
+              "font_style": [],
+              "color": "#FFFFFF",
+              "position_x": 3,
+              "position_y": 3,
+              "rotation": 0,
+              "default_color": "#FFFFFF",
+              "position_preset": "Top-Left",
+              "edge_distance": 3,
+              "linked_to_header": true,
+              "styled_segments": []
+            }
+          ],
+          "symbols": [],
+          "lines": [],
+          "areas": [],
+          "thickness_measurements": [],
+          "add_scale_bar": false,
+          "scale_bar": null,
+          "zoom_inset": {
+            "inset_type": "Adjacent Panel",
+            "zoom_factor": 2,
+            "x": 10,
+            "y": 12,
+            "width": 20,
+            "height": 16,
+            "side": "Top",
+            "margin_offset": 20,
+            "scale_bar": null,
+            "zoom_label": null
+          },
+          "add_zoom_inset": true,
+          "zoom_insets": [],
+          "rotation": 0,
+          "flip_horizontal": false,
+          "flip_vertical": false
+        },
+        {
+          "image_name": "r1c1.png",
+          "crop_image": true,
+          "crop": null,
+          "labels": [
+            {
+              "text": "e",
+              "font_path": null,
+              "font_name": "arial.ttf",
+              "font_size": 20,
+              "font_style": [],
+              "color": "#FFFFFF",
+              "position_x": 3,
+              "position_y": 3,
+              "rotation": 0,
+              "default_color": "#FFFFFF",
+              "position_preset": "Top-Left",
+              "edge_distance": 3,
+              "linked_to_header": true,
+              "styled_segments": []
+            }
+          ],
+          "symbols": [],
+          "lines": [],
+          "areas": [],
+          "thickness_measurements": [],
+          "add_scale_bar": false,
+          "scale_bar": null,
+          "zoom_inset": null,
+          "add_zoom_inset": false,
+          "zoom_insets": [],
+          "rotation": 0,
+          "flip_horizontal": false,
+          "flip_vertical": false
+        },
+        {
+          "image_name": "r1c2.png",
+          "crop_image": true,
+          "crop": null,
+          "labels": [
+            {
+              "text": "f",
+              "font_path": null,
+              "font_name": "arial.ttf",
+              "font_size": 20,
+              "font_style": [],
+              "color": "#FFFFFF",
+              "position_x": 3,
+              "position_y": 3,
+              "rotation": 0,
+              "default_color": "#FFFFFF",
+              "position_preset": "Top-Left",
+              "edge_distance": 3,
+              "linked_to_header": true,
+              "styled_segments": []
+            }
+          ],
+          "symbols": [],
+          "lines": [],
+          "areas": [],
+          "thickness_measurements": [],
+          "add_scale_bar": false,
+          "scale_bar": null,
+          "zoom_inset": null,
+          "add_zoom_inset": true,
+          "zoom_insets": [
+            {
+              "inset_type": "Standard Zoom",
+              "zoom_factor": 2,
+              "x": 10,
+              "y": 12,
+              "width": 20,
+              "height": 16,
+              "side": "Left",
+              "margin_offset": 20,
+              "scale_bar": null,
+              "zoom_label": null
+            }
+          ],
+          "rotation": 0,
+          "flip_horizontal": false,
+          "flip_vertical": false
+        }
+      ]
+    ],
+    "column_labels": [
+      {
+        "text": "C1",
+        "font_size": 12,
+        "font_name": "arial.ttf",
+        "font_path": null,
+        "font_style": [],
+        "default_color": "#000000",
+        "distance": 0.025,
+        "position": "Top",
+        "rotation": 0,
+        "styled_segments": [],
+        "visible": true
+      },
+      {
+        "text": "C2",
+        "font_size": 12,
+        "font_name": "arial.ttf",
+        "font_path": null,
+        "font_style": [],
+        "default_color": "#000000",
+        "distance": 0.025,
+        "position": "Top",
+        "rotation": 0,
+        "styled_segments": [],
+        "visible": true
+      },
+      {
+        "text": "C3",
+        "font_size": 12,
+        "font_name": "arial.ttf",
+        "font_path": null,
+        "font_style": [],
+        "default_color": "#000000",
+        "distance": 0.025,
+        "position": "Bottom",
+        "rotation": 90,
+        "styled_segments": [],
+        "visible": true
+      }
+    ],
+    "row_labels": [
+      {
+        "text": "R1",
+        "font_size": 12,
+        "font_name": "arial.ttf",
+        "font_path": null,
+        "font_style": [],
+        "default_color": "#000000",
+        "distance": 0.025,
+        "position": "Left",
+        "rotation": 90,
+        "styled_segments": [],
+        "visible": true
+      },
+      {
+        "text": "R2",
+        "font_size": 12,
+        "font_name": "arial.ttf",
+        "font_path": null,
+        "font_style": [],
+        "default_color": "#000000",
+        "distance": 0.025,
+        "position": "Right",
+        "rotation": 0,
+        "styled_segments": [],
+        "visible": true
+      }
+    ],
+    "column_headers": [
+      {
+        "headers": [
+          {
+            "text": "All",
+            "columns_or_rows": [
+              0,
+              1,
+              2
+            ],
+            "font_size": 12,
+            "font_name": "arial.ttf",
+            "font_path": null,
+            "font_style": [],
+            "default_color": "#000000",
+            "distance": 0.01,
+            "position": "Top",
+            "rotation": 0,
+            "line_color": "#000000",
+            "line_width": 1,
+            "line_style": "solid",
+            "line_length": 1,
+            "end_caps": false,
+            "styled_segments": []
+          }
+        ]
+      },
+      {
+        "headers": [
+          {
+            "text": "AB",
+            "columns_or_rows": [
+              0,
+              1
+            ],
+            "font_size": 12,
+            "font_name": "arial.ttf",
+            "font_path": null,
+            "font_style": [],
+            "default_color": "#000000",
+            "distance": 0.01,
+            "position": "Top",
+            "rotation": 0,
+            "line_color": "#000000",
+            "line_width": 1,
+            "line_style": "solid",
+            "line_length": 1,
+            "end_caps": false,
+            "styled_segments": []
+          },
+          {
+            "text": "C",
+            "columns_or_rows": [
+              2
+            ],
+            "font_size": 12,
+            "font_name": "arial.ttf",
+            "font_path": null,
+            "font_style": [],
+            "default_color": "#000000",
+            "distance": 0.01,
+            "position": "Bottom",
+            "rotation": 0,
+            "line_color": "#000000",
+            "line_width": 1,
+            "line_style": "solid",
+            "line_length": 1,
+            "end_caps": false,
+            "styled_segments": []
+          }
+        ]
+      }
+    ],
+    "row_headers": [
+      {
+        "headers": [
+          {
+            "text": "Rows",
+            "columns_or_rows": [
+              0,
+              1
+            ],
+            "font_size": 12,
+            "font_name": "arial.ttf",
+            "font_path": null,
+            "font_style": [],
+            "default_color": "#000000",
+            "distance": 0.01,
+            "position": "Left",
+            "rotation": 90,
+            "line_color": "#000000",
+            "line_width": 1,
+            "line_style": "solid",
+            "line_length": 1,
+            "end_caps": false,
+            "styled_segments": []
+          }
+        ]
+      }
+    ],
+    "resolution_entries": {},
+    "dpi": 300,
+    "show_column_labels": true,
+    "show_row_labels": false
+  },
+  "after": {
+    "rows": 3,
+    "cols": 2,
+    "spacing": 0.02,
+    "output_format": "TIFF",
+    "background": "White",
+    "panels": [
+      [
+        {
+          "image_name": "r0c0.png",
+          "crop_image": true,
+          "crop": null,
+          "labels": [
+            {
+              "text": "a",
+              "font_path": null,
+              "font_name": "arial.ttf",
+              "font_size": 20,
+              "font_style": [],
+              "color": "#FFFFFF",
+              "position_x": 3,
+              "position_y": 3,
+              "rotation": 0,
+              "default_color": "#FFFFFF",
+              "position_preset": "Top-Left",
+              "edge_distance": 3,
+              "linked_to_header": true,
+              "styled_segments": []
+            }
+          ],
+          "symbols": [],
+          "lines": [],
+          "areas": [],
+          "thickness_measurements": [],
+          "add_scale_bar": false,
+          "scale_bar": null,
+          "zoom_inset": null,
+          "add_zoom_inset": false,
+          "zoom_insets": [],
+          "rotation": 0,
+          "flip_horizontal": false,
+          "flip_vertical": false
+        },
+        {
+          "image_name": "r1c0.png",
+          "crop_image": true,
+          "crop": null,
+          "labels": [
+            {
+              "text": "d",
+              "font_path": null,
+              "font_name": "arial.ttf",
+              "font_size": 20,
+              "font_style": [],
+              "color": "#FFFFFF",
+              "position_x": 3,
+              "position_y": 3,
+              "rotation": 0,
+              "default_color": "#FFFFFF",
+              "position_preset": "Top-Left",
+              "edge_distance": 3,
+              "linked_to_header": true,
+              "styled_segments": []
+            }
+          ],
+          "symbols": [],
+          "lines": [],
+          "areas": [],
+          "thickness_measurements": [],
+          "add_scale_bar": false,
+          "scale_bar": null,
+          "zoom_inset": {
+            "inset_type": "Adjacent Panel",
+            "zoom_factor": 2,
+            "x": 10,
+            "y": 12,
+            "width": 20,
+            "height": 16,
+            "side": "Left",
+            "margin_offset": 20,
+            "scale_bar": null,
+            "zoom_label": null
+          },
+          "add_zoom_inset": true,
+          "zoom_insets": [],
+          "rotation": 0,
+          "flip_horizontal": false,
+          "flip_vertical": false
+        }
+      ],
+      [
+        {
+          "image_name": "r0c1.png",
+          "crop_image": true,
+          "crop": null,
+          "labels": [
+            {
+              "text": "b",
+              "font_path": null,
+              "font_name": "arial.ttf",
+              "font_size": 20,
+              "font_style": [],
+              "color": "#FFFFFF",
+              "position_x": 3,
+              "position_y": 3,
+              "rotation": 0,
+              "default_color": "#FFFFFF",
+              "position_preset": "Top-Left",
+              "edge_distance": 3,
+              "linked_to_header": true,
+              "styled_segments": []
+            }
+          ],
+          "symbols": [],
+          "lines": [],
+          "areas": [],
+          "thickness_measurements": [],
+          "add_scale_bar": false,
+          "scale_bar": null,
+          "zoom_inset": null,
+          "add_zoom_inset": true,
+          "zoom_insets": [
+            {
+              "inset_type": "Adjacent Panel",
+              "zoom_factor": 2,
+              "x": 10,
+              "y": 12,
+              "width": 20,
+              "height": 16,
+              "side": "Bottom",
+              "margin_offset": 20,
+              "scale_bar": null,
+              "zoom_label": null,
+              "include_in_analysis": true,
+              "adjacent_panel_row": 2,
+              "adjacent_panel_col": 0
+            }
+          ],
+          "rotation": 0,
+          "flip_horizontal": false,
+          "flip_vertical": false
+        },
+        {
+          "image_name": "r1c1.png",
+          "crop_image": true,
+          "crop": null,
+          "labels": [
+            {
+              "text": "e",
+              "font_path": null,
+              "font_name": "arial.ttf",
+              "font_size": 20,
+              "font_style": [],
+              "color": "#FFFFFF",
+              "position_x": 3,
+              "position_y": 3,
+              "rotation": 0,
+              "default_color": "#FFFFFF",
+              "position_preset": "Top-Left",
+              "edge_distance": 3,
+              "linked_to_header": true,
+              "styled_segments": []
+            }
+          ],
+          "symbols": [],
+          "lines": [],
+          "areas": [],
+          "thickness_measurements": [],
+          "add_scale_bar": false,
+          "scale_bar": null,
+          "zoom_inset": null,
+          "add_zoom_inset": false,
+          "zoom_insets": [],
+          "rotation": 0,
+          "flip_horizontal": false,
+          "flip_vertical": false
+        }
+      ],
+      [
+        {
+          "image_name": "r0c2.png",
+          "crop_image": true,
+          "crop": null,
+          "labels": [
+            {
+              "text": "c",
+              "font_path": null,
+              "font_name": "arial.ttf",
+              "font_size": 20,
+              "font_style": [],
+              "color": "#FFFFFF",
+              "position_x": 3,
+              "position_y": 3,
+              "rotation": 0,
+              "default_color": "#FFFFFF",
+              "position_preset": "Top-Left",
+              "edge_distance": 3,
+              "linked_to_header": true,
+              "styled_segments": []
+            }
+          ],
+          "symbols": [],
+          "lines": [],
+          "areas": [],
+          "thickness_measurements": [],
+          "add_scale_bar": false,
+          "scale_bar": null,
+          "zoom_inset": null,
+          "add_zoom_inset": false,
+          "zoom_insets": [],
+          "rotation": 0,
+          "flip_horizontal": false,
+          "flip_vertical": false,
+          "zoom_source_row": 1,
+          "zoom_source_col": 0
+        },
+        {
+          "image_name": "r1c2.png",
+          "crop_image": true,
+          "crop": null,
+          "labels": [
+            {
+              "text": "f",
+              "font_path": null,
+              "font_name": "arial.ttf",
+              "font_size": 20,
+              "font_style": [],
+              "color": "#FFFFFF",
+              "position_x": 3,
+              "position_y": 3,
+              "rotation": 0,
+              "default_color": "#FFFFFF",
+              "position_preset": "Top-Left",
+              "edge_distance": 3,
+              "linked_to_header": true,
+              "styled_segments": []
+            }
+          ],
+          "symbols": [],
+          "lines": [],
+          "areas": [],
+          "thickness_measurements": [],
+          "add_scale_bar": false,
+          "scale_bar": null,
+          "zoom_inset": null,
+          "add_zoom_inset": true,
+          "zoom_insets": [
+            {
+              "inset_type": "Standard Zoom",
+              "zoom_factor": 2,
+              "x": 10,
+              "y": 12,
+              "width": 20,
+              "height": 16,
+              "side": "Left",
+              "margin_offset": 20,
+              "scale_bar": null,
+              "zoom_label": null
+            }
+          ],
+          "rotation": 0,
+          "flip_horizontal": false,
+          "flip_vertical": false
+        }
+      ]
+    ],
+    "column_labels": [
+      {
+        "text": "R1",
+        "font_size": 12,
+        "font_name": "arial.ttf",
+        "font_path": null,
+        "font_style": [],
+        "default_color": "#000000",
+        "distance": 0.025,
+        "position": "Top",
+        "rotation": 0,
+        "styled_segments": [],
+        "visible": true
+      },
+      {
+        "text": "R2",
+        "font_size": 12,
+        "font_name": "arial.ttf",
+        "font_path": null,
+        "font_style": [],
+        "default_color": "#000000",
+        "distance": 0.025,
+        "position": "Bottom",
+        "rotation": 90,
+        "styled_segments": [],
+        "visible": true
+      }
+    ],
+    "row_labels": [
+      {
+        "text": "C1",
+        "font_size": 12,
+        "font_name": "arial.ttf",
+        "font_path": null,
+        "font_style": [],
+        "default_color": "#000000",
+        "distance": 0.025,
+        "position": "Left",
+        "rotation": 90,
+        "styled_segments": [],
+        "visible": true
+      },
+      {
+        "text": "C2",
+        "font_size": 12,
+        "font_name": "arial.ttf",
+        "font_path": null,
+        "font_style": [],
+        "default_color": "#000000",
+        "distance": 0.025,
+        "position": "Left",
+        "rotation": 90,
+        "styled_segments": [],
+        "visible": true
+      },
+      {
+        "text": "C3",
+        "font_size": 12,
+        "font_name": "arial.ttf",
+        "font_path": null,
+        "font_style": [],
+        "default_color": "#000000",
+        "distance": 0.025,
+        "position": "Right",
+        "rotation": 0,
+        "styled_segments": [],
+        "visible": true
+      }
+    ],
+    "column_headers": [
+      {
+        "headers": [
+          {
+            "text": "Rows",
+            "columns_or_rows": [
+              0,
+              1
+            ],
+            "font_size": 12,
+            "font_name": "arial.ttf",
+            "font_path": null,
+            "font_style": [],
+            "default_color": "#000000",
+            "distance": 0.01,
+            "position": "Top",
+            "rotation": 0,
+            "line_color": "#000000",
+            "line_width": 1,
+            "line_style": "solid",
+            "line_length": 1,
+            "end_caps": false,
+            "styled_segments": []
+          }
+        ]
+      }
+    ],
+    "row_headers": [
+      {
+        "headers": [
+          {
+            "text": "All",
+            "columns_or_rows": [
+              0,
+              1,
+              2
+            ],
+            "font_size": 12,
+            "font_name": "arial.ttf",
+            "font_path": null,
+            "font_style": [],
+            "default_color": "#000000",
+            "distance": 0.01,
+            "position": "Left",
+            "rotation": 90,
+            "line_color": "#000000",
+            "line_width": 1,
+            "line_style": "solid",
+            "line_length": 1,
+            "end_caps": false,
+            "styled_segments": []
+          }
+        ]
+      },
+      {
+        "headers": [
+          {
+            "text": "AB",
+            "columns_or_rows": [
+              0,
+              1
+            ],
+            "font_size": 12,
+            "font_name": "arial.ttf",
+            "font_path": null,
+            "font_style": [],
+            "default_color": "#000000",
+            "distance": 0.01,
+            "position": "Left",
+            "rotation": 90,
+            "line_color": "#000000",
+            "line_width": 1,
+            "line_style": "solid",
+            "line_length": 1,
+            "end_caps": false,
+            "styled_segments": []
+          },
+          {
+            "text": "C",
+            "columns_or_rows": [
+              2
+            ],
+            "font_size": 12,
+            "font_name": "arial.ttf",
+            "font_path": null,
+            "font_style": [],
+            "default_color": "#000000",
+            "distance": 0.01,
+            "position": "Right",
+            "rotation": 90,
+            "line_color": "#000000",
+            "line_width": 1,
+            "line_style": "solid",
+            "line_length": 1,
+            "end_caps": false,
+            "styled_segments": []
+          }
+        ]
+      }
+    ],
+    "resolution_entries": {},
+    "dpi": 300,
+    "show_column_labels": false,
+    "show_row_labels": true
+  }
+}

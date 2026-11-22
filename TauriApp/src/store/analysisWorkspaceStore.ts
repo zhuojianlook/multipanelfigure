@@ -95,9 +95,11 @@ import {
 } from "../utils/workflowPersist";
 import {
   bindMeasurementRefs, closedKeyBase, deriveOwnership, docKeyBase, docRefs, isLocked, isPristineTab,
-  missingOwners, newDocUid, rebindDoc, rekeyKey, rekeyRecord, rekeyTabs, removeDocSources,
+  mapRecordKeys, missingOwners, newDocUid, pivotTabs, rebindDoc, rekeyKey, rekeyRecord, rekeyTabs, removeDocSources,
   type DocRef, type KnownDoc, type OwnershipCtx,
 } from "../utils/workflowOwnership";
+import { figKey } from "../utils/analysisKeys";
+import { pivotAnalysisKey } from "../utils/pivotGrid";
 import {
   asLabels, DIRECT_UPLOAD_FOLDER, docMetaOf, fileUnderFolder, mergeDocMeta, metaAsRead, metaSigForm, readDocMeta,
   uploadKey,
@@ -190,6 +192,12 @@ export interface AnalysisWorkspaceState {
   uploads: InsetSource[];
   /** Closed documents some workflow names, by uid (from manifests). */
   knownDocs: Record<string, KnownDoc>;
+  /** Session doc id → figure ids whose Analysis keys were moved by a Pivot
+   *  (pivotFigureKeys) that the document's file doesn't have yet. Cleared
+   *  when its figure is saved; undone (revertPendingPivots) when its unsaved
+   *  figure edits are thrown away, since its workflows are still written to
+   *  the file then. In memory only. */
+  pivotPending: Record<string, Record<string, true>>;
 
   /** The graph's setWorkflowTabs: a value or an updater; returning the same
    *  array is a no-op. An empty result is replaced by one pristine tab. */
@@ -239,6 +247,20 @@ export interface AnalysisWorkspaceState {
    *  changed): sources, ranWith and picker ids in all tabs, and the Edit
    *  Panel revisions / results / re-run requests in sourceEditStore. */
   rekeyDoc: (oldBase: string, newBase: string) => void;
+  /** Figure `figureId` of document `doc` was pivoted (panel (r, c) is now at
+   *  (c, r)): every Analysis key of its panels follows the panel — the tabs
+   *  (workflowOwnership.pivotTabs), the Edit Panel revisions / results /
+   *  re-run requests in sourceEditStore, and the panel's labels in
+   *  localStorage (pivotAnalysisStorage). The pixels didn't change, so no
+   *  result goes stale. Its own inverse: calling it again moves everything
+   *  back. Toggles `pivotPending[doc.id][figureId]`. */
+  pivotFigureKeys: (doc: { id: string; path?: string | null }, figureId: string) => void;
+  /** Document `docId`'s unsaved figure edits are being thrown away: undo the
+   *  key moves of every pivot its file doesn't have (pivotPending), so the
+   *  workflows written to the file match the figure in it. Returns the
+   *  figure ids undone — pivotFigureKeys on each redoes them (the document
+   *  stays open after all). */
+  revertPendingPivots: (docId: string) => string[];
 
   // ── Persistence ──
   /** Read document `docId`'s saved workflows once per doc id (one file at a
@@ -464,7 +486,22 @@ const MEAS_GROUPS_KEY = "mpfig.measurement_groups";
  *  there and keeps its labels). Returns whether anything moved. */
 export function rekeyAnalysisStorage(oldBase: string, newBase: string, keepOld: boolean): boolean {
   if (!oldBase || oldBase === newBase) return false;
-  const move = (k: string) => rekeyKey(k, oldBase, newBase);
+  return mapAnalysisStorage((k) => rekeyKey(k, oldBase, newBase), keepOld, { oldBase, newBase });
+}
+
+/** The panel's labels (source renames, source-library folders, measurement
+ *  group labels) of figure `fk` follow its panels through a Pivot: r{r}c{c}
+ *  source keys and R{r+1}C{c+1} measurement rows move to the transposed cell.
+ *  Returns whether anything moved. */
+export function pivotAnalysisStorage(fk: string): boolean {
+  if (!fk) return false;
+  return mapAnalysisStorage((k) => pivotAnalysisKey(k, fk), false, { pivot: fk });
+}
+
+/** Every localStorage label key moved by `move` (which must not send two
+ *  keys to one, or the later one wins). `keepOld` copies instead of moving.
+ *  `detail` goes with ANALYSIS_KEYS_MOVED_EVENT when anything moved. */
+function mapAnalysisStorage(move: (k: string) => string, keepOld: boolean, detail?: object): boolean {
   const read = (key: string): unknown => {
     try { return JSON.parse(localStorage.getItem(key) || "null"); } catch { return null; }
   };
@@ -506,7 +543,7 @@ export function rekeyAnalysisStorage(oldBase: string, newBase: string, keepOld: 
     if (moved) { write(SOURCE_GROUPS_KEY, next); changed = true; }
   }
   if (changed) {
-    try { window.dispatchEvent(new CustomEvent(ANALYSIS_KEYS_MOVED_EVENT, { detail: { oldBase, newBase } })); }
+    try { window.dispatchEvent(new CustomEvent(ANALYSIS_KEYS_MOVED_EVENT, { detail: detail ?? {} })); }
     catch { /* no window (tests) */ }
   }
   return changed;
@@ -644,7 +681,7 @@ try {
 // ── Store ───────────────────────────────────────────────────
 
 type WorkspaceData = Pick<AnalysisWorkspaceState,
-  "tabs" | "activeId" | "docUids" | "hydrated" | "savedSig" | "tombstones" | "uploads" | "knownDocs">;
+  "tabs" | "activeId" | "docUids" | "hydrated" | "savedSig" | "tombstones" | "uploads" | "knownDocs" | "pivotPending">;
 
 /** One pristine tab saved in the active document. */
 function initialState(): WorkspaceData {
@@ -660,6 +697,7 @@ function initialState(): WorkspaceData {
     tombstones: {},
     uploads: [],
     knownDocs: {},
+    pivotPending: {},
   };
 }
 
@@ -863,6 +901,49 @@ export const useAnalysisWorkspaceStore = create<AnalysisWorkspaceState>()((set, 
     se.publishWithResults(se.withResults.map((k) => rekeyKey(k, oldBase, newBase)));
   },
 
+  pivotFigureKeys: (doc, figureId) => {
+    const fk = figKey(doc, figureId);
+    const s = get();
+    const moved = pivotTabs(s.tabs, { fk, docId: doc.id, figureId });
+    // A workflow whose keys moved is newer than every copy of it on disk,
+    // even a greyed-out (locked) one, which the sync pass never bumps.
+    // Without this, a tie with a closed co-owner's stale copy keeps whichever
+    // file is read first — and that copy reads the wrong cells of the
+    // pivoted figure. Unchanged tabs keep their identity (and their stamp).
+    const now = Date.now();
+    const tabs = moved === s.tabs ? moved
+      : moved.map((t, i) => (t === s.tabs[i] ? t : { ...t, updatedAt: Math.max(now, (t.updatedAt ?? 0) + 1) }));
+    // A second pivot of the same figure undoes the first: nothing pending.
+    const mine = { ...(s.pivotPending[doc.id] || {}) };
+    if (mine[figureId]) delete mine[figureId]; else mine[figureId] = true;
+    const { [doc.id]: _old, ...others } = s.pivotPending;
+    const pivotPending = Object.keys(mine).length ? { ...others, [doc.id]: mine } : others;
+    set(tabs !== s.tabs ? { tabs, pivotPending } : { pivotPending });
+    const se = useSourceEditStore.getState();
+    const move = (k: string) => pivotAnalysisKey(k, fk);
+    const revs = mapRecordKeys(se.revs, move);
+    const rerun = mapRecordKeys(se.rerun, move);
+    if (revs !== se.revs || rerun !== se.rerun) useSourceEditStore.setState({ revs, rerun });
+    se.publishWithResults(se.withResults.map(move));
+    pivotAnalysisStorage(fk);
+  },
+
+  revertPendingPivots: (docId) => {
+    const pending = get().pivotPending[docId];
+    if (!pending) return [];
+    const doc = openDoc(docId);
+    if (!doc) {
+      // Closed already: its keys left with it.
+      const { [docId]: _gone, ...pivotPending } = get().pivotPending;
+      set({ pivotPending });
+      return [];
+    }
+    // The key moves are their own inverse; each call also clears its flag.
+    const figureIds = Object.keys(pending);
+    for (const figureId of figureIds) get().pivotFigureKeys(doc, figureId);
+    return figureIds;
+  },
+
   ensureDocLoaded: (docId, path, opts) => {
     const inFlight = pendingLoads.get(docId);
     if (inFlight) {
@@ -1011,6 +1092,13 @@ export const useAnalysisWorkspaceStore = create<AnalysisWorkspaceState>()((set, 
     const cs = useCollageStore.getState();
     const doc = cs.openDocs.find((d) => d.id === docId);
     if (!doc) return;
+    // The file now holds the pivoted figure: its moved Analysis keys are the
+    // right ones to keep, even if the figure is closed without saving later.
+    const pivoted = get().pivotPending[docId];
+    if (pivoted) {
+      const { [docId]: _saved, ...pivotPending } = get().pivotPending;
+      set({ pivotPending });
+    }
     const prev = oldPath || null;
     const moved = prev !== newPath;
     const uidBefore = get().docUids[docId];
@@ -1049,6 +1137,11 @@ export const useAnalysisWorkspaceStore = create<AnalysisWorkspaceState>()((set, 
       const copy = !!prev && (opts.sourceKept ?? (get().docUids[docId] !== uidBefore
         || (!!prevFileUid && prevFileUid !== uidBefore)));
       rekeyAnalysisStorage(oldBase, newBase, copy);
+      // The previous file is still there with the figure as it was before an
+      // unsaved Pivot: the labels left behind for it go back to its cells.
+      if (copy && pivoted) {
+        for (const figureId of Object.keys(pivoted)) pivotAnalysisStorage(figKey({ id: docId, path: prev }, figureId));
+      }
       if (!copy && prev && registryUidAt(prev) === get().docUids[docId]) forgetDocFile(prev);
       // The new file holds what the save carried, not what savedSig describes.
       set((s) => {
@@ -1473,6 +1566,10 @@ function closeDocState(doc: DocTab, others: readonly DocTab[]): void {
   const s = store.getState();
   const uid = s.docUids[doc.id];
   forgetHydration(doc.id);
+  if (s.pivotPending[doc.id]) {
+    const { [doc.id]: _closed, ...pivotPending } = s.pivotPending;
+    store.setState({ pivotPending });
+  }
   if (!uid) return;
   const ctxOpen: OwnershipCtx = { docs: docRefs([...others, doc], s.docUids), known: s.knownDocs };
   const stillOpen = new Set(docRefs(others, s.docUids).map((d) => d.uid));
