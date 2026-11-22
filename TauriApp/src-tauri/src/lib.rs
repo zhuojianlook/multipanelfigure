@@ -5,6 +5,8 @@ use tauri_plugin_shell::process::CommandChild;
 use tauri_plugin_updater::UpdaterExt;
 use std::sync::{Arc, Mutex};
 
+mod engineproc;
+
 #[derive(serde::Serialize, Clone)]
 struct UpdateProgress {
     downloaded: u64,
@@ -14,6 +16,21 @@ struct UpdateProgress {
 #[tauri::command]
 fn get_sidecar_port(state: tauri::State<'_, SidecarPort>) -> u16 {
     state.0
+}
+
+/// Port and per-launch token of THIS app's engine. The frontend builds its
+/// direct-fetch URLs from the port and rejects a health reply whose token
+/// differs (another program answering on the port). Token is None in a debug
+/// build, which talks to an engine started outside the app.
+#[derive(serde::Serialize)]
+struct SidecarInfo {
+    port: u16,
+    token: Option<String>,
+}
+
+#[tauri::command]
+fn get_sidecar_info(port: tauri::State<'_, SidecarPort>, token: tauri::State<'_, SidecarToken>) -> SidecarInfo {
+    SidecarInfo { port: port.0, token: token.0.clone() }
 }
 
 #[tauri::command]
@@ -72,28 +89,20 @@ async fn kill_sidecar(state: tauri::State<'_, SidecarChild>) -> Result<(), Strin
     Ok(())
 }
 
-/// Helper to kill sidecar and any child processes
+/// Stop THIS app's engine and every process below it, by pid. Never by name:
+/// `pkill -f api-server` also killed other apps' engines (see engineproc.rs).
+/// Safe to call more than once; later calls find nothing to stop.
 fn kill_sidecar_process(child_mutex: &Arc<Mutex<Option<CommandChild>>>) {
-    if let Ok(mut guard) = child_mutex.lock() {
-        if let Some(child) = guard.take() {
-            eprintln!("[cleanup] Killing sidecar process");
+    let child = match child_mutex.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    if let Some(child) = child {
+        let pid = child.pid();
+        eprintln!("[cleanup] Stopping engine pid {} and its children", pid);
+        engineproc::kill_tree(pid, move || {
             let _ = child.kill();
-        }
-    }
-    // On Windows, PyInstaller --onefile spawns a child process that may survive.
-    // Kill any remaining api-server processes.
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/IM", "api-server.exe", "/T"])
-            .output();
-    }
-    // On macOS/Linux, kill any remaining api-server processes
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = std::process::Command::new("pkill")
-            .args(["-f", "api-server"])
-            .output();
+        });
     }
 }
 
@@ -419,6 +428,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 struct SidecarPort(u16);
 struct SidecarError(Arc<Mutex<Option<String>>>);
 struct SidecarChild(Arc<Mutex<Option<CommandChild>>>);
+struct SidecarToken(Option<String>);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -441,9 +451,16 @@ pub fn run() {
 
       // Launch sidecar in production; in dev, assume it's already running
       let port: u16;
+      let mut token: Option<String> = None;
       if cfg!(debug_assertions) {
         port = 8765;
       } else {
+        // A free port picked now, not the fixed 8765: another program (or
+        // another copy of this app) may hold 8765, and whatever answers there
+        // is not ours. The launch token lets the frontend verify that.
+        port = engineproc::free_local_port().unwrap_or(8765);
+        let launch_token = engineproc::new_launch_token();
+        token = Some(launch_token.clone());
         // On macOS, remove quarantine attribute from the entire .app bundle.
         // PyInstaller --onefile binaries extract to /tmp at runtime, and macOS
         // propagates the quarantine flag to extracted files. Removing it from
@@ -480,7 +497,10 @@ pub fn run() {
         let sidecar_result = app.shell().sidecar("api-server");
         match sidecar_result {
           Ok(cmd) => {
-            let cmd = cmd.args(["--port", "8765"]);
+            let port_arg = port.to_string();
+            let cmd = cmd
+              .args(["--port", port_arg.as_str()])
+              .env("MPF_LAUNCH_TOKEN", &launch_token);
             match cmd.spawn() {
               Ok((mut rx, child)) => {
                 // Store child handle so we can kill it on app exit
@@ -528,15 +548,15 @@ pub fn run() {
             *sidecar_error.lock().unwrap() = Some(msg);
           }
         }
-        port = 8765;
       }
 
       app.manage(SidecarPort(port));
+      app.manage(SidecarToken(token));
       app.manage(SidecarError(sidecar_error));
       app.manage(SidecarChild(sidecar_child));
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, save_base64_to_path, move_file, file_size, delete_file, open_url, interrupt_pid, app_pid, download_and_install_update, kill_sidecar])
+    .invoke_handler(tauri::generate_handler![get_sidecar_port, get_sidecar_info, get_sidecar_error, proxy_request, proxy_upload, upload_files_from_paths, copy_image_to_clipboard, fetch_url, save_base64_to_path, move_file, file_size, delete_file, open_url, interrupt_pid, app_pid, download_and_install_update, kill_sidecar])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| {
