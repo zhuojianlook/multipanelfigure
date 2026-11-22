@@ -155,12 +155,12 @@ describe("hydrate: the openDocs subscriber reads each file once, one at a time",
     await flush();
     expect(st().hydrated).toEqual({ [U.id]: "done", [A.id]: "pending", [B.id]: "pending" });
     expect(mockApi.readWorkflows).toHaveBeenCalledTimes(1);           // B waits for A
-    expect(mockApi.readWorkflows).toHaveBeenLastCalledWith(A.path);
+    expect(mockApi.readWorkflows).toHaveBeenLastCalledWith(A.path, { noDownload: true });
     reads[0].resolve(EMPTY);
     await flush();
     expect(st().hydrated[A.id]).toBe("done");
     expect(mockApi.readWorkflows).toHaveBeenCalledTimes(2);
-    expect(mockApi.readWorkflows).toHaveBeenLastCalledWith(B.path);
+    expect(mockApi.readWorkflows).toHaveBeenLastCalledWith(B.path, { noDownload: true });
     reads[1].resolve(EMPTY);
     await flush();
     expect(st().hydrated[B.id]).toBe("done");
@@ -176,7 +176,7 @@ describe("hydrate: the openDocs subscriber reads each file once, one at a time",
     expect(mockApi.readWorkflows).toHaveBeenCalledTimes(1);
     useCollageStore.getState().docEnsure(B.path!, undefined, B.id);
     await flush();
-    expect(mockApi.readWorkflows).toHaveBeenLastCalledWith(B.path);
+    expect(mockApi.readWorkflows).toHaveBeenLastCalledWith(B.path, { noDownload: true });
     expect(st().hydrated[B.id]).toBe("done");
   });
 

@@ -100,6 +100,7 @@ export function AppShell() {
   // window is made non-interactive so no click or shortcut edits the outgoing
   // doc after it was stashed, or lands in the incoming one.
   const docSwapBusy = useCollageStore((s) => s.docSwapBusy);
+  const docSwapLabel = useCollageStore((s) => s.docSwapLabel);
   useEffect(() => {
     if (!docSwapBusy) return;
     const swallow = (e: KeyboardEvent) => {
@@ -436,7 +437,22 @@ export function AppShell() {
       {/* Transparent, below MUI dialogs (z 1300) so a "Load failed" alert
           raised mid-swap stays clickable. */}
       {docSwapBusy && (
-        <div className="fixed inset-0" style={{ zIndex: 1240, cursor: "progress" }} />
+        <div className="fixed inset-0 flex items-center justify-center" style={{ zIndex: 1240, cursor: "progress" }}>
+          {/* Said only once the swap turns out slow (a file stored online
+              only is downloaded first): fades in after a moment, so a quick
+              tab switch shows nothing. */}
+          {docSwapLabel && (
+            <div style={{
+              display: "flex", alignItems: "center", gap: 10, padding: "9px 16px", borderRadius: 8,
+              backgroundColor: "rgba(20,20,20,0.9)", color: "#fff", fontSize: 13,
+              boxShadow: "0 4px 18px rgba(0,0,0,0.35)", animation: "mpfSwapLabelIn 0.2s ease-out 0.8s both",
+            }}>
+              <CircularProgress size={16} sx={{ color: "#fff" }} />
+              <span>{docSwapLabel}</span>
+              <style>{`@keyframes mpfSwapLabelIn { from { opacity: 0; } to { opacity: 1; } }`}</style>
+            </div>
+          )}
+        </div>
       )}
       {/* ── File Drop Overlay ──────────────────────────── */}
       {fileDragOver && (

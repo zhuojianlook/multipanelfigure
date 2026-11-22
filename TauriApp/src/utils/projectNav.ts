@@ -16,7 +16,7 @@ import { api } from "../api/client";
 import { confirm as confirmDialog, confirmThree, alert as alertDialog } from "../components/shared/ConfirmDialog";
 import { saveProjectDialog } from "../components/shared/SaveProjectDialog";
 import { serializeDocOp, isStateCacheMiss } from "./docOpQueue";
-import { fileUidOf, isMissingFileError } from "./docIdentity";
+import { cloudProviderOf, fileUidOf, isMissingFileError, loadFailureNotice } from "./docIdentity";
 import {
   findRenamedOpenTab, itemUidAt, knownFileUid, locateOpenDoc, markItemsMissingAt, ontoAnotherTab, relinkCollageItem,
   relocateOpenDoc, repointOpenDoc, resolveRefs,
@@ -280,17 +280,37 @@ async function activateDoc(target: { id: string; path: string | null; name?: str
   }
   if (doc.path) {
     try {
-      await useFigureStore.getState().loadProject(doc.path, doc.id);
+      await loadProjectLabelled(doc.path, doc.id, doc.name);
     } catch (e) {
       // No file at its path any more: renamed or moved outside the app.
       // Found by its uid → the tab follows it there and loads it from there.
       if (!isMissingFileError(e)) throw e;
       const moved = await relocateOpenDoc(doc.id);
       if (!moved) throw e;
-      await useFigureStore.getState().loadProject(moved, doc.id);
+      await loadProjectLabelled(moved, doc.id, doc.name);
     }
+    // Its saved Analysis, if that read was put off while the file was stored
+    // online only: the file was just downloaded for the figure (queued, not
+    // awaited — the swap does not wait for it; a no-op once read).
+    const now = useCollageStore.getState().openDocs.find((d) => d.id === doc.id);
+    if (now?.path) void useAnalysisWorkspaceStore.getState().ensureDocLoaded(now.id, now.path, { download: true });
   } else {
     await useFigureStore.getState().newBlankFigure(doc.id);
+  }
+}
+
+/** figureStore.loadProject, saying on the swap shield what is being opened
+ *  should it take a while — a file stored online only (Google Drive,
+ *  Dropbox…) is downloaded first, which can take many seconds. */
+async function loadProjectLabelled(path: string, docId: string, name?: string): Promise<void> {
+  const where = cloudProviderOf(path);
+  const what = `"${name || basenameOf(path).replace(/\.mpf$/i, "") || "the document"}"`;
+  const cs = useCollageStore.getState();
+  cs.setDocSwapLabel(where ? `Opening ${what} from ${where}…` : `Opening ${what}…`);
+  try {
+    await useFigureStore.getState().loadProject(path, docId);
+  } finally {
+    useCollageStore.getState().setDocSwapLabel(null);
   }
 }
 
@@ -719,10 +739,9 @@ async function recoverMissingDoc(docId: string, err: unknown): Promise<boolean> 
   const doc = openDoc(docId);
   if (!doc) return false;
   if (!doc.path || !isMissingFileError(err)) {
-    await alertDialog({
-      title: "Load failed",
-      body: `Could not load "${doc.name}".\n\nIts .mpf may have been moved or deleted.`,
-    });
+    // Still at its path but unreadable — e.g. stored online only and its
+    // cloud app could not download it: say why (no Locate: it is not lost).
+    await alertDialog(loadFailureNotice(doc.name, doc.path, err));
     return false;
   }
   // Its collage figures have no file either: they no longer keep the tab
@@ -791,7 +810,7 @@ async function adoptLocatedFile(docId: string, picked: string): Promise<boolean>
     await activateDoc({ id: docId, path: picked, name: doc.name });
   } catch (e) {
     console.error("[projectNav] loading the located file failed:", e);
-    await alertDialog({ title: "Load failed", body: `Could not load "${basenameOf(picked)}".` });
+    await alertDialog(loadFailureNotice(basenameOf(picked), picked, e));
     return false;
   }
   markItemsMissingAt(picked, false);
@@ -910,13 +929,12 @@ async function openProjectIntoTabImpl(path: string): Promise<void> {
     if (!(await stashCurrentDoc())) { await alertCouldNotPark(); return; }
     const newId = newDocId();
     try {
-      await useFigureStore.getState().loadProject(path, newId);
+      await loadProjectLabelled(path, newId);
     } catch (e) {
       console.error("[projectNav] open project failed:", e);
-      await alertDialog({
-        title: "Load failed",
-        body: "Could not load that project file — it may have been moved or deleted.",
-      });
+      await alertDialog(isMissingFileError(e)
+        ? { title: "Load failed", body: "Could not load that project file — it may have been moved or deleted." }
+        : loadFailureNotice(basenameOf(path).replace(/\.mpf$/i, "") || path, path, e));
       return;
     }
     const id = useCollageStore.getState().docEnsure(path, undefined, newId);
@@ -1043,7 +1061,7 @@ async function closeDocImpl(docId: string): Promise<boolean> {
           return;
         } catch (e) {
           console.error("[projectNav] activate neighbour after close failed:", e);
-          await alertDialog({ title: "Load failed", body: `Could not load "${next.name}".` });
+          await alertDialog(loadFailureNotice(next.name, next.path, e));
         }
       }
       // No docs left (or the neighbour failed) — a fresh blank one, so the

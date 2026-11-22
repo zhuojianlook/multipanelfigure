@@ -541,7 +541,7 @@ describe("relocateOpenDoc / findRenamedOpenTab", () => {
     expect(fileUidOf("doc_a")).toBeUndefined();
     await expect(relocateOpenDoc("doc_a")).resolves.toBe("/exp/a2.mpf");
     await flush();
-    expect(mockApi.readWorkflows).toHaveBeenLastCalledWith("/exp/a2.mpf");
+    expect(mockApi.readWorkflows).toHaveBeenLastCalledWith("/exp/a2.mpf", { noDownload: true });
     expect(ws().hydrated.doc_a).toBe("done");
     expect(ws().docUids.doc_a).toBe("du_a");
     expect(fileUidOf("doc_a")).toBe("du_a");

@@ -642,6 +642,10 @@ export type CollageState = {
    *  the builder/analysis content is inert so no edit lands mid-swap. */
   docSwapBusy: boolean;
   setDocSwapBusy: (v: boolean) => void;
+  /** What the swap in flight is doing ("Opening "x" from Google Drive…"),
+   *  shown on the shield only once it turns out slow; null: no label. */
+  docSwapLabel: string | null;
+  setDocSwapLabel: (v: string | null) => void;
   /** Replace the set of docs that have unsaved in-memory snapshots. */
   setSnapshotDirtyDocIds: (ids: string[]) => void;
 
@@ -926,6 +930,7 @@ export const useCollageStore = create<CollageState>()(
     snapshotDirtyDocIds: [],
     missingItemIds: [],
     docSwapBusy: false,
+    docSwapLabel: null,
     elemSyncItemId: null,
     elemListByItem: {},
     elemSelByItem: {},
@@ -1383,6 +1388,7 @@ export const useCollageStore = create<CollageState>()(
     },
 
     setDocSwapBusy: (v) => set((s) => { s.docSwapBusy = v; }),
+    setDocSwapLabel: (v) => set((s) => { s.docSwapLabel = v; }),
 
     setSnapshotDirtyDocIds: (ids) => set((s) => { s.snapshotDirtyDocIds = ids; }),
 

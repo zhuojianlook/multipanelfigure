@@ -4,7 +4,8 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
-  DOC_REGISTRY_CAP, DOC_REGISTRY_KEY, buildRef, clearFileUid, fileUidOf, forgetDocFile, isMissingFileError,
+  DOC_REGISTRY_CAP, DOC_REGISTRY_KEY, buildRef, clearFileUid, cloudProviderOf, fileUidOf, forgetDocFile,
+  isCloudDownloadError, isMissingFileError, loadFailureNotice,
   noteDocFile, onIdentityChange, registryPathsOf, registryUidAt, resetDocIdentityForTests, setDocRegistryStorage,
   setFileUid, type DocRegistryStorage,
 } from "./docIdentity";
@@ -177,5 +178,47 @@ describe("isMissingFileError", () => {
     expect(isMissingFileError(new Error("disk full"))).toBe(false);
     expect(isMissingFileError(new Error('API error: "Image \'x\' not found"'))).toBe(false);
     expect(isMissingFileError(undefined)).toBe(false);
+  });
+});
+
+describe("files stored online only", () => {
+  const GD = "/Users/u/Library/CloudStorage/GoogleDrive-u@x.com/My Drive/Lab Data/DeepRed Staining.mpf";
+  const cloudErr = new Error(`API error: "Cloud file could not be downloaded: ${GD} (Resource deadlock avoided)"`);
+
+  it("recognises the sidecar's cloud download failure, and never as a missing file", () => {
+    expect(isCloudDownloadError(cloudErr)).toBe(true);
+    expect(isMissingFileError(cloudErr)).toBe(false);
+    expect(isCloudDownloadError(new Error('API error: "Project file not found: /a.mpf"'))).toBe(false);
+    expect(isCloudDownloadError(undefined)).toBe(false);
+  });
+
+  it("names the cloud service from the synced folder's path", () => {
+    expect(cloudProviderOf(GD)).toBe("Google Drive");
+    expect(cloudProviderOf("/Users/u/Library/CloudStorage/Dropbox/GitHub/x.mpf")).toBe("Dropbox");
+    expect(cloudProviderOf("/Users/u/Dropbox (Lab)/x.mpf")).toBe("Dropbox");
+    expect(cloudProviderOf("/Users/u/Library/CloudStorage/OneDrive-Uni/x.mpf")).toBe("OneDrive");
+    expect(cloudProviderOf("C:\\Users\\u\\OneDrive - Uni\\x.mpf")).toBe("OneDrive");
+    expect(cloudProviderOf("/Users/u/Library/Mobile Documents/com~apple~CloudDocs/x.mpf")).toBe("iCloud Drive");
+    expect(cloudProviderOf("G:\\My Drive\\x.mpf")).toBe("Google Drive");
+    expect(cloudProviderOf("/Users/u/Documents/x.mpf")).toBeNull();
+    expect(cloudProviderOf(null)).toBeNull();
+  });
+
+  it("the notice says the file is online only and what to check — not that it was moved or deleted", () => {
+    const n = loadFailureNotice("DeepRed Staining", GD, cloudErr);
+    expect(n.title).toBe("Could not download the file");
+    expect(n.body).toContain('"DeepRed Staining" is stored online only in Google Drive');
+    expect(n.body).toContain("Check that Google Drive is running and that you are online");
+    expect(n.body).not.toMatch(/moved or deleted/);
+    const anywhere = loadFailureNotice("x", "/Volumes/NAS/x.mpf", cloudErr);
+    expect(anywhere.body).toContain("Check that your cloud storage app is running");
+  });
+
+  it("any other failure says what the sidecar reported", () => {
+    const n = loadFailureNotice("x", "/a/x.mpf", new Error('API error: "Could not read /a/x.mpf: Permission denied"'));
+    expect(n).toEqual({ title: "Load failed", body: 'Could not load "x".\n\nCould not read /a/x.mpf: Permission denied' });
+    // Not the sidecar's JSON (a plain 500, a dropped connection): the old hint.
+    expect(loadFailureNotice("x", "/a/x.mpf", new SyntaxError("Unexpected token")).body)
+      .toMatch(/could not be read\. It may be damaged, or it may have been moved or deleted/);
   });
 });

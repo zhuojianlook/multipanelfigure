@@ -249,6 +249,65 @@ export function isMissingFileError(e: unknown): boolean {
   return msg.includes("Project file not found");
 }
 
+/** The sidecar's answer when a file stored online only (evicted by Google
+ *  Drive, Dropbox, OneDrive or iCloud to save space) could not be downloaded
+ *  to be read: the cloud app is not running, or the Mac is offline. The file
+ *  is still there — never treat it as missing. */
+export function isCloudDownloadError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e ?? "");
+  return msg.includes("Cloud file could not be downloaded");
+}
+
+/** The sidecar's answer to a background read (readWorkflows noDownload) of a
+ *  file stored online only: not downloaded for it, read when its tab opens. */
+export function isCloudOnlineOnlyError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e ?? "");
+  return msg.includes("Cloud file is stored online only");
+}
+
+/** The cloud service whose synced folder holds `path` (for messages), or
+ *  null for an ordinary folder. */
+export function cloudProviderOf(path: string | null | undefined): string | null {
+  if (!path) return null;
+  const p = path.replace(/\\/g, "/");
+  if (/\/Library\/CloudStorage\/GoogleDrive|\/(Google Drive|My Drive|Shared drives)\//i.test(p)) return "Google Drive";
+  if (/\/Library\/CloudStorage\/Dropbox|\/Dropbox( \([^/]*\))?\//i.test(p)) return "Dropbox";
+  if (/\/Library\/CloudStorage\/OneDrive|\/OneDrive( - [^/]*)?\//i.test(p)) return "OneDrive";
+  if (/\/Library\/CloudStorage\/Box|\/Box\//.test(p)) return "Box";
+  if (/\/Library\/Mobile Documents\/|\/iCloud Drive\//i.test(p)) return "iCloud Drive";
+  return null;
+}
+
+/** Title and text of the notice for document `name` (file at `path`) that
+ *  could not be loaded with `err` — other than a missing file, which has its
+ *  own Locate… / Close tab prompt. */
+export function loadFailureNotice(
+  name: string, path: string | null | undefined, err: unknown,
+): { title: string; body: string } {
+  if (isCloudDownloadError(err)) {
+    const where = cloudProviderOf(path);
+    return {
+      title: "Could not download the file",
+      body: `"${name}" is stored online only${where ? ` in ${where}` : ""}, and it could not be downloaded.\n\n`
+        + `Check that ${where ?? "your cloud storage app"} is running and that you are online, then try again.`,
+    };
+  }
+  return { title: "Load failed", body: `Could not load "${name}".\n\n${loadFailureReason(err)}` };
+}
+
+function loadFailureReason(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  const m = /^API error: ([\s\S]*)$/.exec(msg);
+  if (m) {
+    try {
+      const detail: unknown = JSON.parse(m[1]);
+      if (typeof detail === "string" && detail) return detail;
+    } catch { /* not JSON: show it as it came */ }
+    if (m[1]) return m[1];
+  }
+  return "The file could not be read. It may be damaged, or it may have been moved or deleted.";
+}
+
 /** api.writeWorkflows' answer when the file at the path names another
  *  document than the one expected (the sidecar's 409 {other_document}):
  *  nothing was written. */

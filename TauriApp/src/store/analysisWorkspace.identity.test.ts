@@ -667,3 +667,93 @@ describe("a file renamed while it was closed", () => {
     expect(names()).toEqual({ [oldKey]: "Ctrl" });
   });
 });
+
+describe("files stored online only (Google Drive, Dropbox… evicted them)", () => {
+  /** Files not on this Mac: a background read is answered at once, unread;
+   *  any other read downloads the file. */
+  const online = new Set<string>();
+  /** B's file holds a saved workflow of its own ("wfB"). */
+  async function savedInB() {
+    await open([B]);
+    st().setTabs([wf("wfB", [src(B, "r0c0_i0")])]);
+    await expect(st().persistDocWorkflows(B.id)).resolves.toBe("written");
+  }
+  const readsOf = (path: string) => mockApi.readWorkflows.mock.calls.filter((c) => c[0] === path).map((c) => c[1] ?? null);
+
+  beforeEach(() => {
+    online.clear();
+    const base = mockApi.readWorkflows.getMockImplementation()!;
+    mockApi.readWorkflows.mockImplementation(async (path: string, opts?: { noDownload?: boolean }) => {
+      if (online.has(path)) {
+        if (opts?.noDownload) throw new Error(`API error: "Cloud file is stored online only: ${path}"`);
+        online.delete(path);                                     // downloaded by this read
+      }
+      return base(path);
+    });
+  });
+
+  it("a restored tab's file is not downloaded in the background; opening the tab reads its Analysis", async () => {
+    await savedInB();
+    online.add(B.path!);
+    mockApi.readWorkflows.mockClear();
+    await open([A, B], A.id);                                    // relaunch: B restored, not opened
+    expect(readsOf(B.path!)).toEqual([{ noDownload: true }]);
+    expect(st().hydrated[B.id]).toBe("failed");                  // never overwritten meanwhile
+    expect(tab("wfB")).toBeUndefined();
+    // Other tab changes do not try again (no download, no loop).
+    useCollageStore.setState({ openDocs: [A, B, U] });
+    await flush();
+    expect(readsOf(B.path!)).toHaveLength(1);
+    // The user opens B's tab (activateDoc): read again, downloading.
+    await st().ensureDocLoaded(B.id, B.path, { download: true });
+    expect(readsOf(B.path!)).toEqual([{ noDownload: true }, null]);
+    expect(st().hydrated[B.id]).toBe("done");
+    expect(tab("wfB")).toBeDefined();
+  });
+
+  it("entering Analysis reads the documents put off", async () => {
+    await savedInB();
+    online.add(B.path!);
+    await open([A, B], A.id);
+    expect(tab("wfB")).toBeUndefined();
+    useCollageStore.getState().setMode("analysis");
+    await flush();
+    expect(st().hydrated[B.id]).toBe("done");
+    expect(tab("wfB")).toBeDefined();
+    useCollageStore.getState().setMode("builder");
+  });
+
+  it("a quit downloads a put-off file only when there is Analysis of its own to write into it", async () => {
+    await savedInB();
+    online.add(B.path!);
+    await open([A, B], A.id);
+    mockApi.writeWorkflows.mockClear();
+    // Nothing of B's in the workspace: not read, not written.
+    await expect(st().persistDocWorkflows(B.id)).resolves.toBe("not-hydrated");
+    expect(online.has(B.path!)).toBe(true);
+    expect(mockApi.writeWorkflows).not.toHaveBeenCalled();
+    // New Analysis on B's figure: its file is read first (downloaded), then written —
+    // the workflow already saved in it is kept.
+    st().setTabs([...st().tabs, wf("wfNew", [src(B, "r0c1_i0")])]);
+    await expect(st().persistDocWorkflows(B.id)).resolves.toBe("written");
+    expect(online.has(B.path!)).toBe(false);
+    const saved = (manifestAt(B.path!)!.workflows as Array<{ id: string }>).map((w) => w.id).sort();
+    expect(saved).toEqual(["wfB", "wfNew"]);
+  });
+
+  it("a download that fails (cloud app not running, offline) is tried again when the tab is opened", async () => {
+    await savedInB();
+    online.add(B.path!);
+    await open([A, B], A.id);
+    const base = mockApi.readWorkflows.getMockImplementation()!;
+    mockApi.readWorkflows.mockImplementationOnce(async (path: string) => {
+      throw new Error(`API error: "Cloud file could not be downloaded: ${path} (Operation timed out)"`);
+    });
+    await st().ensureDocLoaded(B.id, B.path, { download: true });
+    expect(st().hydrated[B.id]).toBe("failed");
+    mockApi.readWorkflows.mockImplementation(base);
+    await st().ensureDocLoaded(B.id, B.path, { download: true });
+    expect(st().hydrated[B.id]).toBe("done");
+    expect(tab("wfB")).toBeDefined();
+  });
+});

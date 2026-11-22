@@ -104,7 +104,8 @@ import {
   type AnalysisLabels, type DocMeta,
 } from "../utils/analysisMeta";
 import {
-  clearFileUid, fileUidOf, forgetDocFile, isMissingFileError, isOtherDocumentError, noteDocFile, refreshDocFileId,
+  clearFileUid, fileUidOf, forgetDocFile, isCloudDownloadError, isCloudOnlineOnlyError, isMissingFileError,
+  isOtherDocumentError, noteDocFile, refreshDocFileId,
   registryPathsOf, registryUidAt, resetDocIdentityForTests, setFileIdOf, setFileUid,
 } from "../utils/docIdentity";
 import { confirm as confirmDialog } from "../components/shared/ConfirmDialog";
@@ -242,8 +243,12 @@ export interface AnalysisWorkspaceState {
   // ── Persistence ──
   /** Read document `docId`'s saved workflows once per doc id (one file at a
    *  time, queued). A document without a file is done at once. Resolves when
-   *  its hydration finished (or was dropped because it closed). */
-  ensureDocLoaded: (docId: string, path: string | null) => Promise<void>;
+   *  its hydration finished (or was dropped because it closed).
+   *  `download`: the user is opening this document (its tab, Analysis, Open
+   *  missing) — a file stored online only may be downloaded for the read, and
+   *  a read put off for that reason (cloudDeferred) is made now. Background
+   *  reads (restored / collage-seeded tabs) never download. */
+  ensureDocLoaded: (docId: string, path: string | null, opts?: { download?: boolean }) => Promise<void>;
   /** Fold one file's read response into the workspace: adopt the file's uid,
    *  merge its workflows (plan §1.5), restore results and upload tiles, take
    *  savedSig from the file as read. A second call for the doc is a no-op. */
@@ -858,11 +863,22 @@ export const useAnalysisWorkspaceStore = create<AnalysisWorkspaceState>()((set, 
     se.publishWithResults(se.withResults.map((k) => rekeyKey(k, oldBase, newBase)));
   },
 
-  ensureDocLoaded: (docId, path) => {
+  ensureDocLoaded: (docId, path, opts) => {
     const inFlight = pendingLoads.get(docId);
-    if (inFlight) return inFlight;
-    const status = get().hydrated[docId];
+    if (inFlight) {
+      if (opts?.download) readMayDownload.add(docId);        // the queued read may download
+      return inFlight;
+    }
+    let status: HydrationStatus | undefined = get().hydrated[docId];
+    if (opts?.download && status === "failed" && cloudDeferred.has(docId)) {
+      // Put off while its file was online only (or its cloud app could not
+      // download it): the user is opening it now — read it again.
+      cloudDeferred.delete(docId);
+      hydratedPath.delete(docId);
+      status = undefined;
+    }
     if (status && status !== "pending") return Promise.resolve();
+    if (opts?.download) readMayDownload.add(docId);
     if (!path) {
       // Nothing on disk to read: an Untitled document starts with no saved analysis.
       if (openDoc(docId)) { hydratedPath.set(docId, null); setHydrated(docId, "done"); }
@@ -1191,6 +1207,14 @@ let persistChain: Promise<void> = Promise.resolve();
 // document tabs need it too.
 /** Doc id → its file holds a workflows/ section (read, or written since). */
 const fileHasSection = new Map<string, boolean>();
+/** Documents whose read was put off because their file is stored online only
+ *  (Google Drive, Dropbox… evicted it to save space) or its cloud app could
+ *  not download it: hydrated "failed" (so never overwritten) until the user
+ *  opens the document — ensureDocLoaded(…, {download: true}) reads it then.
+ *  Launch never downloads every restored tab's file in the background. */
+const cloudDeferred = new Set<string>();
+/** Documents the user is opening: their read may download an online-only file. */
+const readMayDownload = new Set<string>();
 /** Workflows openMissing is looking for documents of (no double run). */
 const lookingFor = new Set<string>();
 
@@ -1207,6 +1231,8 @@ function setHydrated(docId: string, status: HydrationStatus): void {
 function forgetHydration(docId: string): void {
   pendingLoads.delete(docId);
   hydratedPath.delete(docId);
+  cloudDeferred.delete(docId);
+  readMayDownload.delete(docId);
   clearFileUid(docId);
   fileHasSection.delete(docId);
   const s = useAnalysisWorkspaceStore.getState();
@@ -1242,13 +1268,28 @@ async function loadOne(docId: string, gen: number): Promise<void> {
     }
     let resp: WorkflowsReadResponse | null = null;
     let failure: unknown = null;
-    try { resp = await api.readWorkflows(path); } catch (e) { failure = e ?? new Error("read failed"); }
+    const download = readMayDownload.has(docId) || awaitedLoads.has(docId);
+    try {
+      resp = await (download ? api.readWorkflows(path) : api.readWorkflows(path, { noDownload: true }));
+    } catch (e) { failure = e ?? new Error("read failed"); }
     if (!live()) return;
     if (openDoc(docId)!.path !== path) continue;
     if (!resp && !isSidecarReply(failure) && retries < READ_RETRIES && !awaitedLoads.has(docId)) {
       retries++;
       await new Promise((r) => setTimeout(r, READ_RETRY_MS));
       continue;
+    }
+    if (!resp && (isCloudOnlineOnlyError(failure) || isCloudDownloadError(failure))) {
+      // Stored online only: read when the user opens the document (its tab,
+      // Analysis). Until then "failed" — never overwritten.
+      // Opened meanwhile (its tab loaded the file): read again, downloading.
+      if (!download && readMayDownload.has(docId)) continue;
+      console.info("[analysis] saved workflows of", path, "wait until it is opened:", failure);
+      cloudDeferred.add(docId);
+      readMayDownload.delete(docId);
+      hydratedPath.set(docId, path);
+      setHydrated(docId, "failed");
+      return;
     }
     if (!resp) {
       console.error("[analysis] could not read the saved workflows of", path, failure);
@@ -1278,6 +1319,8 @@ async function loadOne(docId: string, gen: number): Promise<void> {
         forgetDocFile(old);
       }
     }
+    cloudDeferred.delete(docId);
+    readMayDownload.delete(docId);
     store.getState().hydrateDoc(docId, resp);
     return;
   }
@@ -1295,7 +1338,13 @@ async function persistNow(docId: string, opts: PersistOptions): Promise<PersistO
   let doc = openDoc(docId);
   if (!doc?.path) return "no-path";
   // Its file must have been read first — a write would replace what it holds.
+  // One put off while stored online only is read now (downloading it) only
+  // when there is Analysis of its own to write: a quit with many restored
+  // tabs never downloads them all.
   if (!store.getState().hydrated[docId]) void store.getState().ensureDocLoaded(docId, doc.path);
+  else if (cloudDeferred.has(docId) && docHasAnalysis(docId)) {
+    void store.getState().ensureDocLoaded(docId, doc.path, { download: true });
+  }
   const pending = pendingLoads.get(docId);
   if (pending) {
     awaitedLoads.add(docId);
@@ -1544,7 +1593,7 @@ function stillMissing(wfId: string, uid: string): boolean {
 async function openLocated(wfId: string, uid: string, path: string): Promise<boolean> {
   const store = useAnalysisWorkspaceStore;
   const docId = useCollageStore.getState().docEnsure(path);
-  await store.getState().ensureDocLoaded(docId, path);
+  await store.getState().ensureDocLoaded(docId, path, { download: true });
   if (!stillMissing(wfId, uid)) return true;               // its read resolved it
   let doc = openDoc(docId);
   if (!doc) return false;
@@ -1687,6 +1736,8 @@ export function resetAnalysisWorkspaceForTests(): void {
   pendingLoads.clear();
   awaitedLoads.clear();
   hydratedPath.clear();
+  cloudDeferred.clear();
+  readMayDownload.clear();
   resetDocIdentityForTests();
   fileHasSection.clear();
   lookingFor.clear();
@@ -1717,6 +1768,14 @@ useAnalysisWorkspaceStore.subscribe((s, p) => {
   if (s.tabs !== p.tabs || s.docUids !== p.docUids || s.knownDocs !== p.knownDocs) scheduleSync();
 });
 useCollageStore.subscribe((s, p) => {
+  // Entering Analysis: the documents whose saved workflows were put off
+  // while their files were online only are read now (Analysis lists every
+  // open document's sources, which downloads them anyway).
+  if (s.mode !== p.mode && s.mode === "analysis") {
+    for (const d of s.openDocs) {
+      if (cloudDeferred.has(d.id)) void useAnalysisWorkspaceStore.getState().ensureDocLoaded(d.id, d.path, { download: true });
+    }
+  }
   if (s.openDocs === p.openDocs) return;
   ensureOpenDocUids();
   // A tab removed without closeDoc (e.g. session restore dropping the blank

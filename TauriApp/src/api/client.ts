@@ -392,8 +392,12 @@ class ApiClient {
    *  and restore its embedded uploads into the Analysis store. Names taken
    *  by different content come back in `renamed`. Rejects when the file is
    *  missing or not a readable .mpf. */
-  async readWorkflows(path: string): Promise<WorkflowsReadResponse> {
-    return apiJson<WorkflowsReadResponse>("/api/project/workflows/read", "POST", JSON.stringify({ path }));
+  /** `noDownload`: a background read — a file stored online only (Google
+   *  Drive, Dropbox…) is not downloaded for it; the sidecar answers at once
+   *  with "Cloud file is stored online only" (docIdentity.isCloudOnlineOnlyError). */
+  async readWorkflows(path: string, opts?: { noDownload?: boolean }): Promise<WorkflowsReadResponse> {
+    return apiJson<WorkflowsReadResponse>("/api/project/workflows/read", "POST",
+      JSON.stringify(opts?.noDownload ? { path, no_download: true } : { path }));
   }
 
   /** `docId` = the tab the project is opened into, so the sidecar knows

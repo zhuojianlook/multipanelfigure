@@ -16,9 +16,9 @@
 
 import { useFigureStore } from "../store/figureStore";
 import { useCollageStore, newDocId } from "../store/collageStore";
-import { confirm } from "../components/shared/ConfirmDialog";
+import { alert as alertDialog, confirm } from "../components/shared/ConfirmDialog";
 import { serializeDocOp } from "./projectNav";
-import { buildRef, registryFileIdAt, registryUidAt } from "./docIdentity";
+import { buildRef, isCloudDownloadError, loadFailureNotice, registryFileIdAt, registryUidAt } from "./docIdentity";
 import { knownCopies, repointOpenDocs, resolveRefs } from "./docLinks";
 import { basenameOf } from "./workflowPersist";
 
@@ -258,10 +258,18 @@ async function restoreNow(onBuilt: () => void): Promise<boolean> {
     // Now fill the builder with the active doc's content.
     try {
       await useFigureStore.getState().loadProject(activePath, activeId);
-    } catch {
-      // Rare: the file vanished between the existence check and the load. Reset
-      // to a clean blank working doc so the active tab and backend stay
-      // consistent (the other restored tabs remain and load on click).
+    } catch (e) {
+      // Rare: the file vanished between the existence check and the load, or
+      // it is stored online only and its cloud app could not download it yet
+      // (not running so soon after login, or offline). Reset to a clean blank
+      // working doc so the active tab and backend stay consistent; the
+      // restored tab remains and loads on click — say so for a cloud file,
+      // which is not lost.
+      if (isCloudDownloadError(e)) {
+        const tab = useCollageStore.getState().openDocs.find((d) => d.id === activeId);
+        const notice = loadFailureNotice(tab?.name || basenameOf(activePath), activePath, e);
+        void alertDialog({ ...notice, body: `${notice.body} Its tab stays open: click it to load it.` });
+      }
       const blankId = newDocId();
       await useFigureStore.getState().newBlankFigure(blankId).catch(() => {});
       useCollageStore.getState().docAdd({ id: blankId, path: null });

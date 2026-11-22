@@ -6,6 +6,7 @@ Launched as a Tauri sidecar — communicates via HTTP on a random port.
 from __future__ import annotations
 import argparse
 import base64
+import errno
 import hashlib
 import datetime as _dt
 import io
@@ -28,6 +29,39 @@ os.environ["MPLCONFIGDIR"] = _mpl_config
 # bundled deps (numpy/PIL/cv2/scipy/skimage/matplotlib). Never triggered in dev
 # (there sys.executable is a real Python and we call it directly).
 import sys as _sys_boot
+
+
+# ── Online-only cloud files (Google Drive, Dropbox, OneDrive, iCloud) ──────
+# On macOS a file its cloud app has evicted to save space is a "dataless"
+# placeholder. Reading one makes the kernel ask the provider to download it
+# first — but only for a process whose I/O policy allows that. Under the
+# default policy (which a sidecar spawned by the app gets) the read fails at
+# once with EDEADLK, "Resource deadlock avoided", so an evicted .mpf (or
+# image) could not be opened until the user opened it in Finder. Opt this
+# process (and what it spawns) in: reads now wait for the download. Our own
+# scans (/api/fs/mpf-resolve) still never start one — they check the
+# placeholder flag before opening anything. Not needed on Windows, where an
+# ordinary read hydrates a cloud file by itself.
+def _allow_cloud_downloads() -> None:
+    if _sys_boot.platform != "darwin":
+        return
+    try:
+        import ctypes
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES = 3
+        IOPOL_SCOPE_PROCESS = 0
+        IOPOL_MATERIALIZE_DATALESS_FILES_ON = 2
+        if libc.setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS,
+                               IOPOL_MATERIALIZE_DATALESS_FILES_ON) != 0:
+            print(f"[cloud] could not allow downloads of online-only files (errno {ctypes.get_errno()})",
+                  file=_sys_boot.stderr, flush=True)
+    except Exception as _e:   # never fatal: only evicted files are affected
+        print(f"[cloud] could not allow downloads of online-only files: {_e}",
+              file=_sys_boot.stderr, flush=True)
+
+
+_allow_cloud_downloads()
+
 if len(_sys_boot.argv) >= 3 and _sys_boot.argv[1] == "--mpfig-run-script":
     import runpy as _runpy_boot
     _boot_script = _sys_boot.argv[2]
@@ -283,6 +317,10 @@ _GATE_SELF = frozenset({
     "/api/analysis/run-python", "/api/analysis/run-cellpose",
     "/api/analysis/cellpose-preview", "/api/analysis/run-imagej",
     "/api/analysis/run-matlab",
+    # Read the saved .mpf outside the gate (it may be stored online only and
+    # download for a long while), then render under shared.
+    "/api/collage/figure-elements", "/api/collage/render-figure",
+    "/api/collage/decompose",
 })
 
 
@@ -4745,6 +4783,41 @@ def _is_cloud_placeholder(st) -> bool:
     return bool((getattr(st, "st_file_attributes", 0) or 0) & _WIN_PLACEHOLDER_ATTRS)
 
 
+# The frontend matches these prefixes (utils/docIdentity.isCloudDownloadError,
+# isCloudOnlineOnlyError).
+_CLOUD_READ_FAILED = "Cloud file could not be downloaded"
+_CLOUD_ONLINE_ONLY = "Cloud file is stored online only"
+
+
+def _stat_or_none(path: str):
+    try:
+        return os.stat(path)
+    except OSError:
+        return None
+
+
+def _mpf_read_failure(path: str, err: Exception, st_before) -> Optional[HTTPException]:
+    """The HTTP error for a failed read of the .mpf at `path` (None: let it
+    propagate). An online-only file that could not be downloaded — its cloud
+    app not running, offline, or (an older policy) EDEADLK — is reported as
+    that, never as a missing or broken file: it is still there, and opening
+    it again once the cloud app is back works."""
+    if isinstance(err, _zipfile.BadZipFile) and isinstance(err.__context__, OSError):
+        # zipfile reports any OSError of its first read (an online-only file
+        # that could not be downloaded: EDEADLK, ETIMEDOUT…) as "File is not
+        # a zip file"; the real cause is the OSError it was raised from.
+        err = err.__context__
+    if isinstance(err, OSError):
+        if err.errno == errno.ENOENT:
+            return HTTPException(404, f"Project file not found: {path}")
+        if err.errno == errno.EDEADLK or (st_before is not None and _is_cloud_placeholder(st_before)):
+            return HTTPException(503, f"{_CLOUD_READ_FAILED}: {path} ({err.strerror or err})")
+        return HTTPException(500, f"Could not read {path}: {err.strerror or err}")
+    if isinstance(err, _zipfile.BadZipFile):
+        return HTTPException(400, f"Not a readable .mpf ({path}): {err}")
+    return None
+
+
 def _peek_uid(path: str, st=None) -> Optional[str]:
     """The id of the .mpf at `path` (models.read_mpf_uid), cached. None for
     a file without one, an unreadable file and a cloud placeholder."""
@@ -5467,6 +5540,10 @@ def write_workflows(body: WorkflowsWriteRequest):
 
 class WorkflowsReadRequest(BaseModel):
     path: str
+    # A background read (tabs restored at launch, seeded from a collage):
+    # a file stored online only is NOT downloaded for it — answered at once
+    # with _CLOUD_ONLINE_ONLY instead; it is read when the tab is opened.
+    no_download: bool = False
 
 
 def _restore_target(name: str, sha: str):
@@ -5604,10 +5681,16 @@ def read_workflows(body: WorkflowsReadRequest):
     path = _norm_mpf_path(body.path, ensure_ext=False)
     if not os.path.isfile(path):
         raise HTTPException(404, f"Project file not found: {path}")
+    st_before = _stat_or_none(path)      # an online-only file downloads in the read
+    if body.no_download and st_before is not None and _is_cloud_placeholder(st_before):
+        raise HTTPException(503, f"{_CLOUD_ONLINE_ONLY}: {path}")
     try:
         wf = read_workflow_members(path, with_uploads=False)
-    except _zipfile.BadZipFile as e:
-        raise HTTPException(400, f"Not a readable .mpf ({path}): {e}")
+    except Exception as e:
+        failure = _mpf_read_failure(path, e, st_before)
+        if failure is None:
+            raise
+        raise failure from e
     blobs_out: Dict[str, dict] = {}
     for bid, (kind, raw) in wf["blobs"].items():
         data = (base64.b64encode(raw).decode("ascii") if kind == "png"
@@ -5762,7 +5845,14 @@ def load_proj(body: ProjectLoadRequest):
         path = os.path.join(os.path.expanduser("~"), "Documents", path)
     if not os.path.isfile(path):
         raise HTTPException(404, f"Project file not found: {path}")
-    loaded_cfg, img_bytes_dict, font_bytes_dict, analysis, channel_data = load_project(path)
+    st_before = _stat_or_none(path)      # an online-only file downloads in the read
+    try:
+        loaded_cfg, img_bytes_dict, font_bytes_dict, analysis, channel_data = load_project(path)
+    except Exception as e:
+        failure = _mpf_read_failure(path, e, st_before)
+        if failure is None:
+            raise
+        raise failure from e
     global _live_doc_id
     # Parse outside the gate; replace the live doc under EXCLUSIVE (see
     # activate-state). An id-less load marks the live doc unknown rather than
@@ -6787,6 +6877,27 @@ _collage_mpf_cache: Dict[str, dict] = {}
 _COLLAGE_CACHE_MAX = 12  # rough LRU cap; collage size is usually small
 
 
+def _preload_collage_mpf(raw_path: str) -> None:
+    """Parse (into _collage_mpf_cache) the saved .mpf a collage route is about
+    to read, BEFORE the route takes the doc gate: a file stored online only
+    is downloaded first, and a tab switch must not wait for that behind the
+    gate. A missing file is left to the route (its own 404); a read that
+    fails says why (a cloud download failure is not a broken file)."""
+    path = os.path.expanduser((raw_path or "").strip())
+    if not os.path.dirname(path):
+        path = os.path.join(os.path.expanduser("~"), "Documents", path)
+    if not os.path.isfile(path):
+        return
+    st_before = _stat_or_none(path)
+    try:
+        _load_collage_mpf(path)
+    except Exception as e:
+        failure = _mpf_read_failure(path, e, st_before)
+        if failure is None:
+            raise
+        raise failure from e
+
+
 def _load_collage_mpf(path: str):
     """Return (FigureConfig, dict[name → PIL.Image]) for the .mpf at
     `path`. Caches the parsed result per-process keyed by path and
@@ -7002,6 +7113,12 @@ def _apply_font_pt(cfg, new_pt, element_ids=None):
 
 @app.post("/api/collage/figure-elements")
 def collage_figure_elements(body: "CollageFigureElementsRequest"):
+    _preload_collage_mpf(body.project_path)     # outside the gate: may download
+    with _doc_gate.shared():
+        return _collage_figure_elements(body)
+
+
+def _collage_figure_elements(body: "CollageFigureElementsRequest"):
     """List the editable text elements of a saved .mpf so the collage UI
     can offer per-element font synchronization. Returns id / type / text /
     current font_size for each element."""
@@ -7085,6 +7202,12 @@ def collage_figure_elements(body: "CollageFigureElementsRequest"):
 
 @app.post("/api/collage/render-figure")
 def render_collage_figure(body: CollageFigureRenderRequest):
+    _preload_collage_mpf(body.project_path)     # outside the gate: may download
+    with _doc_gate.shared():
+        return _render_collage_figure(body)
+
+
+def _render_collage_figure(body: CollageFigureRenderRequest):
     """Stateless render of a saved .mpf into a PNG, optionally
     re-targeting all header/label point sizes so multiple figures
     in the same collage end up with visually-uniform header sizes
@@ -7387,6 +7510,12 @@ class CollageDecomposeRequest(BaseModel):
 
 @app.post("/api/collage/decompose")
 def decompose_collage_figure(body: CollageDecomposeRequest):
+    _preload_collage_mpf(body.project_path)     # outside the gate: may download
+    with _doc_gate.shared():
+        return _decompose_collage_figure(body)
+
+
+def _decompose_collage_figure(body: CollageDecomposeRequest):
     """Render a saved .mpf into a header-LESS body PNG plus the geometry
     of every column/row header, so the collage can lay headers out as
     live overlays. This is what makes the 'unify headers' button instant:

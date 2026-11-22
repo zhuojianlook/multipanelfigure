@@ -431,6 +431,26 @@ describe("switching to a tab whose file is not where it was", () => {
     expect(dialogs.confirmThree).not.toHaveBeenCalled();
   });
 
+  it("stored online only and its cloud app could not download it: says so, no Locate…, the tab stays", async () => {
+    await open([A, B], A.id);
+    let label: string | null = null;
+    mockApi.loadProject.mockImplementationOnce(async (path: string) => {
+      label = useCollageStore.getState().docSwapLabel;          // what the shield says meanwhile
+      throw new Error(`API error: "Cloud file could not be downloaded: ${path} (Resource deadlock avoided)"`);
+    });
+    await expect(switchToDocument(B.id)).resolves.toBe(false);
+    expect(label).toBe('Opening "b"…');
+    expect(useCollageStore.getState().docSwapLabel).toBeNull();
+    expect(dialogs.confirmThree).not.toHaveBeenCalled();
+    expect(dialogs.alert).toHaveBeenCalledWith(expect.objectContaining({
+      title: "Could not download the file",
+      body: expect.stringContaining('"b" is stored online only'),
+    }));
+    expect(useCollageStore.getState().activeDocId).toBe(A.id);
+    expect(tabOf(B.id)!.path).toBe(B.path);
+    expect(useCollageStore.getState().missingItemIds).toEqual([]);
+  });
+
   it("found nowhere: Locate… / Close tab / Cancel", async () => {
     await open([A, B], A.id, [figItem("ib", B.path!, "du_b")]);
     files.delete(B.path!);
@@ -475,7 +495,7 @@ describe("switching to a tab whose file is not where it was", () => {
     await expect(switchToDocument(B.id)).resolves.toBe(true);
     await flush();
     expect(tabOf(B.id)!.path).toBe("/elsewhere/other.mpf");
-    expect(mockApi.readWorkflows).toHaveBeenCalledWith("/elsewhere/other.mpf");
+    expect(mockApi.readWorkflows.mock.calls.map((c) => c[0])).toContain("/elsewhere/other.mpf");
     expect(ws().hydrated[B.id]).toBe("done");
   });
 
@@ -489,7 +509,7 @@ describe("switching to a tab whose file is not where it was", () => {
     dialogs.open.mockResolvedValueOnce("/elsewhere/other.mpf");
     await expect(switchToDocument(B.id)).resolves.toBe(true);
     await flush();
-    expect(mockApi.readWorkflows).toHaveBeenCalledWith("/elsewhere/other.mpf");
+    expect(mockApi.readWorkflows.mock.calls.map((c) => c[0])).toContain("/elsewhere/other.mpf");
     expect(ws().docUids[B.id]).toBe("du_other");
     useFigureStore.setState({ unsaved: true });
     await expect(saveDocument(B.id)).resolves.toBe(true);
