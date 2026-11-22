@@ -306,9 +306,16 @@ class _GatedRoute(_APIRoute):
 
 app.router.route_class = _GatedRoute
 
+# Per-launch token from the app that started this engine (empty when run by
+# hand). Echoed by /api/health so the app can tell its own engine from another
+# program answering on the same port. Taken out of os.environ so scripts this
+# engine runs don't inherit it.
+_LAUNCH_TOKEN = os.environ.pop("MPF_LAUNCH_TOKEN", "")
+
+
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "token": _LAUNCH_TOKEN}
 
 
 # Sidecar build identifier — bumped manually each push. Lets the UI verify

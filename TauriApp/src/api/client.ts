@@ -31,22 +31,61 @@ import type {
  *  bodies the api.* wrappers don't expose). Those MUST build their URL from
  *  getApiBase() too — never a hard-coded "http://127.0.0.1:8765".
  *
+ *  The packaged app starts its engine on a free port picked at launch (not
+ *  8765, which another program may hold) and reports it via the
+ *  get_sidecar_info command; initSidecarInfo() below adopts it before the
+ *  first health check, and every direct fetch happens after that.
+ *
  *  Overridable via VITE_API_BASE so a dev frontend can be pointed at its OWN
  *  throwaway sidecar. Without this, `npm run dev` always targets 8765 — the
- *  same port the INSTALLED app's sidecar listens on — so testing against a
- *  running app would silently mutate the user's open figure. VITE_API is
+ *  same port an older installed app's sidecar listens on — so testing against
+ *  a running app would silently mutate the user's open figure. VITE_API is
  *  honoured as a legacy alias (some dialogs used to read it instead), so a
  *  dev setup that only sets one of the two still redirects every request.
- *  Defaults to 8765, so nothing changes for a normal dev run or for the
- *  shipped build. */
+ *  An explicit override always wins over the port Tauri reports. */
 // Cast: this project doesn't pull in vite/client's ImportMeta augmentation.
 const _env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
-const DEFAULT_BASE = _env?.VITE_API_BASE || _env?.VITE_API || "http://127.0.0.1:8765";
+const ENV_BASE = _env?.VITE_API_BASE || _env?.VITE_API || "";
+let DEFAULT_BASE = ENV_BASE || "http://127.0.0.1:8765";
 
 /** Sidecar origin (no trailing slash) for code that has to call fetch()
  *  directly instead of going through apiJson/apiRequest. */
 export function getApiBase(): string {
   return DEFAULT_BASE;
+}
+
+/** Per-launch token of THIS app's engine (null = don't check: dev build or
+ *  plain browser). /api/health must echo it, so another program answering on
+ *  the port is never taken for our engine. */
+let _expectedToken: string | null = null;
+let _sidecarInfo: Promise<void> | null = null;
+
+/** Ask the Tauri side which port/token its engine was started with. Runs
+ *  once; later calls return the same promise. A failure (older backend
+ *  without the command, plain browser) leaves the defaults in place. */
+export function initSidecarInfo(): Promise<void> {
+  if (!_sidecarInfo) {
+    _sidecarInfo = (async () => {
+      const invoke = await getInvoke();
+      if (!invoke) return;
+      try {
+        const info = (await invoke("get_sidecar_info", {})) as { port?: number; token?: string | null };
+        if (!ENV_BASE && typeof info?.port === "number" && info.port > 0) {
+          DEFAULT_BASE = `http://127.0.0.1:${info.port}`;
+        }
+        _expectedToken = info?.token || null;
+      } catch {
+        /* keep defaults */
+      }
+    })();
+  }
+  return _sidecarInfo;
+}
+
+/** True when a /api/health reply came from this app's own engine. */
+export function healthIsOurs(data: { status?: unknown; token?: unknown }, expectedToken: string | null): boolean {
+  if (data?.status !== "ok") return false;
+  return expectedToken === null || data.token === expectedToken;
 }
 
 /** Try to use Tauri invoke for HTTP requests; fall back to browser fetch */
@@ -131,11 +170,16 @@ export let lastHealthError = "";
 /** Check if the sidecar API is reachable */
 export async function checkHealth(): Promise<boolean> {
   try {
+    await initSidecarInfo();
     const text = await apiRequest("/api/health");
     const data = JSON.parse(text);
-    if (data.status === "ok") {
+    if (healthIsOurs(data, _expectedToken)) {
       lastHealthError = "";
       return true;
+    }
+    if (data?.status === "ok") {
+      lastHealthError = `${DEFAULT_BASE} answered, but it is not this app's engine (launch token mismatch)`;
+      return false;
     }
     lastHealthError = `Health response: ${text.substring(0, 200)}`;
     return false;
