@@ -251,6 +251,9 @@ interface FigureState {
   syncToBackend: () => Promise<void>;
 
   saveProject: (path: string) => Promise<boolean>;
+  /** The live document's file is now at `path` (it was renamed or moved
+   *  outside the app and found again by its uid): nothing is loaded or saved. */
+  setCurrentProjectPath: (path: string | null) => void;
   loadProject: (path: string, docId?: string) => Promise<void>;
   /** Restore an in-session document snapshot (a base64 .mpf blob captured
    *  by api.snapshotProject) into the builder. Used by the document-tab
@@ -2077,7 +2080,19 @@ export const useFigureStore = create<FigureState>()(
       let saved: ProjectSaveResponse;
       try {
         await get().syncToBackend();
-        saved = await api.saveProject(path, { carryFrom: prevPath });
+        // The document's uid goes into the file (doc.json), so the file is
+        // still recognised after a rename. Only once its file was read (or it
+        // never had one): until then the tab's uid is a provisional one, and
+        // leaving it out keeps the uid the file already carries. Imported
+        // lazily: the workspace store imports the collage store.
+        const { useAnalysisWorkspaceStore } = await import("./analysisWorkspaceStore");
+        const ws = useAnalysisWorkspaceStore.getState();
+        const read = docId ? ws.hydrated[docId] : undefined;
+        const sendUid = !!docId && (!prevPath || read === "done" || read === "unsupported");
+        saved = await api.saveProject(path, {
+          carryFrom: prevPath,
+          ...(sendUid ? { docUid: ws.uidFor(docId!) } : {}),
+        });
         // The file the sidecar actually wrote (".mpf" added, "~" expanded, a
         // bare name placed in ~/Documents) — the tab and its Analysis follow
         // that path, never the raw text typed in the dialog.
@@ -2096,20 +2111,27 @@ export const useFigureStore = create<FigureState>()(
         return false;
       }
       // The figure is saved. Its Analysis workflows: on a new path, re-key
-      // them to it (and a new document uid on Save As), then write them into
-      // the file. A failure here doesn't undo the figure save — the workflows
-      // stay unsaved and close / quit write (or report) them again.
-      // Imported lazily: the workspace store imports the collage store.
+      // them to it (the tab takes the uid the file was saved under — a new
+      // one for a Save As copy), then write them into the file. A failure
+      // here doesn't undo the figure save — the workflows stay unsaved and
+      // close / quit write (or report) them again.
       if (docId) {
         try {
           const { useAnalysisWorkspaceStore } = await import("./analysisWorkspaceStore");
           await useAnalysisWorkspaceStore.getState().afterDocSaved(docId, prevPath, path,
-            { workflowsCarried: saved?.workflows_carried });
+            {
+              workflowsCarried: saved?.workflows_carried, docUid: saved?.doc_uid, sourceKept: saved?.source_kept,
+              fileId: saved?.file_id,
+            });
         } catch (err) {
           console.error("Saving the Analysis workflows failed", err);
         }
       }
       return true;
+    },
+
+    setCurrentProjectPath: (path) => {
+      if (get().currentProjectPath !== path) set((s) => { s.currentProjectPath = path; });
     },
 
     newBlankFigure: async (docId) => {

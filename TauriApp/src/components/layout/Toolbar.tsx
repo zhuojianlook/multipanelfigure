@@ -179,6 +179,9 @@ import { useFigureStore } from "../../store/figureStore";
 import { SaveFigureDialog } from "../dialogs/SaveFigureDialog";
 import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 import { ensureProjectSaved } from "../../utils/projectNav";
+import { withItemPath } from "../../utils/docLinks";
+import { fileUidOf, registryUidAt } from "../../utils/docIdentity";
+import { useAnalysisWorkspaceStore } from "../../store/analysisWorkspaceStore";
 import { DEFAULT_FIGURE_ID } from "../../utils/figures";
 import { rRerunPng, rRerenderError } from "../../utils/rRerender";
 
@@ -547,6 +550,13 @@ function SaveCollageButton() {
     // Rasterise every page in `nonEmpty` to a base64 PNG (DPI-tagged).
     // The render uses the page's own items / canvas dims / background.
     const renderedPng: { name: string; b64: string; canvasWpx: number; canvasHpx: number }[] = [];
+    // Figures that could not be re-rendered at the export resolution (their
+    // .mpf not found, or the render failed): they go out at screen
+    // resolution, and the user is told which once the export is done.
+    const lowRes: string[] = [];
+    const lowResNote = () => (lowRes.length
+      ? `\n\nExported at screen resolution because their .mpf could not be found or re-rendered: ${lowRes.join(", ")}`
+      : "");
     try {
     for (const __pg of nonEmpty) {
     // Per-page aliases — shadow the outer closure-captured values so the
@@ -586,13 +596,15 @@ function SaveCollageButton() {
           // ~150 dpi while the page is 300 dpi, so MPF text looked soft.)
           const SS = 2;
           const dpi = Math.max(200, Math.min(1200, Math.round(150 * (it.w * factor * SS) / Math.max(1, it.naturalW))));
-          const resp = await api.renderCollageFigure(
-            it.projectPath, pt ?? null, Math.max(0.001, scale), it.w, elementIds,
+          // Its .mpf, found again by its uid if it was renamed or moved.
+          const resp = await withItemPath(it.id, (projectPath) => api.renderCollageFigure(
+            projectPath, pt ?? null, Math.max(0.001, scale), it.w, elementIds,
             overrides as Record<string, unknown> | null, dpi, it.figureId,
-          );
+          ));
           if (resp?.image) hiRes.set(it.id, `data:image/png;base64,${resp.image}`);
         } catch (e) {
           console.warn("[collage] hi-res figure render failed for", it.name, e);
+          if (!lowRes.includes(it.name)) lowRes.push(it.name);
         }
       } else if (it.kind === "image" && it.rCode) {
         try {
@@ -975,7 +987,7 @@ function SaveCollageButton() {
         const summary = outs.length === 1
           ? `Saved ${outs[0].ext.toUpperCase()} to ${savePath}`
           : `Saved ${outs.length} ${outs[0].ext.toUpperCase()} file(s) (one per page) next to ${savePath}`;
-        await alertDialog({ title: "Collage saved", body: `${summary}\n@ ${exportDpi} DPI` });
+        await alertDialog({ title: "Collage saved", body: `${summary}\n@ ${exportDpi} DPI${lowResNote()}` });
       } catch (e) {
         console.error("[collage] save failed", e);
         await alertDialog({ title: "Save failed", body: `Could not write the file(s). ${e instanceof Error ? e.message : String(e)}` });
@@ -990,6 +1002,7 @@ function SaveCollageButton() {
       a.download = outs.length === 1 ? `collage.${o.ext}` : `collage_${o.pageName || `page${i + 1}`}.${o.ext}`;
       a.click();
     }
+    if (lowRes.length) await alertDialog({ title: "Collage exported", body: lowResNote().trim() });
     } finally {
       setExporting(false);
     }
@@ -1107,10 +1120,25 @@ function CollageWorkspaceControls() {
     // Uniqueness check — each figure tab of an .mpf can appear at most once
     // in a collage. If a duplicate exists, offer to refresh that item
     // (re-render with the latest state) instead of adding a second. Items
-    // added before figure tabs carry no figureId = the first figure.
+    // added before figure tabs carry no figureId = the first figure. The
+    // file's document uid goes on the item, so it finds the file again after
+    // a rename; an item whose file went missing (moved, not found) is this
+    // document's when it carries the same uid — it is updated and re-linked.
     const { activeFigureId, figures } = useFigureStore.getState();
-    const existing = useCollageStore.getState().items.find((i) =>
-      i.projectPath === projectPath && (i.figureId ?? DEFAULT_FIGURE_ID) === activeFigureId);
+    const cs0 = useCollageStore.getState();
+    // A tab whose file names another open document's uid (a Finder copy: the
+    // held rule gave it its own) stamps its own: its file is that document's
+    // once it is saved, and a lookup for the original's uid would find the
+    // original's file instead of this one.
+    const fileUid = cs0.activeDocId ? fileUidOf(cs0.activeDocId) : undefined;
+    const tabUid = cs0.activeDocId ? useAnalysisWorkspaceStore.getState().docUids[cs0.activeDocId] : undefined;
+    const projectUid = (fileUid && tabUid && fileUid !== tabUid ? tabUid : fileUid) ?? registryUidAt(projectPath);
+    const sameFigure = (i: { figureId?: string }) => (i.figureId ?? DEFAULT_FIGURE_ID) === activeFigureId;
+    const existing = cs0.items.find((i) => i.projectPath === projectPath && sameFigure(i))
+      ?? (projectUid
+        ? cs0.items.find((i) => i.kind === "figure" && i.projectUid === projectUid
+            && cs0.missingItemIds.includes(i.id) && sameFigure(i))
+        : undefined);
 
     try {
       // Capture the figure as a baked raster (headers included), exactly
@@ -1142,7 +1170,10 @@ function CollageWorkspaceControls() {
           src: `data:image/png;base64,${resp.image}`,
           naturalW,
           naturalH,
+          ...(existing.projectPath !== projectPath ? { projectPath } : {}),
+          ...(projectUid ? { projectUid } : {}),
         });
+        useCollageStore.getState().setItemMissing(existing.id, false);
         setMode("collage");
         return;
       }
@@ -1166,6 +1197,7 @@ function CollageWorkspaceControls() {
         naturalW,
         naturalH,
         projectPath,
+        ...(projectUid ? { projectUid } : {}),
       });
       setMode("collage");
     } catch (e) {

@@ -16,9 +16,11 @@
 
 import { useFigureStore } from "../store/figureStore";
 import { useCollageStore, newDocId } from "../store/collageStore";
-import { api } from "../api/client";
 import { confirm } from "../components/shared/ConfirmDialog";
 import { serializeDocOp } from "./projectNav";
+import { buildRef, registryFileIdAt, registryUidAt } from "./docIdentity";
+import { knownCopies, repointOpenDocs, resolveRefs } from "./docLinks";
+import { basenameOf } from "./workflowPersist";
 
 /** Preference flag: when "1", last session's .mpf tabs reopen on launch. */
 const REOPEN_PREF_KEY = "mpfig_reopen_tabs_v1";
@@ -48,8 +50,12 @@ export function setReopenPref(on: boolean): void {
 /** Mirror the current open .mpf tabs (those backed by a disk path) + the active
  *  doc's path to localStorage. Cheap and idempotent — safe to call on every
  *  document change. Stored regardless of the preference so toggling it on later
- *  (and crash recovery) has data to work with; only RESTORE honours the pref. */
+ *  (and crash recovery) has data to work with; only RESTORE honours the pref.
+ *  Not while last session's record is still to be offered ("Reopen last
+ *  session?" not answered yet): tabs seeded from the collage meanwhile must
+ *  not replace it — a quit or crash at the prompt keeps it for next time. */
 export function persistOpenDocs(): void {
+  if (_restorePending) return;
   try {
     const { openDocs, activeDocId } = useCollageStore.getState();
     const withPath = openDocs.filter((d) => !!d.path);
@@ -96,12 +102,29 @@ const _bootSession: PersistedSession | null = readSession();
  *  even if an effect double-invokes (React StrictMode in dev). */
 let _restoreAttempted = false;
 
+/** Last session's record will be offered (the preference is on and it has
+ *  tabs) and maybeRestoreSession has not settled yet: persistOpenDocs keeps
+ *  it as it is meanwhile (tab seeding from the collage runs asynchronously,
+ *  after AppShell's open-docs subscriber started). */
+let _restorePending = getReopenPref() && !!_bootSession?.docs.length;
+
+/** A file's name without ".mpf" (what a tab named after its file shows). */
+function stem(path: string): string {
+  return basenameOf(path).replace(/\.mpf$/i, "");
+}
+
 /** On launch, when the preference is on, offer to rebuild the document tabs
  *  from the last session.
  *
- *  - Files deleted/moved since last launch are filtered out FIRST (via a cheap
- *    existence check) so they never reopen as phantom tabs. If none survive,
- *    we silently start clean.
+ *  - Each file is looked up FIRST, by the document uid the last-seen table
+ *    saw at its path (one cheap api.resolveMpf call): a file renamed or moved
+ *    since last launch reopens where it is now (found in its folder or where
+ *    it was seen before); one found nowhere is dropped — never a phantom tab
+ *    — and named in the prompt; a path that still holds a file is never
+ *    dropped, even when its uid turned up only in a copy it must not follow.
+ *    If none survive, we silently start clean.
+ *  - Until the prompt is answered, the saved record is not overwritten
+ *    (persistOpenDocs); reopened, the restored tabs are recorded.
  *  - The user is then ASKED whether to reopen the surviving tabs or start with
  *    a blank document (the preference enables the offer; it doesn't force it).
  *
@@ -116,14 +139,54 @@ let _restoreAttempted = false;
 export async function maybeRestoreSession(): Promise<boolean> {
   if (_restoreAttempted) return false; // one shot per launch (guards StrictMode double-invoke)
   _restoreAttempted = true;
+  let built = false;
+  try {
+    return await restoreNow(() => { built = true; });
+  } finally {
+    if (_restorePending) {
+      _restorePending = false;
+      // Reopened: the restored tabs are recorded now (the writes skipped
+      // while the prompt was up). Start fresh / nothing left: last session's
+      // record stays until the tabs next change, as before.
+      if (built) persistOpenDocs();
+    }
+  }
+}
+
+async function restoreNow(onBuilt: () => void): Promise<boolean> {
   if (!getReopenPref()) return false;
   const session = _bootSession;
   if (!session || session.docs.length === 0) return false;
 
-  // Drop docs whose .mpf no longer exists so deleted files don't reopen as
-  // empty phantom tabs.
-  const existMap = await api.pathsExist(session.docs.map((d) => d.path));
-  const liveDocs = session.docs.filter((d) => existMap[d.path]);
+  // Where each .mpf is now. Renamed / moved since last launch: it reopens at
+  // its new path (a tab named after the old file takes the new name). Gone:
+  // dropped, so deleted files don't reopen as empty phantom tabs.
+  const found = await resolveRefs(session.docs.map((d, i) =>
+    buildRef(String(i), d.path, registryUidAt(d.path), [], registryFileIdAt(d.path))));
+  const liveDocs: PersistedDoc[] = [];
+  const moves: { from: string; to: string; uid: string | null; fileId?: string | null }[] = [];
+  const pathFor = new Map<string, string>();
+  const notFound: string[] = [];
+  session.docs.forEach((d, i) => {
+    const r = found[String(i)];
+    // Not into a file the last-seen table saw carrying the uid next to this
+    // one (knownCopies: a Finder copy's original, or the other way round).
+    // Not followed (that, or several / a possible copy: ambiguous) while a
+    // file is still at the path: it reopens there, as before files had uids.
+    const follow = r?.status === "moved" && !!r.path && !knownCopies(d.path, r.path, registryUidAt(d.path));
+    const path = r?.status === "ok" ? d.path
+      : follow ? (r!.path as string)
+      : r?.exists ? d.path : null;
+    if (!path) { notFound.push(basenameOf(d.path) || d.path); return; }
+    pathFor.set(d.path, path);
+    if (liveDocs.some((x) => x.path === path)) return;        // two entries, one file
+    if (path !== d.path) {
+      moves.push({ from: d.path, to: path, uid: r?.uid ?? null, ...(r?.file_id ? { fileId: r.file_id } : {}) });
+      liveDocs.push({ ...d, path, name: !d.name || d.name === stem(d.path) ? stem(path) : d.name });
+    } else {
+      liveDocs.push(d);
+    }
+  });
   if (liveDocs.length === 0) return false; // nothing left → start clean
 
   // Even with the preference on, confirm before reopening so the user can
@@ -132,7 +195,8 @@ export async function maybeRestoreSession(): Promise<boolean> {
   const ok = await confirm({
     title: "Reopen last session?",
     body: `You have ${n} saved figure ${n === 1 ? "tab" : "tabs"} from your last session.\n\n`
-      + "Reopen them, or start with a blank document?",
+      + "Reopen them, or start with a blank document?"
+      + (notFound.length ? `\n\nNot found (moved or deleted): ${notFound.join(", ")}` : ""),
     confirmLabel: n === 1 ? "Reopen tab" : `Reopen ${n} tabs`,
     cancelLabel: "Start fresh",
   });
@@ -141,12 +205,19 @@ export async function maybeRestoreSession(): Promise<boolean> {
   // Build the tabs + load the active doc as ONE serialized operation, so a tab
   // click during the (slow) active load can't race the backend and leave the
   // session half-restored.
-  return serializeDocOp(async () => {
+  return await serializeDocOp(async () => {
     const cs = useCollageStore.getState();
+    // Files found at a new path: what still names the old one follows them
+    // (a tab seeded from the collage meanwhile, collage figures, the labels
+    // kept under the old path, the last-seen table) — before any tab opens.
+    // Computed before the prompt: a move another one (seeding) already made
+    // finds that path taken by the file now there, and leaves it.
+    repointOpenDocs(moves);
     // Pick which doc lands in the builder: the previously-active one if it still
-    // exists, else the first surviving one.
-    const activePath = (session.activePath && liveDocs.some((d) => d.path === session.activePath))
-      ? session.activePath
+    // exists (wherever it is now), else the first surviving one.
+    const wasActive = session.activePath ? pathFor.get(session.activePath) : undefined;
+    const activePath = wasActive && liveDocs.some((d) => d.path === wasActive)
+      ? wasActive
       : liveDocs[0].path;
 
     // Shape the tab strip to its FINAL form in one synchronous batch — add the
@@ -182,6 +253,7 @@ export async function maybeRestoreSession(): Promise<boolean> {
     }
     useCollageStore.getState().docSetActive(activeId);
     useCollageStore.getState().setMode("builder");
+    onBuilt();
 
     // Now fill the builder with the active doc's content.
     try {

@@ -2,6 +2,7 @@
    write/read) — what the sidecar receives and how its answers map. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "./client";
+import { isMissingFileError, isOtherDocumentError } from "../utils/docIdentity";
 
 let fetchMock: ReturnType<typeof vi.fn>;
 
@@ -63,6 +64,16 @@ describe("api.writeWorkflows", () => {
     expect(r).toEqual({ ok: true, size_bytes: 10, workflows_bytes: 4, missing_uploads: [], fast_path: true });
   });
 
+  it("sends doc_uid only when given (a doc.json naming another uid is rewritten to it)", async () => {
+    respond({ ok: true, size_bytes: 10, workflows_bytes: 4, missing_uploads: [], fast_path: false, doc_uid: "du_v" });
+    respond({ ok: true, size_bytes: 10, workflows_bytes: 4, missing_uploads: [], fast_path: true, doc_uid: "du_v" });
+    const r = await api.writeWorkflows("/a.mpf", payload, { docUid: "du_v" });
+    await api.writeWorkflows("/a.mpf", payload, {});
+    expect(sent(0).body).toEqual({ path: "/a.mpf", ...payload, doc_uid: "du_v" });
+    expect(sent(1).body).toEqual({ path: "/a.mpf", ...payload });
+    expect(r).toMatchObject({ ok: true, doc_uid: "du_v" });
+  });
+
   it("maps a 409 for kept blobs the file lacks to {ok: false, missing}", async () => {
     respond({ detail: { missing: ["b2"] } });
     expect(await api.writeWorkflows("/a.mpf", payload)).toEqual({ ok: false, missing: ["b2"] });
@@ -71,6 +82,15 @@ describe("api.writeWorkflows", () => {
   it("maps a newer-format file to {ok: false, unsupported}", async () => {
     respond({ detail: { unsupported: true, version: 2 } });
     expect(await api.writeWorkflows("/a.mpf", payload)).toEqual({ ok: false, unsupported: true, version: 2 });
+  });
+
+  it("sends expect_uid when given; a file naming another document rejects (nothing written)", async () => {
+    respond({ detail: { other_document: "du_w" } });
+    const p = api.writeWorkflows("/a.mpf", payload, { docUid: "du_v", expectUid: "du_a" });
+    const err = await p.catch((e: unknown) => e);
+    expect(sent().body).toEqual({ path: "/a.mpf", ...payload, doc_uid: "du_v", expect_uid: "du_a" });
+    expect(isOtherDocumentError(err)).toBe(true);
+    expect(isMissingFileError(err)).toBe(false);
   });
 
   it("rejects on any other error", async () => {

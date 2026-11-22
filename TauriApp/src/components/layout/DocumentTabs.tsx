@@ -31,6 +31,7 @@ import { useCollageStore } from "../../store/collageStore";
 import { useAnalysisWorkspaceStore, untitledAnalysisDocIds } from "../../store/analysisWorkspaceStore";
 import { enterCollage, enterAnalysis, switchToDocument, newBlankDoc, closeDoc, saveDocument } from "../../utils/projectNav";
 import { getReopenPref, setReopenPref } from "../../utils/sessionRestore";
+import { seedTabsFromCollage } from "../../utils/docLinks";
 import { dropSlot, moveToSlot } from "../../utils/tabReorder";
 import { RecordAppButton, DEV_OPTIONS_KEY } from "./Toolbar";
 
@@ -247,7 +248,9 @@ export function DocumentTabs() {
 
   // Seed tabs once from persisted collage figure items, so figures that
   // survived a reload still appear as openable document tabs. Only adds
-  // missing paths; never reorders or removes.
+  // missing paths; never reorders or removes. Each file is looked up by its
+  // uid first (docLinks.seedTabsFromCollage): one renamed or moved while the
+  // app was closed opens at its new path, one that is gone gets no tab.
   const seeded = useRef(false);
   useEffect(() => {
     if (seeded.current) return;
@@ -257,9 +260,7 @@ export function DocumentTabs() {
     // If the builder already has a project loaded, reflect it on the
     // initial Untitled tab rather than leaving a stale "Untitled".
     if (cur && cs.activeDocId) cs.docSetPath(cs.activeDocId, cur);
-    for (const it of cs.items) {
-      if (it.kind === "figure" && it.projectPath) cs.docEnsure(it.projectPath);
-    }
+    void seedTabsFromCollage();
   }, []);
 
   const tabSx = (active: boolean) => ({

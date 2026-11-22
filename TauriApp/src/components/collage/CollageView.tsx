@@ -61,6 +61,7 @@ import { api } from "../../api/client";
 import { sortFontList, pickDefaultFont } from "../../utils/fontList";
 import { alert as alertDialog } from "../shared/ConfirmDialog";
 import { openProjectIntoTab } from "../../utils/projectNav";
+import { withItemPath } from "../../utils/docLinks";
 import { rRerenderError, rPlotNotRerenderable } from "../../utils/rRerender";
 
 type Corner = "nw" | "ne" | "sw" | "se";
@@ -534,10 +535,11 @@ export function CollageView() {
     const elementIds = sel ? Object.keys(sel).filter((k) => sel[k]) : null;
     const overrides = useCollageStore.getState().elemOverridesByItem[itemId] || null;
     try {
-      const resp = await api.renderCollageFigure(
-        it.projectPath, pt ?? null, Math.max(0.001, scale), it.w, elementIds,
+      // Its .mpf, found again by its uid if it was renamed or moved.
+      const resp = await withItemPath(itemId, (projectPath) => api.renderCollageFigure(
+        projectPath, pt ?? null, Math.max(0.001, scale), it.w, elementIds,
         overrides as Record<string, unknown> | null, undefined, it.figureId,
-      );
+      ));
       if (resp?.image && resp.width && resp.height) {
         updateItem(itemId, {
           src: `data:image/png;base64,${resp.image}`,
@@ -563,7 +565,7 @@ export function CollageView() {
     if (it && it.kind === "figure" && it.projectPath) {
       setElemSyncItem(it.id);
       if (!elemListByItem[it.id]) {
-        api.getFigureElements(it.projectPath, it.figureId)
+        withItemPath(it.id, (projectPath) => api.getFigureElements(projectPath, it.figureId))
           .then(({ elements }) => setElemList(it.id, elements))
           .catch((e) => console.error("[collage] load elements (select) failed", e));
       }

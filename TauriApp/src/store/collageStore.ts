@@ -126,6 +126,11 @@ export type CollageItem = {
    *  editor. Doubles as a uniqueness key — a single .mpf can appear
    *  at most once in the collage. Null for image-kind items. */
   projectPath: string | null;
+  /** The document uid of that .mpf (utils/docIdentity) when it was added or
+   *  last re-saved — how the item finds its file again after the file is
+   *  renamed or moved outside the app (projectPath is only where it was).
+   *  Absent on items added before 0.1.426, filled in once their file is seen. */
+  projectUid?: string;
   /** Figure tab of that .mpf this item shows (utils/figures.ts). Absent on
    *  items added before figure tabs = the project's first figure, which is
    *  the only figure such a project had. With projectPath it is the item's
@@ -519,6 +524,10 @@ export type CollageState = {
    *  dirty tab). Reactive mirror of projectNav's snapshot map so tabs can
    *  show an unsaved dot. Session-only, never persisted. */
   snapshotDirtyDocIds: string[];
+  /** Figure items whose .mpf could not be found (moved, renamed or deleted
+   *  outside the app, and not found by its uid). Session-only, never
+   *  persisted: looked for again on the next launch. */
+  missingItemIds: string[];
 
   /** Per-element font-sync state (shared so the canvas can overlay
    *  clickable hotspots in sync with the sidebar checkboxes). Session-only.
@@ -544,6 +553,9 @@ export type CollageState = {
 
   addItem: (item: Omit<CollageItem, "id" | "z" | "rotation" | "kind" | "projectPath"> & Partial<Pick<CollageItem, "rotation" | "kind" | "projectPath">>) => string;
   updateItem: (id: string, patch: Partial<CollageItem>) => void;
+  /** Mark (or clear) figure item `id` as having no .mpf to be found
+   *  (missingItemIds). */
+  setItemMissing: (id: string, missing: boolean) => void;
   removeItem: (id: string) => void;
   moveItem: (id: string, dx: number, dy: number) => void;
   bringToFront: (id: string) => void;
@@ -912,6 +924,7 @@ export const useCollageStore = create<CollageState>()(
     openDocs: [{ id: "doc_initial", path: null, name: "Untitled_1", seq: 0 }],
     activeDocId: "doc_initial",
     snapshotDirtyDocIds: [],
+    missingItemIds: [],
     docSwapBusy: false,
     elemSyncItemId: null,
     elemListByItem: {},
@@ -957,11 +970,20 @@ export const useCollageStore = create<CollageState>()(
       persist(get());
     },
 
+    setItemMissing: (id, missing) => {
+      if (get().missingItemIds.includes(id) === missing) return;
+      // Session-only: no persist().
+      set((s) => {
+        s.missingItemIds = missing ? [...s.missingItemIds, id] : s.missingItemIds.filter((x) => x !== id);
+      });
+    },
+
     removeItem: (id) => {
       set((s) => {
         s.items = s.items.filter((i) => i.id !== id);
         s.selectedIds = s.selectedIds.filter((x) => x !== id);
         if (s.selectedId === id) s.selectedId = s.selectedIds[s.selectedIds.length - 1] ?? null;
+        if (s.missingItemIds.includes(id)) s.missingItemIds = s.missingItemIds.filter((x) => x !== id);
       });
       persist(get());
     },
@@ -1081,7 +1103,7 @@ export const useCollageStore = create<CollageState>()(
     },
 
     clear: () => {
-      set((s) => { s.items = []; s.selectedId = null; s.selectedIds = []; });
+      set((s) => { s.items = []; s.selectedId = null; s.selectedIds = []; s.missingItemIds = []; });
       persist(get());
     },
 

@@ -55,6 +55,8 @@ from models import (
     WORKFLOWS_PREFIX, WORKFLOWS_MANIFEST, WORKFLOWS_UPLOADS, WORKFLOWS_FORMAT,
     WORKFLOWS_VERSION, WORKFLOW_BLOB_KINDS, workflow_blob_member, workflow_member_plan,
     write_zip_members, copy_zip_member, read_workflow_members, workflows_manifest_status,
+    new_doc_uid, valid_doc_uid, make_doc_meta, read_doc_meta, doc_meta_uid, read_doc_uid,
+    read_mpf_uid, write_doc_meta, DOC_META_MEMBER,
 )
 from image_processing import process_panel
 from figure_builder import assemble_figure
@@ -251,6 +253,9 @@ _GATE_EXEMPT = frozenset({
     "/api/figure/render-video/{job_id}/progress",
     "/api/figure/render-video/{job_id}/cancel",
     "/api/fs/exists",
+    # Reads only .mpf files on disk (and its own id cache); a folder scan
+    # must never hold the shared gate.
+    "/api/fs/mpf-resolve",
     "/api/analysis/check-r", "/api/analysis/run-r",
     "/api/analysis/r-deps", "/api/analysis/r-deps/install",
     "/api/analysis/run-console",
@@ -310,7 +315,7 @@ async def health():
 # which sidecar binary is actually running (auto-updater bundles can drift
 # from the frontend if a CI build is partial / cached). Surfaced by the
 # Plugins dialog + the fluor picker's repair flow.
-SIDECAR_BUILD = "0.1.425"  # CI re-syncs this from the release tag (build-sidecar)
+SIDECAR_BUILD = "0.1.426"  # CI re-syncs this from the release tag (build-sidecar)
 
 
 @app.get("/api/version")
@@ -4715,6 +4720,55 @@ import zlib as _zlib_wf
 _mpf_write_lock = _threading.Lock()
 
 
+# ── .mpf ids on disk (doc.json, see models.DOC_META_MEMBER) ─────────────────
+# Finding a renamed or moved document means reading the id of many files, so
+# the id read from each file is cached against its (mtime, size) and dropped
+# whenever this process writes that file. Cloud placeholders (a file the sync
+# client has not downloaded) are never opened: reading one would start a
+# download, and the user's files live in Dropbox. Their id counts as unknown.
+_mpf_uid_cache: Dict[str, tuple] = {}     # abspath -> (st_mtime_ns, st_size, uid | None)
+_mpf_uid_lock = _threading.Lock()
+_MPF_UID_CACHE_MAX = 4096
+_SF_DATALESS = 0x40000000                 # macOS st_flags: contents not on disk
+# Windows: FILE_ATTRIBUTE_OFFLINE, _RECALL_ON_OPEN, _RECALL_ON_DATA_ACCESS.
+_WIN_PLACEHOLDER_ATTRS = 0x1000 | 0x40000 | 0x400000
+
+
+def _mpf_uid_forget(path: str) -> None:
+    with _mpf_uid_lock:
+        _mpf_uid_cache.pop(os.path.abspath(path), None)
+
+
+def _is_cloud_placeholder(st) -> bool:
+    if (getattr(st, "st_flags", 0) or 0) & _SF_DATALESS:
+        return True
+    return bool((getattr(st, "st_file_attributes", 0) or 0) & _WIN_PLACEHOLDER_ATTRS)
+
+
+def _peek_uid(path: str, st=None) -> Optional[str]:
+    """The id of the .mpf at `path` (models.read_mpf_uid), cached. None for
+    a file without one, an unreadable file and a cloud placeholder."""
+    try:
+        if st is None:
+            st = os.stat(path)
+    except OSError:
+        return None
+    if _is_cloud_placeholder(st):
+        return None
+    key = os.path.abspath(path)
+    sig = (st.st_mtime_ns, st.st_size)
+    with _mpf_uid_lock:
+        hit = _mpf_uid_cache.get(key)
+        if hit is not None and hit[:2] == sig:
+            return hit[2]
+    uid = read_mpf_uid(path)
+    with _mpf_uid_lock:
+        if len(_mpf_uid_cache) >= _MPF_UID_CACHE_MAX:
+            _mpf_uid_cache.clear()
+        _mpf_uid_cache[key] = (sig[0], sig[1], uid)
+    return uid
+
+
 def _norm_mpf_path(raw: str, *, ensure_ext: bool = True) -> str:
     """The on-disk path a request means: ~ expanded, a bare file name placed
     in ~/Documents and, for a save (ensure_ext), exactly one .mpf extension."""
@@ -4829,6 +4883,101 @@ def _carry_members(src: str, dst: str, prefixes) -> int:
     return n
 
 
+def _same_file(a: str, b: str) -> bool:
+    """Whether two paths name one file (a symlink, another spelling on a
+    case-insensitive volume). Falls back to comparing the paths when either
+    is missing. On a volume that reports no inode numbers (st_ino 0: some
+    SMB / WebDAV / cloud drives on Windows) the inodes can't tell two files
+    apart — samestat would call every pair on it one file — so the real
+    paths are compared, as _file_key does."""
+    try:
+        if os.path.exists(a) and os.path.exists(b):
+            sa, sb = os.stat(a), os.stat(b)
+            if sa.st_ino and sb.st_ino:
+                return os.path.samestat(sa, sb)
+            return (os.path.normcase(os.path.realpath(a))
+                    == os.path.normcase(os.path.realpath(b)))
+    except OSError:
+        pass
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _file_id(p: Optional[str]) -> Optional[str]:
+    """The physical file at `p` as "dev:ino" — what tells a file renamed or
+    moved on its volume (same inode) from a Finder / Dropbox copy of it (a
+    new one) when both carry one document id. Every write of a .mpf here
+    replaces it (_commit_mpf: os.replace), so a write reports the new one.
+    None when it can't be stat'ed or the volume reports no inode numbers."""
+    if not p:
+        return None
+    try:
+        st = os.stat(p)
+    except OSError:
+        return None
+    return f"{st.st_dev}:{st.st_ino}" if st.st_ino else None
+
+
+def _save_identity(requested: Optional[str], carry_src: Optional[str], path: str,
+                   carry_from: Optional[str] = None):
+    """(uid, uid_minted, doc_meta) for a figure save to `path`.
+
+    - Save As (the previous file `carry_src` is another file that still
+      exists and is this document, or has no id): the copy is a new
+      document, so it gets a new id in this same write.
+    - Otherwise the requested id (the tab's), when valid.
+    - Without one, the id `path` already has when this save is a re-save of
+      it (`carry_from` omitted, or naming `path`): a request without an id
+      never changes a file's id. Over another file (the document's previous
+      one is gone, or it never had one) the content is not the document
+      that file was: a new id, not the one it overwrites.
+    A previous file that is gone (renamed or deleted outside the app) is not
+    a copy: the document moved and keeps its id. `uid_minted` is True when
+    the saved id is not the one requested. The file's doc.json "created" is
+    kept while its id stays the same."""
+    want = requested if valid_doc_uid(requested) else None
+    # The previous file is the target itself (a plain re-save): the save
+    # reads it anyway, to carry its saved Analysis over.
+    own = bool(carry_src) and _same_file(carry_src, path)
+    is_copy = False
+    if carry_src and not own:
+        src_uid = read_mpf_uid(carry_src)
+        if src_uid is None or src_uid == (want or src_uid):
+            is_copy = True
+    if is_copy:
+        uid = new_doc_uid()
+    elif want:
+        uid = want
+    else:
+        if carry_from is None:
+            resave = True
+        elif carry_from.strip():
+            resave = _same_file(_norm_mpf_path(carry_from, ensure_ext=False), path)
+        else:
+            resave = False
+        uid = (read_mpf_uid(path) if resave and os.path.isfile(path) else None) or new_doc_uid()
+    created = None
+    # The file being replaced is opened only to keep its "created", which it
+    # holds only under the id kept: never for a Save As copy (its id is new,
+    # no file has it yet), and not when it is a cloud placeholder (a file
+    # the sync client has not downloaded) the save would not read anyway —
+    # opening it would download all of it, under the doc gate, only for it
+    # to be replaced. "created" then starts again.
+    try:
+        readable = (not is_copy and os.path.isfile(path)
+                    and (own or not _is_cloud_placeholder(os.stat(path))))
+    except OSError:
+        readable = False
+    if readable:
+        try:
+            with _zipfile.ZipFile(path, "r") as zf:
+                meta = read_doc_meta(zf)
+        except Exception:
+            meta = None
+        if doc_meta_uid(meta) == uid and isinstance(meta.get("created"), str):
+            created = meta["created"]
+    return uid, uid != want, make_doc_meta(uid, created)
+
+
 class ProjectSaveRequest(BaseModel):
     path: str
     # Optional analysis payload. Shape:
@@ -4845,6 +4994,13 @@ class ProjectSaveRequest(BaseModel):
     # into the saved file. Omitted/null = carry from `path` itself (a plain
     # re-save); "" = carry nothing (a document that never had a file).
     carry_from: Optional[str] = None
+    # The document's id (the tab's "du_…"), written to doc.json. Omitted: a
+    # re-save keeps the id the file has (a tab whose file was not read yet
+    # must not replace it); over another file it gets a new one. A Save As
+    # copy gets a new id whatever is sent; the response says which id was
+    # written (doc_uid, uid_minted) and whether the previous file is another
+    # one still there (source_kept).
+    doc_uid: Optional[str] = None
 
 
 @app.post("/api/project/save")
@@ -4885,6 +5041,13 @@ def save_proj(body: ProjectSaveRequest):
     # (workflows/) and a legacy analysis/ section are carried from disk.
     prefixes = (WORKFLOWS_PREFIX,) if analysis_payload else ("analysis/", WORKFLOWS_PREFIX)
     carry_src = _carry_source(body.carry_from, path)
+    # The id written to doc.json: decided from the request and the files on
+    # disk, never held in the sidecar's document state.
+    uid, uid_minted, doc_meta = _save_identity(body.doc_uid, carry_src, path, body.carry_from)
+    # Whether the document's previous file is another file that is still
+    # there (a Save As, whatever id the copy gets): it keeps its local
+    # Analysis labels too. Gone, or the same file: the document moved.
+    source_kept = bool(carry_src) and not _same_file(carry_src, path)
 
     # Pre-flight disk-space check. Project file size ≈ sum of all image
     # bytes (+ carried members) plus ~10% overhead for config JSON + ZIP
@@ -4900,7 +5063,7 @@ def save_proj(body: ProjectSaveRequest):
         tmp = _mpf_temp_path(path)
         try:
             save_project(cfg, img_bytes, tmp, custom_fonts or None, analysis_payload,
-                         channel_data=channel_data)
+                         channel_data=channel_data, doc_meta=doc_meta)
             if carry_src:
                 try:
                     _carry_members(carry_src, tmp, prefixes)
@@ -4911,7 +5074,7 @@ def save_proj(body: ProjectSaveRequest):
                     print(f"[save_proj] could not carry members from {carry_src}: {carry_error}",
                           file=_sys.stderr, flush=True)
                     save_project(cfg, img_bytes, tmp, custom_fonts or None, analysis_payload,
-                                 channel_data=channel_data)
+                                 channel_data=channel_data, doc_meta=doc_meta)
             # Verify the file was written before it replaces the previous one.
             if os.path.getsize(tmp) == 0:
                 raise HTTPException(500, f"Save failed: file at {path} is empty or missing (possible disk-full or permission issue).")
@@ -4926,8 +5089,11 @@ def save_proj(body: ProjectSaveRequest):
         except BaseException:
             _unlink_quiet(tmp)
             raise
+        finally:
+            _mpf_uid_forget(path)
     out = {"ok": True, "path": path, "size_bytes": os.path.getsize(path),
-           "workflows_carried": workflows_carried}
+           "workflows_carried": workflows_carried, "doc_uid": uid, "uid_minted": uid_minted,
+           "source_kept": source_kept, "file_id": _file_id(path)}
     if carry_error:
         out["carry_error"] = carry_error
     return out
@@ -4953,6 +5119,17 @@ class WorkflowsWriteRequest(BaseModel):
     blobs: Dict[str, dict] = Field(default_factory=dict)
     # Analysis-store upload names whose original files are embedded.
     uploads: List[str] = Field(default_factory=list)
+    # The id this manifest is written under (its docUid). A doc.json naming
+    # another id is rewritten to it in the same write: a tab the held rule
+    # gave an id of its own (a Finder copy opened beside its original)
+    # becomes that document on disk, as its next figure save would make it.
+    # Omitted, or the file has no doc.json: doc.json is left as it is.
+    doc_uid: Optional[str] = None
+    # The id the caller's file named when last read or written. The file now
+    # names another (renamed or replaced outside the app — another document
+    # has its name): 409 {"other_document": <its id>}, nothing written. A
+    # file naming no id counts as a match.
+    expect_uid: Optional[str] = None
 
 
 def _decode_workflow_blobs(raw: Dict[str, dict]) -> Dict[str, tuple]:
@@ -5090,14 +5267,19 @@ def _plan_workflow_uploads(members, old_manifest, names, origs, shas, opened):
     return kept + new, entries, missing
 
 
-def _rewrite_workflows_full(path: str, zs, plan) -> str:
+def _rewrite_workflows_full(path: str, zs, plan, doc_meta: Optional[dict] = None) -> str:
     """Baseline rewrite: every non-workflows/ member copied into a new zip,
-    then the new workflows/ section. Returns the temp path."""
+    then the new workflows/ section. With `doc_meta`, a new doc.json heads
+    the file in place of the old one. Returns the temp path."""
     tmp = _mpf_temp_path(path)
     try:
         with _zipfile.ZipFile(tmp, "w", _zipfile.ZIP_DEFLATED) as zd:
             zd.comment = zs.comment
+            if doc_meta is not None:
+                write_doc_meta(zd, doc_meta)
             for info in zs.infolist():
+                if doc_meta is not None and info.filename == DOC_META_MEMBER:
+                    continue
                 if not info.filename.startswith(WORKFLOWS_PREFIX):
                     copy_zip_member(zs, info, zd)
             write_zip_members(zd, plan, src_zf=zs)
@@ -5170,8 +5352,11 @@ _WF_TAIL_REWRITE = True
 
 
 def _rewrite_workflows(path: str, manifest: dict, blobs: Dict[str, tuple],
-                       uploads: List[str]) -> dict:
-    """Atomically replace the workflows/ section of the .mpf at `path`."""
+                       uploads: List[str], doc_uid: Optional[str] = None,
+                       expect_uid: Optional[str] = None) -> dict:
+    """Atomically replace the workflows/ section of the .mpf at `path` (and
+    its doc.json, when it names another id than `doc_uid`). The file names
+    another id than `expect_uid`: 409 {"other_document": id}, untouched."""
     st = _analysis_store
     origs = dict(st.get("orig_files") or {})
     shas = dict(st.get("orig_sha") or {})
@@ -5187,7 +5372,27 @@ def _rewrite_workflows(path: str, manifest: dict, blobs: Dict[str, tuple],
                     raise HTTPException(400, f"Not a readable .mpf ({path}): {e}")
                 with zs:
                     members = {i.filename: i for i in zs.infolist()}
+                    # The file's doc.json names another document than the one
+                    # writing its Analysis (a Finder copy opened beside its
+                    # original keeps an id of its own — the held rule): it
+                    # follows, so the file's two copies of its id never
+                    # disagree and its next read is not taken for the
+                    # original. doc.json heads the file, so only the full
+                    # rewrite can replace it. A file without one is left
+                    # without: its id is the manifest's, written now.
+                    file_uid = doc_meta_uid(read_doc_meta(zs)) if DOC_META_MEMBER in members else None
                     old_manifest = _existing_workflows_manifest(zs, members)
+                    # Another document now has the caller's file name: never
+                    # written over (nor its doc.json re-identified) — the
+                    # caller looks for its own file. Checked under the lock.
+                    m_uid = old_manifest.get("docUid") if old_manifest else None
+                    cur = file_uid or (m_uid if valid_doc_uid(m_uid) else None)
+                    if valid_doc_uid(expect_uid) and cur and cur != expect_uid:
+                        raise HTTPException(409, {"other_document": cur})
+                    doc_meta = None
+                    if valid_doc_uid(doc_uid) and file_uid and file_uid != doc_uid:
+                        doc_meta = make_doc_meta(doc_uid)
+                        file_uid = doc_uid
                     blob_items, missing = _plan_workflow_blobs(zs, members, blobs)
                     if missing:
                         raise HTTPException(409, {"missing": missing})
@@ -5205,7 +5410,7 @@ def _rewrite_workflows(path: str, manifest: dict, blobs: Dict[str, tuple],
                                       os.path.getsize(path) + new_bytes + 16 * 1024 * 1024,
                                       "workflows/write")
                     tmp = None
-                    if _WF_TAIL_REWRITE:
+                    if _WF_TAIL_REWRITE and doc_meta is None:
                         try:
                             tmp = _rewrite_workflows_fast(path, src_f, zs, plan)
                         except Exception as e:
@@ -5214,7 +5419,7 @@ def _rewrite_workflows(path: str, manifest: dict, blobs: Dict[str, tuple],
                             tmp = None
                     fast = tmp is not None
                     if tmp is None:
-                        tmp = _rewrite_workflows_full(path, zs, plan)
+                        tmp = _rewrite_workflows_full(path, zs, plan, doc_meta)
             finally:
                 src_f.close()
             try:
@@ -5231,8 +5436,13 @@ def _rewrite_workflows(path: str, manifest: dict, blobs: Dict[str, tuple],
                     f.close()
                 except OSError:
                     pass
+            # A file without doc.json has its id in the manifest just written.
+            _mpf_uid_forget(path)
+    # doc_uid: what the file's doc.json names now (None: it has none, and its
+    # id is the manifest's docUid). file_id: the file just put in place.
     return {"ok": True, "size_bytes": os.path.getsize(path), "workflows_bytes": wf_bytes,
-            "missing_uploads": missing_uploads, "fast_path": fast}
+            "missing_uploads": missing_uploads, "fast_path": fast, "doc_uid": file_uid,
+            "file_id": _file_id(path)}
 
 
 @app.post("/api/project/workflows/write")
@@ -5242,12 +5452,17 @@ def write_workflows(body: WorkflowsWriteRequest):
     Shared gate (default wrap): reads only disk and the Analysis store's
     upload originals. 404 when the file is missing; 409 {"missing": [...]}
     for kept blobs the file doesn't hold; 409 {"unsupported": true} for a
-    file whose workflows were written by a newer format."""
+    file whose workflows were written by a newer format; 409
+    {"other_document": id} when the file names another id than
+    `expect_uid`. `doc_uid`: a doc.json naming another id is rewritten to
+    it (full rewrite); the response's doc_uid is what doc.json names after
+    the write."""
     path = _norm_mpf_path(body.path, ensure_ext=False)
     if not os.path.isfile(path):
         raise HTTPException(404, f"Project file not found: {path}")
     blobs = _decode_workflow_blobs(body.blobs)
-    return _rewrite_workflows(path, dict(body.manifest), blobs, list(body.uploads))
+    return _rewrite_workflows(path, dict(body.manifest), blobs, list(body.uploads), body.doc_uid,
+                              body.expect_uid)
 
 
 class WorkflowsReadRequest(BaseModel):
@@ -5381,11 +5596,11 @@ def _register_restored_uploads(path: str, entries) -> dict:
 def read_workflows(body: WorkflowsReadRequest):
     """The workflows/ section of a .mpf: {manifest | null, blobs: {id: {kind,
     data}}, unsupported, uploads: [{name, thumbnail, size}], renamed: {old:
-    new}, missing_uploads, failed_uploads}. Reads only workflows/* (never the
-    figure). Embedded uploads are restored into the Analysis store; a name
-    already taken by different content comes back as `stem (2).ext` in
-    `renamed`, for the caller to rewrite in that document's workflows.
-    Self-gated: parsed outside the gate, exclusive only around the ingest."""
+    new}, missing_uploads, failed_uploads, doc_uid}. Reads only workflows/*
+    and doc.json (never the figure). Embedded uploads are restored into the
+    Analysis store; a name already taken by different content comes back as
+    `stem (2).ext` in `renamed`, for the caller to rewrite in that
+    document's workflows. Self-gated: parsed outside the gate, exclusive only around the ingest."""
     path = _norm_mpf_path(body.path, ensure_ext=False)
     if not os.path.isfile(path):
         raise HTTPException(404, f"Project file not found: {path}")
@@ -5398,9 +5613,11 @@ def read_workflows(body: WorkflowsReadRequest):
         data = (base64.b64encode(raw).decode("ascii") if kind == "png"
                 else raw.decode("utf-8", errors="replace"))
         blobs_out[bid] = {"kind": kind, "data": data}
+    # The file's own id (doc.json only, no manifest fallback, so the caller
+    # can tell the two apart), whatever the state of its workflows/ section.
     out = {"manifest": wf["manifest"], "blobs": blobs_out, "unsupported": wf["unsupported"],
            "version": wf["version"], "uploads": [], "renamed": {}, "missing_uploads": [],
-           "failed_uploads": []}
+           "failed_uploads": [], "doc_uid": read_doc_uid(path), "file_id": _file_id(path)}
     ups = wf["manifest"].get("uploads") if isinstance(wf["manifest"], dict) else None
     if isinstance(ups, list) and ups:
         try:
@@ -5613,6 +5830,251 @@ def fs_exists(body: PathsExistRequest):
         except Exception:
             out[raw] = False
     return {"exists": out}
+
+
+# ── Finding a document after its file was renamed or moved ──────────────────
+# The frontend knows each document by path and by id (doc.json). The path
+# wins: a file at the path is used unless it holds a DIFFERENT id and the
+# wanted id is positively found in another file. Otherwise the id is looked
+# for in the caller's candidate paths (where the app last saw that id), then
+# in a few folders (the path's own, the candidates', the caller's extra
+# ones). No recursion and no Spotlight: each folder is listed once per
+# request, newest .mpf first, with hard caps on files and time so a large or
+# slow (cloud) folder can never stall the app.
+import stat as _stat_rs
+import time as _time_rs
+
+
+# Lenient (null = absent): a request this model rejects would leave the
+# caller with its path-only fallback for every ref.
+class MpfRef(BaseModel):
+    key: str
+    path: Optional[str] = ""
+    uid: Optional[str] = None
+    candidates: Optional[List[str]] = None   # best first
+    dirs: Optional[List[str]] = None
+    # The physical file `path` last named (_file_id), when known: a single
+    # other file carrying the id is followed only when it is that very file,
+    # and among several, the one that is that very file is followed.
+    file_id: Optional[str] = None
+
+
+class MpfResolveRequest(BaseModel):
+    refs: List[MpfRef] = Field(default_factory=list)
+    scan: Optional[bool] = True
+
+
+_RESOLVE_MAX_FOLDERS = 8         # per ref
+_RESOLVE_MAX_CANDIDATES = 32     # per ref
+_RESOLVE_MAX_FILES = 400         # per folder, newest first
+_RESOLVE_BUDGET_S = 2.0          # per request
+
+
+def _resolve_norm(raw: Optional[str]) -> str:
+    """A ref path as /api/fs/exists reads it ("" for none)."""
+    p = os.path.expanduser((raw or "").strip())
+    if p and not os.path.dirname(p):
+        p = os.path.join(os.path.expanduser("~"), "Documents", p)
+    return p
+
+
+def _file_key(p: str):
+    """One key per file (or folder) however it is spelled: its (device,
+    inode). A symlink, a hard link, or a folder spelled in another letter
+    case on a case-insensitive volume (the macOS default, where realpath
+    keeps the case it was given) all name the same file. The realpath when
+    it can't be stat'ed or the volume reports no inode numbers. A stat
+    never downloads a cloud placeholder."""
+    try:
+        st = os.stat(p)
+        if st.st_ino:
+            return (st.st_dev, st.st_ino)
+    except OSError:
+        pass
+    return os.path.realpath(p)
+
+
+class _MpfScan:
+    """One request's view of the disk: ids per folder, listed once and
+    shared by every ref, under one wall-clock budget."""
+
+    def __init__(self, budget_s: float):
+        self.deadline = _time_rs.monotonic() + budget_s
+        self.truncated = False
+        self._folders: Dict[object, Dict[str, list]] = {}    # _file_key(folder) -> index
+
+    def out_of_time(self) -> bool:
+        if _time_rs.monotonic() > self.deadline:
+            self.truncated = True
+            return True
+        return False
+
+    def peek(self, path: str):
+        """(uid, mtime_ns) of an existing regular file, else None."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        if not _stat_rs.S_ISREG(st.st_mode):
+            return None
+        return _peek_uid(path, st), st.st_mtime_ns
+
+    def folder(self, folder: str) -> Dict[str, list]:
+        """{uid: [(path, mtime_ns)]} of the .mpf files directly in `folder`.
+        Dot-files (our own .name.xxxx.tmp temps) are skipped."""
+        key = _file_key(folder)
+        if key in self._folders:
+            return self._folders[key]
+        index: Dict[str, list] = {}
+        self._folders[key] = index
+        if self.out_of_time():
+            return index
+        found = []
+        try:
+            with os.scandir(folder) as it:
+                for n, e in enumerate(it, 1):
+                    if n % 512 == 0 and self.out_of_time():
+                        break
+                    if e.name.startswith(".") or not e.name.lower().endswith(".mpf"):
+                        continue
+                    try:
+                        if not e.is_file():
+                            continue
+                        st = e.stat()
+                        link = e.is_symlink()
+                    except OSError:
+                        continue
+                    found.append((-st.st_mtime_ns, link, e.name, e.path, st))
+        except OSError:
+            return index
+        found.sort(key=lambda t: t[:3])          # newest first, real files before links
+        if len(found) > _RESOLVE_MAX_FILES:
+            self.truncated = True
+            del found[_RESOLVE_MAX_FILES:]
+        for neg_mtime, _link, _name, p, st in found:
+            if self.out_of_time():
+                break
+            uid = _peek_uid(p, st)
+            if uid:
+                index.setdefault(uid, []).append((p, -neg_mtime))
+        return index
+
+
+def _resolve_one(ref: MpfRef, scan: bool, sc: _MpfScan) -> dict:
+    path = _resolve_norm(ref.path)
+    want = ref.uid if valid_doc_uid(ref.uid) else None
+    candidates = [c for c in (ref.candidates or []) if isinstance(c, str)]
+    dirs = [d for d in (ref.dirs or []) if isinstance(d, str)]
+    exists = bool(path) and os.path.isfile(path)
+    file_uid = _peek_uid(path) if exists else None
+    # The path holds the document (or a file without an id, or the caller
+    # has no id to check): use it.
+    if exists and (not want or not file_uid or file_uid == want):
+        return {"status": "ok", "path": ref.path, "exists": True, "uid": file_uid,
+                "file_id": _file_id(path)}
+    if not want:
+        return {"status": "missing", "path": None, "exists": exists, "uid": None}
+
+    # Hits are counted per file, not per spelling (_file_key): one file seen
+    # through a symlink, a hard link or a folder spelled in another case is
+    # one hit. The first spelling seen is kept (candidates first; a folder
+    # lists real files before links).
+    own = _file_key(path) if path else None
+    hits: Dict[object, tuple] = {}       # file key -> (path, mtime_ns)
+
+    def hit(p: str, mtime_ns: int):
+        k = _file_key(p)
+        if k != own and k not in hits:
+            hits[k] = (p, mtime_ns)
+
+    for raw in candidates[:_RESOLVE_MAX_CANDIDATES]:
+        cp = _resolve_norm(raw)
+        if not cp or sc.out_of_time():
+            continue
+        got = sc.peek(cp)
+        if got is not None and got[0] == want:
+            hit(cp, got[1])
+    if scan:
+        folders, seen = [], set()
+        for f in ([os.path.dirname(path)] if path else []) + \
+                 [os.path.dirname(_resolve_norm(c)) for c in candidates] + \
+                 [os.path.expanduser(d.strip()) for d in dirs]:
+            if not f or not os.path.isabs(f) or len(folders) >= _RESOLVE_MAX_FOLDERS:
+                continue
+            if not os.path.isdir(f):
+                continue
+            key = _file_key(f)
+            if key in seen:
+                continue
+            seen.add(key)
+            folders.append(f)
+        for f in folders:
+            for p, mtime_ns in sc.folder(f).get(want, ()):
+                hit(p, mtime_ns)
+
+    found = list(hits.values())
+    if len(found) == 1:
+        hit_path = found[0][0]
+        hit_id = _file_id(hit_path)
+        if ref.file_id and hit_id != ref.file_id:
+            # Not the file `path` was (another inode): a Finder / Dropbox copy
+            # whose original is gone, or a move across volumes. The id alone
+            # can't tell those from a rename, and following a copy writes the
+            # document over it: not picked — the caller asks.
+            return {"status": "ambiguous", "path": None, "exists": exists, "uid": None,
+                    "matches": [hit_path]}
+        return {"status": "moved", "path": hit_path, "exists": exists, "uid": want,
+                "file_id": hit_id}
+    if found:
+        # Several files carry the id (a Finder / Dropbox copy and the
+        # original, or the renamed file and a copy of it). The very file
+        # `path` was (ref.file_id, its dev:ino) is followed: a rename keeps
+        # the inode, a copy never does — and hits are one per (dev, ino), so
+        # at most one can match.
+        if ref.file_id:
+            same = [h for h in found if _file_id(h[0]) == ref.file_id]
+            if len(same) == 1:
+                return {"status": "moved", "path": same[0][0], "exists": exists, "uid": want,
+                        "file_id": ref.file_id}
+        # Otherwise none is picked — not even one the caller knew; following
+        # a copy's id into its original would write one document over
+        # another. The caller asks.
+        found.sort(key=lambda h: -h[1])
+        return {"status": "ambiguous", "path": None, "exists": exists, "uid": None,
+                "matches": [h[0] for h in found]}
+    if exists:
+        # The path holds another id and the wanted one is nowhere: keep the
+        # path (the caller heals its stored id from `uid`).
+        return {"status": "ok", "path": ref.path, "exists": True, "uid": file_uid,
+                "file_id": _file_id(path)}
+    return {"status": "missing", "path": None, "exists": False, "uid": None}
+
+
+@app.post("/api/fs/mpf-resolve")
+def fs_mpf_resolve(body: MpfResolveRequest):
+    """Where each referenced document is now. Request: {refs: [{key, path,
+    uid?, candidates?: [path], dirs?: [folder], file_id?}], scan?: true}.
+    Response: {results: {key: {status: "ok"|"moved"|"missing"|"ambiguous",
+    path (the one to use; for "ok" the ref's own string, null when missing
+    or ambiguous), exists (the ref's path is a file), uid (the id in the
+    file at `path`), file_id? (ok / moved: that file's _file_id), matches?
+    (ambiguous: newest first — a single one when the only file carrying the
+    id is not the ref's `file_id`; never when one of several is that very
+    file: it is followed, "moved")}}, truncated (a cap or the time budget cut
+    a scan short)}. Paths are read like /api/fs/exists (~ expanded, a bare
+    name in ~/Documents). Gate-exempt: reads only disk."""
+    sc = _MpfScan(_RESOLVE_BUDGET_S)
+    results: Dict[str, dict] = {}
+    for ref in body.refs:
+        try:
+            results[ref.key] = _resolve_one(ref, body.scan is not False, sc)
+        except Exception as e:
+            print(f"[mpf-resolve] {ref.key}: {e}", file=_sys.stderr, flush=True)
+            p = _resolve_norm(ref.path)
+            ok = bool(p) and os.path.isfile(p)
+            results[ref.key] = {"status": "ok" if ok else "missing",
+                                "path": ref.path if ok else None, "exists": ok, "uid": None}
+    return {"results": results, "truncated": sc.truncated}
 
 
 @app.get("/api/project/snapshot")
@@ -6317,23 +6779,26 @@ class CollageFigureElementsRequest(BaseModel):
     figure_id: str = ""
 
 
-# Per-process cache of decoded .mpf data, keyed by (absolute path, mtime).
-# Re-renders for the global-header-pt feature otherwise re-decompress the
-# zip + decode every image on every call, which dominates the wall-time
-# for a typical 4-panel project (~2-3 sec per render).
+# Per-process cache of decoded .mpf data, keyed by path and checked against
+# the file's (mtime, size). Re-renders for the global-header-pt feature
+# otherwise re-decompress the zip + decode every image on every call, which
+# dominates the wall-time for a typical 4-panel project (~2-3 sec per render).
 _collage_mpf_cache: Dict[str, dict] = {}
 _COLLAGE_CACHE_MAX = 12  # rough LRU cap; collage size is usually small
 
 
 def _load_collage_mpf(path: str):
     """Return (FigureConfig, dict[name → PIL.Image]) for the .mpf at
-    `path`. Caches the parsed result per-process keyed by (path, mtime)
-    so subsequent collage renders skip the zip decompression entirely.
+    `path`. Caches the parsed result per-process keyed by path and
+    validated by (mtime in ns, size), so subsequent collage renders skip the
+    zip decompression entirely. A rename keeps a file's mtime, so mtime
+    alone could serve another file's content after two files swap names.
     Mutating images is unsafe — process_panel already img.copy()s, so
     callers can share the cached PIL objects safely."""
-    mtime = os.path.getmtime(path)
+    st = os.stat(path)
+    sig = (st.st_mtime_ns, st.st_size)
     hit = _collage_mpf_cache.get(path)
-    if hit and hit.get("mtime") == mtime:
+    if hit and hit.get("sig") == sig:
         return hit["cfg"], hit["images"]
     loaded_cfg, img_bytes_dict, _font_bytes, _analysis, _channel_data = load_project(path)
     loaded_cfg.ensure_grid()
@@ -6352,7 +6817,7 @@ def _load_collage_mpf(path: str):
                     pass
         else:
             local_images[name] = Image.open(io.BytesIO(data)).convert("RGB")
-    _collage_mpf_cache[path] = {"mtime": mtime, "cfg": loaded_cfg, "images": local_images}
+    _collage_mpf_cache[path] = {"sig": sig, "cfg": loaded_cfg, "images": local_images}
     # Naive size cap — drop the oldest entry when we exceed the limit.
     if len(_collage_mpf_cache) > _COLLAGE_CACHE_MAX:
         oldest = next(iter(_collage_mpf_cache))

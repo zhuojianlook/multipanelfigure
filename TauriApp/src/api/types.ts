@@ -493,6 +493,13 @@ export interface SaveProjectOptions {
   carryFrom?: string | null;
   /** Legacy analysis payload; when given it replaces the file's `analysis/`. */
   analysis?: AnalysisPayload | null;
+  /** The document's uid (analysisWorkspaceStore.docUids), written into the
+   *  file's `doc.json` so the file is still recognised after it is renamed or
+   *  moved. Omit to let the sidecar keep the uid the file already has on a
+   *  re-save (a tab whose file was never read must not overwrite it) — over
+   *  another file it gets a new one; a Save As copy whose original is still
+   *  on disk gets a new one either way. */
+  docUid?: string;
 }
 
 export interface ProjectSaveResponse {
@@ -505,6 +512,69 @@ export interface ProjectSaveResponse {
   /** Whether the saved file holds a workflows/ section carried from the
    *  previous file (absent from older sidecars). */
   workflows_carried?: boolean;
+  /** The uid the file was written under (its `doc.json`); absent from older
+   *  sidecars. */
+  doc_uid?: string;
+  /** True when that uid is not the `docUid` sent: none was sent, or the save
+   *  made a copy of a file that is still there (a new document). */
+  uid_minted?: boolean;
+  /** Whether the previous file (`carry_from`) is another file that is still
+   *  there: a Save As copy, whatever uid it was written under — the old file
+   *  keeps its labels. False: the same file, or it was gone (the document
+   *  moved). Absent from older sidecars. */
+  source_kept?: boolean;
+  /** The saved file as a physical file ("dev:inode"; every save replaces
+   *  it) — see MpfResolveRef.file_id. Null / absent: can't be told. */
+  file_id?: string | null;
+}
+
+// ── Finding .mpf files by document uid (POST /api/fs/mpf-resolve) ──────────
+
+/** One file `api.resolveMpf` looks for. */
+export interface MpfResolveRef {
+  /** The caller's name for it; the result comes back under this key. */
+  key: string;
+  /** Where the file was last known to be. */
+  path: string;
+  /** The document uid the file should carry. Without one only `path` is
+   *  checked (nothing is searched). */
+  uid?: string | null;
+  /** Other paths it may be at now, best first (e.g. the last-seen table). */
+  candidates?: string[];
+  /** Extra folders to look in (not recursive). The folders of `path` and of
+   *  `candidates` are always looked in. */
+  dirs?: string[];
+  /** The physical file `path` last named ("dev:inode", from a read or write
+   *  of it). A rename keeps it, a Finder / Dropbox copy does not: a single
+   *  other file carrying the uid is "moved" only when it is that very file,
+   *  else "ambiguous" (it may be a copy — the caller asks). Unknown: omitted. */
+  file_id?: string;
+}
+
+/** ok        `path` is the file (it exists, and carries the uid or none);
+ *  moved     the uid was found in another file — use the result's `path`;
+ *  missing   not found;
+ *  ambiguous several other files carry the uid (`matches`, newest first). */
+export type MpfResolveStatus = "ok" | "moved" | "missing" | "ambiguous";
+
+export interface MpfResolveResult {
+  status: MpfResolveStatus;
+  /** The path to use; null when missing / ambiguous. */
+  path: string | null;
+  /** Whether the ref's ORIGINAL path is a file. */
+  exists: boolean;
+  /** The uid found in the file at `path` (null: none, or unknown). */
+  uid: string | null;
+  matches?: string[];
+  /** ok / moved: the file at `path` as a physical file (MpfResolveRef.file_id). */
+  file_id?: string | null;
+}
+
+export interface MpfResolveResponse {
+  results: Record<string, MpfResolveResult>;
+  /** A folder held more .mpf files than one lookup reads (or it ran out of
+   *  time): a file it missed may still be there. */
+  truncated: boolean;
 }
 
 // ── Saved Analysis workflows: the .mpf's `workflows/` section ──────────────
@@ -562,6 +632,13 @@ export type WorkflowsWriteResult =
       missing_uploads: string[];
       /** True when only the tail of the file was rewritten. */
       fast_path: boolean;
+      /** The uid the file's `doc.json` names after the write (rewritten to
+       *  the `docUid` sent when it named another); null: it has no doc.json,
+       *  so its uid is the manifest's. Absent from older sidecars. */
+      doc_uid?: string | null;
+      /** The file put in place by the write (every write replaces it) —
+       *  MpfResolveRef.file_id. */
+      file_id?: string | null;
     }
   /** Kept blobs (sent without data) the file doesn't hold — nothing was
    *  written; resend them with data. */
@@ -593,6 +670,13 @@ export interface WorkflowsReadResponse {
   missing_uploads: string[];
   /** Uploads whose bytes could not be decoded. */
   failed_uploads: { name: string; error: string }[];
+  /** The uid in the file's `doc.json` (written by every figure save since
+   *  0.1.426) — given even when `manifest` is null or `unsupported`. Null /
+   *  absent: the file has none (or an older sidecar); its manifest's `docUid`
+   *  may still name it. */
+  doc_uid?: string | null;
+  /** The file read, as a physical file (MpfResolveRef.file_id). */
+  file_id?: string | null;
 }
 
 /** A named subgroup divider inside an image group's drawer. Its images are

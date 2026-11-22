@@ -22,10 +22,14 @@
    setEdges bail out on a same-reference return; without that the
    parseDeclaredOutputs effect loops ("infinite update", blank view).
 
-   Document identity (utils/workflowOwnership): every open document
-   gets a durable uid in `docUids` as soon as it appears in
+   Document identity (utils/workflowOwnership, utils/docIdentity): every
+   open document gets a durable uid in `docUids` as soon as it appears in
    collageStore.openDocs. A document read from disk adopts the uid its
-   file was saved under (adoptUid).
+   file was saved under (adoptUid): its doc.json uid, else its manifest
+   docUid. A figure save writes the tab's uid into the file, so the file
+   is recognised after a rename; a file found at a new path (renamed or
+   moved outside the app) is re-pointed with docMoved — a move, never a
+   new uid.
 
    A debounced subscriber (syncWorkspaceNow) keeps each workflow's
    `updatedAt` (bumped when its saved content changes — never while it
@@ -64,11 +68,13 @@
        a locked tab is discarded unless flagged { view: true } (selection,
        measured size); deleteWorkflow refuses one;
      • openMissing looks for the closed documents (saved path, path
-       relative to an owner's file, same name next to it — one
-       api.pathsExist call) and opens hits as cold tabs; the read that
-       follows re-keys "u:<uid>" back to the document. A file without a
-       uid (re-saved by an older build) adopts the expected one; a file
-       with another uid is used only after the user confirms (rebindDoc).
+       relative to an owner's file, same name next to it, the paths the
+       last-seen table knows, and a file carrying the uid in those
+       folders — one api.resolveMpf call) and opens hits as cold tabs;
+       the read that follows re-keys "u:<uid>" back to the document. A
+       file without a uid (re-saved by an older build) adopts the
+       expected one; a file with another uid is used only after the user
+       confirms (rebindDoc).
        Not found → locate (native open dialog);
      • removeMissingSources ("Remove their sources") drops the closed
        documents' sources and tables, leaving it editable;
@@ -79,7 +85,7 @@
 import { create } from "zustand";
 import type { Edge, Node } from "@xyflow/react";
 import { api } from "../api/client";
-import type { WorkflowsReadResponse } from "../api/types";
+import type { MpfResolveRef, MpfResolveResult, WorkflowsReadResponse, WorkflowsWriteResult } from "../api/types";
 import type { InsetSource, NodeData, WorkflowTab } from "../utils/analysisTypes";
 import { upstreamSourceKeys } from "../utils/analysisStale";
 import {
@@ -97,6 +103,10 @@ import {
   uploadKey,
   type AnalysisLabels, type DocMeta,
 } from "../utils/analysisMeta";
+import {
+  clearFileUid, fileUidOf, forgetDocFile, isMissingFileError, isOtherDocumentError, noteDocFile, refreshDocFileId,
+  registryPathsOf, registryUidAt, resetDocIdentityForTests, setFileIdOf, setFileUid,
+} from "../utils/docIdentity";
 import { confirm as confirmDialog } from "../components/shared/ConfirmDialog";
 import { chooseDocument } from "../components/shared/ChooseDocumentDialog";
 import { useCollageStore, type DocTab } from "./collageStore";
@@ -241,19 +251,34 @@ export interface AnalysisWorkspaceState {
   /** Write what document `docId` owns now into its .mpf, when dirty. Waits
    *  for its pending read. Rejects when the write fails. */
   persistDocWorkflows: (docId: string, opts?: PersistOptions) => Promise<PersistOutcome>;
-  /** A figure save finished: on a path change re-mint the uid (Save As),
-   *  point the tab and every key at the new file; then persist (forced on a
-   *  path change). Rejects when the persist fails. */
+  /** A figure save finished: the tab takes the uid the file was saved under
+   *  (`opts.docUid`, from the sidecar — without it, the old rule: a Save As
+   *  re-mints); on a path change point the tab and every key at the new
+   *  file; then persist (forced on a path change). `opts.sourceKept`: the
+   *  previous file is another file that is still there (the sidecar says
+   *  so) — a copy, so the old file keeps its labels too. `opts.fileId`: the
+   *  physical file written (docIdentity). Rejects when the persist fails. */
   afterDocSaved: (docId: string, oldPath: string | null, newPath: string,
-    opts?: { workflowsCarried?: boolean }) => Promise<void>;
+    opts?: { workflowsCarried?: boolean; docUid?: string; sourceKept?: boolean; fileId?: string | null }) => Promise<void>;
+  /** The file of every open tab at `oldPath` is at `newPath` now (renamed or
+   *  moved outside the app, found again by its uid): the tabs, their keys and
+   *  their labels follow it. The same document — no new uid, no re-read; a
+   *  document whose Analysis was saved stays saved. `opts.reread`: the file
+   *  at `newPath` is not known to be the one that was read (Locate… picked
+   *  a file whose uid can't be told): it is read there before any write,
+   *  instead of counting as read. `opts.ids`: only these tabs on `oldPath`
+   *  move (docLinks.repointOpenDocs: in a swap, the tabs one hop delivered
+   *  to a path stay there when the next hop leaves it). */
+  docMoved: (oldPath: string, newPath: string, opts?: { reread?: boolean; ids?: readonly string[] }) => void;
   /** Document `docId` is closing (call before collageStore.docRemove; the
    *  openDocs subscriber covers a tab removed any other way): its
    *  single-owner workflows leave, shared ones are re-keyed "u:<uid>". */
   closeDoc: (docId: string) => void;
   /** Open the closed documents locked workflow `wfId` needs: each one's
-   *  saved path, its path relative to an open owner's file, or the same file
-   *  name next to it (one api.pathsExist call); a hit opens as a cold tab
-   *  (no builder swap) and is read. A document found nowhere goes to locate. */
+   *  saved path, its path relative to an open owner's file, the same file
+   *  name next to it, or a file carrying its uid near any of those (one
+   *  api.resolveMpf call); a hit opens as a cold tab (no builder swap) and is
+   *  read. A document found nowhere goes to locate. */
   openMissing: (wfId: string) => Promise<void>;
   /** Let the user point at closed document `uid`'s file (native open dialog),
    *  then open it the same way. */
@@ -863,22 +888,40 @@ export const useAnalysisWorkspaceStore = create<AnalysisWorkspaceState>()((set, 
     ensureOpenDocUids();
     hydratedPath.set(docId, doc.path ?? null);
     const m = payload.manifest;
+    // The document is the one its file names: its doc.json uid (written by
+    // every figure save), else the docUid its saved Analysis carries (older
+    // files, and files an older build re-saved — that drops doc.json) — in
+    // whatever format that Analysis is, so a newer-format file is still
+    // recognised. Unless another open document already holds that uid (the
+    // same file under a second path string, a Finder copy): then it keeps
+    // its own, merge rule 3 keeps them apart, and its next save writes its
+    // own uid into the file.
+    const docJsonUid = typeof payload.doc_uid === "string" && payload.doc_uid ? payload.doc_uid : undefined;
+    const manifestUid = m && typeof m.docUid === "string" && m.docUid ? m.docUid : undefined;
+    const fileUid = docJsonUid ?? manifestUid;
+    // The physical file read (docIdentity): what tells it from a copy later.
+    const fileId = typeof payload.file_id === "string" && payload.file_id ? payload.file_id : undefined;
+    if (fileUid) {
+      const held = cs.openDocs.some((d) => d.id !== docId && get().docUids[d.id] === fileUid);
+      if (!held) {
+        get().adoptUid(docId, fileUid);
+        if (doc.path) noteDocFile(fileUid, doc.path, doc.name, fileId);
+      }
+    }
+    setFileUid(docId, fileUid ?? null, doc.path ?? null, fileId);
     if (payload.unsupported || (m && (m.format !== WORKFLOWS_FORMAT || typeof m.version !== "number"
         || m.version > WORKFLOWS_VERSION))) {
       // Written by a newer build (or unreadable): shown nowhere, never overwritten.
       setHydrated(docId, "unsupported");
       return;
     }
-    // The document is the one its file names — unless another open document
-    // already holds that uid (the same file under a second path string, a
-    // Finder copy): then it keeps its own and merge rule 3 keeps them apart.
-    const fileUid = m && typeof m.docUid === "string" && m.docUid ? m.docUid : undefined;
-    fileUidOf.set(docId, fileUid ?? null);
     fileHasSection.set(docId, !!m);
-    if (fileUid) {
-      const held = cs.openDocs.some((d) => d.id !== docId && get().docUids[d.id] === fileUid);
-      if (!held) get().adoptUid(docId, fileUid);
-    }
+    // The file's two copies of its uid disagree — a Save As copy whose
+    // Analysis was never rewritten still names the original in its manifest.
+    // The doc.json one is the file's (the manifest's was mapped onto it by
+    // deserializeDoc below); not clean, so the next persist rewrites the
+    // manifest under it.
+    const uidMismatch = !!docJsonUid && !!manifestUid && docJsonUid !== manifestUid;
     const s = get();
     const uid = s.uidFor(docId);
     const revs = useSourceEditStore.getState().revs;
@@ -928,7 +971,7 @@ export const useAnalysisWorkspaceStore = create<AnalysisWorkspaceState>()((set, 
     for (const id of Object.values(merged.reminted)) seen.delete(id);
     set({
       tabs, activeId, knownDocs, tombstones,
-      savedSig: { ...get().savedSig, [docId]: sig },
+      savedSig: { ...get().savedSig, [docId]: uidMismatch ? `${sig}|uid-mismatch` : sig },
       hydrated: { ...get().hydrated, [docId]: "done" },
     });
     if (d.uploads.length) get().addUploads(d.uploads);
@@ -954,22 +997,62 @@ export const useAnalysisWorkspaceStore = create<AnalysisWorkspaceState>()((set, 
     if (!doc) return;
     const prev = oldPath || null;
     const moved = prev !== newPath;
+    const uidBefore = get().docUids[docId];
+    // The uid its previous file named. Another one than the tab's: that file
+    // is another document's (a Finder copy opened while its original was
+    // open keeps a uid of its own — the held rule).
+    const prevFileUid = fileUidOf(docId);
+    // The uid the file was written under (its doc.json), as the sidecar chose
+    // it: the tab's own when it was sent, the file's when it wasn't (a tab
+    // whose file was never read), a new one for a Save As copy whose
+    // original is still there. The tab takes it unless another open tab
+    // holds it. An older sidecar names none: then a Save As still makes the
+    // copy a new document here, and the old file keeps its uid.
+    const fileUid = opts.docUid || undefined;
+    if (fileUid) {
+      const held = cs.openDocs.some((d) => d.id !== docId && get().docUids[d.id] === fileUid);
+      if (!held && uidBefore !== fileUid) get().adoptUid(docId, fileUid);
+    } else if (moved && prev) {
+      get().adoptUid(docId, newDocUid());
+    }
     if (moved) {
       const oldBase = docKeyBase({ id: docId, path: prev });
       const newBase = docKeyBase({ id: docId, path: newPath });
-      // Save As: the copy is a new document; the old file keeps its uid.
-      if (prev) get().adoptUid(docId, newDocUid());
       // Recorded before the tab moves, so the openDocs subscriber doesn't
       // take the new path for a file whose workflows were never read.
       hydratedPath.set(docId, newPath);
       if (doc.path !== newPath) cs.docSetPath(docId, newPath);
       get().rekeyDoc(oldBase, newBase);
-      rekeyAnalysisStorage(oldBase, newBase, !!prev);
+      // A copy — its previous file is still there — keeps its labels on the
+      // old file too. The sidecar says whether it is (sourceKept); an older
+      // one doesn't, and then the uid tells: it changed (a Save As copy), or
+      // the previous file named another document (a held tab keeps its own
+      // uid on Save As, so its uid alone can't tell). Its old file gone, the
+      // document moved: the labels move with it, and the last-seen table no
+      // longer has it at the old path.
+      const copy = !!prev && (opts.sourceKept ?? (get().docUids[docId] !== uidBefore
+        || (!!prevFileUid && prevFileUid !== uidBefore)));
+      rekeyAnalysisStorage(oldBase, newBase, copy);
+      if (!copy && prev && registryUidAt(prev) === get().docUids[docId]) forgetDocFile(prev);
       // The new file holds what the save carried, not what savedSig describes.
       set((s) => {
         const { [docId]: _gone, ...savedSig } = s.savedSig;
         return { savedSig };
       });
+    }
+    if (fileUid) {
+      setFileUid(docId, fileUid, newPath, opts.fileId);
+      if (get().docUids[docId] === fileUid) noteDocFile(fileUid, newPath, openDoc(docId)?.name, opts.fileId);
+      // Collage figures placed from the file at newPath follow the uid it now
+      // carries — how items added before uids get one, how they stay with a
+      // file re-identified by this save, and (a save over a file already in
+      // the collage — an Untitled tab or a Save As onto it) how they keep
+      // naming what is at that path, never a same-uid copy of what was there.
+      // Figures of the previous file (a Save As) sit on its path: untouched.
+      followFileUid(newPath, fileUid);
+    } else if (moved) {
+      // Not known until the persist below writes the uid into its manifest.
+      clearFileUid(docId);
     }
     // The save couldn't bring the file's saved Analysis along (its previous
     // file was gone or unreadable): the new file lacks it while savedSig still
@@ -977,6 +1060,53 @@ export const useAnalysisWorkspaceStore = create<AnalysisWorkspaceState>()((set, 
     const lost = !moved && opts.workflowsCarried === false && fileHasSection.get(docId) === true;
     if (lost) fileHasSection.set(docId, false);
     await get().persistDocWorkflows(docId, { force: moved || lost });
+  },
+
+  docMoved: (oldPath, newPath, opts = {}) => {
+    if (!oldPath || !newPath || oldPath === newPath) return;
+    const cs = useCollageStore.getState();
+    // Every tab on the old path moves together: they share its key base
+    // (opts.ids: only those, see above).
+    const moving = cs.openDocs.filter((d) => d.path === oldPath && (!opts.ids || opts.ids.includes(d.id)));
+    if (!moving.length) return;
+    // Signatures carry each document's own name, which a rename changes: a
+    // document whose file is up to date is signed again afterwards so it
+    // stays up to date (the file's stored name for itself is never read).
+    // One with unsaved Analysis keeps its old signature — still unsaved.
+    syncWorkspaceNow();                                     // signed as persist signs
+    const s0 = get();
+    const upToDate = new Set(moving.filter((d) => !opts.reread && s0.hydrated[d.id] === "done"
+      && s0.savedSig[d.id] !== undefined && s0.savedSig[d.id] === persistSnapshot(d).sig).map((d) => d.id));
+    const oldName = basenameOf(oldPath).replace(/\.mpf$/i, "");
+    for (const d of moving) {
+      // Recorded before the tab moves, so the openDocs subscriber doesn't
+      // forget the read (it is the same file, already read). A read that
+      // failed — most often because the file was already gone from the old
+      // path — is not carried over: the subscriber forgets it and the file
+      // is read again where it is now; and so is a file not known to be the
+      // one that was read (opts.reread): what it holds is read and merged
+      // before anything is written to it, and until then a figure save
+      // leaves its uid alone.
+      if (!opts.reread && hydratedPath.get(d.id) === oldPath && s0.hydrated[d.id] !== "failed") {
+        hydratedPath.set(d.id, newPath);
+      }
+      // A tab named after its file is renamed with it; a name the user gave stays.
+      cs.docSetPath(d.id, newPath, d.name === oldName ? undefined : d.name);
+    }
+    const oldBase = docKeyBase({ id: moving[0].id, path: oldPath });
+    const newBase = docKeyBase({ id: moving[0].id, path: newPath });
+    get().rekeyDoc(oldBase, newBase);
+    // The old path holds nothing any more: the labels move, not copy.
+    rekeyAnalysisStorage(oldBase, newBase, false);
+    if (upToDate.size) {
+      syncWorkspaceNow();
+      const savedSig = { ...get().savedSig };
+      for (const id of upToDate) {
+        const d = openDoc(id);
+        if (d) savedSig[id] = persistSnapshot(d).sig;
+      }
+      set({ savedSig });
+    }
   },
 
   closeDoc: (docId) => {
@@ -997,19 +1127,15 @@ export const useAnalysisWorkspaceStore = create<AnalysisWorkspaceState>()((set, 
       if (!missing.length) return;
       const holders = ownerPaths(wf, ctx);
       const cands = new Map(missing.map((u) => [u, missingDocCandidates(s.knownDocs[u], holders)]));
-      const all = [...new Set([...cands.values()].flat())];
-      let exists: Record<string, boolean> = {};
-      if (all.length) {
-        try { exists = await api.pathsExist(all); } catch { exists = {}; }
-      }
+      const found = await findMissingDocs(missing, cands, holders, s.knownDocs);
       for (const uid of missing) {
         if (!stillMissing(wfId, uid)) continue;           // opened meanwhile
-        const tried = cands.get(uid) || [];
-        const hit = tried.find((p) => exists[p]);
+        const hit = found.get(uid);
+        // openLocated still checks the uid the file names once it is read.
         if (hit) await openLocated(wfId, uid, hit);
         // Saved somewhere, just not where it was: ask. A document that was
         // never saved has no file to look for ("Remove their sources").
-        else if (tried.length) await get().locate(wfId, uid);
+        else if ((cands.get(uid) || []).length || registryPathsOf(uid).length) await get().locate(wfId, uid);
       }
     } finally {
       lookingFor.delete(wfId);
@@ -1060,9 +1186,9 @@ const awaitedLoads = new Set<string>();
 /** Bumped by the test reset: queued reads of an earlier generation drop out. */
 let hydrateGen = 0;
 let persistChain: Promise<void> = Promise.resolve();
-/** Doc id → the uid its file named when it was read; null: none (no saved
- *  analysis, or re-saved by an older build, which drops workflows/). */
-const fileUidOf = new Map<string, string | null>();
+// Doc id → the uid its file names (doc.json, else its manifest's docUid):
+// utils/docIdentity's fileUidOf / setFileUid — the collage and the
+// document tabs need it too.
 /** Doc id → its file holds a workflows/ section (read, or written since). */
 const fileHasSection = new Map<string, boolean>();
 /** Workflows openMissing is looking for documents of (no double run). */
@@ -1081,7 +1207,7 @@ function setHydrated(docId: string, status: HydrationStatus): void {
 function forgetHydration(docId: string): void {
   pendingLoads.delete(docId);
   hydratedPath.delete(docId);
-  fileUidOf.delete(docId);
+  clearFileUid(docId);
   fileHasSection.delete(docId);
   const s = useAnalysisWorkspaceStore.getState();
   if (!(docId in s.hydrated) && !(docId in s.savedSig)) return;
@@ -1131,9 +1257,37 @@ async function loadOne(docId: string, gen: number): Promise<void> {
       setHydrated(docId, "failed");
       return;
     }
+    // Renamed or moved while it was closed: the last-seen table saw its uid
+    // at another path, which is gone now. The labels this machine keeps for
+    // it under that path (source names, measurement group labels, source
+    // folders) follow it — before hydrateDoc compares them with the file, so
+    // they count as its own. Not when the old file is still there (a copy) or
+    // open in another tab; a failed check moves nothing.
+    const uid = fileUidIn(resp);
+    const old = uid ? registryPathsOf(uid).find((p) => p !== path) : undefined;
+    if (uid && old && registryUidAt(path) !== uid
+        && !useCollageStore.getState().openDocs.some((d) => d.path === old)) {
+      let gone = false;
+      try {
+        gone = (await api.resolveMpf([{ key: "old", path: old }], { scan: false })).old?.exists === false;
+      } catch { gone = false; }
+      if (!live()) return;
+      if (openDoc(docId)!.path !== path) continue;
+      if (gone) {
+        rekeyAnalysisStorage(docKeyBase({ id: docId, path: old }), docKeyBase({ id: docId, path }), false);
+        forgetDocFile(old);
+      }
+    }
     store.getState().hydrateDoc(docId, resp);
     return;
   }
+}
+
+/** The uid a read file names: its doc.json uid, else its manifest's docUid. */
+function fileUidIn(resp: WorkflowsReadResponse): string | undefined {
+  if (typeof resp.doc_uid === "string" && resp.doc_uid) return resp.doc_uid;
+  const m = resp.manifest;
+  return m && typeof m.docUid === "string" && m.docUid ? m.docUid : undefined;
 }
 
 async function persistNow(docId: string, opts: PersistOptions): Promise<PersistOutcome> {
@@ -1152,11 +1306,89 @@ async function persistNow(docId: string, opts: PersistOptions): Promise<PersistO
   doc = openDoc(docId);
   if (!doc?.path) return "no-path";
   if (status !== "done" || hydratedPath.get(docId) !== doc.path) return "not-hydrated";
-  const path = doc.path;
+  let path = doc.path;
   const version = await appVersion();
   syncWorkspaceNow();                                       // updatedAt / home current
-  const s = store.getState();
-  const uid = s.uidFor(docId);
+  let snap = persistSnapshot(doc, version);
+  if (!opts.force && store.getState().savedSig[docId] === snap.sig) return "clean";
+  const payloadOf = (sn: PersistSnapshot) => serializeForDoc(
+    sn.uid, { ...sn.state, meta: metaFor(sn.uid, sn.meta) }, { figureDiscarded: opts.figureDiscarded });
+  // A file whose doc.json names another uid than the one this manifest is
+  // written under (a Finder copy the held rule gave a uid of its own): its
+  // doc.json follows in the same write, so the file's two copies of its uid
+  // never disagree — read again, it is this document, not the original.
+  // The uid the file named (expectUid): a file at the path naming another
+  // (another document has its name now) is never written — the sidecar
+  // refuses, and the tab looks for its own file as for a missing one.
+  const write = (p: string, sn: PersistSnapshot) => {
+    const f = fileUidOf(docId);
+    return f && f !== sn.uid
+      ? api.writeWorkflows(p, payloadOf(sn), { docUid: sn.uid, expectUid: f })
+      : f ? api.writeWorkflows(p, payloadOf(sn), { expectUid: f })
+        : api.writeWorkflows(p, payloadOf(sn));
+  };
+  let res: WorkflowsWriteResult;
+  try {
+    res = await write(path, snap);
+  } catch (e) {
+    // Its file is no longer where the tab says — renamed or moved outside the
+    // app while open (or another document now has its name). Found by its
+    // uid, the tab follows it (docMoved) and the write goes there, once;
+    // signed again, since the tab's name may have changed with the file's.
+    // Not found: the failure stands (close / quit report it). Imported
+    // lazily: docLinks imports this store.
+    if (!isMissingFileError(e) && !isOtherDocumentError(e)) throw e;
+    const { relocateOpenDoc } = await import("../utils/docLinks");
+    const found = await relocateOpenDoc(docId).catch(() => null);
+    if (!found) throw e;
+    path = found;
+    snap = persistSnapshot(openDoc(docId) ?? doc, version);
+    res = await write(path, snap);
+  }
+  if (!res.ok) {
+    if ("unsupported" in res) { setHydrated(docId, "unsupported"); return "unsupported"; }
+    throw new Error(`the file is missing ${res.missing.length} stored result(s) expected to be kept`);
+  }
+  if (res.missing_uploads?.length) {
+    console.warn("[analysis] uploads not embedded (no original kept):", res.missing_uploads);
+  }
+  if (openDoc(docId)?.path === path) {
+    // Results stored "needs re-run" for a discarded figure: not what the live
+    // workspace signs as, so a later persist (figure saved after all) rewrites.
+    const saved = opts.figureDiscarded ? `${snap.sig}|figure-discarded` : snap.sig;
+    store.setState((st) => ({ savedSig: { ...st.savedSig, [docId]: saved } }));
+    fileHasSection.set(docId, true);
+    // The uid the file names now: its doc.json's, as the sidecar reports it
+    // (rewritten to this one when it named another), else — no doc.json —
+    // its manifest's, just written: this one. An older sidecar reports
+    // none: a file that named no uid names this one now.
+    const now = fileUidOf(docId);
+    const onDisk = res.doc_uid !== undefined ? (res.doc_uid || snap.uid) : (now ?? snap.uid);
+    if (onDisk !== now) {
+      setFileUid(docId, onDisk, path, res.file_id);
+      if (onDisk === snap.uid) noteDocFile(snap.uid, path, openDoc(docId)?.name, res.file_id);
+    } else {
+      // The same uid in a new physical file (every write replaces it).
+      setFileIdOf(docId, res.file_id);
+      refreshDocFileId(path, onDisk, res.file_id);
+    }
+  }
+  return "written";
+}
+
+/** What persistNow writes for open document `doc` now, and its signature. */
+interface PersistSnapshot {
+  uid: string;
+  state: PersistState;
+  meta: DocMeta | undefined;
+  sig: string;
+}
+
+/** The workspace as document `doc`'s file would hold it now (persistNow;
+ *  docMoved signs with it too). */
+function persistSnapshot(doc: DocTab, version?: string): PersistSnapshot {
+  const s = useAnalysisWorkspaceStore.getState();
+  const uid = s.uidFor(doc.id);
   const state: PersistState = {
     docs: workspaceOwnershipCtx(s).docs,
     known: s.knownDocs,
@@ -1171,24 +1403,16 @@ async function persistNow(docId: string, opts: PersistOptions): Promise<PersistO
   const ownedUploads = new Set(uploadsOwnedBy(uid, state).map(uploadKey));
   const meta = docMetaOf(readAnalysisLabels(), docKeyBase(doc), ownedUploads);
   const sig = docSig(uid, { ...state, meta: metaFor(uid, metaSigForm(meta)) });
-  if (!opts.force && s.savedSig[docId] === sig) return "clean";
-  const payload = serializeForDoc(uid, { ...state, meta: metaFor(uid, meta) }, { figureDiscarded: opts.figureDiscarded });
-  const res = await api.writeWorkflows(path, payload);
-  if (!res.ok) {
-    if ("unsupported" in res) { setHydrated(docId, "unsupported"); return "unsupported"; }
-    throw new Error(`the file is missing ${res.missing.length} stored result(s) expected to be kept`);
+  return { uid, state, meta, sig };
+}
+
+/** Collage figures of the file at `path` carry document `uid` (it was just
+ *  saved under it). */
+function followFileUid(path: string, uid: string): void {
+  const cs = useCollageStore.getState();
+  for (const it of cs.items) {
+    if (it.projectPath === path && it.projectUid !== uid) cs.updateItem(it.id, { projectUid: uid });
   }
-  if (res.missing_uploads?.length) {
-    console.warn("[analysis] uploads not embedded (no original kept):", res.missing_uploads);
-  }
-  if (openDoc(docId)?.path === path) {
-    // Results stored "needs re-run" for a discarded figure: not what the live
-    // workspace signs as, so a later persist (figure saved after all) rewrites.
-    const saved = opts.figureDiscarded ? `${sig}|figure-discarded` : sig;
-    store.setState((st) => ({ savedSig: { ...st.savedSig, [docId]: saved } }));
-    fileHasSection.set(docId, true);
-  }
-  return "written";
 }
 
 /** Document `doc` leaves the open set (`others` stay). Its single-owner
@@ -1257,6 +1481,52 @@ function missingDocCandidates(k: KnownDoc | undefined, holders: readonly string[
   return out;
 }
 
+/** Where each closed document in `missing` is now, by uid → path (one
+ *  api.resolveMpf call): the first of its candidates (`cands`) when that file
+ *  is still there, else the file carrying its uid among the paths the
+ *  last-seen table saw it at, the other candidates, and the folders of all
+ *  of those, of its owners' files and of its saved path. Found nowhere (or a
+ *  sidecar without that lookup): the first candidate that exists, uid or not
+ *  (one api.pathsExist call, as before) — a file re-saved by an older build
+ *  names none, and openLocated takes it. Several files carrying the uid: none
+ *  is picked (the user locates it). A document never saved is not looked for. */
+async function findMissingDocs(
+  missing: readonly string[], cands: ReadonlyMap<string, string[]>, holders: readonly string[],
+  known: Readonly<Record<string, KnownDoc>>,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const refs: MpfResolveRef[] = [];
+  for (const uid of missing) {
+    const tried = cands.get(uid) || [];
+    const seen = registryPathsOf(uid);
+    const path = tried[0] ?? seen[0];
+    if (!path) continue;
+    const candidates = [...seen, ...tried].filter((p, i, a) => p !== path && a.indexOf(p) === i);
+    const dirs = [...holders, ...(known[uid]?.path ? [known[uid].path!] : [])]
+      .map(dirnameOf).filter((d, i, a) => !!d && a.indexOf(d) === i);
+    refs.push({ key: uid, path, uid, ...(candidates.length ? { candidates } : {}), ...(dirs.length ? { dirs } : {}) });
+  }
+  if (!refs.length) return out;
+  let results: Record<string, MpfResolveResult> | null = null;
+  try { results = await api.resolveMpf(refs); } catch { results = null; }
+  const byName: string[] = [];
+  for (const r of refs) {
+    const res = results?.[r.key];
+    if (res && (res.status === "ok" || res.status === "moved") && res.path) out.set(r.key, res.path);
+    else if (!res || res.status === "missing") byName.push(r.key);
+  }
+  const paths = [...new Set(byName.flatMap((u) => cands.get(u) || []))];
+  if (paths.length) {
+    let exists: Record<string, boolean> = {};
+    try { exists = await api.pathsExist(paths); } catch { exists = {}; }
+    for (const u of byName) {
+      const hit = (cands.get(u) || []).find((p) => exists[p]);
+      if (hit) out.set(u, hit);
+    }
+  }
+  return out;
+}
+
 /** Whether workflow `wfId` still waits for closed document `uid`. */
 function stillMissing(wfId: string, uid: string): boolean {
   const s = useAnalysisWorkspaceStore.getState();
@@ -1288,7 +1558,7 @@ async function openLocated(wfId: string, uid: string, path: string): Promise<boo
     console.warn("[analysis] can't use", path, "for a closed document: its analysis is", s.hydrated[docId]);
     return false;
   }
-  if (fileUidOf.get(docId) === null) {
+  if (fileUidOf(docId) === null) {
     s.adoptUid(docId, uid);
     reopenIn(uid, doc, s.knownDocs[uid]?.sessionId);
     return true;
@@ -1417,7 +1687,7 @@ export function resetAnalysisWorkspaceForTests(): void {
   pendingLoads.clear();
   awaitedLoads.clear();
   hydratedPath.clear();
-  fileUidOf.clear();
+  resetDocIdentityForTests();
   fileHasSection.clear();
   lookingFor.clear();
   promptedLocked.clear();

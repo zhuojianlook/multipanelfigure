@@ -9,6 +9,9 @@ import type {
   FigureConfig,
   UploadResponse,
   ImagesListResponse,
+  MpfResolveRef,
+  MpfResolveResponse,
+  MpfResolveResult,
   PreviewResponse,
   ProjectLoadResponse,
   ProjectSaveResponse,
@@ -338,12 +341,15 @@ class ApiClient {
   /** Save the live document to `path` (atomic). `opts.carryFrom`: see
    *  SaveProjectOptions — the document's previous file, whose saved
    *  Analysis is carried into the new one (omit for a plain re-save, null
-   *  for a document that never had a file). */
+   *  for a document that never had a file). `opts.docUid`: the document's
+   *  uid, written into the file (omit to keep the file's own). */
   async saveProject(path: string, opts: SaveProjectOptions | null = null): Promise<ProjectSaveResponse> {
     const body: Record<string, unknown> = { path, analysis: opts?.analysis ?? null };
     // The sidecar reads an omitted/null carry_from as "carry from `path`"
     // and "" as "carry nothing".
     if (opts && opts.carryFrom !== undefined) body.carry_from = opts.carryFrom ?? "";
+    // Only when given: an omitted doc_uid keeps the uid the file already has.
+    if (opts?.docUid) body.doc_uid = opts.docUid;
     return apiJson<ProjectSaveResponse>("/api/project/save", "POST", JSON.stringify(body));
   }
 
@@ -353,10 +359,19 @@ class ApiClient {
    *  not loaded — and leaves its figure edits alone. Resolves
    *  `{ok: false, missing}` for kept blobs the file lacks and
    *  `{ok: false, unsupported: true}` for a newer-format file (in both cases
-   *  nothing was written); other failures reject. */
-  async writeWorkflows(path: string, payload: WorkflowsPayload): Promise<WorkflowsWriteResult> {
+   *  nothing was written); other failures reject. `opts.docUid`: the uid the
+   *  manifest is written under — a file whose doc.json names another is
+   *  rewritten to it in the same write. `opts.expectUid`: the uid the file
+   *  named when last read or written — a file naming another (another
+   *  document has its name now) is left untouched and the call rejects
+   *  (docIdentity.isOtherDocumentError). */
+  async writeWorkflows(
+    path: string, payload: WorkflowsPayload, opts: { docUid?: string; expectUid?: string } = {},
+  ): Promise<WorkflowsWriteResult> {
     const text = await apiRequest("/api/project/workflows/write", "POST", JSON.stringify({
       path, manifest: payload.manifest, blobs: payload.blobs, uploads: payload.uploads,
+      ...(opts.docUid ? { doc_uid: opts.docUid } : {}),
+      ...(opts.expectUid ? { expect_uid: opts.expectUid } : {}),
     }));
     const parsed = JSON.parse(text);
     const detail = parsed?.detail;
@@ -364,6 +379,9 @@ class ApiClient {
       if (Array.isArray(detail.missing)) return { ok: false, missing: detail.missing as string[] };
       if (detail.unsupported) {
         return { ok: false, unsupported: true, version: typeof detail.version === "number" ? detail.version : undefined };
+      }
+      if (typeof detail.other_document === "string") {
+        throw new Error("Its file now holds another document (renamed or replaced outside the app), so nothing was written into it.");
       }
     }
     if (detail) throw new Error(`API error: ${JSON.stringify(detail)}`);
@@ -413,6 +431,31 @@ class ApiClient {
       for (const p of paths) all[p] = true;
       return all;
     }
+  }
+
+  /** Where each .mpf in `refs` is now, recognised by the document uid inside
+   *  it (POST /api/fs/mpf-resolve): its path when the file there is that
+   *  document (or carries no uid), else a file carrying the uid among the
+   *  ref's candidates and in their folders (`opts.scan` false: candidates
+   *  only, no folder listing). Reads only each file's tiny `doc.json`, never
+   *  a whole project. Results by ref key. Degrades like pathsExist when the
+   *  endpoint is unavailable (an older sidecar): `ok` where the path exists,
+   *  `missing` where it doesn't, never `moved`, no uids. */
+  async resolveMpf(refs: MpfResolveRef[], opts: { scan?: boolean } = {}): Promise<Record<string, MpfResolveResult>> {
+    if (refs.length === 0) return {};
+    try {
+      const data = await apiJson<MpfResolveResponse>(
+        "/api/fs/mpf-resolve", "POST", JSON.stringify({ refs, scan: opts.scan ?? true }),
+      );
+      if (data && data.results && typeof data.results === "object") return data.results;
+    } catch { /* older sidecar (404) or unreachable: by path only, below */ }
+    const exists = await this.pathsExist([...new Set(refs.map((r) => r.path).filter(Boolean))]);
+    const out: Record<string, MpfResolveResult> = {};
+    for (const r of refs) {
+      const there = !!r.path && exists[r.path] === true;
+      out[r.key] = { status: there ? "ok" : "missing", path: there ? r.path : null, exists: there, uid: null };
+    }
+    return out;
   }
 
   // ── In-session document snapshots (for seamless tab switching) ──

@@ -265,8 +265,10 @@ describe("API endpoint integration", () => {
     await useFigureStore.getState().saveProject("/tmp/test.mpfig");
 
     // The document's previous file (none: an Untitled document) is passed as
-    // carryFrom, so a file it overwrites passes no saved Analysis on.
-    expect(mockApi.saveProject).toHaveBeenCalledWith("/tmp/test.mpfig", { carryFrom: null });
+    // carryFrom, so a file it overwrites passes no saved Analysis on; its
+    // document uid goes into the file.
+    expect(mockApi.saveProject).toHaveBeenCalledWith("/tmp/test.mpfig",
+      { carryFrom: null, docUid: expect.stringMatching(/^du_/) });
   });
 
   it("loadProject restores config and images", async () => {

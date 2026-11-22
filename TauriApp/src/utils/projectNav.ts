@@ -13,9 +13,15 @@ import { useFigureStore } from "../store/figureStore";
 import { useCollageStore, newDocId } from "../store/collageStore";
 import { useAnalysisWorkspaceStore, docHasAnalysis, untitledAnalysisDocIds } from "../store/analysisWorkspaceStore";
 import { api } from "../api/client";
-import { confirmThree, alert as alertDialog } from "../components/shared/ConfirmDialog";
+import { confirm as confirmDialog, confirmThree, alert as alertDialog } from "../components/shared/ConfirmDialog";
 import { saveProjectDialog } from "../components/shared/SaveProjectDialog";
 import { serializeDocOp, isStateCacheMiss } from "./docOpQueue";
+import { fileUidOf, isMissingFileError } from "./docIdentity";
+import {
+  findRenamedOpenTab, itemUidAt, knownFileUid, locateOpenDoc, markItemsMissingAt, ontoAnotherTab, relinkCollageItem,
+  relocateOpenDoc, repointOpenDoc, resolveRefs,
+} from "./docLinks";
+import { basenameOf, dirnameOf } from "./workflowPersist";
 
 /* ── Per-document in-memory state cache ──────────────────────────────────
    The Python backend holds exactly ONE builder document's state (config +
@@ -239,7 +245,10 @@ async function withDocSwap<T>(fn: () => Promise<T>): Promise<T> {
 /** Load a document's state into the backend builder: prefer its in-memory
  *  cache — a dirty stash (preserves unsaved edits) or a clean perf cache (fast
  *  reload) — else the on-disk .mpf, else blank. */
-async function activateDoc(doc: { id: string; path: string | null; name?: string }): Promise<void> {
+async function activateDoc(target: { id: string; path: string | null; name?: string }): Promise<void> {
+  // The tab as it is now: its file may have been re-pointed (renamed or moved
+  // outside the app) since the caller looked.
+  const doc = useCollageStore.getState().openDocs.find((d) => d.id === target.id) ?? target;
   const wasDirty = backendStashed.has(doc.id);
   if (wasDirty || cleanCached.has(doc.id)) {
     try {
@@ -270,10 +279,103 @@ async function activateDoc(doc: { id: string; path: string | null; name?: string
     }
   }
   if (doc.path) {
-    await useFigureStore.getState().loadProject(doc.path, doc.id);
+    try {
+      await useFigureStore.getState().loadProject(doc.path, doc.id);
+    } catch (e) {
+      // No file at its path any more: renamed or moved outside the app.
+      // Found by its uid → the tab follows it there and loads it from there.
+      if (!isMissingFileError(e)) throw e;
+      const moved = await relocateOpenDoc(doc.id);
+      if (!moved) throw e;
+      await useFigureStore.getState().loadProject(moved, doc.id);
+    }
   } else {
     await useFigureStore.getState().newBlankFigure(doc.id);
   }
+}
+
+/** The document `docId` is (still) on the open-document list. */
+function openDoc(docId: string) {
+  return useCollageStore.getState().openDocs.find((d) => d.id === docId);
+}
+
+/** Native "open .mpf" dialog (as Analysis' Locate uses). Null: cancelled,
+ *  or no dialog (a browser preview). */
+async function pickMpfFile(title: string, startIn?: string): Promise<string | null> {
+  let picked: unknown;
+  try {
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    picked = await dialog.open({
+      title,
+      multiple: false,
+      directory: false,
+      filters: [{ name: "Project", extensions: ["mpf"] }],
+      ...(startIn ? { defaultPath: startIn } : {}),
+    });
+  } catch (e) {
+    console.warn("[projectNav] the file dialog is unavailable", e);
+    return null;
+  }
+  if (typeof picked === "string") return picked;
+  if (picked && typeof picked === "object" && typeof (picked as { path?: unknown }).path === "string") {
+    return (picked as { path: string }).path;
+  }
+  return null;
+}
+
+/* ── A tab whose file was renamed, moved or deleted outside the app ──────
+   Before a save writes a tab's file, the file is looked up by the uid it
+   carries (docLinks.locateOpenDoc): found elsewhere, the tab follows it and
+   the save goes there — Save must not quietly re-create "a.mpf" next to the
+   "b.mpf" the user renamed it to. Found nowhere, the user decides. */
+
+/** Open tab `docId`'s file is gone (`at`: where it was, missing / ambiguous):
+ *  ask where to save it — the same path again, somewhere else (the save
+ *  dialog), or not at all (null). Either way the old file is gone, so the
+ *  sidecar keeps the document's uid: it is the same document. When another
+ *  document's file now has that name (`at.exists`), only somewhere else (the
+ *  save dialog, which itself asks before overwriting) or not at all. */
+async function askWhereToSaveMissing(
+  docId: string, at: { status: string; path: string; matches?: string[]; exists?: boolean },
+): Promise<string | null> {
+  const name = openDoc(docId)?.name || basenameOf(at.path);
+  const found = at.status === "ambiguous" ? at.matches ?? [] : [];
+  const several = found.length > 1
+    ? `\n\nSeveral copies of it were found, so none was picked:\n${found.slice(0, 3).join("\n")}`
+    : found.length === 1
+      ? `\n\nA file carrying it was found, but it is not the file this tab had (it may be a copy), so it was not picked:\n${found[0]}`
+      : "";
+  if (at.exists) {
+    const ok = await confirmDialog({
+      title: `"${basenameOf(at.path) || at.path}" now holds a different document`,
+      body: `This document's file was moved, renamed or replaced outside the app, and another document now has its name:\n${at.path}${several}\n\nSave it somewhere else?`,
+      confirmLabel: "Save somewhere else…",
+      cancelLabel: "Cancel",
+    });
+    return ok ? saveProjectDialog({ title: `Save "${name}" as…`, defaultPath: at.path }) : null;
+  }
+  const choice = await confirmThree({
+    title: `"${basenameOf(at.path) || at.path}" is no longer where it was`,
+    body: `It was moved, renamed or deleted outside the app.\n${at.path}${several}`,
+    confirmLabel: "Save here again",
+    tertiaryLabel: "Save somewhere else…",
+    cancelLabel: "Cancel",
+  });
+  if (choice === "cancel") return null;
+  if (choice === "confirm") return at.path;
+  return saveProjectDialog({ title: `Save "${name}" as…`, defaultPath: at.path });
+}
+
+/** Where to save open tab `docId`, which has a file: its path; the file's
+ *  new path when it was renamed or moved outside the app (found by its uid —
+ *  the tab is re-pointed there, no prompt); when it can't be found, the
+ *  user's pick (askWhereToSaveMissing). Null: cancelled. A lookup that
+ *  could not be made keeps the tab's path. */
+export async function ensureDocFile(docId: string): Promise<string | null> {
+  const at = await locateOpenDoc(docId);
+  if (!at) return openDoc(docId)?.path ?? null;
+  if (at.status === "ok" || at.status === "moved") return at.path;
+  return askWhereToSaveMissing(docId, at);
 }
 
 /** Mirror the builder's current project path onto the active doc tab,
@@ -290,8 +392,17 @@ function syncActiveDocPath() {
  *  Save Project button uses) so the user picks where + what name.
  *  Returns the path on success, null if cancelled. */
 export async function ensureProjectSaved(): Promise<string | null> {
+  // The live document's file may have been renamed or moved outside the app:
+  // found by its uid, the tab (and currentProjectPath) follow it; not found,
+  // it is saved again even when clean (the dialog below).
+  let gone = false;
+  const live = openDoc(useCollageStore.getState().activeDocId ?? "");
+  if (live?.path && live.path === useFigureStore.getState().currentProjectPath) {
+    const at = await locateOpenDoc(live.id);
+    gone = !!at && at.status !== "ok" && at.status !== "moved";
+  }
   const { currentProjectPath, unsaved, saveProject } = useFigureStore.getState();
-  if (currentProjectPath && !unsaved) return currentProjectPath;
+  if (currentProjectPath && !unsaved && !gone) return currentProjectPath;
 
   const picked = await saveProjectDialog({
     defaultPath: currentProjectPath || defaultProjectName(),
@@ -304,6 +415,30 @@ export async function ensureProjectSaved(): Promise<string | null> {
   }
   syncActiveDocPath();
   return useFigureStore.getState().currentProjectPath || picked;
+}
+
+/** The builder Sidebar's "Save Project" button: the Save Project modal for
+ *  the live document. Its file is looked up by its uid first, as Save does:
+ *  renamed or moved outside the app → the tab follows it and the modal
+ *  offers the new path, so saving under another name is a copy of that file
+ *  (a new uid), not a move of one that is gone; not found → the user picks
+ *  (askWhereToSaveMissing) instead of re-creating the old name unasked.
+ *  Serialized, like the tab's Save. */
+export function saveProjectWithDialog(): Promise<boolean> {
+  return serializeDocOp(async () => {
+    const live = openDoc(useCollageStore.getState().activeDocId ?? "");
+    const at = live?.path && live.path === useFigureStore.getState().currentProjectPath
+      ? await locateOpenDoc(live.id) : null;
+    const picked = live && at && at.status !== "ok" && at.status !== "moved"
+      ? await askWhereToSaveMissing(live.id, at)
+      : await saveProjectDialog({
+        // Seeded from the (renamed) active tab when unsaved, else the current
+        // path — as it is now — else a timestamp, matching ensureProjectSaved.
+        defaultPath: useFigureStore.getState().currentProjectPath || defaultProjectName(),
+      });
+    if (!picked) return false;
+    return useFigureStore.getState().saveProject(picked);
+  });
 }
 
 /** Save a document tab from its in-tab Save button. Contextual, like ⌘S:
@@ -324,11 +459,18 @@ async function saveDocumentImpl(docId: string): Promise<boolean> {
     if (!switched) return false;
   }
   const fs = useFigureStore.getState();
-  const existingPath = doc.path || fs.currentProjectPath;
-  let path = existingPath;
-  if (!path) {
-    path = await saveProjectDialog({ defaultPath: defaultProjectName() });
-    if (!path) return false; // user cancelled
+  let path: string | null;
+  if (openDoc(docId)?.path) {
+    // Its file, wherever it is now (renamed / moved outside the app → the
+    // tab follows it); gone → the user picks where (or cancels).
+    path = await ensureDocFile(docId);
+    if (!path) return false;
+  } else {
+    path = fs.currentProjectPath;
+    if (!path) {
+      path = await saveProjectDialog({ defaultPath: defaultProjectName() });
+      if (!path) return false; // user cancelled
+    }
   }
   const ok = await fs.saveProject(path);
   if (!ok) {
@@ -358,8 +500,8 @@ export function saveDocument(docId: string): Promise<boolean> {
 /** Default project filename for the Save Project modal. If the user has
  *  renamed the active (unsaved) tab, that name seeds the filename; otherwise
  *  fall back to a timestamped name. Sanitizes path-illegal characters and
- *  ensures a .mpf extension. Exported so the Sidebar's Save Project button
- *  uses the identical default. */
+ *  ensures a .mpf extension. The Sidebar's Save Project button uses the
+ *  identical default (saveProjectWithDialog). */
 export function defaultProjectName(): string {
   const cs = useCollageStore.getState();
   const doc = cs.openDocs.find((d) => d.id === cs.activeDocId);
@@ -395,10 +537,17 @@ async function saveDocumentAs(docId: string): Promise<boolean> {
     if (!switched) return false;
   }
   const fs = useFigureStore.getState();
-  const existingPath = doc.path || fs.currentProjectPath;
+  // Its file, wherever it is now (renamed / moved outside the app → the tab
+  // follows it, and the overwrite below names the new file).
+  const at = await locateOpenDoc(docId);
+  const existingPath = at?.path || openDoc(docId)?.path || fs.currentProjectPath;
 
   let path: string | null;
-  if (existingPath) {
+  if (at && at.status !== "ok" && at.status !== "moved") {
+    // Gone: there is nothing to overwrite — ask where to save it instead.
+    path = await askWhereToSaveMissing(docId, at);
+    if (!path) return false; // cancelled → abort
+  } else if (existingPath) {
     // Modified existing .mpf — confirm overwrite, or let the user redirect it.
     const fileName = existingPath.split(/[\\/]/).pop() || existingPath;
     const choice = await confirmThree({
@@ -436,7 +585,7 @@ async function saveDocumentAs(docId: string): Promise<boolean> {
   path = useFigureStore.getState().currentProjectPath || path;   // as written (".mpf" added…)
   // Reflect a new location on the tab (leave the name alone when overwriting
   // the same path, so a custom rename sticks).
-  if (path !== doc.path) useCollageStore.getState().docSetPath(docId, path);
+  if (path !== openDoc(docId)?.path) useCollageStore.getState().docSetPath(docId, path);
   dropStash(docId);
   syncSnapshotDirty();
   return true;
@@ -549,18 +698,159 @@ async function switchToDocumentImpl(docId: string): Promise<boolean> {
       await activateDoc(doc);
     } catch (e) {
       console.error("[projectNav] switch document failed:", e);
-      await alertDialog({
-        title: "Load failed",
-        body: `Could not load "${doc.name}".\n\nIts .mpf may have been moved or deleted.`,
-      });
       // Leave the previous doc active/live — do NOT flip activeDocId to a tab
       // whose content failed to load (that would desync active vs backend).
-      return false;
+      // A file that is gone (and was not found by its uid): the user can
+      // point at it, or close the tab.
+      return recoverMissingDoc(docId, e);
     }
     useCollageStore.getState().docSetActive(docId);
     useCollageStore.getState().setMode("builder");
     return true;
   });
+}
+
+/** Switching to tab `docId` failed with `err`. Its file gone (renamed,
+ *  moved or deleted outside the app, and not found by its uid): Locate… /
+ *  Close tab / Cancel. Any other failure: the plain "Load failed" notice.
+ *  Runs inside the switch's doc op (only plain awaits, never a queued op).
+ *  True only when the tab became the live document after all. */
+async function recoverMissingDoc(docId: string, err: unknown): Promise<boolean> {
+  const doc = openDoc(docId);
+  if (!doc) return false;
+  if (!doc.path || !isMissingFileError(err)) {
+    await alertDialog({
+      title: "Load failed",
+      body: `Could not load "${doc.name}".\n\nIts .mpf may have been moved or deleted.`,
+    });
+    return false;
+  }
+  // Its collage figures have no file either: they no longer keep the tab
+  // open (closeDocImpl), and re-link if the file is opened later.
+  markItemsMissingAt(doc.path);
+  const file = basenameOf(doc.path) || doc.path;
+  const choice = await confirmThree({
+    title: `"${file}" could not be found`,
+    body: `"${doc.name}" could not be loaded: its file is no longer at\n${doc.path}\n\n`
+      + "It was moved, renamed or deleted outside the app. Locate it, or close this tab?",
+    confirmLabel: "Locate…",
+    tertiaryLabel: "Close tab",
+    cancelLabel: "Cancel",
+  });
+  if (choice === "cancel") return false;
+  if (choice === "tertiary") {
+    await closeDocImpl(docId);
+    return false;
+  }
+  const picked = await pickMpfFile(`Locate "${file}"`, dirnameOf(doc.path) || undefined);
+  if (!picked) return false;
+  return adoptLocatedFile(docId, picked);
+}
+
+/** The user located tab `docId`'s file at `picked`. The same document (its
+ *  uid matches, or one of the two is unknown): the tab — and everything on
+ *  its old path — follows it there and is loaded. Another document (or a
+ *  file another tab already has): it opens in a tab of its own, and this
+ *  tab stays as it was. */
+async function adoptLocatedFile(docId: string, picked: string): Promise<boolean> {
+  const doc = openDoc(docId);
+  if (!doc?.path) return false;
+  if (picked !== doc.path) {                                 // (else: put back where it was)
+    const expected = knownFileUid(docId, doc.path);
+    const found = (await resolveRefs([{ key: "pick", path: picked }], { scan: false })).pick;
+    const there = openDoc(docId);
+    if (!there?.path) return false;
+    const other = useCollageStore.getState().openDocs.some((d) => d.id !== docId && d.path === picked);
+    const differs = !!expected && !!found?.uid && found.uid !== expected;
+    if (other || differs) {
+      if (differs) {
+        await alertDialog({
+          title: "A different document",
+          body: `"${basenameOf(picked)}" is not the document of the tab "${there.name}", `
+            + "so it opens in a tab of its own.",
+        });
+      }
+      await openProjectIntoTabImpl(picked);
+      return false;
+    }
+    // Its Analysis counts as read only for the very file that was read (the
+    // two uids match). A file whose uid can't be told (it carries none, or
+    // it is a cloud placeholder), or a tab that knew none, may hold Analysis
+    // this tab never read: it is read where it is now before anything is
+    // written to it (and until then a figure save leaves the file's uid alone).
+    // So may the file a held tab (a Finder copy's, a uid of its own) locates:
+    // the uid it expects is the original's, which the original's file carries too.
+    const f = fileUidOf(docId);
+    const held = !!f && useAnalysisWorkspaceStore.getState().docUids[docId] !== f;
+    const same = !held && !!expected && found?.uid === expected;
+    repointOpenDoc(there.path, picked, found?.uid || expected, {
+      reread: !same, ...(found?.file_id ? { fileId: found.file_id } : {}),
+    });
+  }
+  try {
+    await activateDoc({ id: docId, path: picked, name: doc.name });
+  } catch (e) {
+    console.error("[projectNav] loading the located file failed:", e);
+    await alertDialog({ title: "Load failed", body: `Could not load "${basenameOf(picked)}".` });
+    return false;
+  }
+  markItemsMissingAt(picked, false);
+  useCollageStore.getState().docSetActive(docId);
+  useCollageStore.getState().setMode("builder");
+  return true;
+}
+
+/** Collage figure `itemId`'s .mpf could not be found (missingItemIds: moved
+ *  to a folder no lookup reaches, or several copies of it were found): the
+ *  user points at it with the native open dialog. The file picked is peeked
+ *  at for its uid. The same document (the uids match, or one of the two is
+ *  unknown): everything on the figure's old path follows it there
+ *  (repointOpenDoc — other figures placed from it, a tab still on it).
+ *  Another document's file — used only after "Use it anyway?" — or a file
+ *  another tab already has: only this figure is re-linked. Then a tab on the
+ *  file, as at launch. True: re-linked; false: cancelled or not possible. */
+async function locateCollageItemImpl(itemId: string): Promise<boolean> {
+  const it = useCollageStore.getState().items.find((i) => i.id === itemId);
+  if (!it || it.kind !== "figure" || !it.projectPath) return false;
+  const old = it.projectPath;
+  const picked = await pickMpfFile(`Locate "${basenameOf(old) || old}"`, dirnameOf(old) || undefined);
+  if (!picked) return false;
+  const found = (await resolveRefs([{ key: "pick", path: picked }], { scan: false })).pick;
+  if (!found || found.status !== "ok") {
+    await alertDialog({ title: "Could not open that file", body: `"${basenameOf(picked)}" could not be found.` });
+    return false;
+  }
+  const now = useCollageStore.getState().items.find((i) => i.id === itemId);
+  if (!now?.projectPath) return false;                     // removed meanwhile
+  const expected = itemUidAt(now.projectPath, itemId);
+  const differs = !!expected && !!found.uid && found.uid !== expected;
+  if (differs && !(await confirmDialog({
+    title: "A different document",
+    body: `"${basenameOf(picked)}" is not the document "${now.name}" was placed from.\n\nUse it anyway?`,
+    confirmLabel: "Use it",
+  }))) return false;
+  const cur = useCollageStore.getState().items.find((i) => i.id === itemId);
+  if (!cur?.projectPath) return false;
+  if (picked !== cur.projectPath) {
+    if (!differs && !ontoAnotherTab(cur.projectPath, picked)) {
+      // A tab still on the old path counts the picked file as read only when
+      // it is known to be the very file (the uids match).
+      const same = !!expected && found.uid === expected;
+      repointOpenDoc(cur.projectPath, picked, found.uid || expected, {
+        reread: !same, ...(found.file_id ? { fileId: found.file_id } : {}),
+      });
+    }
+    relinkCollageItem(itemId, picked, found.uid || expected);
+  }
+  useCollageStore.getState().setItemMissing(itemId, false);
+  useCollageStore.getState().docEnsure(picked);
+  return true;
+}
+
+/** Locate… for a collage figure whose .mpf is missing (Sidebar). Serialized:
+ *  it may re-point an open tab. */
+export function locateCollageItem(itemId: string): Promise<boolean> {
+  return serializeDocOp(() => locateCollageItemImpl(itemId));
 }
 
 /** Public, serialized entry point for tab switching (see serializeDocOp). */
@@ -596,12 +886,27 @@ export function newBlankDoc(): Promise<void> {
 /** Open a project file into a (new or existing) document tab. Seamless —
  *  the prior tab is snapshotted (if dirty) so its edits survive. */
 export function openProjectIntoTab(path: string): Promise<void> {
-  return queueDocSwap(async () => {
-    // Already open → just focus its tab. (Re-loading it from disk used to
-    // silently discard that tab's unsaved edits.)
-    const existing = useCollageStore.getState().openDocs.find((d) => d.path === path);
-    if (existing) { await switchToDocumentImpl(existing.id); return; }
-    await withDocSwap(async () => {
+  return queueDocSwap(() => openProjectIntoTabImpl(path));
+}
+
+/** openProjectIntoTab's body, for callers already inside a doc op. */
+async function openProjectIntoTabImpl(path: string): Promise<void> {
+  // Already open → just focus its tab. (Re-loading it from disk used to
+  // silently discard that tab's unsaved edits.)
+  const existing = useCollageStore.getState().openDocs.find((d) => d.path === path);
+  if (existing) { await switchToDocumentImpl(existing.id); return; }
+  // The file of an open tab, renamed or moved outside the app while it was
+  // open (its uid, and the tab's old file gone): that tab follows it and is
+  // focused — not reloaded, so its unsaved edits stay. A copy whose
+  // original is still there opens in a tab of its own, as below.
+  const twin = await findRenamedOpenTab(path);
+  const twinNow = twin ? openDoc(twin.id) : undefined;
+  if (twinNow?.path && !useCollageStore.getState().openDocs.some((d) => d.path === path)) {
+    repointOpenDoc(twinNow.path, path, knownFileUid(twinNow.id, twinNow.path));
+    await switchToDocumentImpl(twinNow.id);
+    return;
+  }
+  await withDocSwap(async () => {
     if (!(await stashCurrentDoc())) { await alertCouldNotPark(); return; }
     const newId = newDocId();
     try {
@@ -620,7 +925,6 @@ export function openProjectIntoTab(path: string): Promise<void> {
     syncSnapshotDirty();
     useCollageStore.getState().docSetActive(id);
     useCollageStore.getState().setMode("builder");
-    });
   });
 }
 
@@ -635,10 +939,11 @@ async function closeDocImpl(docId: string): Promise<boolean> {
 
   // Block closing a tab whose .mpf is placed in the collage — the
   // collage item depends on that figure. The user must remove it from
-  // the collage first.
+  // the collage first. Not for figures whose file is gone (missingItemIds):
+  // the tab can't show them either, and a dead tab must be closable.
   if (doc.path) {
     const usedInCollage = cs.items.some(
-      (it) => it.kind === "figure" && it.projectPath === doc.path,
+      (it) => it.kind === "figure" && it.projectPath === doc.path && !cs.missingItemIds.includes(it.id),
     );
     if (usedInCollage) {
       await alertDialog({

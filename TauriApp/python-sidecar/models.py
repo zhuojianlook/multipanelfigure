@@ -5,7 +5,7 @@ All state is held in plain dataclass objects — no Qt dependencies here.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List, Dict
-import json, copy, zipfile, base64, os, shutil, time
+import json, copy, zipfile, base64, os, re, secrets, shutil, time
 
 
 # ---------------------------------------------------------------------------
@@ -1195,13 +1195,125 @@ def paste_panel_settings(panel: PanelInfo, clipboard: PanelSettingsClipboard,
 
 
 # ---------------------------------------------------------------------------
+# The document's identity: doc.json
+# ---------------------------------------------------------------------------
+# Every .mpf this build saves carries a stable id ("du_…", the same id the
+# frontend keeps per document tab) in a tiny `doc.json` member. It lets the
+# app find a document again after the user renamed or moved the file: the
+# path is tried first, the id when the path no longer holds the document.
+# The member is written FIRST and STORED, so a folder scan reads it with one
+# central-directory parse and one small uncompressed read. A Save As copy gets
+# a new id (decided by the save endpoint). Older builds ignore the member and
+# drop it when they re-save the file; the redundant copy in
+# workflows/manifest.json ("docUid") survives that, so read_mpf_uid falls
+# back to it. Never under workflows/: a workflows/ rewrite drops unknown
+# members there.
+
+DOC_META_MEMBER = "doc.json"
+DOC_META_FORMAT = "mpf-doc"
+DOC_META_VERSION = 1
+# Lenient on purpose (tests and older manifests use short ids); only rules
+# out what could never be an id we wrote.
+_DOC_UID_RE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+_DOC_META_MAX_BYTES = 64 * 1024
+_BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _base36(n: int) -> str:
+    out = ""
+    while True:
+        n, r = divmod(n, 36)
+        out = _BASE36[r] + out
+        if n == 0:
+            return out
+
+
+def new_doc_uid() -> str:
+    """A new document id, shaped like the frontend's newDocUid
+    (workflowOwnership.ts): "du_" + base-36 milliseconds + 8 random base-36
+    characters."""
+    rand = "".join(secrets.choice(_BASE36) for _ in range(8))
+    return f"du_{_base36(int(time.time() * 1000))}{rand}"
+
+
+def valid_doc_uid(u) -> bool:
+    return isinstance(u, str) and _DOC_UID_RE.fullmatch(u) is not None
+
+
+def make_doc_meta(uid: str, created: Optional[str] = None) -> dict:
+    """The doc.json content for `uid`. `created` (ISO-8601 UTC) is kept from
+    the file's previous doc.json when the id did not change."""
+    return {"format": DOC_META_FORMAT, "version": DOC_META_VERSION, "uid": uid,
+            "created": created or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+def write_doc_meta(zf: zipfile.ZipFile, meta: dict) -> None:
+    """Write doc.json (`meta`) into the zip being written: stored, so a scan
+    reads it without inflating. Callers write it first."""
+    zi = zipfile.ZipInfo(DOC_META_MEMBER, date_time=time.localtime()[:6])
+    zi.external_attr = 0o600 << 16
+    zf.writestr(zi, json.dumps(meta), compress_type=zipfile.ZIP_STORED)
+
+
+def read_doc_meta(zf: zipfile.ZipFile) -> Optional[dict]:
+    """The parsed doc.json of an open .mpf, or None when it is absent or
+    unreadable. Any version is accepted: the uid field keeps its meaning."""
+    try:
+        info = zf.getinfo(DOC_META_MEMBER)
+        if info.file_size > _DOC_META_MAX_BYTES:
+            return None
+        meta = json.loads(zf.read(info))
+    except Exception:
+        return None
+    if not isinstance(meta, dict) or meta.get("format", DOC_META_FORMAT) != DOC_META_FORMAT:
+        return None
+    return meta
+
+
+def doc_meta_uid(meta) -> Optional[str]:
+    u = meta.get("uid") if isinstance(meta, dict) else None
+    return u if valid_doc_uid(u) else None
+
+
+def read_doc_uid(path: str) -> Optional[str]:
+    """doc.json's uid of the .mpf at `path` (no manifest fallback), or None.
+    Never raises."""
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            return doc_meta_uid(read_doc_meta(zf))
+    except Exception:
+        return None
+
+
+def read_mpf_uid(path: str) -> Optional[str]:
+    """The id of the .mpf at `path`: doc.json's uid, else the docUid of
+    workflows/manifest.json (whatever that manifest's version: it is the
+    only copy an older build's re-save keeps), else None. Never raises; a
+    file that is not a readable zip gives None."""
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            uid = doc_meta_uid(read_doc_meta(zf))
+            if uid:
+                return uid
+            try:
+                manifest = json.loads(zf.read(WORKFLOWS_MANIFEST))
+            except Exception:
+                return None
+            u = manifest.get("docUid") if isinstance(manifest, dict) else None
+            return u if valid_doc_uid(u) else None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Zip-based project save / load  (config + images in one file)
 # ---------------------------------------------------------------------------
 
 def save_project(cfg: FigureConfig, images: Dict[str, bytes], path: str,
                   fonts: Dict[str, bytes] = None,
                   analysis: Optional[dict] = None,
-                  channel_data: Optional[Dict[str, dict]] = None):
+                  channel_data: Optional[Dict[str, dict]] = None,
+                  doc_meta: Optional[dict] = None):
     """Save a full project: config JSON + images + videos + custom fonts into a .mpf zip.
 
     Optionally bundles an `analysis` payload of the shape:
@@ -1210,9 +1322,14 @@ def save_project(cfg: FigureConfig, images: Dict[str, bytes], path: str,
           "plots":  { "<plot_id>": <bytes>, ... },   # PNG binaries
           "tables": { "<table_id>": "<csv text>", ... },
         }
-    Any of the three sub-keys may be missing/empty."""
+    Any of the three sub-keys may be missing/empty.
+
+    `doc_meta` (see DOC_META_MEMBER) is written as the first member, stored.
+    Snapshots of a tab pass none: they are never user files."""
     import io
     with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        if doc_meta is not None:
+            write_doc_meta(zf, doc_meta)
         zf.writestr('config.json', json.dumps(_to_dict(cfg), indent=2))
         for name, img_bytes in images.items():
             zf.writestr(f'images/{name}', img_bytes)

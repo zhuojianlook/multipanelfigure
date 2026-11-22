@@ -604,8 +604,9 @@ describe("figureStore save / load", () => {
     await open([A]);
     st().setTabs([wf("wfA", [src(A, "r0c0_i0")])]);
     useFigureStore.setState({ config: { rows: 1, cols: 1, panels: [[{}]] } as never, currentProjectPath: A.path });
+    const uid = st().docUids[A.id];
     await expect(useFigureStore.getState().saveProject("/exp/a2.mpf")).resolves.toBe(true);
-    expect(mockApi.saveProject).toHaveBeenCalledWith("/exp/a2.mpf", { carryFrom: A.path });
+    expect(mockApi.saveProject).toHaveBeenCalledWith("/exp/a2.mpf", { carryFrom: A.path, docUid: uid });
     expect(useCollageStore.getState().openDocs[0].path).toBe("/exp/a2.mpf");
     expect(fileManifest("/exp/a2.mpf")!.workflows.map((w) => w.id)).toEqual(["wfA"]);
   });
@@ -614,7 +615,7 @@ describe("figureStore save / load", () => {
     await open([U]);
     useFigureStore.setState({ config: { rows: 1, cols: 1, panels: [[{}]] } as never, currentProjectPath: null });
     await useFigureStore.getState().saveProject("/exp/u.mpf");
-    expect(mockApi.saveProject).toHaveBeenCalledWith("/exp/u.mpf", { carryFrom: null });
+    expect(mockApi.saveProject).toHaveBeenCalledWith("/exp/u.mpf", { carryFrom: null, docUid: st().docUids[U.id] });
   });
 
   it("a failed figure save writes no workflows; a failed workflow write doesn't fail the figure save", async () => {

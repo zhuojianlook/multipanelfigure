@@ -40,9 +40,9 @@ import { sortFontList, pickDefaultFont } from "../../utils/fontList";
 import { api } from "../../api/client";
 import { confirm as confirmDialog, alert as alertDialog } from "../shared/ConfirmDialog";
 import { detectGlobalFont, describeDetectedFont } from "../../utils/detectGlobalFont";
-import { openProjectIntoTab, enterAnalysis, defaultProjectName } from "../../utils/projectNav";
+import { openProjectIntoTab, enterAnalysis, locateCollageItem, saveProjectWithDialog } from "../../utils/projectNav";
+import { withItemPath } from "../../utils/docLinks";
 import { rRerunPng, rRerenderError } from "../../utils/rRerender";
-import { saveProjectDialog } from "../shared/SaveProjectDialog";
 
 /* ── tiny reusable pieces ─────────────────────────────── */
 
@@ -232,6 +232,9 @@ function CollageSidebar() {
   // UI-only local state.
   const elements = useCollageStore((s) => s.elemListByItem);
   const elemSel = useCollageStore((s) => s.elemSelByItem);
+  // Figures whose .mpf could not be found (renamed / moved where no lookup
+  // reaches, or several copies): marked in their row, with Locate….
+  const missingIds = useCollageStore((s) => s.missingItemIds);
   const setElemList = useCollageStore((s) => s.setElemList);
   const toggleElemSel = useCollageStore((s) => s.toggleElemSel);
   const setAllElemSel = useCollageStore((s) => s.setAllElemSel);
@@ -244,18 +247,33 @@ function CollageSidebar() {
   const loadElements = async (it: typeof figureItems[number]) => {
     if (elements[it.id] || elemLoading[it.id]) return;
     setElemLoading((m) => ({ ...m, [it.id]: true }));
+    let retry = false;
     try {
-      const { elements: els } = await api.getFigureElements(it.projectPath!, it.figureId);
+      // Its .mpf, found again by its uid if it was renamed or moved.
+      const { elements: els } = await withItemPath(it.id, (projectPath) => api.getFigureElements(projectPath, it.figureId));
       setElemList(it.id, els);
     } catch (e) {
       console.error("[collage] load elements failed for", it.name, e);
-      await alertDialog({
-        title: "Could not read figure",
-        body: "Failed to list this figure's text elements — its .mpf may have moved.",
-      });
+      if (useCollageStore.getState().missingItemIds.includes(it.id)) {
+        // Not found by its uid either: the user can point at it.
+        const locate = await confirmDialog({
+          title: "Could not find this figure's file",
+          body: `"${it.name}" was placed from\n${it.projectPath}\n\n`
+            + "It was moved, renamed or deleted outside the app.",
+          confirmLabel: "Locate…",
+        });
+        retry = locate && await locateCollageItem(it.id);
+      } else {
+        await alertDialog({
+          title: "Could not read figure",
+          body: "Failed to list this figure's text elements — its .mpf may have moved.",
+        });
+      }
     } finally {
       setElemLoading((m) => ({ ...m, [it.id]: false }));
     }
+    // Located: list them from the file found (withItemPath reads the path anew).
+    if (retry) void loadElements(it);
   };
   const toggleExpand = (it: typeof figureItems[number]) => {
     const open = !expanded[it.id];
@@ -313,7 +331,7 @@ function CollageSidebar() {
           let els = useCollageStore.getState().elemListByItem[it.id];
           if (!els) {
             try {
-              const r = await api.getFigureElements(it.projectPath, it.figureId);
+              const r = await withItemPath(it.id, (projectPath) => api.getFigureElements(projectPath, it.figureId));
               setElemList(it.id, r.elements);
               els = r.elements;
             } catch (e) {
@@ -333,10 +351,10 @@ function CollageSidebar() {
         const scale = it.naturalW > 0 ? it.w / it.naturalW : 1;
         const overrides = useCollageStore.getState().elemOverridesByItem[it.id] || null;
         try {
-          const resp = await api.renderCollageFigure(
-            it.projectPath, applySize ? targetPt : null, Math.max(0.001, scale), it.w, elementIds,
+          const resp = await withItemPath(it.id, (projectPath) => api.renderCollageFigure(
+            projectPath, applySize ? targetPt : null, Math.max(0.001, scale), it.w, elementIds,
             overrides as Record<string, unknown> | null, undefined, it.figureId,
-          );
+          ));
           if (resp?.image && resp.width && resp.height) {
             const newAspect = resp.width / resp.height;
             updateItem(it.id, {
@@ -589,6 +607,17 @@ function CollageSidebar() {
                         <Typography variant="caption" sx={{ fontSize: "0.62rem", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={it.name}>
                           {it.name}
                         </Typography>
+                        {missingIds.includes(it.id) && (
+                          <Typography
+                            component="span"
+                            variant="caption"
+                            title={`File not found: ${it.projectPath}`}
+                            onClick={(e) => { e.stopPropagation(); void locateCollageItem(it.id); }}
+                            sx={{ fontSize: "0.55rem", color: "warning.main", cursor: "pointer", flexShrink: 0, pl: 0.5, "&:hover": { textDecoration: "underline" } }}
+                          >
+                            File not found · Locate…
+                          </Typography>
+                        )}
                         {selCount !== null && (
                           <Typography variant="caption" sx={{ fontSize: "0.55rem", color: "text.secondary", ml: "auto", pl: 0.5, flexShrink: 0 }}>
                             {selCount} el
@@ -760,8 +789,6 @@ function BuilderSidebar() {
   const updateGridSize = useFigureStore((s) => s.updateGridSize);
   const setSpacing = useFigureStore((s) => s.setSpacing);
   const setConfig = useFigureStore((s) => s.setConfig);
-  const saveProject = useFigureStore((s) => s.saveProject);
-  const currentProjectPath = useFigureStore((s) => s.currentProjectPath);
   const checkGridResizeConflict = useFigureStore((s) => s.checkGridResizeConflict);
   const fetchFonts = useFigureStore((s) => s.fetchFonts);
   const fonts = useFigureStore((s) => s.fonts);
@@ -776,7 +803,7 @@ function BuilderSidebar() {
   const [fontWarningConflicts, setFontWarningConflicts] = useState<string[]>([]);
   const [pendingGlobalFont, setPendingGlobalFont] = useState<string | null>(null);
 
-  // Load project dialog (Save uses the shared saveProjectDialog helper)
+  // Load project dialog (Save uses projectNav's saveProjectWithDialog)
   const [loadDialogOpen, setLoadDialogOpen] = useState(false);
   const [projectPath, setProjectPath] = useState("");
   // Project-load progress. The backend's /api/project/load can take
@@ -1539,13 +1566,11 @@ function BuilderSidebar() {
           fullWidth
           variant="contained"
           color="primary"
-          onClick={async () => {
-            // Seed the filename from the (renamed) active tab when unsaved, else
-            // the current path, else a timestamp — matching ensureProjectSaved.
-            const picked = await saveProjectDialog({
-              defaultPath: currentProjectPath || defaultProjectName(),
-            });
-            if (picked) await saveProject(picked);
+          onClick={() => {
+            // The Save Project modal, seeded like ensureProjectSaved's — after
+            // the live document's file is looked up by its uid (renamed or
+            // moved outside the app → the new path; gone → the user decides).
+            void saveProjectWithDialog();
           }}
         >
           Save Project

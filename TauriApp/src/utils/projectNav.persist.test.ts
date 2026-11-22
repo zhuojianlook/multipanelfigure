@@ -231,7 +231,7 @@ describe("Save all", () => {
     dialogs.saveProjectDialog.mockResolvedValueOnce("/exp/untitled.mpf");
     await expect(saveAllOpenDocs()).resolves.toBe(true);
     expect(dialogs.saveProjectDialog).toHaveBeenCalledTimes(1);
-    expect(mockApi.saveProject).toHaveBeenCalledWith("/exp/untitled.mpf", { carryFrom: null });
+    expect(mockApi.saveProject).toHaveBeenCalledWith("/exp/untitled.mpf", { carryFrom: null, docUid: ws().docUids[U.id] });
     expect(useCollageStore.getState().openDocs.find((d) => d.id === U.id)!.path).toBe("/exp/untitled.mpf");
     expect(manifestAt("/exp/untitled.mpf")!.workflows.map((w) => w.id)).toEqual(["wfU"]);
     expect(unsavedAnalysisDocIds()).toEqual([]);
